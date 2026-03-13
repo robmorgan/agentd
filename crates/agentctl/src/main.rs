@@ -1,4 +1,5 @@
 use std::{
+    io::{Read, Write},
     path::PathBuf,
     process::Stdio,
     time::{Duration, Instant},
@@ -6,9 +7,11 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, Subcommand};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::UnixStream,
+    net::{UnixStream, unix::OwnedReadHalf},
+    sync::mpsc,
 };
 
 use agentd_shared::{
@@ -40,7 +43,27 @@ enum Command {
         rm: bool,
         session_id: String,
     },
+    Attach {
+        session_id: String,
+    },
+    SendInput {
+        session_id: String,
+        #[arg(long)]
+        source_session_id: Option<String>,
+        #[arg(
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "DATA"
+        )]
+        data: Vec<String>,
+    },
     Logs {
+        session_id: String,
+        #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true", default_value_t = true)]
+        follow: bool,
+    },
+    Events {
         session_id: String,
         #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true", default_value_t = true)]
         follow: bool,
@@ -64,12 +87,8 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum WorktreeCommand {
-    Create {
-        session_id: String,
-    },
-    Cleanup {
-        session_id: String,
-    },
+    Create { session_id: String },
+    Cleanup { session_id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -132,8 +151,35 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
+        Command::Attach { session_id } => {
+            attach_session(&paths, &session_id).await?;
+        }
+        Command::SendInput {
+            session_id,
+            source_session_id,
+            data,
+        } => {
+            let response = send_request(
+                &paths,
+                &Request::SendInput {
+                    session_id,
+                    data: data.join(" "),
+                    source_session_id,
+                },
+            )
+            .await?;
+
+            match response {
+                Response::InputAccepted => {}
+                Response::Error { message } => bail!(message),
+                other => bail!("unexpected response: {:?}", other),
+            }
+        }
         Command::Logs { session_id, follow } => {
             stream_logs(&paths, &session_id, follow).await?;
+        }
+        Command::Events { session_id, follow } => {
+            stream_events(&paths, &session_id, follow).await?;
         }
         Command::Sessions => {
             let response = send_request(&paths, &Request::ListSessions).await?;
@@ -161,7 +207,8 @@ async fn main() -> Result<()> {
         }
         Command::Worktree { command } => match command {
             WorktreeCommand::Create { session_id } => {
-                let response = send_request(&paths, &Request::CreateWorktree { session_id }).await?;
+                let response =
+                    send_request(&paths, &Request::CreateWorktree { session_id }).await?;
                 match response {
                     Response::Worktree { worktree } => print_worktree(&worktree),
                     Response::Error { message } => bail!(message),
@@ -169,7 +216,8 @@ async fn main() -> Result<()> {
                 }
             }
             WorktreeCommand::Cleanup { session_id } => {
-                let response = send_request(&paths, &Request::CleanupWorktree { session_id }).await?;
+                let response =
+                    send_request(&paths, &Request::CleanupWorktree { session_id }).await?;
                 match response {
                     Response::Worktree { worktree } => {
                         println!("cleaned up worktree for session {}", worktree.session_id);
@@ -287,7 +335,9 @@ async fn daemon_info(paths: &AppPaths) -> Result<DaemonInfo> {
 
 async fn daemon_has_running_sessions(paths: &AppPaths) -> Result<bool> {
     match send_request_no_bootstrap(paths, &Request::ListSessions).await? {
-        Response::Sessions { sessions } => Ok(sessions.iter().any(|session| session.status_string() == "running")),
+        Response::Sessions { sessions } => Ok(sessions
+            .iter()
+            .any(|session| session.status_string() == "running")),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected response: {:?}", other),
     }
@@ -387,6 +437,81 @@ async fn stream_logs(paths: &AppPaths, session_id: &str, follow: bool) -> Result
     Ok(())
 }
 
+async fn stream_events(paths: &AppPaths, session_id: &str, follow: bool) -> Result<()> {
+    let mut stream = try_connect(paths).await?;
+    let payload = serde_json::to_vec(&Request::StreamEvents {
+        session_id: session_id.to_string(),
+        follow,
+    })?;
+    stream.write_all(&payload).await?;
+    stream.write_all(b"\n").await?;
+    stream.flush().await?;
+
+    let mut lines = BufReader::new(stream).lines();
+    while let Some(line) = lines.next_line().await? {
+        match serde_json::from_str::<Response>(&line)? {
+            Response::Event { event } => {
+                println!("{}", serde_json::to_string(&event)?);
+            }
+            Response::EndOfStream => break,
+            Response::Error { message } => bail!(message),
+            other => bail!("unexpected response: {:?}", other),
+        }
+    }
+    Ok(())
+}
+
+async fn attach_session(paths: &AppPaths, session_id: &str) -> Result<()> {
+    let mut stream = try_connect(paths).await?;
+    let payload = serde_json::to_vec(&Request::AttachSession {
+        session_id: session_id.to_string(),
+    })?;
+    stream.write_all(&payload).await?;
+    stream.write_all(b"\n").await?;
+    stream.flush().await?;
+
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+    let Some(line) = lines.next_line().await? else {
+        bail!("agentd closed the connection");
+    };
+
+    match serde_json::from_str::<Response>(&line)? {
+        Response::Attached => {}
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {:?}", other),
+    }
+
+    eprintln!("attached to {session_id}; detach with Ctrl-]");
+    let _raw_mode = RawModeGuard::new()?;
+    let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel();
+
+    let stdin_task = tokio::task::spawn_blocking(move || read_attach_stdin(stdin_tx));
+    let mut output_task = tokio::spawn(async move { stream_attach_output(lines).await });
+
+    loop {
+        tokio::select! {
+            event = stdin_rx.recv() => match event {
+                Some(AttachInput::Data(data)) => {
+                    let payload = serde_json::to_vec(&Request::AttachInput { data })?;
+                    write_half.write_all(&payload).await?;
+                    write_half.write_all(b"\n").await?;
+                    write_half.flush().await?;
+                }
+                Some(AttachInput::Detach) | None => break,
+            },
+            result = &mut output_task => {
+                result??;
+                break;
+            }
+        }
+    }
+
+    drop(write_half);
+    stdin_task.abort();
+    Ok(())
+}
+
 async fn try_connect(paths: &AppPaths) -> Result<UnixStream> {
     UnixStream::connect(paths.socket.as_std_path())
         .await
@@ -397,7 +522,10 @@ fn print_sessions(sessions: &[SessionRecord]) {
     for session in sessions {
         println!(
             "{}\t{}\t{}\t{}",
-            session.session_id, session.agent, session.status_string(), session.branch
+            session.session_id,
+            session.agent,
+            session.status_string(),
+            session.branch
         );
     }
 }
@@ -446,6 +574,72 @@ fn print_kill_result(session_id: &str, was_running: bool, removed: bool) {
     }
     if removed {
         println!("removed session {session_id}");
+    }
+}
+
+async fn stream_attach_output(mut lines: tokio::io::Lines<BufReader<OwnedReadHalf>>) -> Result<()> {
+    let mut stdout = std::io::stdout();
+    while let Some(line) = lines.next_line().await? {
+        match serde_json::from_str::<Response>(&line)? {
+            Response::PtyOutput { data } => {
+                stdout.write_all(data.as_bytes())?;
+                stdout.flush()?;
+            }
+            Response::EndOfStream => break,
+            Response::Error { message } => bail!(message),
+            other => bail!("unexpected response: {:?}", other),
+        }
+    }
+    Ok(())
+}
+
+fn read_attach_stdin(tx: mpsc::UnboundedSender<AttachInput>) -> Result<()> {
+    let mut stdin = std::io::stdin();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        let count = stdin.read(&mut buffer)?;
+        if count == 0 {
+            let _ = tx.send(AttachInput::Detach);
+            break;
+        }
+
+        let bytes = &buffer[..count];
+        if let Some(index) = bytes.iter().position(|byte| *byte == DETACH_BYTE) {
+            if index > 0 {
+                let data = String::from_utf8_lossy(&bytes[..index]).to_string();
+                let _ = tx.send(AttachInput::Data(data));
+            }
+            let _ = tx.send(AttachInput::Detach);
+            break;
+        }
+
+        let data = String::from_utf8_lossy(bytes).to_string();
+        if tx.send(AttachInput::Data(data)).is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+const DETACH_BYTE: u8 = 29;
+
+enum AttachInput {
+    Data(String),
+    Detach,
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn new() -> Result<Self> {
+        enable_raw_mode().context("failed to enable raw terminal mode")?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
     }
 }
 

@@ -75,7 +75,10 @@ mod tests {
 
     #[test]
     fn branch_names_are_slugified() {
-        assert_eq!(branch_name_from_task("fix failing tests"), "agent/fix-failing-tests");
+        assert_eq!(
+            branch_name_from_task("fix failing tests"),
+            "agent/fix-failing-tests"
+        );
     }
 
     #[test]

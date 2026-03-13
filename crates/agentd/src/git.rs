@@ -76,7 +76,13 @@ pub fn create_worktree(
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root.as_str())
-        .args(["worktree", "add", "--detach", worktree.as_str(), base_branch])
+        .args([
+            "worktree",
+            "add",
+            "--detach",
+            worktree.as_str(),
+            base_branch,
+        ])
         .output()
         .with_context(|| format!("failed to create worktree {}", worktree))?;
 
@@ -136,7 +142,10 @@ pub fn remove_worktree(repo_root: &Utf8Path, worktree: &Utf8Path) -> Result<()> 
 
 pub fn diff_against_base(worktree: &Utf8Path, base_branch: &str) -> Result<String> {
     let status = run_git(worktree, &["status", "--short"])?;
-    let committed = run_git(worktree, &["diff", "--stat", &format!("{base_branch}...HEAD")])?;
+    let committed = run_git(
+        worktree,
+        &["diff", "--stat", &format!("{base_branch}...HEAD")],
+    )?;
     let patch = run_git(worktree, &["diff", &format!("{base_branch}...HEAD")])?;
     let working_tree = run_git(worktree, &["diff"])?;
 

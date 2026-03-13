@@ -1,7 +1,11 @@
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -13,10 +17,11 @@ use nix::{
     unistd::Pid,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use tokio::task;
+use tokio::{sync::broadcast, task};
 
 use agentd_shared::{
     config::Config,
+    event::{NewSessionEvent, SessionEvent},
     paths::AppPaths,
     session::{
         CreateSessionResult, SessionDiff, SessionRecord, SessionStatus, WorktreeRecord,
@@ -35,11 +40,17 @@ pub struct AppState {
     pub paths: AppPaths,
     pub db: Database,
     pub config: Config,
+    runtimes: SessionRuntimeRegistry,
 }
 
 impl AppState {
     pub fn new(paths: AppPaths, db: Database, config: Config) -> Self {
-        Self { paths, db, config }
+        Self {
+            paths,
+            db,
+            config,
+            runtimes: SessionRuntimeRegistry::default(),
+        }
     }
 
     pub async fn create_session(
@@ -51,6 +62,7 @@ impl AppState {
         let paths = self.paths.clone();
         let db = self.db.clone();
         let config = self.config.clone();
+        let runtimes = self.runtimes.clone();
 
         task::spawn_blocking(move || {
             let workspace = Utf8PathBuf::from(workspace);
@@ -74,14 +86,27 @@ impl AppState {
             })?;
 
             if let Err(err) = git::create_worktree(&repo_root, &base_branch, &branch, &worktree) {
-                let _ = db.mark_failed(&session_id, err.to_string());
+                let _ = record_session_failure(&db, &session_id, err.to_string());
                 return Err(err);
             }
+            let _ = db.append_events(
+                &session_id,
+                &[daemon_event(
+                    "WORKTREE_CREATED",
+                    serde_json::json!({
+                        "source": "daemon",
+                        "repo_path": repo_root.as_str(),
+                        "base_branch": base_branch,
+                        "branch": branch,
+                        "worktree": worktree.as_str()
+                    }),
+                )],
+            );
 
             let log_path = paths.log_path(&session_id);
             if let Err(err) = File::create(log_path.as_std_path()) {
                 let err = anyhow!(err).context("failed to create session log file");
-                let _ = db.mark_failed(&session_id, err.to_string());
+                let _ = record_session_failure(&db, &session_id, err.to_string());
                 return Err(err);
             }
 
@@ -102,6 +127,7 @@ impl AppState {
                 command.env(&key, &value);
             }
             command.env("AGENTD_SESSION_ID", &session_id);
+            command.env("AGENTD_SOCKET", paths.socket.as_str());
             command.env("AGENTD_WORKSPACE", repo_root.as_str());
             command.env("AGENTD_WORKTREE", worktree.as_str());
             command.env("AGENTD_BRANCH", &branch);
@@ -111,7 +137,7 @@ impl AppState {
                 Ok(child) => child,
                 Err(err) => {
                     let err = anyhow!(err).context("failed to spawn agent process");
-                    let _ = db.mark_failed(&session_id, err.to_string());
+                    let _ = record_session_failure(&db, &session_id, err.to_string());
                     return Err(err);
                 }
             };
@@ -119,26 +145,76 @@ impl AppState {
             let pid = child.process_id().map(|value| value as u32);
             if let Some(pid) = pid {
                 db.mark_running(&session_id, pid)?;
+                let _ = db.append_events(
+                    &session_id,
+                    &[daemon_event(
+                        "SESSION_STARTED",
+                        serde_json::json!({
+                            "source": "daemon",
+                            "pid": pid,
+                            "agent": agent_name,
+                            "branch": branch,
+                            "worktree": worktree.as_str()
+                        }),
+                    )],
+                );
             } else {
                 db.mark_running(&session_id, 0)?;
+                let _ = db.append_events(
+                    &session_id,
+                    &[daemon_event(
+                        "SESSION_STARTED",
+                        serde_json::json!({
+                            "source": "daemon",
+                            "pid": 0,
+                            "agent": agent_name,
+                            "branch": branch,
+                            "worktree": worktree.as_str()
+                        }),
+                    )],
+                );
             }
 
-            let reader = pair.master.try_clone_reader().context("failed to clone PTY reader")?;
+            let reader = pair
+                .master
+                .try_clone_reader()
+                .context("failed to clone PTY reader")?;
+            let writer = pair
+                .master
+                .take_writer()
+                .context("failed to clone PTY writer")?;
+            let runtime = runtimes.insert(
+                session_id.clone(),
+                SessionRuntime::new(writer, OUTPUT_BUFFER_CAPACITY),
+            );
             let writer_db = db.clone();
             let writer_session_id = session_id.clone();
             let writer_log_path = log_path.clone();
+            let writer_runtime = runtime.clone();
             std::thread::spawn(move || {
-                if let Err(err) = pump_pty_to_log(reader, &writer_log_path) {
-                    let _ = writer_db.mark_failed(&writer_session_id, err.to_string());
+                if let Err(err) = pump_pty_to_log(reader, &writer_log_path, &writer_runtime) {
+                    let _ = record_session_failure(&writer_db, &writer_session_id, err.to_string());
                 }
             });
 
             let exit_db = db.clone();
             let exit_session_id = session_id.clone();
+            let exit_runtimes = runtimes.clone();
             std::thread::spawn(move || {
                 let status = child.wait();
                 let code = status.ok().map(|value| value.exit_code() as i32);
+                exit_runtimes.remove(&exit_session_id);
                 let _ = exit_db.mark_exited(&exit_session_id, code);
+                let _ = exit_db.append_events(
+                    &exit_session_id,
+                    &[daemon_event(
+                        "SESSION_FINISHED",
+                        serde_json::json!({
+                            "source": "daemon",
+                            "exit_code": code
+                        }),
+                    )],
+                );
             });
 
             Ok(CreateSessionResult {
@@ -161,6 +237,36 @@ impl AppState {
     pub async fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         let db = self.db.clone();
         task::spawn_blocking(move || db.list_sessions()).await?
+    }
+
+    pub async fn append_session_events(
+        &self,
+        session_id: &str,
+        events: Vec<NewSessionEvent>,
+    ) -> Result<Vec<SessionEvent>> {
+        let db = self.db.clone();
+        let session_id = session_id.to_string();
+        task::spawn_blocking(move || {
+            db.get_session(&session_id)?
+                .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+            db.append_events(&session_id, &events)
+        })
+        .await?
+    }
+
+    pub async fn list_events_since(
+        &self,
+        session_id: &str,
+        after_id: Option<i64>,
+    ) -> Result<Vec<SessionEvent>> {
+        let db = self.db.clone();
+        let session_id = session_id.to_string();
+        task::spawn_blocking(move || {
+            db.get_session(&session_id)?
+                .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+            db.list_events_since(&session_id, after_id)
+        })
+        .await?
     }
 
     pub async fn reconcile_sessions(&self) -> Result<()> {
@@ -198,6 +304,19 @@ impl AppState {
             }
 
             git::create_worktree(&repo_root, &session.base_branch, &session.branch, &worktree)?;
+            let _ = db.append_events(
+                &session_id,
+                &[daemon_event(
+                    "WORKTREE_CREATED",
+                    serde_json::json!({
+                        "source": "daemon",
+                        "repo_path": session.repo_path,
+                        "base_branch": session.base_branch,
+                        "branch": session.branch,
+                        "worktree": session.worktree
+                    }),
+                )],
+            );
 
             Ok(WorktreeRecord {
                 session_id: session.session_id,
@@ -226,6 +345,18 @@ impl AppState {
             }
 
             git::remove_worktree(&repo_root, &worktree)?;
+            let _ = db.append_events(
+                &session_id,
+                &[daemon_event(
+                    "WORKTREE_REMOVED",
+                    serde_json::json!({
+                        "source": "daemon",
+                        "repo_path": session.repo_path,
+                        "branch": session.branch,
+                        "worktree": session.worktree
+                    }),
+                )],
+            );
 
             Ok(WorktreeRecord {
                 session_id: session.session_id,
@@ -248,13 +379,25 @@ impl AppState {
                 .get_session(&session_id)?
                 .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
 
-            let was_running = session.status == SessionStatus::Running && process_exists(session.pid);
+            let was_running =
+                session.status == SessionStatus::Running && process_exists(session.pid);
             if !was_running && !remove {
                 bail!("session `{session_id}` is not running");
             }
 
             if was_running {
                 terminate_session_process(&session_id, session.pid)?;
+                let _ = db.append_events(
+                    &session_id,
+                    &[daemon_event(
+                        "SESSION_KILLED",
+                        serde_json::json!({
+                            "source": "daemon",
+                            "pid": session.pid,
+                            "signal": "SIGTERM"
+                        }),
+                    )],
+                );
                 let _ = db.mark_exited(&session_id, None);
             }
 
@@ -291,6 +434,169 @@ impl AppState {
         })
         .await?
     }
+
+    pub async fn send_input(
+        &self,
+        session_id: &str,
+        data: String,
+        source_session_id: Option<String>,
+    ) -> Result<()> {
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+        ensure_session_running(&session)?;
+
+        let runtime = self
+            .runtimes
+            .get(session_id)
+            .ok_or_else(|| anyhow!("session `{session_id}` does not have a live PTY"))?;
+        runtime.write_input(&data)?;
+
+        let db = self.db.clone();
+        let session_id = session_id.to_string();
+        task::spawn_blocking(move || {
+            db.append_events(
+                &session_id,
+                &[daemon_event(
+                    "SESSION_INPUT_INJECTED",
+                    serde_json::json!({
+                        "source": "daemon",
+                        "target_session_id": session_id,
+                        "source_session_id": source_session_id,
+                        "byte_count": data.len(),
+                        "preview": preview_input(&data),
+                    }),
+                )],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    pub async fn write_attached_input(&self, session_id: &str, data: String) -> Result<()> {
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+        ensure_session_running(&session)?;
+
+        let runtime = self
+            .runtimes
+            .get(session_id)
+            .ok_or_else(|| anyhow!("session `{session_id}` does not have a live PTY"))?;
+        runtime.write_input(&data)
+    }
+
+    pub async fn attach_session(
+        &self,
+        session_id: &str,
+    ) -> Result<(AttachLease, broadcast::Receiver<String>)> {
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+        ensure_session_running(&session)?;
+
+        let runtime = self
+            .runtimes
+            .get(session_id)
+            .ok_or_else(|| anyhow!("session `{session_id}` does not have a live PTY"))?;
+        let lease = runtime
+            .try_attach()
+            .ok_or_else(|| anyhow!("session `{session_id}` already has an attached client"))?;
+        let receiver = runtime.subscribe_output();
+        Ok((lease, receiver))
+    }
+}
+
+const OUTPUT_BUFFER_CAPACITY: usize = 256;
+
+#[derive(Clone, Default)]
+struct SessionRuntimeRegistry {
+    inner: Arc<Mutex<HashMap<String, Arc<SessionRuntime>>>>,
+}
+
+impl SessionRuntimeRegistry {
+    fn insert(&self, session_id: String, runtime: SessionRuntime) -> Arc<SessionRuntime> {
+        let runtime = Arc::new(runtime);
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("session runtime registry poisoned");
+        inner.insert(session_id, runtime.clone());
+        runtime
+    }
+
+    fn get(&self, session_id: &str) -> Option<Arc<SessionRuntime>> {
+        let inner = self
+            .inner
+            .lock()
+            .expect("session runtime registry poisoned");
+        inner.get(session_id).cloned()
+    }
+
+    fn remove(&self, session_id: &str) {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("session runtime registry poisoned");
+        inner.remove(session_id);
+    }
+}
+
+struct SessionRuntime {
+    writer: Mutex<Box<dyn Write + Send>>,
+    output_tx: broadcast::Sender<String>,
+    attached: AtomicBool,
+}
+
+impl SessionRuntime {
+    fn new(writer: Box<dyn Write + Send>, output_buffer_capacity: usize) -> Self {
+        let (output_tx, _) = broadcast::channel(output_buffer_capacity);
+        Self {
+            writer: Mutex::new(writer),
+            output_tx,
+            attached: AtomicBool::new(false),
+        }
+    }
+
+    fn write_input(&self, data: &str) -> Result<()> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| anyhow!("PTY writer poisoned"))?;
+        writer.write_all(data.as_bytes())?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn publish_output(&self, data: String) {
+        let _ = self.output_tx.send(data);
+    }
+
+    fn subscribe_output(&self) -> broadcast::Receiver<String> {
+        self.output_tx.subscribe()
+    }
+
+    fn try_attach(self: &Arc<Self>) -> Option<AttachLease> {
+        self.attached
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(AttachLease {
+            runtime: self.clone(),
+        })
+    }
+}
+
+pub struct AttachLease {
+    runtime: Arc<SessionRuntime>,
+}
+
+impl Drop for AttachLease {
+    fn drop(&mut self) {
+        self.runtime.attached.store(false, Ordering::Release);
+    }
 }
 
 fn unique_session_id(db: &Database) -> Result<String> {
@@ -303,7 +609,33 @@ fn unique_session_id(db: &Database) -> Result<String> {
     bail!("failed to allocate a unique session id")
 }
 
-fn unique_branch_name(repo_root: &camino::Utf8Path, task_text: &str, session_id: &str) -> Result<String> {
+fn daemon_event(event_type: &str, payload_json: serde_json::Value) -> NewSessionEvent {
+    NewSessionEvent {
+        event_type: event_type.to_string(),
+        payload_json,
+    }
+}
+
+fn record_session_failure(db: &Database, session_id: &str, error: String) -> Result<()> {
+    db.mark_failed(session_id, error.clone())?;
+    db.append_events(
+        session_id,
+        &[daemon_event(
+            "SESSION_FAILED",
+            serde_json::json!({
+                "source": "daemon",
+                "error": error
+            }),
+        )],
+    )?;
+    Ok(())
+}
+
+fn unique_branch_name(
+    repo_root: &camino::Utf8Path,
+    task_text: &str,
+    session_id: &str,
+) -> Result<String> {
     let base = branch_name_from_task(task_text);
     if !git::branch_exists(repo_root, &base)? {
         return Ok(base);
@@ -317,7 +649,11 @@ fn unique_branch_name(repo_root: &camino::Utf8Path, task_text: &str, session_id:
     Ok(branch)
 }
 
-fn pump_pty_to_log(mut reader: Box<dyn Read + Send>, log_path: &Utf8PathBuf) -> Result<()> {
+fn pump_pty_to_log(
+    mut reader: Box<dyn Read + Send>,
+    log_path: &Utf8PathBuf,
+    runtime: &SessionRuntime,
+) -> Result<()> {
     let file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -335,6 +671,7 @@ fn pump_pty_to_log(mut reader: Box<dyn Read + Send>, log_path: &Utf8PathBuf) -> 
         let mut file = file.lock().map_err(|_| anyhow!("log writer poisoned"))?;
         file.write_all(&buffer[..bytes_read])?;
         file.flush()?;
+        runtime.publish_output(String::from_utf8_lossy(&buffer[..bytes_read]).to_string());
     }
 
     Ok(())
@@ -364,7 +701,9 @@ fn send_signal(pid: Pid, signal: Signal, session_id: &str) -> Result<()> {
     match kill(pid, Some(signal)) {
         Ok(()) => Ok(()),
         Err(Errno::ESRCH) => bail!("session `{session_id}` is not running"),
-        Err(err) => Err(anyhow!(err)).context(format!("failed to send {signal:?} to session `{session_id}`")),
+        Err(err) => Err(anyhow!(err)).context(format!(
+            "failed to send {signal:?} to session `{session_id}`"
+        )),
     }
 }
 
@@ -391,11 +730,7 @@ fn process_exists(pid: Option<u32>) -> bool {
         return false;
     }
 
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid as i32),
-        None,
-    )
-    .is_ok()
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
 }
 
 fn remove_session_artifacts(paths: &AppPaths, session: &SessionRecord) -> Result<()> {
@@ -420,6 +755,22 @@ fn remove_log_if_present(paths: &AppPaths, session: &SessionRecord) -> Result<()
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(anyhow!(err)).context(format!("failed to remove {}", log_path)),
     }
+}
+
+fn preview_input(data: &str) -> String {
+    let mut preview = data.replace('\n', "\\n").replace('\r', "\\r");
+    if preview.len() > 120 {
+        preview.truncate(120);
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn ensure_session_running(session: &SessionRecord) -> Result<()> {
+    if session.status != SessionStatus::Running || !process_exists(session.pid) {
+        bail!("session `{}` is not running", session.session_id);
+    }
+    Ok(())
 }
 
 fn ensure_session_not_running(session: &SessionRecord) -> Result<()> {

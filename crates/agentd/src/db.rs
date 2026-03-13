@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::Value;
 
 use agentd_shared::{
+    event::{NewSessionEvent, SessionEvent},
     paths::AppPaths,
     session::{SessionRecord, SessionStatus},
 };
@@ -55,10 +57,28 @@ impl Database {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 exited_at TEXT
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                type TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_session_id_id
+                ON events (session_id, id);
+            ",
         )?;
-        self.ensure_column(&conn, "repo_path", "ALTER TABLE sessions ADD COLUMN repo_path TEXT")?;
-        self.ensure_column(&conn, "base_branch", "ALTER TABLE sessions ADD COLUMN base_branch TEXT")?;
+        self.ensure_column(
+            &conn,
+            "repo_path",
+            "ALTER TABLE sessions ADD COLUMN repo_path TEXT",
+        )?;
+        self.ensure_column(
+            &conn,
+            "base_branch",
+            "ALTER TABLE sessions ADD COLUMN base_branch TEXT",
+        )?;
         conn.execute(
             "UPDATE sessions
              SET repo_path = COALESCE(repo_path, workspace),
@@ -121,13 +141,24 @@ impl Database {
             "UPDATE sessions
              SET status = ?2, exit_code = ?3, updated_at = ?4, exited_at = ?4
              WHERE session_id = ?1",
-            params![session_id, status_to_str(SessionStatus::Exited), exit_code, now],
+            params![
+                session_id,
+                status_to_str(SessionStatus::Exited),
+                exit_code,
+                now
+            ],
         )?;
         Ok(())
     }
 
     pub fn mark_unknown_recovered(&self, session_id: &str) -> Result<()> {
-        self.update_state(session_id, SessionStatus::UnknownRecovered, None, None, None)
+        self.update_state(
+            session_id,
+            SessionStatus::UnknownRecovered,
+            None,
+            None,
+            None,
+        )
     }
 
     fn update_state(
@@ -148,7 +179,14 @@ impl Database {
                  error = COALESCE(?5, error),
                  updated_at = ?6
              WHERE session_id = ?1",
-            params![session_id, status_to_str(status), pid, exit_code, error, now],
+            params![
+                session_id,
+                status_to_str(status),
+                pid,
+                exit_code,
+                error,
+                now
+            ],
         )?;
         Ok(())
     }
@@ -174,16 +212,79 @@ impl Database {
              FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
+            "DELETE FROM events WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        conn.execute(
             "DELETE FROM sessions WHERE session_id = ?1",
             params![session_id],
         )?;
         Ok(())
+    }
+
+    pub fn append_events(
+        &self,
+        session_id: &str,
+        events: &[NewSessionEvent],
+    ) -> Result<Vec<SessionEvent>> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let mut inserted = Vec::with_capacity(events.len());
+
+        for event in events {
+            validate_new_event(event)?;
+            let timestamp = Utc::now();
+            let payload_json = serde_json::to_string(&event.payload_json)?;
+            tx.execute(
+                "INSERT INTO events (session_id, timestamp, type, payload_json)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    session_id,
+                    timestamp.to_rfc3339(),
+                    event.event_type,
+                    payload_json,
+                ],
+            )?;
+            inserted.push(SessionEvent {
+                id: tx.last_insert_rowid(),
+                session_id: session_id.to_string(),
+                timestamp,
+                event_type: event.event_type.clone(),
+                payload_json: event.payload_json.clone(),
+            });
+        }
+
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    pub fn list_events_since(
+        &self,
+        session_id: &str,
+        after_id: Option<i64>,
+    ) -> Result<Vec<SessionEvent>> {
+        let conn = self.connect()?;
+        let after_id = after_id.unwrap_or(0);
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, timestamp, type, payload_json
+             FROM events
+             WHERE session_id = ?1 AND id > ?2
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id, after_id], row_to_event)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 }
 
@@ -197,21 +298,53 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         base_branch: row.get(5)?,
         branch: row.get(6)?,
         worktree: row.get(7)?,
-        status: str_to_status(&row.get::<_, String>(8)?)
-            .map_err(|err| rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(err)))?,
+        status: str_to_status(&row.get::<_, String>(8)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(err))
+        })?,
         pid: row.get::<_, Option<u32>>(9)?,
         exit_code: row.get(10)?,
         error: row.get(11)?,
         created_at: parse_time(row.get::<_, String>(12)?)?,
         updated_at: parse_time(row.get::<_, String>(13)?)?,
-        exited_at: row.get::<_, Option<String>>(14)?.map(parse_time).transpose()?,
+        exited_at: row
+            .get::<_, Option<String>>(14)?
+            .map(parse_time)
+            .transpose()?,
     })
 }
 
 fn parse_time(value: String) -> rusqlite::Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(&value)
         .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err)))
+        .map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+        })
+}
+
+fn parse_payload(value: String) -> rusqlite::Result<Value> {
+    serde_json::from_str(&value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
+}
+
+fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
+    Ok(SessionEvent {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        timestamp: parse_time(row.get::<_, String>(2)?)?,
+        event_type: row.get(3)?,
+        payload_json: parse_payload(row.get::<_, String>(4)?)?,
+    })
+}
+
+fn validate_new_event(event: &NewSessionEvent) -> Result<()> {
+    if event.event_type.trim().is_empty() {
+        anyhow::bail!("event type must not be empty");
+    }
+    if !event.payload_json.is_object() {
+        anyhow::bail!("event payload must be a JSON object");
+    }
+    Ok(())
 }
 
 fn status_to_str(status: SessionStatus) -> &'static str {
@@ -235,5 +368,102 @@ fn str_to_status(value: &str) -> std::result::Result<SessionStatus, std::io::Err
             std::io::ErrorKind::InvalidData,
             format!("unknown session status `{value}`"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Database;
+    use agentd_shared::{event::NewSessionEvent, paths::AppPaths};
+    use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_paths() -> AppPaths {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = camino::Utf8PathBuf::from(format!("/tmp/agentd-db-test-{suffix}"));
+        AppPaths {
+            socket: root.join("agentd.sock"),
+            pid_file: root.join("agentd.pid"),
+            database: root.join("state.db"),
+            config: root.join("config.toml"),
+            logs_dir: root.join("logs"),
+            worktrees_dir: root.join("worktrees"),
+            root,
+        }
+    }
+
+    #[test]
+    fn event_rows_round_trip_in_order() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        db.insert_session(&super::NewSession {
+            session_id: "demo",
+            agent: "codex",
+            workspace: "/tmp/repo",
+            repo_path: "/tmp/repo",
+            task: "test",
+            base_branch: "main",
+            branch: "agent/test",
+            worktree: "/tmp/worktree",
+        })
+        .unwrap();
+
+        let inserted = db
+            .append_events(
+                "demo",
+                &[
+                    NewSessionEvent {
+                        event_type: "SESSION_STARTED".to_string(),
+                        payload_json: json!({"source":"daemon"}),
+                    },
+                    NewSessionEvent {
+                        event_type: "COMMAND_EXECUTED".to_string(),
+                        payload_json: json!({"command":"cargo test"}),
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(inserted.len(), 2);
+        assert!(inserted[0].id < inserted[1].id);
+
+        let listed = db.list_events_since("demo", None).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].event_type, "SESSION_STARTED");
+        assert_eq!(listed[1].event_type, "COMMAND_EXECUTED");
+    }
+
+    #[test]
+    fn deleting_session_removes_events() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        db.insert_session(&super::NewSession {
+            session_id: "demo",
+            agent: "codex",
+            workspace: "/tmp/repo",
+            repo_path: "/tmp/repo",
+            task: "test",
+            base_branch: "main",
+            branch: "agent/test",
+            worktree: "/tmp/worktree",
+        })
+        .unwrap();
+        db.append_events(
+            "demo",
+            &[NewSessionEvent {
+                event_type: "SESSION_STARTED".to_string(),
+                payload_json: json!({"source":"daemon"}),
+            }],
+        )
+        .unwrap();
+
+        db.delete_session("demo").unwrap();
+
+        assert!(db.list_events_since("demo", None).unwrap().is_empty());
     }
 }

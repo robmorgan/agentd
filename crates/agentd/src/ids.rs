@@ -1,8 +1,7 @@
 use rand::prelude::IndexedRandom;
 
 const ADJECTIVES: &[&str] = &[
-    "brisk", "calm", "clever", "curious", "gentle", "nimble", "quiet", "steady", "swift",
-    "wrinkly",
+    "brisk", "calm", "clever", "curious", "gentle", "nimble", "quiet", "steady", "swift", "wrinkly",
 ];
 const ANIMALS: &[&str] = &[
     "badgers", "bears", "foxes", "geckos", "otters", "pandas", "ravens", "tigers", "whales",

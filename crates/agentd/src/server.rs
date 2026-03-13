@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream, unix::OwnedWriteHalf},
-    sync::watch,
+    sync::{broadcast, watch},
 };
 
 use agentd_shared::{
@@ -33,8 +33,8 @@ pub async fn serve() -> Result<()> {
     let state = AppState::new(paths.clone(), db, config);
     state.reconcile_sessions().await?;
 
-    let listener = UnixListener::bind(paths.socket.as_std_path())
-        .context("failed to bind agentd socket")?;
+    let listener =
+        UnixListener::bind(paths.socket.as_std_path()).context("failed to bind agentd socket")?;
     std::fs::write(paths.pid_file.as_std_path(), std::process::id().to_string())
         .with_context(|| format!("failed to write {}", paths.pid_file))?;
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -87,9 +87,13 @@ async fn handle_connection(
         }
         Request::ShutdownDaemon => {
             if state.has_running_sessions().await? {
-                send_response(&mut writer, &Response::Error {
-                    message: "cannot shut down agentd while sessions are running".to_string(),
-                }).await?;
+                send_response(
+                    &mut writer,
+                    &Response::Error {
+                        message: "cannot shut down agentd while sessions are running".to_string(),
+                    },
+                )
+                .await?;
             } else {
                 send_response(&mut writer, &Response::Ok).await?;
                 let _ = shutdown_tx.send(true);
@@ -99,54 +103,161 @@ async fn handle_connection(
             workspace,
             task,
             agent,
-        } => {
-            match state.create_session(workspace, task, agent).await {
-                Ok(session) => send_response(&mut writer, &Response::CreateSession { session }).await?,
-                Err(err) => send_response(&mut writer, &Response::Error { message: err.to_string() }).await?,
+        } => match state.create_session(workspace, task, agent).await {
+            Ok(session) => send_response(&mut writer, &Response::CreateSession { session }).await?,
+            Err(err) => {
+                send_response(
+                    &mut writer,
+                    &Response::Error {
+                        message: err.to_string(),
+                    },
+                )
+                .await?
             }
-        }
-        Request::CreateWorktree { session_id } => {
-            match state.create_worktree(&session_id).await {
-                Ok(worktree) => send_response(&mut writer, &Response::Worktree { worktree }).await?,
-                Err(err) => send_response(&mut writer, &Response::Error { message: err.to_string() }).await?,
+        },
+        Request::CreateWorktree { session_id } => match state.create_worktree(&session_id).await {
+            Ok(worktree) => send_response(&mut writer, &Response::Worktree { worktree }).await?,
+            Err(err) => {
+                send_response(
+                    &mut writer,
+                    &Response::Error {
+                        message: err.to_string(),
+                    },
+                )
+                .await?
             }
-        }
+        },
         Request::CleanupWorktree { session_id } => {
             match state.cleanup_worktree(&session_id).await {
-                Ok(worktree) => send_response(&mut writer, &Response::Worktree { worktree }).await?,
-                Err(err) => send_response(&mut writer, &Response::Error { message: err.to_string() }).await?,
+                Ok(worktree) => {
+                    send_response(&mut writer, &Response::Worktree { worktree }).await?
+                }
+                Err(err) => {
+                    send_response(
+                        &mut writer,
+                        &Response::Error {
+                            message: err.to_string(),
+                        },
+                    )
+                    .await?
+                }
             }
         }
         Request::KillSession { session_id, remove } => {
             match state.kill_session(&session_id, remove).await {
-                Ok((removed, was_running)) => send_response(
+                Ok((removed, was_running)) => {
+                    send_response(
+                        &mut writer,
+                        &Response::KillSession {
+                            removed,
+                            was_running,
+                        },
+                    )
+                    .await?
+                }
+                Err(err) => {
+                    send_response(
+                        &mut writer,
+                        &Response::Error {
+                            message: err.to_string(),
+                        },
+                    )
+                    .await?
+                }
+            }
+        }
+        Request::AttachSession { session_id } => {
+            attach_session(&state, &session_id, &mut lines, &mut writer).await?;
+        }
+        Request::AttachInput { .. } => {
+            send_response(
+                &mut writer,
+                &Response::Error {
+                    message: "attach_input is only valid during an attached session".to_string(),
+                },
+            )
+            .await?;
+        }
+        Request::SendInput {
+            session_id,
+            data,
+            source_session_id,
+        } => match state.send_input(&session_id, data, source_session_id).await {
+            Ok(()) => send_response(&mut writer, &Response::InputAccepted).await?,
+            Err(err) => {
+                send_response(
                     &mut writer,
-                    &Response::KillSession {
-                        removed,
-                        was_running,
+                    &Response::Error {
+                        message: err.to_string(),
                     },
                 )
-                .await?,
-                Err(err) => send_response(&mut writer, &Response::Error { message: err.to_string() }).await?,
+                .await?
             }
-        }
-        Request::DiffSession { session_id } => {
-            match state.diff_session(&session_id).await {
-                Ok(diff) => send_response(&mut writer, &Response::Diff { diff }).await?,
-                Err(err) => send_response(&mut writer, &Response::Error { message: err.to_string() }).await?,
+        },
+        Request::DiffSession { session_id } => match state.diff_session(&session_id).await {
+            Ok(diff) => send_response(&mut writer, &Response::Diff { diff }).await?,
+            Err(err) => {
+                send_response(
+                    &mut writer,
+                    &Response::Error {
+                        message: err.to_string(),
+                    },
+                )
+                .await?
             }
-        }
+        },
         Request::GetSession { session_id } => match state.get_session(&session_id).await? {
             Some(session) => send_response(&mut writer, &Response::Session { session }).await?,
-            None => send_response(&mut writer, &Response::Error { message: format!("session `{session_id}` not found") }).await?,
+            None => {
+                send_response(
+                    &mut writer,
+                    &Response::Error {
+                        message: format!("session `{session_id}` not found"),
+                    },
+                )
+                .await?
+            }
         },
         Request::ListSessions => {
             let sessions = state.list_sessions().await?;
             send_response(&mut writer, &Response::Sessions { sessions }).await?;
         }
+        Request::AppendSessionEvents { session_id, events } => {
+            match state.append_session_events(&session_id, events).await {
+                Ok(_) => send_response(&mut writer, &Response::Ok).await?,
+                Err(err) => {
+                    send_response(
+                        &mut writer,
+                        &Response::Error {
+                            message: err.to_string(),
+                        },
+                    )
+                    .await?
+                }
+            }
+        }
         Request::StreamLogs { session_id, follow } => {
             if let Err(err) = stream_logs(&state, &session_id, follow, &mut writer).await {
-                send_response(&mut writer, &Response::Error { message: err.to_string() }).await?;
+                send_response(
+                    &mut writer,
+                    &Response::Error {
+                        message: err.to_string(),
+                    },
+                )
+                .await?;
+            } else {
+                send_response(&mut writer, &Response::EndOfStream).await?;
+            }
+        }
+        Request::StreamEvents { session_id, follow } => {
+            if let Err(err) = stream_events(&state, &session_id, follow, &mut writer).await {
+                send_response(
+                    &mut writer,
+                    &Response::Error {
+                        message: err.to_string(),
+                    },
+                )
+                .await?;
             } else {
                 send_response(&mut writer, &Response::EndOfStream).await?;
             }
@@ -156,10 +267,72 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn send_response(
+async fn attach_session(
+    state: &AppState,
+    session_id: &str,
+    lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
     writer: &mut OwnedWriteHalf,
-    response: &Response,
 ) -> Result<()> {
+    let (_lease, mut output_rx) = match state.attach_session(session_id).await {
+        Ok(attached) => attached,
+        Err(err) => {
+            send_response(
+                writer,
+                &Response::Error {
+                    message: err.to_string(),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    send_response(writer, &Response::Attached).await?;
+
+    loop {
+        tokio::select! {
+            output = output_rx.recv() => match output {
+                Ok(data) => send_response(writer, &Response::PtyOutput { data }).await?,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            line = lines.next_line() => {
+                let Some(line) = line? else {
+                    break;
+                };
+                match serde_json::from_str::<Request>(&line).context("invalid attach request payload")? {
+                    Request::AttachInput { data } => {
+                        if let Err(err) = state.write_attached_input(session_id, data).await {
+                            send_response(
+                                writer,
+                                &Response::Error {
+                                    message: err.to_string(),
+                                },
+                            )
+                            .await?;
+                            break;
+                        }
+                    }
+                    other => {
+                        send_response(
+                            writer,
+                            &Response::Error {
+                                message: format!("unexpected request during attach: {other:?}"),
+                            },
+                        )
+                        .await?;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    send_response(writer, &Response::EndOfStream).await?;
+    Ok(())
+}
+
+async fn send_response(writer: &mut OwnedWriteHalf, response: &Response) -> Result<()> {
     let payload = serde_json::to_vec(response)?;
     writer.write_all(&payload).await?;
     writer.write_all(b"\n").await?;
@@ -187,11 +360,48 @@ async fn stream_logs(
         }
 
         let session = state.get_session(session_id).await?;
-        let is_running = matches!(session.as_ref().map(|item| item.status), Some(SessionStatus::Running));
+        let is_running = matches!(
+            session.as_ref().map(|item| item.status),
+            Some(SessionStatus::Running)
+        );
         if !follow || !is_running {
             let (remainder, _) = read_from_offset(&log_path, position)?;
             if !remainder.is_empty() {
                 send_response(writer, &Response::LogChunk { data: remainder }).await?;
+            }
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    Ok(())
+}
+
+async fn stream_events(
+    state: &AppState,
+    session_id: &str,
+    follow: bool,
+    writer: &mut OwnedWriteHalf,
+) -> Result<()> {
+    let mut last_event_id = None;
+
+    loop {
+        let events = state.list_events_since(session_id, last_event_id).await?;
+        for event in events {
+            last_event_id = Some(event.id);
+            send_response(writer, &Response::Event { event }).await?;
+        }
+
+        let session = state.get_session(session_id).await?;
+        let is_running = matches!(
+            session.as_ref().map(|item| item.status),
+            Some(SessionStatus::Running)
+        );
+        if !follow || !is_running {
+            let trailing = state.list_events_since(session_id, last_event_id).await?;
+            for event in trailing {
+                send_response(writer, &Response::Event { event }).await?;
             }
             break;
         }

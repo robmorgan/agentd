@@ -26,8 +26,7 @@ impl Config {
 
         let contents = fs::read_to_string(paths.config.as_std_path())
             .with_context(|| format!("failed to read {}", paths.config))?;
-        toml::from_str(&contents)
-            .with_context(|| format!("failed to parse {}", paths.config))
+        toml::from_str(&contents).with_context(|| format!("failed to parse {}", paths.config))
     }
 
     pub fn write_default(paths: &AppPaths) -> Result<()> {

@@ -19,7 +19,8 @@ pub struct AppPaths {
 impl AppPaths {
     pub fn discover() -> Result<Self> {
         let home = dirs::home_dir().context("could not determine home directory")?;
-        let home = Utf8PathBuf::from_path_buf(home).map_err(|_| anyhow::anyhow!("home directory is not valid UTF-8"))?;
+        let home = Utf8PathBuf::from_path_buf(home)
+            .map_err(|_| anyhow::anyhow!("home directory is not valid UTF-8"))?;
         let root = home.join(APP_DIR_NAME);
         Ok(Self {
             socket: root.join("agentd.sock"),
