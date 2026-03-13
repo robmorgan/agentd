@@ -14,7 +14,7 @@ use tokio::{
 use agentd_shared::{
     config::Config,
     paths::AppPaths,
-    protocol::{Request, Response},
+    protocol::{DaemonInfo, PROTOCOL_VERSION, Request, Response},
     session::{SessionDiff, SessionRecord, WorktreeRecord},
 };
 
@@ -51,6 +51,10 @@ enum Command {
         #[command(subcommand)]
         command: WorktreeCommand,
     },
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -61,6 +65,12 @@ enum WorktreeCommand {
     Cleanup {
         session_id: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    Info,
+    Restart,
 }
 
 #[tokio::main]
@@ -146,6 +156,21 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Command::Daemon { command } => match command {
+            DaemonCommand::Info => {
+                let info = daemon_info(&paths).await?;
+                println!("daemon_version: {}", info.daemon_version);
+                println!("protocol_version: {}", info.protocol_version);
+                println!("client_version: {}", env!("CARGO_PKG_VERSION"));
+                println!("expected_protocol_version: {}", PROTOCOL_VERSION);
+            }
+            DaemonCommand::Restart => {
+                restart_daemon(&paths).await?;
+                let info = daemon_info(&paths).await?;
+                println!("daemon_version: {}", info.daemon_version);
+                println!("protocol_version: {}", info.protocol_version);
+            }
+        },
     }
 
     Ok(())
@@ -160,9 +185,15 @@ fn ensure_config(paths: &AppPaths) -> Result<()> {
 
 async fn ensure_daemon(paths: &AppPaths) -> Result<()> {
     if try_connect(paths).await.is_ok() {
+        ensure_compatible_daemon(paths).await?;
         return Ok(());
     }
 
+    spawn_daemon(paths).await?;
+    ensure_compatible_daemon(paths).await
+}
+
+async fn spawn_daemon(paths: &AppPaths) -> Result<()> {
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
     let daemon_exe = current_exe
         .parent()
@@ -190,7 +221,111 @@ async fn ensure_daemon(paths: &AppPaths) -> Result<()> {
     }
 }
 
+async fn ensure_compatible_daemon(paths: &AppPaths) -> Result<()> {
+    match daemon_info(paths).await {
+        Ok(info) if info.protocol_version == PROTOCOL_VERSION => Ok(()),
+        Ok(info) => restart_incompatible_daemon(paths, Some(info)).await,
+        Err(_) => restart_incompatible_daemon(paths, None).await,
+    }
+}
+
+async fn restart_incompatible_daemon(paths: &AppPaths, info: Option<DaemonInfo>) -> Result<()> {
+    if daemon_has_running_sessions(paths).await? {
+        let daemon_version = info
+            .map(|value| value.daemon_version)
+            .unwrap_or_else(|| "legacy".to_string());
+        bail!(
+            "agentd `{daemon_version}` is incompatible with agentctl `{}` and cannot be restarted while sessions are running",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+
+    shutdown_or_kill_daemon(paths).await?;
+    spawn_daemon(paths).await?;
+    match daemon_info(paths).await {
+        Ok(info) if info.protocol_version == PROTOCOL_VERSION => Ok(()),
+        Ok(info) => bail!(
+            "agentd `{}` still reports incompatible protocol version {}",
+            info.daemon_version,
+            info.protocol_version
+        ),
+        Err(err) => Err(err),
+    }
+}
+
+async fn daemon_info(paths: &AppPaths) -> Result<DaemonInfo> {
+    match send_request_no_bootstrap(paths, &Request::GetDaemonInfo).await? {
+        Response::DaemonInfo { info } => Ok(info),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {:?}", other),
+    }
+}
+
+async fn daemon_has_running_sessions(paths: &AppPaths) -> Result<bool> {
+    match send_request_no_bootstrap(paths, &Request::ListSessions).await? {
+        Response::Sessions { sessions } => Ok(sessions.iter().any(|session| session.status_string() == "running")),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {:?}", other),
+    }
+}
+
+async fn shutdown_or_kill_daemon(paths: &AppPaths) -> Result<()> {
+    let shutdown_result = send_request_no_bootstrap(paths, &Request::ShutdownDaemon).await;
+    match shutdown_result {
+        Ok(Response::Ok) => {}
+        Ok(Response::Error { message }) => bail!(message),
+        Ok(_) | Err(_) => kill_daemon_from_pid_file(paths)?,
+    }
+    wait_for_daemon_stop(paths).await
+}
+
+fn kill_daemon_from_pid_file(paths: &AppPaths) -> Result<()> {
+    let pid = std::fs::read_to_string(paths.pid_file.as_std_path())
+        .with_context(|| format!("failed to read {}", paths.pid_file))?;
+    let pid: i32 = pid.trim().parse().context("invalid daemon pid file")?;
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        Some(nix::sys::signal::Signal::SIGTERM),
+    )
+    .context("failed to terminate agentd")?;
+    Ok(())
+}
+
+async fn wait_for_daemon_stop(paths: &AppPaths) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if try_connect(paths).await.is_err() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for agentd to stop");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn restart_daemon(paths: &AppPaths) -> Result<()> {
+    match try_connect(paths).await {
+        Ok(_) => {
+            if daemon_has_running_sessions(paths).await? {
+                bail!("cannot restart agentd while sessions are running");
+            }
+            shutdown_or_kill_daemon(paths).await?;
+            spawn_daemon(paths).await?;
+            ensure_compatible_daemon(paths).await
+        }
+        Err(_) => {
+            spawn_daemon(paths).await?;
+            ensure_compatible_daemon(paths).await
+        }
+    }
+}
+
 async fn send_request(paths: &AppPaths, request: &Request) -> Result<Response> {
+    send_request_no_bootstrap(paths, request).await
+}
+
+async fn send_request_no_bootstrap(paths: &AppPaths, request: &Request) -> Result<Response> {
     let mut stream = try_connect(paths).await?;
     let payload = serde_json::to_vec(request)?;
     stream.write_all(&payload).await?;

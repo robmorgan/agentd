@@ -8,5 +8,6 @@ license.workspace = true
 agentd-shared = { path = "../agentd-shared" }
 anyhow.workspace = true
 clap.workspace = true
+nix.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

@@ -9,6 +9,7 @@ pub const APP_DIR_NAME: &str = ".agentd";
 pub struct AppPaths {
     pub root: Utf8PathBuf,
     pub socket: Utf8PathBuf,
+    pub pid_file: Utf8PathBuf,
     pub database: Utf8PathBuf,
     pub config: Utf8PathBuf,
     pub logs_dir: Utf8PathBuf,
@@ -22,6 +23,7 @@ impl AppPaths {
         let root = home.join(APP_DIR_NAME);
         Ok(Self {
             socket: root.join("agentd.sock"),
+            pid_file: root.join("agentd.pid"),
             database: root.join("state.db"),
             config: root.join("config.toml"),
             logs_dir: root.join("logs"),

@@ -2,9 +2,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::session::{CreateSessionResult, SessionDiff, SessionRecord, WorktreeRecord};
 
+pub const PROTOCOL_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonInfo {
+    pub daemon_version: String,
+    pub protocol_version: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
+    GetDaemonInfo,
+    ShutdownDaemon,
     CreateSession {
         workspace: String,
         task: String,
@@ -33,6 +43,7 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
+    DaemonInfo { info: DaemonInfo },
     CreateSession { session: CreateSessionResult },
     Worktree { worktree: WorktreeRecord },
     Diff { diff: SessionDiff },

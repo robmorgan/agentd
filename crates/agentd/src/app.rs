@@ -169,6 +169,13 @@ impl AppState {
         Ok(())
     }
 
+    pub async fn has_running_sessions(&self) -> Result<bool> {
+        let sessions = self.list_sessions().await?;
+        Ok(sessions
+            .into_iter()
+            .any(|session| session.status == SessionStatus::Running && process_exists(session.pid)))
+    }
+
     pub async fn create_worktree(&self, session_id: &str) -> Result<WorktreeRecord> {
         let db = self.db.clone();
         let session_id = session_id.to_string();

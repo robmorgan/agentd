@@ -4,12 +4,13 @@ use anyhow::{Context, Result, bail};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream, unix::OwnedWriteHalf},
+    sync::watch,
 };
 
 use agentd_shared::{
     config::Config,
     paths::AppPaths,
-    protocol::{Request, Response},
+    protocol::{DaemonInfo, PROTOCOL_VERSION, Request, Response},
     session::SessionStatus,
 };
 
@@ -34,19 +35,41 @@ pub async fn serve() -> Result<()> {
 
     let listener = UnixListener::bind(paths.socket.as_std_path())
         .context("failed to bind agentd socket")?;
+    std::fs::write(paths.pid_file.as_std_path(), std::process::id().to_string())
+        .with_context(|| format!("failed to write {}", paths.pid_file))?;
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
     loop {
-        let (stream, _) = listener.accept().await?;
-        let state = state.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_connection(state, stream).await {
-                eprintln!("connection error: {err:#}");
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let (stream, _) = accept_result?;
+                let state = state.clone();
+                let shutdown_tx = shutdown_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = handle_connection(state, shutdown_tx, stream).await {
+                        eprintln!("connection error: {err:#}");
+                    }
+                });
             }
-        });
+            changed = shutdown_rx.changed() => {
+                changed?;
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+        }
     }
+
+    let _ = std::fs::remove_file(paths.socket.as_std_path());
+    let _ = std::fs::remove_file(paths.pid_file.as_std_path());
+    Ok(())
 }
 
-async fn handle_connection(state: AppState, stream: UnixStream) -> Result<()> {
+async fn handle_connection(
+    state: AppState,
+    shutdown_tx: watch::Sender<bool>,
+    stream: UnixStream,
+) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     let Some(line) = lines.next_line().await? else {
@@ -55,6 +78,23 @@ async fn handle_connection(state: AppState, stream: UnixStream) -> Result<()> {
 
     let request: Request = serde_json::from_str(&line).context("invalid request payload")?;
     match request {
+        Request::GetDaemonInfo => {
+            let info = DaemonInfo {
+                daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            };
+            send_response(&mut writer, &Response::DaemonInfo { info }).await?;
+        }
+        Request::ShutdownDaemon => {
+            if state.has_running_sessions().await? {
+                send_response(&mut writer, &Response::Error {
+                    message: "cannot shut down agentd while sessions are running".to_string(),
+                }).await?;
+            } else {
+                send_response(&mut writer, &Response::Ok).await?;
+                let _ = shutdown_tx.send(true);
+            }
+        }
         Request::CreateSession {
             workspace,
             task,
