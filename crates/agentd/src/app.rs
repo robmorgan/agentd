@@ -1,11 +1,17 @@
 use std::{
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{Read, Write},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use camino::Utf8PathBuf;
+use nix::{
+    errno::Errno,
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::task;
 
@@ -232,6 +238,36 @@ impl AppState {
         .await?
     }
 
+    pub async fn kill_session(&self, session_id: &str, remove: bool) -> Result<(bool, bool)> {
+        let db = self.db.clone();
+        let paths = self.paths.clone();
+        let session_id = session_id.to_string();
+
+        task::spawn_blocking(move || {
+            let session = db
+                .get_session(&session_id)?
+                .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+
+            let was_running = session.status == SessionStatus::Running && process_exists(session.pid);
+            if !was_running && !remove {
+                bail!("session `{session_id}` is not running");
+            }
+
+            if was_running {
+                terminate_session_process(&session_id, session.pid)?;
+                let _ = db.mark_exited(&session_id, None);
+            }
+
+            if remove {
+                remove_session_artifacts(&paths, &session)?;
+                db.delete_session(&session_id)?;
+            }
+
+            Ok((remove, was_running))
+        })
+        .await?
+    }
+
     pub async fn diff_session(&self, session_id: &str) -> Result<SessionDiff> {
         let db = self.db.clone();
         let session_id = session_id.to_string();
@@ -255,7 +291,6 @@ impl AppState {
         })
         .await?
     }
-
 }
 
 fn unique_session_id(db: &Database) -> Result<String> {
@@ -305,6 +340,49 @@ fn pump_pty_to_log(mut reader: Box<dyn Read + Send>, log_path: &Utf8PathBuf) -> 
     Ok(())
 }
 
+fn terminate_session_process(session_id: &str, pid: Option<u32>) -> Result<()> {
+    let pid = pid.ok_or_else(|| anyhow!("session `{session_id}` has no recorded pid"))?;
+    if pid == 0 {
+        bail!("session `{session_id}` has an invalid pid");
+    }
+
+    let pid = Pid::from_raw(pid as i32);
+    send_signal(pid, Signal::SIGTERM, session_id)?;
+    if wait_for_exit(pid, Duration::from_secs(5)) {
+        return Ok(());
+    }
+
+    send_signal(pid, Signal::SIGKILL, session_id)?;
+    if wait_for_exit(pid, Duration::from_secs(5)) {
+        return Ok(());
+    }
+
+    bail!("session `{session_id}` did not exit after SIGTERM and SIGKILL")
+}
+
+fn send_signal(pid: Pid, signal: Signal, session_id: &str) -> Result<()> {
+    match kill(pid, Some(signal)) {
+        Ok(()) => Ok(()),
+        Err(Errno::ESRCH) => bail!("session `{session_id}` is not running"),
+        Err(err) => Err(anyhow!(err)).context(format!("failed to send {signal:?} to session `{session_id}`")),
+    }
+}
+
+fn wait_for_exit(pid: Pid, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match kill(pid, None) {
+            Ok(()) => {}
+            Err(Errno::ESRCH) => return true,
+            Err(_) => return false,
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn process_exists(pid: Option<u32>) -> bool {
     let Some(pid) = pid else {
         return false;
@@ -318,6 +396,30 @@ fn process_exists(pid: Option<u32>) -> bool {
         None,
     )
     .is_ok()
+}
+
+fn remove_session_artifacts(paths: &AppPaths, session: &SessionRecord) -> Result<()> {
+    remove_worktree_if_present(session)?;
+    remove_log_if_present(paths, session)?;
+    Ok(())
+}
+
+fn remove_worktree_if_present(session: &SessionRecord) -> Result<()> {
+    let repo_root = Utf8PathBuf::from(session.repo_path.clone());
+    let worktree = Utf8PathBuf::from(session.worktree.clone());
+    if worktree.exists() {
+        git::remove_worktree(&repo_root, &worktree)?;
+    }
+    Ok(())
+}
+
+fn remove_log_if_present(paths: &AppPaths, session: &SessionRecord) -> Result<()> {
+    let log_path = paths.log_path(&session.session_id);
+    match fs::remove_file(log_path.as_std_path()) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(anyhow!(err)).context(format!("failed to remove {}", log_path)),
+    }
 }
 
 fn ensure_session_not_running(session: &SessionRecord) -> Result<()> {

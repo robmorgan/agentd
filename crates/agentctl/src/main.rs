@@ -35,6 +35,11 @@ enum Command {
         #[arg(long)]
         agent: String,
     },
+    Kill {
+        #[arg(long)]
+        rm: bool,
+        session_id: String,
+    },
     Logs {
         session_id: String,
         #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true", default_value_t = true)]
@@ -104,6 +109,25 @@ async fn main() -> Result<()> {
                     println!("branch: {}", session.branch);
                     println!("worktree: {}", session.worktree);
                 }
+                Response::Error { message } => bail!(message),
+                other => bail!("unexpected response: {:?}", other),
+            }
+        }
+        Command::Kill { rm, session_id } => {
+            let response = send_request(
+                &paths,
+                &Request::KillSession {
+                    session_id: session_id.clone(),
+                    remove: rm,
+                },
+            )
+            .await?;
+
+            match response {
+                Response::KillSession {
+                    removed,
+                    was_running,
+                } => print_kill_result(&session_id, was_running, removed),
                 Response::Error { message } => bail!(message),
                 other => bail!("unexpected response: {:?}", other),
             }
@@ -414,6 +438,15 @@ fn print_diff(diff: &SessionDiff) {
     println!("worktree: {}", diff.worktree);
     println!();
     print!("{}", diff.diff);
+}
+
+fn print_kill_result(session_id: &str, was_running: bool, removed: bool) {
+    if was_running {
+        println!("terminated session {session_id}");
+    }
+    if removed {
+        println!("removed session {session_id}");
+    }
 }
 
 trait StatusString {

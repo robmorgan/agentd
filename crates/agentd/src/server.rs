@@ -117,6 +117,19 @@ async fn handle_connection(
                 Err(err) => send_response(&mut writer, &Response::Error { message: err.to_string() }).await?,
             }
         }
+        Request::KillSession { session_id, remove } => {
+            match state.kill_session(&session_id, remove).await {
+                Ok((removed, was_running)) => send_response(
+                    &mut writer,
+                    &Response::KillSession {
+                        removed,
+                        was_running,
+                    },
+                )
+                .await?,
+                Err(err) => send_response(&mut writer, &Response::Error { message: err.to_string() }).await?,
+            }
+        }
         Request::DiffSession { session_id } => {
             match state.diff_session(&session_id).await {
                 Ok(diff) => send_response(&mut writer, &Response::Diff { diff }).await?,

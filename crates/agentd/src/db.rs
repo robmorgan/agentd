@@ -176,6 +176,15 @@ impl Database {
         let rows = stmt.query_map([], row_to_session)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
+
+    pub fn delete_session(&self, session_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "DELETE FROM sessions WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
 }
 
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
