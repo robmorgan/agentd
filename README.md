@@ -7,7 +7,7 @@ Run multiple coding agents in parallel with durable sessions, isolated branches,
 V1 includes:
 
 - local `agentd` daemon over a Unix socket
-- `agentctl create`, `logs`, `sessions`, and `status`
+- `agentctl create`, `logs`, `sessions`, `status`, `diff`, and `worktree`
 - PTY-backed agent processes that outlive client connections
 - SQLite session metadata in `~/.agentd/state.db`
 - per-session PTY logs in `~/.agentd/logs/`
@@ -54,4 +54,7 @@ agentctl create --workspace ~/Code/myrepo --task "fix failing tests" --agent cla
 agentctl logs wrinkly-bears
 agentctl sessions
 agentctl status wrinkly-bears
+agentctl diff wrinkly-bears
+agentctl worktree cleanup wrinkly-bears
+agentctl worktree create wrinkly-bears
 ```

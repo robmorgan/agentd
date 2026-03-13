@@ -17,7 +17,9 @@ pub struct SessionRecord {
     pub session_id: String,
     pub agent: String,
     pub workspace: String,
+    pub repo_path: String,
     pub task: String,
+    pub base_branch: String,
     pub branch: String,
     pub worktree: String,
     pub status: SessionStatus,
@@ -32,9 +34,28 @@ pub struct SessionRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSessionResult {
     pub session_id: String,
+    pub base_branch: String,
     pub branch: String,
     pub worktree: String,
     pub status: SessionStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeRecord {
+    pub session_id: String,
+    pub repo_path: String,
+    pub base_branch: String,
+    pub branch: String,
+    pub worktree: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionDiff {
+    pub session_id: String,
+    pub base_branch: String,
+    pub branch: String,
+    pub worktree: String,
+    pub diff: String,
 }
 
 pub fn branch_name_from_task(task: &str) -> String {

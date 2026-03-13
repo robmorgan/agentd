@@ -12,7 +12,10 @@ use tokio::task;
 use agentd_shared::{
     config::Config,
     paths::AppPaths,
-    session::{CreateSessionResult, SessionRecord, SessionStatus, branch_name_from_task},
+    session::{
+        CreateSessionResult, SessionDiff, SessionRecord, SessionStatus, WorktreeRecord,
+        branch_name_from_task,
+    },
 };
 
 use crate::{
@@ -46,6 +49,7 @@ impl AppState {
         task::spawn_blocking(move || {
             let workspace = Utf8PathBuf::from(workspace);
             let repo_root = git::canonical_repo_root(&workspace)?;
+            let base_branch = git::current_branch(&repo_root)?;
             let agent = config.require_agent(&agent_name)?.clone();
 
             let session_id = unique_session_id(&db)?;
@@ -56,12 +60,14 @@ impl AppState {
                 session_id: &session_id,
                 agent: &agent_name,
                 workspace: repo_root.as_str(),
+                repo_path: repo_root.as_str(),
                 task: &task_text,
+                base_branch: &base_branch,
                 branch: &branch,
                 worktree: worktree.as_str(),
             })?;
 
-            if let Err(err) = git::create_worktree(&repo_root, &branch, &worktree) {
+            if let Err(err) = git::create_worktree(&repo_root, &base_branch, &branch, &worktree) {
                 let _ = db.mark_failed(&session_id, err.to_string());
                 return Err(err);
             }
@@ -131,6 +137,7 @@ impl AppState {
 
             Ok(CreateSessionResult {
                 session_id,
+                base_branch,
                 branch,
                 worktree: worktree.to_string(),
                 status: SessionStatus::Running,
@@ -160,6 +167,86 @@ impl AppState {
             }
         }
         Ok(())
+    }
+
+    pub async fn create_worktree(&self, session_id: &str) -> Result<WorktreeRecord> {
+        let db = self.db.clone();
+        let session_id = session_id.to_string();
+        task::spawn_blocking(move || {
+            let session = db
+                .get_session(&session_id)?
+                .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+            ensure_session_not_running(&session)?;
+
+            let repo_root = Utf8PathBuf::from(session.repo_path.clone());
+            let worktree = Utf8PathBuf::from(session.worktree.clone());
+            if worktree.exists() {
+                bail!("worktree `{worktree}` already exists");
+            }
+
+            git::create_worktree(&repo_root, &session.base_branch, &session.branch, &worktree)?;
+
+            Ok(WorktreeRecord {
+                session_id: session.session_id,
+                repo_path: session.repo_path,
+                base_branch: session.base_branch,
+                branch: session.branch,
+                worktree: session.worktree,
+            })
+        })
+        .await?
+    }
+
+    pub async fn cleanup_worktree(&self, session_id: &str) -> Result<WorktreeRecord> {
+        let db = self.db.clone();
+        let session_id = session_id.to_string();
+        task::spawn_blocking(move || {
+            let session = db
+                .get_session(&session_id)?
+                .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+            ensure_session_not_running(&session)?;
+
+            let repo_root = Utf8PathBuf::from(session.repo_path.clone());
+            let worktree = Utf8PathBuf::from(session.worktree.clone());
+            if !worktree.exists() {
+                bail!("worktree `{worktree}` does not exist");
+            }
+
+            git::remove_worktree(&repo_root, &worktree)?;
+
+            Ok(WorktreeRecord {
+                session_id: session.session_id,
+                repo_path: session.repo_path,
+                base_branch: session.base_branch,
+                branch: session.branch,
+                worktree: session.worktree,
+            })
+        })
+        .await?
+    }
+
+    pub async fn diff_session(&self, session_id: &str) -> Result<SessionDiff> {
+        let db = self.db.clone();
+        let session_id = session_id.to_string();
+        task::spawn_blocking(move || {
+            let session = db
+                .get_session(&session_id)?
+                .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+            let worktree = Utf8PathBuf::from(session.worktree.clone());
+            if !worktree.exists() {
+                bail!("worktree `{worktree}` does not exist");
+            }
+
+            let diff = git::diff_against_base(&worktree, &session.base_branch)?;
+            Ok(SessionDiff {
+                session_id: session.session_id,
+                base_branch: session.base_branch,
+                branch: session.branch,
+                worktree: session.worktree,
+                diff,
+            })
+        })
+        .await?
     }
 
 }
@@ -224,4 +311,11 @@ fn process_exists(pid: Option<u32>) -> bool {
         None,
     )
     .is_ok()
+}
+
+fn ensure_session_not_running(session: &SessionRecord) -> Result<()> {
+    if session.status == SessionStatus::Running && process_exists(session.pid) {
+        bail!("session `{}` is still running", session.session_id);
+    }
+    Ok(())
 }

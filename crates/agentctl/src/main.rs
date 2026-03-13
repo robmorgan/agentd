@@ -15,7 +15,7 @@ use agentd_shared::{
     config::Config,
     paths::AppPaths,
     protocol::{Request, Response},
-    session::SessionRecord,
+    session::{SessionDiff, SessionRecord, WorktreeRecord},
 };
 
 #[derive(Debug, Parser)]
@@ -42,6 +42,23 @@ enum Command {
     },
     Sessions,
     Status {
+        session_id: String,
+    },
+    Diff {
+        session_id: String,
+    },
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorktreeCommand {
+    Create {
+        session_id: String,
+    },
+    Cleanup {
         session_id: String,
     },
 }
@@ -73,6 +90,7 @@ async fn main() -> Result<()> {
             match response {
                 Response::CreateSession { session } => {
                     println!("session_id: {}", session.session_id);
+                    println!("base_branch: {}", session.base_branch);
                     println!("branch: {}", session.branch);
                     println!("worktree: {}", session.worktree);
                 }
@@ -91,6 +109,14 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
+        Command::Diff { session_id } => {
+            let response = send_request(&paths, &Request::DiffSession { session_id }).await?;
+            match response {
+                Response::Diff { diff } => print_diff(&diff),
+                Response::Error { message } => bail!(message),
+                other => bail!("unexpected response: {:?}", other),
+            }
+        }
         Command::Status { session_id } => {
             let response = send_request(&paths, &Request::GetSession { session_id }).await?;
             match response {
@@ -99,6 +125,27 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
+        Command::Worktree { command } => match command {
+            WorktreeCommand::Create { session_id } => {
+                let response = send_request(&paths, &Request::CreateWorktree { session_id }).await?;
+                match response {
+                    Response::Worktree { worktree } => print_worktree(&worktree),
+                    Response::Error { message } => bail!(message),
+                    other => bail!("unexpected response: {:?}", other),
+                }
+            }
+            WorktreeCommand::Cleanup { session_id } => {
+                let response = send_request(&paths, &Request::CleanupWorktree { session_id }).await?;
+                match response {
+                    Response::Worktree { worktree } => {
+                        println!("cleaned up worktree for session {}", worktree.session_id);
+                        print_worktree(&worktree);
+                    }
+                    Response::Error { message } => bail!(message),
+                    other => bail!("unexpected response: {:?}", other),
+                }
+            }
+        },
     }
 
     Ok(())
@@ -200,8 +247,10 @@ fn print_session(session: &SessionRecord) {
     println!("session_id: {}", session.session_id);
     println!("agent: {}", session.agent);
     println!("status: {}", session.status_string());
+    println!("repo_path: {}", session.repo_path);
     println!("workspace: {}", session.workspace);
     println!("task: {}", session.task);
+    println!("base_branch: {}", session.base_branch);
     println!("branch: {}", session.branch);
     println!("worktree: {}", session.worktree);
     if let Some(pid) = session.pid {
@@ -213,6 +262,23 @@ fn print_session(session: &SessionRecord) {
     if let Some(error) = &session.error {
         println!("error: {error}");
     }
+}
+
+fn print_worktree(worktree: &WorktreeRecord) {
+    println!("session_id: {}", worktree.session_id);
+    println!("repo_path: {}", worktree.repo_path);
+    println!("base_branch: {}", worktree.base_branch);
+    println!("branch: {}", worktree.branch);
+    println!("worktree: {}", worktree.worktree);
+}
+
+fn print_diff(diff: &SessionDiff) {
+    println!("session_id: {}", diff.session_id);
+    println!("base_branch: {}", diff.base_branch);
+    println!("branch: {}", diff.branch);
+    println!("worktree: {}", diff.worktree);
+    println!();
+    print!("{}", diff.diff);
 }
 
 trait StatusString {

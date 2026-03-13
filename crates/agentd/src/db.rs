@@ -16,7 +16,9 @@ pub struct NewSession<'a> {
     pub session_id: &'a str,
     pub agent: &'a str,
     pub workspace: &'a str,
+    pub repo_path: &'a str,
     pub task: &'a str,
+    pub base_branch: &'a str,
     pub branch: &'a str,
     pub worktree: &'a str,
 }
@@ -41,7 +43,9 @@ impl Database {
                 session_id TEXT PRIMARY KEY,
                 agent TEXT NOT NULL,
                 workspace TEXT NOT NULL,
+                repo_path TEXT,
                 task TEXT NOT NULL,
+                base_branch TEXT,
                 branch TEXT NOT NULL,
                 worktree TEXT NOT NULL,
                 status TEXT NOT NULL,
@@ -53,6 +57,28 @@ impl Database {
                 exited_at TEXT
             );",
         )?;
+        self.ensure_column(&conn, "repo_path", "ALTER TABLE sessions ADD COLUMN repo_path TEXT")?;
+        self.ensure_column(&conn, "base_branch", "ALTER TABLE sessions ADD COLUMN base_branch TEXT")?;
+        conn.execute(
+            "UPDATE sessions
+             SET repo_path = COALESCE(repo_path, workspace),
+                 base_branch = COALESCE(base_branch, 'HEAD')
+             WHERE repo_path IS NULL OR base_branch IS NULL",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn ensure_column(&self, conn: &Connection, column: &str, ddl: &str) -> Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let existing: String = row.get(1)?;
+            if existing == column {
+                return Ok(());
+            }
+        }
+        conn.execute(ddl, [])?;
         Ok(())
     }
 
@@ -61,14 +87,16 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO sessions (
-                session_id, agent, workspace, task, branch, worktree, status,
-                created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+                session_id, agent, workspace, repo_path, task, base_branch, branch, worktree,
+                status, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
             params![
                 new_session.session_id,
                 new_session.agent,
                 new_session.workspace,
+                new_session.repo_path,
                 new_session.task,
+                new_session.base_branch,
                 new_session.branch,
                 new_session.worktree,
                 status_to_str(SessionStatus::Creating),
@@ -128,8 +156,8 @@ impl Database {
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT session_id, agent, workspace, task, branch, worktree, status, pid, exit_code,
-                    error, created_at, updated_at, exited_at
+            "SELECT session_id, agent, workspace, repo_path, task, base_branch, branch, worktree,
+                    status, pid, exit_code, error, created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
             params![session_id],
             row_to_session,
@@ -141,8 +169,8 @@ impl Database {
     pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT session_id, agent, workspace, task, branch, worktree, status, pid, exit_code,
-                    error, created_at, updated_at, exited_at
+            "SELECT session_id, agent, workspace, repo_path, task, base_branch, branch, worktree,
+                    status, pid, exit_code, error, created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
@@ -155,17 +183,19 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         session_id: row.get(0)?,
         agent: row.get(1)?,
         workspace: row.get(2)?,
-        task: row.get(3)?,
-        branch: row.get(4)?,
-        worktree: row.get(5)?,
-        status: str_to_status(&row.get::<_, String>(6)?)
-            .map_err(|err| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(err)))?,
-        pid: row.get::<_, Option<u32>>(7)?,
-        exit_code: row.get(8)?,
-        error: row.get(9)?,
-        created_at: parse_time(row.get::<_, String>(10)?)?,
-        updated_at: parse_time(row.get::<_, String>(11)?)?,
-        exited_at: row.get::<_, Option<String>>(12)?.map(parse_time).transpose()?,
+        repo_path: row.get(3)?,
+        task: row.get(4)?,
+        base_branch: row.get(5)?,
+        branch: row.get(6)?,
+        worktree: row.get(7)?,
+        status: str_to_status(&row.get::<_, String>(8)?)
+            .map_err(|err| rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(err)))?,
+        pid: row.get::<_, Option<u32>>(9)?,
+        exit_code: row.get(10)?,
+        error: row.get(11)?,
+        created_at: parse_time(row.get::<_, String>(12)?)?,
+        updated_at: parse_time(row.get::<_, String>(13)?)?,
+        exited_at: row.get::<_, Option<String>>(14)?.map(parse_time).transpose()?,
     })
 }
 

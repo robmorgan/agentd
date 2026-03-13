@@ -65,6 +65,24 @@ async fn handle_connection(state: AppState, stream: UnixStream) -> Result<()> {
                 Err(err) => send_response(&mut writer, &Response::Error { message: err.to_string() }).await?,
             }
         }
+        Request::CreateWorktree { session_id } => {
+            match state.create_worktree(&session_id).await {
+                Ok(worktree) => send_response(&mut writer, &Response::Worktree { worktree }).await?,
+                Err(err) => send_response(&mut writer, &Response::Error { message: err.to_string() }).await?,
+            }
+        }
+        Request::CleanupWorktree { session_id } => {
+            match state.cleanup_worktree(&session_id).await {
+                Ok(worktree) => send_response(&mut writer, &Response::Worktree { worktree }).await?,
+                Err(err) => send_response(&mut writer, &Response::Error { message: err.to_string() }).await?,
+            }
+        }
+        Request::DiffSession { session_id } => {
+            match state.diff_session(&session_id).await {
+                Ok(diff) => send_response(&mut writer, &Response::Diff { diff }).await?,
+                Err(err) => send_response(&mut writer, &Response::Error { message: err.to_string() }).await?,
+            }
+        }
         Request::GetSession { session_id } => match state.get_session(&session_id).await? {
             Some(session) => send_response(&mut writer, &Response::Session { session }).await?,
             None => send_response(&mut writer, &Response::Error { message: format!("session `{session_id}` not found") }).await?,

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::session::{CreateSessionResult, SessionRecord};
+use crate::session::{CreateSessionResult, SessionDiff, SessionRecord, WorktreeRecord};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -9,6 +9,15 @@ pub enum Request {
         workspace: String,
         task: String,
         agent: String,
+    },
+    CreateWorktree {
+        session_id: String,
+    },
+    CleanupWorktree {
+        session_id: String,
+    },
+    DiffSession {
+        session_id: String,
     },
     GetSession {
         session_id: String,
@@ -25,6 +34,8 @@ pub enum Request {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     CreateSession { session: CreateSessionResult },
+    Worktree { worktree: WorktreeRecord },
+    Diff { diff: SessionDiff },
     Session { session: SessionRecord },
     Sessions { sessions: Vec<SessionRecord> },
     LogChunk { data: String },
