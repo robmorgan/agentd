@@ -26,7 +26,7 @@ use agentd_shared::{
 use crate::local::{LocalStore, normalize_session, print_log_file, remove_session_artifacts};
 
 #[derive(Debug, Parser)]
-#[command(name = "agentctl")]
+#[command(name = "agent")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -240,7 +240,7 @@ async fn main() -> Result<()> {
         }
         (Command::Diff { .. }, ExecutionMode::Local(reason)) => {
             bail!(
-                "{reason}. `agentctl diff` requires a compatible daemon; use `agentctl sessions` and `agentctl kill` to recover first"
+                "{reason}. `agent diff` requires a compatible daemon; use `agent sessions` and `agent kill` to recover first"
             );
         }
         (Command::Status { session_id }, ExecutionMode::Daemon) => {
@@ -344,7 +344,7 @@ async fn degraded_mode_reason(paths: &AppPaths) -> Result<Option<String>> {
         Ok(_) => match daemon_info(paths).await {
             Ok(info) if info.protocol_version == PROTOCOL_VERSION => Ok(None),
             Ok(info) => Ok(Some(format!(
-                "agentd protocol version {} is incompatible with agentctl protocol version {}",
+                "agentd protocol version {} is incompatible with agent protocol version {}",
                 info.protocol_version, PROTOCOL_VERSION
             ))),
             Err(err) => Ok(Some(format!("agentd could not be queried: {err}"))),
@@ -360,13 +360,13 @@ async fn degraded_mode_reason(paths: &AppPaths) -> Result<Option<String>> {
 
 fn print_degraded_notice(reason: &str) {
     eprintln!(
-        "agentctl: {reason}; using local degraded mode for metadata/log/session cleanup commands"
+        "agent: {reason}; using local degraded mode for metadata/log/session cleanup commands"
     );
 }
 
 fn bail_live_command(reason: &str) -> Result<()> {
     bail!(
-        "{reason}. this command needs a compatible daemon with a live PTY; use `agentctl sessions` and `agentctl kill` first"
+        "{reason}. this command needs a compatible daemon with a live PTY; use `agent sessions` and `agent kill` first"
     )
 }
 
@@ -429,7 +429,7 @@ async fn restart_incompatible_daemon(paths: &AppPaths, info: Option<DaemonInfo>)
             .map(|value| value.daemon_version)
             .unwrap_or_else(|| "legacy".to_string());
         bail!(
-            "agentd `{daemon_version}` is incompatible with agentctl `{}` and cannot be restarted while sessions are running",
+            "agentd `{daemon_version}` is incompatible with agent `{}` and cannot be restarted while sessions are running",
             env!("CARGO_PKG_VERSION")
         );
     }

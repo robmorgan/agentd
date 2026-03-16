@@ -15,9 +15,8 @@ But once you run more than one, things get messy:
 * lost artifacts
 * agents needing attention
 
-`agentd` turns coding agents into **durable tasks with state, artifacts, and events.**
-
-Instead of babysitting terminal tabs, you supervise work.
+`agentd` turns coding agents into **durable tasks with state, artifacts, and events.** Instead of babysitting terminal
+tabs, you supervise work.
 
 ## How It Works
 
@@ -111,7 +110,7 @@ Clients surface tasks based on attention instead of raw output.
 - raw PTY logs stored per session in `~/.agentd/logs/`
 - interactive reattach with `agent attach`
 - background PTY input with `agent send`
-- diff inspection against the base branch with `agentctl diff`
+- diff inspection against the base branch with `agent diff`
 
 ## Build
 
@@ -150,11 +149,11 @@ The daemon injects:
 
 Instrumented agents can send structured event batches back to the daemon over the Unix socket
 named by `AGENTD_SOCKET` using the `append_session_events` request. Consumers can read them with
-`stream_events` or `agentctl events`.
+`stream_events` or `agent events`.
 
 Interactive PTY attach is available with `agent attach <session_id>`. Detach with `Ctrl-]`.
 Only one interactive attacher is allowed per session. Background PTY writes are available with
-`agentctl send-input <session_id> -- <text>`.
+`agent send-input <session_id> -- <text>`.
 
 ## Troubleshooting
 

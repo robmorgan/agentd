@@ -2,7 +2,7 @@
 members = [
     "crates/agentd-shared",
     "crates/agentd",
-    "crates/agentctl",
+    "crates/agent",
 ]
 resolver = "2"
 

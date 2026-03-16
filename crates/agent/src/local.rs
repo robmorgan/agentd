@@ -425,7 +425,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = camino::Utf8PathBuf::from(format!("/tmp/agentctl-local-test-{suffix}"));
+        let root = camino::Utf8PathBuf::from(format!("/tmp/agent-local-test-{suffix}"));
         AppPaths {
             socket: root.join("agentd.sock"),
             pid_file: root.join("agentd.pid"),

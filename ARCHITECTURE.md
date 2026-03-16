@@ -30,8 +30,8 @@ client.
 
 Structured events are separate from raw PTY logs. The daemon records lifecycle events such as
 session start, finish, worktree creation or removal, and injected background input. Instrumented
-agents can also append their own events, which makes `agentctl events` useful for machine-readable
-progress while `agentctl logs` remains the raw terminal transcript.
+agents can also append their own events, which makes `agent events` useful for machine-readable
+progress while `agent logs` remains the raw terminal transcript.
 
 ## Socket Files
 

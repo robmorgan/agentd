@@ -5,7 +5,7 @@ build:
 
 install:
 	cargo install --path crates/agentd
-	cargo install --path crates/agentctl
+	cargo install --path crates/agent
 
 test:
 	cargo test
