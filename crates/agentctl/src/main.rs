@@ -14,12 +14,16 @@ use tokio::{
     sync::mpsc,
 };
 
+mod local;
+
 use agentd_shared::{
     config::Config,
     paths::AppPaths,
     protocol::{DaemonInfo, PROTOCOL_VERSION, Request, Response},
-    session::{SessionDiff, SessionRecord, WorktreeRecord},
+    session::{SessionDiff, SessionRecord, SessionStatus, WorktreeRecord},
 };
+
+use crate::local::{LocalStore, normalize_session, print_log_file, remove_session_artifacts};
 
 #[derive(Debug, Parser)]
 #[command(name = "agentctl")]
@@ -103,14 +107,17 @@ async fn main() -> Result<()> {
     let paths = AppPaths::discover()?;
     paths.ensure_layout()?;
     ensure_config(&paths)?;
-    ensure_daemon(&paths).await?;
+    let execution = resolve_execution_mode(&paths, &cli.command).await?;
 
-    match cli.command {
-        Command::Create {
-            workspace,
-            task,
-            agent,
-        } => {
+    match (cli.command, execution) {
+        (
+            Command::Create {
+                workspace,
+                task,
+                agent,
+            },
+            ExecutionMode::Daemon,
+        ) => {
             let response = send_request(
                 &paths,
                 &Request::CreateSession {
@@ -132,7 +139,10 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        Command::Kill { rm, session_id } => {
+        (Command::Create { .. }, ExecutionMode::Local(reason)) => {
+            bail_live_command(&reason)?;
+        }
+        (Command::Kill { rm, session_id }, ExecutionMode::Daemon) => {
             let response = send_request(
                 &paths,
                 &Request::KillSession {
@@ -151,14 +161,24 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        Command::Attach { session_id } => {
+        (Command::Kill { rm, session_id }, ExecutionMode::Local(reason)) => {
+            print_degraded_notice(&reason);
+            local_kill(&paths, &session_id, rm)?;
+        }
+        (Command::Attach { session_id }, ExecutionMode::Daemon) => {
             attach_session(&paths, &session_id).await?;
         }
-        Command::SendInput {
-            session_id,
-            source_session_id,
-            data,
-        } => {
+        (Command::Attach { .. }, ExecutionMode::Local(reason)) => {
+            bail_live_command(&reason)?;
+        }
+        (
+            Command::SendInput {
+                session_id,
+                source_session_id,
+                data,
+            },
+            ExecutionMode::Daemon,
+        ) => {
             let response = send_request(
                 &paths,
                 &Request::SendInput {
@@ -175,13 +195,24 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        Command::Logs { session_id, follow } => {
+        (Command::SendInput { .. }, ExecutionMode::Local(reason)) => {
+            bail_live_command(&reason)?;
+        }
+        (Command::Logs { session_id, follow }, ExecutionMode::Daemon) => {
             stream_logs(&paths, &session_id, follow).await?;
         }
-        Command::Events { session_id, follow } => {
+        (Command::Logs { session_id, follow }, ExecutionMode::Local(reason)) => {
+            print_degraded_notice(&reason);
+            local_logs(&paths, &session_id, follow)?;
+        }
+        (Command::Events { session_id, follow }, ExecutionMode::Daemon) => {
             stream_events(&paths, &session_id, follow).await?;
         }
-        Command::Sessions => {
+        (Command::Events { session_id, follow }, ExecutionMode::Local(reason)) => {
+            print_degraded_notice(&reason);
+            local_events(&paths, &session_id, follow).await?;
+        }
+        (Command::Sessions, ExecutionMode::Daemon) => {
             let response = send_request(&paths, &Request::ListSessions).await?;
             match response {
                 Response::Sessions { sessions } => print_sessions(&sessions),
@@ -189,7 +220,17 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        Command::Diff { session_id } => {
+        (Command::Sessions, ExecutionMode::Local(reason)) => {
+            print_degraded_notice(&reason);
+            let store = LocalStore::open(&paths)?;
+            let sessions = store
+                .list_sessions()?
+                .into_iter()
+                .map(normalize_session)
+                .collect::<Vec<_>>();
+            print_sessions(&sessions);
+        }
+        (Command::Diff { session_id }, ExecutionMode::Daemon) => {
             let response = send_request(&paths, &Request::DiffSession { session_id }).await?;
             match response {
                 Response::Diff { diff } => print_diff(&diff),
@@ -197,7 +238,12 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        Command::Status { session_id } => {
+        (Command::Diff { .. }, ExecutionMode::Local(reason)) => {
+            bail!(
+                "{reason}. `agentctl diff` requires a compatible daemon; use `agentctl sessions` and `agentctl kill` to recover first"
+            );
+        }
+        (Command::Status { session_id }, ExecutionMode::Daemon) => {
             let response = send_request(&paths, &Request::GetSession { session_id }).await?;
             match response {
                 Response::Session { session } => print_session(&session),
@@ -205,7 +251,16 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        Command::Worktree { command } => match command {
+        (Command::Status { session_id }, ExecutionMode::Local(reason)) => {
+            print_degraded_notice(&reason);
+            let store = LocalStore::open(&paths)?;
+            let session = store
+                .get_session(&session_id)?
+                .map(normalize_session)
+                .ok_or_else(|| anyhow::anyhow!("session `{session_id}` not found"))?;
+            print_session(&session);
+        }
+        (Command::Worktree { command }, ExecutionMode::Daemon) => match command {
             WorktreeCommand::Create { session_id } => {
                 let response =
                     send_request(&paths, &Request::CreateWorktree { session_id }).await?;
@@ -228,7 +283,12 @@ async fn main() -> Result<()> {
                 }
             }
         },
-        Command::Daemon { command } => match command {
+        (Command::Worktree { .. }, ExecutionMode::Local(reason)) => {
+            bail!(
+                "{reason}. worktree management requires a compatible daemon or a manual cleanup flow"
+            );
+        }
+        (Command::Daemon { command }, ExecutionMode::Daemon) => match command {
             DaemonCommand::Info => {
                 let info = daemon_info(&paths).await?;
                 println!("daemon_version: {}", info.daemon_version);
@@ -243,9 +303,71 @@ async fn main() -> Result<()> {
                 println!("protocol_version: {}", info.protocol_version);
             }
         },
+        (Command::Daemon { .. }, ExecutionMode::Local(reason)) => {
+            bail!("{reason}. daemon management requires a compatible daemon");
+        }
     }
 
     Ok(())
+}
+
+enum ExecutionMode {
+    Daemon,
+    Local(String),
+}
+
+async fn resolve_execution_mode(paths: &AppPaths, command: &Command) -> Result<ExecutionMode> {
+    if command_supports_local_mode(command) {
+        if let Some(reason) = degraded_mode_reason(paths).await? {
+            return Ok(ExecutionMode::Local(reason));
+        }
+        return Ok(ExecutionMode::Daemon);
+    }
+
+    ensure_daemon(paths).await?;
+    Ok(ExecutionMode::Daemon)
+}
+
+fn command_supports_local_mode(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Kill { .. }
+            | Command::Logs { .. }
+            | Command::Events { .. }
+            | Command::Sessions
+            | Command::Status { .. }
+    )
+}
+
+async fn degraded_mode_reason(paths: &AppPaths) -> Result<Option<String>> {
+    match try_connect(paths).await {
+        Ok(_) => match daemon_info(paths).await {
+            Ok(info) if info.protocol_version == PROTOCOL_VERSION => Ok(None),
+            Ok(info) => Ok(Some(format!(
+                "agentd protocol version {} is incompatible with agentctl protocol version {}",
+                info.protocol_version, PROTOCOL_VERSION
+            ))),
+            Err(err) => Ok(Some(format!("agentd could not be queried: {err}"))),
+        },
+        Err(_) => {
+            if spawn_daemon(paths).await.is_ok() && ensure_compatible_daemon(paths).await.is_ok() {
+                return Ok(None);
+            }
+            Ok(Some("agentd is unavailable".to_string()))
+        }
+    }
+}
+
+fn print_degraded_notice(reason: &str) {
+    eprintln!(
+        "agentctl: {reason}; using local degraded mode for metadata/log/session cleanup commands"
+    );
+}
+
+fn bail_live_command(reason: &str) -> Result<()> {
+    bail!(
+        "{reason}. this command needs a compatible daemon with a live PTY; use `agentctl sessions` and `agentctl kill` first"
+    )
 }
 
 fn ensure_config(paths: &AppPaths) -> Result<()> {
@@ -461,6 +583,69 @@ async fn stream_events(paths: &AppPaths, session_id: &str, follow: bool) -> Resu
     Ok(())
 }
 
+fn local_logs(paths: &AppPaths, session_id: &str, follow: bool) -> Result<()> {
+    print_log_file(paths, session_id, follow)
+}
+
+async fn local_events(paths: &AppPaths, session_id: &str, follow: bool) -> Result<()> {
+    let store = LocalStore::open(paths)?;
+    store
+        .get_session(session_id)?
+        .ok_or_else(|| anyhow::anyhow!("session `{session_id}` not found"))?;
+    let mut after_id = None;
+
+    loop {
+        let events = store.list_events_since(session_id, after_id)?;
+        for event in &events {
+            println!("{}", serde_json::to_string(event)?);
+        }
+        if let Some(last) = events.last() {
+            after_id = Some(last.id);
+        }
+        if !follow {
+            return Ok(());
+        }
+        let session_running = store
+            .get_session(session_id)?
+            .map(|session| local::session_is_running(&session))
+            .unwrap_or(false);
+        if !session_running && events.is_empty() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn local_kill(paths: &AppPaths, session_id: &str, remove: bool) -> Result<()> {
+    let store = LocalStore::open(paths)?;
+    let session = store
+        .get_session(session_id)?
+        .ok_or_else(|| anyhow::anyhow!("session `{session_id}` not found"))?;
+    let was_running = local::session_is_running(&session);
+
+    if !was_running && !remove {
+        if session.status == SessionStatus::Running {
+            store.mark_unknown_recovered(session_id)?;
+        }
+        bail!("session `{session_id}` is not running");
+    }
+
+    if was_running {
+        local::terminate_session_process(session_id, session.pid)?;
+        store.mark_exited(session_id, None)?;
+    } else if session.status == SessionStatus::Running {
+        store.mark_unknown_recovered(session_id)?;
+    }
+
+    if remove {
+        remove_session_artifacts(paths, &session)?;
+        store.delete_session(session_id)?;
+    }
+
+    print_kill_result(session_id, was_running, remove);
+    Ok(())
+}
+
 async fn attach_session(paths: &AppPaths, session_id: &str) -> Result<()> {
     let mut stream = try_connect(paths).await?;
     let payload = serde_json::to_vec(&Request::AttachSession {
@@ -650,11 +835,11 @@ trait StatusString {
 impl StatusString for SessionRecord {
     fn status_string(&self) -> &'static str {
         match self.status {
-            agentd_shared::session::SessionStatus::Creating => "creating",
-            agentd_shared::session::SessionStatus::Running => "running",
-            agentd_shared::session::SessionStatus::Exited => "exited",
-            agentd_shared::session::SessionStatus::Failed => "failed",
-            agentd_shared::session::SessionStatus::UnknownRecovered => "unknown_recovered",
+            SessionStatus::Creating => "creating",
+            SessionStatus::Running => "running",
+            SessionStatus::Exited => "exited",
+            SessionStatus::Failed => "failed",
+            SessionStatus::UnknownRecovered => "unknown_recovered",
         }
     }
 }
