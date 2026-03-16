@@ -3,6 +3,7 @@ mod db;
 mod git;
 mod ids;
 mod server;
+mod terminal_state;
 
 use std::process::Stdio;
 

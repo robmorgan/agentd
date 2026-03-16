@@ -114,6 +114,17 @@ Clients surface tasks based on attention instead of raw output.
 
 ## Build
 
+Bootstrap the pinned Ghostty checkout first:
+
+```sh
+make bootstrap-ghostty
+```
+
+This clones `ghostty-org/ghostty` into `vendor/ghostty` and checks out the
+exact commit recorded in `third_party/ghostty.lock`.
+
+Then build:
+
 ```sh
 cargo build
 ```

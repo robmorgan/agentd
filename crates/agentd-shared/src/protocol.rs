@@ -5,7 +5,7 @@ use crate::{
     session::{CreateSessionResult, SessionDiff, SessionRecord, WorktreeRecord},
 };
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonInfo {
@@ -38,11 +38,11 @@ pub enum Request {
         session_id: String,
     },
     AttachInput {
-        data: String,
+        data_b64: String,
     },
     SendInput {
         session_id: String,
-        data: String,
+        data_b64: String,
         #[serde(default)]
         source_session_id: Option<String>,
     },
@@ -75,7 +75,7 @@ pub enum Response {
     DaemonInfo { info: DaemonInfo },
     CreateSession { session: CreateSessionResult },
     KillSession { removed: bool, was_running: bool },
-    Attached,
+    Attached { snapshot_b64: String },
     InputAccepted,
     Worktree { worktree: WorktreeRecord },
     Diff { diff: SessionDiff },
@@ -83,7 +83,7 @@ pub enum Response {
     Sessions { sessions: Vec<SessionRecord> },
     Event { event: SessionEvent },
     LogChunk { data: String },
-    PtyOutput { data: String },
+    PtyOutput { data_b64: String },
     EndOfStream,
     Error { message: String },
     Ok,
@@ -154,9 +154,10 @@ mod tests {
 
     #[test]
     fn send_input_defaults_to_no_source_session() {
-        let request: Request =
-            serde_json::from_str(r#"{"type":"send_input","session_id":"demo","data":"hello"}"#)
-                .unwrap();
+        let request: Request = serde_json::from_str(
+            r#"{"type":"send_input","session_id":"demo","data_b64":"aGVsbG8="}"#,
+        )
+        .unwrap();
         match request {
             Request::SendInput {
                 source_session_id, ..
@@ -168,12 +169,25 @@ mod tests {
     #[test]
     fn attach_output_response_round_trips() {
         let response = Response::PtyOutput {
-            data: "hello".to_string(),
+            data_b64: "aGVsbG8=".to_string(),
         };
         let json = serde_json::to_string(&response).unwrap();
         let decoded: Response = serde_json::from_str(&json).unwrap();
         match decoded {
-            Response::PtyOutput { data } => assert_eq!(data, "hello"),
+            Response::PtyOutput { data_b64 } => assert_eq!(data_b64, "aGVsbG8="),
+            _ => panic!("unexpected response variant"),
+        }
+    }
+
+    #[test]
+    fn attached_response_round_trips_snapshot() {
+        let response = Response::Attached {
+            snapshot_b64: "aGVsbG8=".to_string(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let decoded: Response = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Response::Attached { snapshot_b64 } => assert_eq!(snapshot_b64, "aGVsbG8="),
             _ => panic!("unexpected response variant"),
         }
     }

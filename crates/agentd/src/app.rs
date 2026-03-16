@@ -33,6 +33,7 @@ use crate::{
     db::{Database, NewSession},
     git,
     ids::generate_session_id,
+    terminal_state::{GhosttyTerminalState, TerminalStateEngine},
 };
 
 #[derive(Clone)]
@@ -113,8 +114,8 @@ impl AppState {
             let pty_system = native_pty_system();
             let pair = pty_system
                 .openpty(PtySize {
-                    rows: 48,
-                    cols: 160,
+                    rows: DEFAULT_PTY_ROWS,
+                    cols: DEFAULT_PTY_COLS,
                     pixel_width: 0,
                     pixel_height: 0,
                 })
@@ -183,9 +184,12 @@ impl AppState {
                 .master
                 .take_writer()
                 .context("failed to clone PTY writer")?;
+            let terminal_state =
+                GhosttyTerminalState::new(DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS, MAX_SCROLLBACK_BYTES)
+                    .context("failed to initialize libghostty-vt state")?;
             let runtime = runtimes.insert(
                 session_id.clone(),
-                SessionRuntime::new(writer, OUTPUT_BUFFER_CAPACITY),
+                SessionRuntime::new(writer, Box::new(terminal_state), OUTPUT_BUFFER_CAPACITY),
             );
             let writer_db = db.clone();
             let writer_session_id = session_id.clone();
@@ -438,7 +442,7 @@ impl AppState {
     pub async fn send_input(
         &self,
         session_id: &str,
-        data: String,
+        data: Vec<u8>,
         source_session_id: Option<String>,
     ) -> Result<()> {
         let session = self
@@ -474,7 +478,7 @@ impl AppState {
         .await?
     }
 
-    pub async fn write_attached_input(&self, session_id: &str, data: String) -> Result<()> {
+    pub async fn write_attached_input(&self, session_id: &str, data: Vec<u8>) -> Result<()> {
         let session = self
             .get_session(session_id)
             .await?
@@ -491,7 +495,7 @@ impl AppState {
     pub async fn attach_session(
         &self,
         session_id: &str,
-    ) -> Result<(AttachLease, broadcast::Receiver<String>)> {
+    ) -> Result<(AttachLease, Vec<u8>, broadcast::Receiver<Vec<u8>>)> {
         let session = self
             .get_session(session_id)
             .await?
@@ -502,15 +506,17 @@ impl AppState {
             .runtimes
             .get(session_id)
             .ok_or_else(|| anyhow!("session `{session_id}` does not have a live PTY"))?;
-        let lease = runtime
+        let (lease, snapshot, receiver) = runtime
             .try_attach()
             .ok_or_else(|| anyhow!("session `{session_id}` already has an attached client"))?;
-        let receiver = runtime.subscribe_output();
-        Ok((lease, receiver))
+        Ok((lease, snapshot, receiver))
     }
 }
 
 const OUTPUT_BUFFER_CAPACITY: usize = 256;
+const DEFAULT_PTY_ROWS: u16 = 48;
+const DEFAULT_PTY_COLS: u16 = 160;
+const MAX_SCROLLBACK_BYTES: usize = 10_000_000;
 
 #[derive(Clone, Default)]
 struct SessionRuntimeRegistry {
@@ -547,46 +553,67 @@ impl SessionRuntimeRegistry {
 
 struct SessionRuntime {
     writer: Mutex<Box<dyn Write + Send>>,
-    output_tx: broadcast::Sender<String>,
+    state: Mutex<SessionRuntimeState>,
+    output_tx: broadcast::Sender<Vec<u8>>,
     attached: AtomicBool,
 }
 
 impl SessionRuntime {
-    fn new(writer: Box<dyn Write + Send>, output_buffer_capacity: usize) -> Self {
+    fn new(
+        writer: Box<dyn Write + Send>,
+        terminal_state: Box<dyn TerminalStateEngine>,
+        output_buffer_capacity: usize,
+    ) -> Self {
         let (output_tx, _) = broadcast::channel(output_buffer_capacity);
         Self {
             writer: Mutex::new(writer),
+            state: Mutex::new(SessionRuntimeState { terminal_state }),
             output_tx,
             attached: AtomicBool::new(false),
         }
     }
 
-    fn write_input(&self, data: &str) -> Result<()> {
+    fn write_input(&self, data: &[u8]) -> Result<()> {
         let mut writer = self
             .writer
             .lock()
             .map_err(|_| anyhow!("PTY writer poisoned"))?;
-        writer.write_all(data.as_bytes())?;
+        writer.write_all(data)?;
         writer.flush()?;
         Ok(())
     }
 
-    fn publish_output(&self, data: String) {
-        let _ = self.output_tx.send(data);
+    fn publish_output(&self, data: &[u8]) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("session runtime state poisoned"))?;
+        state.terminal_state.feed(data)?;
+        let _ = self.output_tx.send(data.to_vec());
+        Ok(())
     }
 
-    fn subscribe_output(&self) -> broadcast::Receiver<String> {
-        self.output_tx.subscribe()
-    }
-
-    fn try_attach(self: &Arc<Self>) -> Option<AttachLease> {
+    fn try_attach(
+        self: &Arc<Self>,
+    ) -> Option<(AttachLease, Vec<u8>, broadcast::Receiver<Vec<u8>>)> {
         self.attached
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
-        Some(AttachLease {
-            runtime: self.clone(),
-        })
+        let mut state = self.state.lock().ok()?;
+        let snapshot = state.terminal_state.snapshot().ok()?;
+        let receiver = self.output_tx.subscribe();
+        Some((
+            AttachLease {
+                runtime: self.clone(),
+            },
+            snapshot,
+            receiver,
+        ))
     }
+}
+
+struct SessionRuntimeState {
+    terminal_state: Box<dyn TerminalStateEngine>,
 }
 
 pub struct AttachLease {
@@ -668,10 +695,12 @@ fn pump_pty_to_log(
             break;
         }
 
-        let mut file = file.lock().map_err(|_| anyhow!("log writer poisoned"))?;
-        file.write_all(&buffer[..bytes_read])?;
-        file.flush()?;
-        runtime.publish_output(String::from_utf8_lossy(&buffer[..bytes_read]).to_string());
+        {
+            let mut file = file.lock().map_err(|_| anyhow!("log writer poisoned"))?;
+            file.write_all(&buffer[..bytes_read])?;
+            file.flush()?;
+        }
+        runtime.publish_output(&buffer[..bytes_read])?;
     }
 
     Ok(())
@@ -757,8 +786,10 @@ fn remove_log_if_present(paths: &AppPaths, session: &SessionRecord) -> Result<()
     }
 }
 
-fn preview_input(data: &str) -> String {
-    let mut preview = data.replace('\n', "\\n").replace('\r', "\\r");
+fn preview_input(data: &[u8]) -> String {
+    let mut preview = String::from_utf8_lossy(data)
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
     if preview.len() > 120 {
         preview.truncate(120);
         preview.push_str("...");

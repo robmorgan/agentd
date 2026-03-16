@@ -3,10 +3,12 @@ name = "agentd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [dependencies]
 agentd-shared = { path = "../agentd-shared" }
 anyhow.workspace = true
+base64.workspace = true
 camino.workspace = true
 chrono.workspace = true
 clap.workspace = true

@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{ArgAction, Parser, Subcommand};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use tokio::{
@@ -183,7 +184,7 @@ async fn main() -> Result<()> {
                 &paths,
                 &Request::SendInput {
                     session_id,
-                    data: data.join(" "),
+                    data_b64: STANDARD.encode(data.join(" ").into_bytes()),
                     source_session_id,
                 },
             )
@@ -662,7 +663,9 @@ async fn attach_session(paths: &AppPaths, session_id: &str) -> Result<()> {
     };
 
     match serde_json::from_str::<Response>(&line)? {
-        Response::Attached => {}
+        Response::Attached { snapshot_b64 } => {
+            write_attach_bytes(&decode_b64(&snapshot_b64)?)?;
+        }
         Response::Error { message } => bail!(message),
         other => bail!("unexpected response: {:?}", other),
     }
@@ -678,7 +681,9 @@ async fn attach_session(paths: &AppPaths, session_id: &str) -> Result<()> {
         tokio::select! {
             event = stdin_rx.recv() => match event {
                 Some(AttachInput::Data(data)) => {
-                    let payload = serde_json::to_vec(&Request::AttachInput { data })?;
+                    let payload = serde_json::to_vec(&Request::AttachInput {
+                        data_b64: STANDARD.encode(data),
+                    })?;
                     write_half.write_all(&payload).await?;
                     write_half.write_all(b"\n").await?;
                     write_half.flush().await?;
@@ -763,13 +768,9 @@ fn print_kill_result(session_id: &str, was_running: bool, removed: bool) {
 }
 
 async fn stream_attach_output(mut lines: tokio::io::Lines<BufReader<OwnedReadHalf>>) -> Result<()> {
-    let mut stdout = std::io::stdout();
     while let Some(line) = lines.next_line().await? {
         match serde_json::from_str::<Response>(&line)? {
-            Response::PtyOutput { data } => {
-                stdout.write_all(data.as_bytes())?;
-                stdout.flush()?;
-            }
+            Response::PtyOutput { data_b64 } => write_attach_bytes(&decode_b64(&data_b64)?)?,
             Response::EndOfStream => break,
             Response::Error { message } => bail!(message),
             other => bail!("unexpected response: {:?}", other),
@@ -791,14 +792,14 @@ fn read_attach_stdin(tx: mpsc::UnboundedSender<AttachInput>) -> Result<()> {
         let bytes = &buffer[..count];
         if let Some(index) = bytes.iter().position(|byte| *byte == DETACH_BYTE) {
             if index > 0 {
-                let data = String::from_utf8_lossy(&bytes[..index]).to_string();
+                let data = bytes[..index].to_vec();
                 let _ = tx.send(AttachInput::Data(data));
             }
             let _ = tx.send(AttachInput::Detach);
             break;
         }
 
-        let data = String::from_utf8_lossy(bytes).to_string();
+        let data = bytes.to_vec();
         if tx.send(AttachInput::Data(data)).is_err() {
             break;
         }
@@ -809,7 +810,7 @@ fn read_attach_stdin(tx: mpsc::UnboundedSender<AttachInput>) -> Result<()> {
 const DETACH_BYTE: u8 = 29;
 
 enum AttachInput {
-    Data(String),
+    Data(Vec<u8>),
     Detach,
 }
 
@@ -842,4 +843,15 @@ impl StatusString for SessionRecord {
             SessionStatus::UnknownRecovered => "unknown_recovered",
         }
     }
+}
+
+fn decode_b64(data: &str) -> Result<Vec<u8>> {
+    STANDARD.decode(data).map_err(Into::into)
+}
+
+fn write_attach_bytes(data: &[u8]) -> Result<()> {
+    let mut stdout = std::io::stdout();
+    stdout.write_all(data)?;
+    stdout.flush()?;
+    Ok(())
 }
