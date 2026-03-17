@@ -37,8 +37,8 @@ impl LocalStore {
     pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT session_id, agent, workspace, repo_path, task, base_branch, branch, worktree,
-                    status, pid, exit_code, error, created_at, updated_at, exited_at
+            "SELECT session_id, thread_id, agent, workspace, repo_path, task, base_branch, branch,
+                    worktree, status, pid, exit_code, error, created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
@@ -49,8 +49,8 @@ impl LocalStore {
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT session_id, agent, workspace, repo_path, task, base_branch, branch, worktree,
-                    status, pid, exit_code, error, created_at, updated_at, exited_at
+            "SELECT session_id, thread_id, agent, workspace, repo_path, task, base_branch, branch,
+                    worktree, status, pid, exit_code, error, created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
             params![session_id],
             row_to_session,
@@ -116,6 +116,10 @@ impl LocalStore {
             "DELETE FROM events WHERE session_id = ?1",
             params![session_id],
         )?;
+        let _ = conn.execute(
+            "DELETE FROM threads WHERE session_id = ?1",
+            params![session_id],
+        );
         conn.execute(
             "DELETE FROM sessions WHERE session_id = ?1",
             params![session_id],
@@ -132,6 +136,7 @@ impl LocalStore {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
+                thread_id TEXT,
                 agent TEXT NOT NULL,
                 workspace TEXT NOT NULL,
                 repo_path TEXT,
@@ -154,8 +159,23 @@ impl LocalStore {
                 type TEXT NOT NULL,
                 payload_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS threads (
+                thread_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL UNIQUE,
+                agent TEXT NOT NULL,
+                title TEXT NOT NULL,
+                initial_prompt TEXT NOT NULL,
+                upstream_thread_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_events_session_id_id
                 ON events (session_id, id);",
+        )?;
+        ensure_column(
+            &conn,
+            "thread_id",
+            "ALTER TABLE sessions ADD COLUMN thread_id TEXT",
         )?;
         ensure_column(
             &conn,
@@ -228,7 +248,12 @@ pub fn remove_session_artifacts(paths: &AppPaths, session: &SessionRecord) -> Re
 }
 
 pub fn print_log_file(paths: &AppPaths, session_id: &str, follow: bool) -> Result<()> {
-    let path = paths.log_path(session_id);
+    let rendered = paths.rendered_log_path(session_id);
+    let path = if rendered.exists() {
+        rendered
+    } else {
+        paths.log_path(session_id)
+    };
     let mut file =
         File::open(path.as_std_path()).with_context(|| format!("failed to open {}", path))?;
     let mut buffer = Vec::new();
@@ -275,23 +300,24 @@ fn ensure_column(conn: &Connection, column: &str, ddl: &str) -> Result<()> {
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     Ok(SessionRecord {
         session_id: row.get(0)?,
-        agent: row.get(1)?,
-        workspace: row.get(2)?,
-        repo_path: row.get(3)?,
-        task: row.get(4)?,
-        base_branch: row.get(5)?,
-        branch: row.get(6)?,
-        worktree: row.get(7)?,
-        status: str_to_status(&row.get::<_, String>(8)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(err))
+        thread_id: row.get(1)?,
+        agent: row.get(2)?,
+        workspace: row.get(3)?,
+        repo_path: row.get(4)?,
+        task: row.get(5)?,
+        base_branch: row.get(6)?,
+        branch: row.get(7)?,
+        worktree: row.get(8)?,
+        status: str_to_status(&row.get::<_, String>(9)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(err))
         })?,
-        pid: row.get::<_, Option<u32>>(9)?,
-        exit_code: row.get(10)?,
-        error: row.get(11)?,
-        created_at: parse_time(row.get::<_, String>(12)?)?,
-        updated_at: parse_time(row.get::<_, String>(13)?)?,
+        pid: row.get::<_, Option<u32>>(10)?,
+        exit_code: row.get(11)?,
+        error: row.get(12)?,
+        created_at: parse_time(row.get::<_, String>(13)?)?,
+        updated_at: parse_time(row.get::<_, String>(14)?)?,
         exited_at: row
-            .get::<_, Option<String>>(14)?
+            .get::<_, Option<String>>(15)?
             .map(parse_time)
             .transpose()?,
     })
@@ -407,12 +433,17 @@ fn remove_worktree_if_present(session: &SessionRecord) -> Result<()> {
 }
 
 fn remove_log_if_present(paths: &AppPaths, session: &SessionRecord) -> Result<()> {
-    let log_path = paths.log_path(&session.session_id);
-    match fs::remove_file(log_path.as_std_path()) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(anyhow!(err)).context(format!("failed to remove {}", log_path)),
+    for log_path in [
+        paths.log_path(&session.session_id),
+        paths.rendered_log_path(&session.session_id),
+    ] {
+        match fs::remove_file(log_path.as_std_path()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(anyhow!(err)).context(format!("failed to remove {}", log_path)),
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]

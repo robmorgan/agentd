@@ -1,6 +1,6 @@
 use std::{io, path::Path, time::Duration};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use tokio::{
     io::BufReader,
     net::{UnixListener, UnixStream, unix::OwnedWriteHalf},
@@ -488,7 +488,16 @@ async fn stream_logs(
     follow: bool,
     writer: &mut OwnedWriteHalf,
 ) -> Result<()> {
-    let log_path = state.paths.log_path(session_id);
+    let session = state
+        .get_session(session_id)
+        .await?
+        .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+    let rendered_log_path = state.paths.rendered_log_path(session_id);
+    let log_path = if session.agent == "codex" && rendered_log_path.exists() {
+        rendered_log_path
+    } else {
+        state.paths.log_path(session_id)
+    };
     if !log_path.exists() {
         bail!("no log file exists for session `{session_id}`");
     }
@@ -575,6 +584,7 @@ mod tests {
         let now = Utc::now();
         SessionRecord {
             session_id: "demo".to_string(),
+            thread_id: Some("thread-demo".to_string()),
             agent: "codex".to_string(),
             workspace: "/tmp/workspace".to_string(),
             repo_path: "/tmp/workspace".to_string(),

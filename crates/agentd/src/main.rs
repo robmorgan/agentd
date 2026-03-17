@@ -1,5 +1,6 @@
 mod app;
 mod codex;
+mod codex_json;
 mod db;
 mod git;
 mod ids;
@@ -179,6 +180,14 @@ fn resolve_resume_session_id_for_upgrade(
 ) -> Result<Option<String>> {
     if !is_resumable_command(&launch.command) {
         return Ok(None);
+    }
+
+    if let Some(thread_id) = &session.thread_id {
+        if let Some(thread) = db.get_thread(thread_id)? {
+            if thread.upstream_thread_id.is_some() {
+                return Ok(thread.upstream_thread_id);
+            }
+        }
     }
 
     if let Some(resume_session_id) = db.get_resume_session_id(&session.session_id)? {

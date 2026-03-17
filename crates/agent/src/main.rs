@@ -897,6 +897,9 @@ fn print_sessions(sessions: &[SessionRecord]) {
 
 fn print_session(session: &SessionRecord) {
     println!("session_id: {}", session.session_id);
+    if let Some(thread_id) = &session.thread_id {
+        println!("thread_id: {thread_id}");
+    }
     println!("agent: {}", session.agent);
     println!("status: {}", session.status_string());
     println!("repo_path: {}", session.repo_path);

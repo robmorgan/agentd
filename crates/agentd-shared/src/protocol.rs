@@ -8,7 +8,7 @@ use crate::{
     session::{CreateSessionResult, SessionDiff, SessionRecord, SessionStatus, WorktreeRecord},
 };
 
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
@@ -874,6 +874,7 @@ fn put_session_diff(buf: &mut Vec<u8>, diff: &SessionDiff) -> Result<()> {
 
 fn put_session_record(buf: &mut Vec<u8>, session: &SessionRecord) -> Result<()> {
     put_string(buf, &session.session_id)?;
+    put_optional_string(buf, session.thread_id.as_deref())?;
     put_string(buf, &session.agent)?;
     put_string(buf, &session.workspace)?;
     put_string(buf, &session.repo_path)?;
@@ -1115,6 +1116,7 @@ impl<'a> Cursor<'a> {
     fn take_session_record(&mut self) -> Result<SessionRecord> {
         Ok(SessionRecord {
             session_id: self.take_string()?,
+            thread_id: self.take_optional_string()?,
             agent: self.take_string()?,
             workspace: self.take_string()?,
             repo_path: self.take_string()?,
@@ -1272,6 +1274,7 @@ mod tests {
         let response = Response::Sessions {
             sessions: vec![SessionRecord {
                 session_id: "demo".to_string(),
+                thread_id: Some("thread-demo".to_string()),
                 agent: "codex".to_string(),
                 workspace: "/tmp/demo".to_string(),
                 repo_path: "/tmp/demo".to_string(),

@@ -40,6 +40,10 @@ impl AppPaths {
         self.logs_dir.join(format!("{session_id}.log"))
     }
 
+    pub fn rendered_log_path(&self, session_id: &str) -> Utf8PathBuf {
+        self.logs_dir.join(format!("{session_id}.rendered.log"))
+    }
+
     pub fn worktree_path(&self, session_id: &str) -> Utf8PathBuf {
         self.worktrees_dir.join(session_id)
     }

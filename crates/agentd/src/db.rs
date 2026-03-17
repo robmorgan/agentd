@@ -16,6 +16,7 @@ pub struct Database {
 
 pub struct NewSession<'a> {
     pub session_id: &'a str,
+    pub thread_id: Option<&'a str>,
     pub agent: &'a str,
     pub agent_command: &'a str,
     pub agent_args_json: &'a str,
@@ -28,10 +29,30 @@ pub struct NewSession<'a> {
     pub worktree: &'a str,
 }
 
+pub struct NewThread<'a> {
+    pub thread_id: &'a str,
+    pub session_id: &'a str,
+    pub agent: &'a str,
+    pub title: &'a str,
+    pub initial_prompt: &'a str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionLaunchInfo {
     pub command: Option<String>,
     pub args: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadRecord {
+    pub thread_id: String,
+    pub session_id: String,
+    pub agent: String,
+    pub title: String,
+    pub initial_prompt: String,
+    pub upstream_thread_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl Database {
@@ -52,6 +73,7 @@ impl Database {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
+                thread_id TEXT,
                 agent TEXT NOT NULL,
                 agent_command TEXT,
                 agent_args_json TEXT,
@@ -77,9 +99,26 @@ impl Database {
                 type TEXT NOT NULL,
                 payload_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS threads (
+                thread_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL UNIQUE,
+                agent TEXT NOT NULL,
+                title TEXT NOT NULL,
+                initial_prompt TEXT NOT NULL,
+                upstream_thread_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_events_session_id_id
                 ON events (session_id, id);
+            CREATE INDEX IF NOT EXISTS idx_threads_session_id
+                ON threads (session_id);
             ",
+        )?;
+        self.ensure_column(
+            &conn,
+            "thread_id",
+            "ALTER TABLE sessions ADD COLUMN thread_id TEXT",
         )?;
         self.ensure_column(
             &conn,
@@ -134,11 +173,12 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO sessions (
-                session_id, agent, agent_command, agent_args_json, resume_session_id, workspace,
+                session_id, thread_id, agent, agent_command, agent_args_json, resume_session_id, workspace,
                 repo_path, task, base_branch, branch, worktree, status, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
             params![
                 new_session.session_id,
+                new_session.thread_id,
                 new_session.agent,
                 new_session.agent_command,
                 new_session.agent_args_json,
@@ -150,6 +190,25 @@ impl Database {
                 new_session.branch,
                 new_session.worktree,
                 status_to_str(SessionStatus::Creating),
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_thread(&self, new_thread: &NewThread<'_>) -> Result<()> {
+        let conn = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO threads (
+                thread_id, session_id, agent, title, initial_prompt, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![
+                new_thread.thread_id,
+                new_thread.session_id,
+                new_thread.agent,
+                new_thread.title,
+                new_thread.initial_prompt,
                 now,
             ],
         )?;
@@ -238,8 +297,8 @@ impl Database {
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT session_id, agent, workspace, repo_path, task, base_branch, branch, worktree,
-                    status, pid, exit_code, error, created_at, updated_at, exited_at
+            "SELECT session_id, thread_id, agent, workspace, repo_path, task, base_branch, branch,
+                    worktree, status, pid, exit_code, error, created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
             params![session_id],
             row_to_session,
@@ -251,8 +310,8 @@ impl Database {
     pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT session_id, agent, workspace, repo_path, task, base_branch, branch, worktree,
-                    status, pid, exit_code, error, created_at, updated_at, exited_at
+            "SELECT session_id, thread_id, agent, workspace, repo_path, task, base_branch, branch,
+                    worktree, status, pid, exit_code, error, created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
@@ -306,18 +365,60 @@ impl Database {
         let conn = self.connect()?;
         let resume_session_id = conn
             .query_row(
-            "SELECT resume_session_id FROM sessions WHERE session_id = ?1",
-            params![session_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?;
+                "SELECT resume_session_id FROM sessions WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
         Ok(resume_session_id.flatten())
+    }
+
+    pub fn get_thread(&self, thread_id: &str) -> Result<Option<ThreadRecord>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT thread_id, session_id, agent, title, initial_prompt, upstream_thread_id,
+                    created_at, updated_at
+             FROM threads WHERE thread_id = ?1",
+            params![thread_id],
+            row_to_thread,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn get_thread_for_session(&self, session_id: &str) -> Result<Option<ThreadRecord>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT thread_id, session_id, agent, title, initial_prompt, upstream_thread_id,
+                    created_at, updated_at
+             FROM threads WHERE session_id = ?1",
+            params![session_id],
+            row_to_thread,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn set_thread_upstream_id(&self, thread_id: &str, upstream_thread_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE threads
+             SET upstream_thread_id = ?2, updated_at = ?3
+             WHERE thread_id = ?1",
+            params![thread_id, upstream_thread_id, now],
+        )?;
+        Ok(())
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
             "DELETE FROM events WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        conn.execute(
+            "DELETE FROM threads WHERE session_id = ?1",
             params![session_id],
         )?;
         conn.execute(
@@ -389,25 +490,39 @@ impl Database {
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     Ok(SessionRecord {
         session_id: row.get(0)?,
-        agent: row.get(1)?,
-        workspace: row.get(2)?,
-        repo_path: row.get(3)?,
-        task: row.get(4)?,
-        base_branch: row.get(5)?,
-        branch: row.get(6)?,
-        worktree: row.get(7)?,
-        status: str_to_status(&row.get::<_, String>(8)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(err))
+        thread_id: row.get(1)?,
+        agent: row.get(2)?,
+        workspace: row.get(3)?,
+        repo_path: row.get(4)?,
+        task: row.get(5)?,
+        base_branch: row.get(6)?,
+        branch: row.get(7)?,
+        worktree: row.get(8)?,
+        status: str_to_status(&row.get::<_, String>(9)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(err))
         })?,
-        pid: row.get::<_, Option<u32>>(9)?,
-        exit_code: row.get(10)?,
-        error: row.get(11)?,
-        created_at: parse_time(row.get::<_, String>(12)?)?,
-        updated_at: parse_time(row.get::<_, String>(13)?)?,
+        pid: row.get::<_, Option<u32>>(10)?,
+        exit_code: row.get(11)?,
+        error: row.get(12)?,
+        created_at: parse_time(row.get::<_, String>(13)?)?,
+        updated_at: parse_time(row.get::<_, String>(14)?)?,
         exited_at: row
-            .get::<_, Option<String>>(14)?
+            .get::<_, Option<String>>(15)?
             .map(parse_time)
             .transpose()?,
+    })
+}
+
+fn row_to_thread(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRecord> {
+    Ok(ThreadRecord {
+        thread_id: row.get(0)?,
+        session_id: row.get(1)?,
+        agent: row.get(2)?,
+        title: row.get(3)?,
+        initial_prompt: row.get(4)?,
+        upstream_thread_id: row.get(5)?,
+        created_at: parse_time(row.get::<_, String>(6)?)?,
+        updated_at: parse_time(row.get::<_, String>(7)?)?,
     })
 }
 
@@ -511,6 +626,7 @@ mod tests {
         let db = Database::open(&paths).unwrap();
         db.insert_session(&super::NewSession {
             session_id: "demo",
+            thread_id: None,
             agent: "codex",
             agent_command: "codex",
             agent_args_json: "[]",
@@ -556,6 +672,7 @@ mod tests {
         let db = Database::open(&paths).unwrap();
         db.insert_session(&super::NewSession {
             session_id: "demo",
+            thread_id: None,
             agent: "codex",
             agent_command: "codex",
             agent_args_json: "[]",
@@ -589,6 +706,7 @@ mod tests {
         let db = Database::open(&paths).unwrap();
         db.insert_session(&super::NewSession {
             session_id: "demo",
+            thread_id: None,
             agent: "codex",
             agent_command: "codex",
             agent_args_json: "[]",
@@ -608,5 +726,45 @@ mod tests {
             db.get_resume_session_id("demo").unwrap().as_deref(),
             Some("thread-123")
         );
+    }
+
+    #[test]
+    fn thread_rows_round_trip_and_link_to_sessions() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        db.insert_session(&super::NewSession {
+            session_id: "demo",
+            thread_id: Some("thread-demo"),
+            agent: "codex",
+            agent_command: "codex",
+            agent_args_json: "[]",
+            resume_session_id: None,
+            workspace: "/tmp/repo",
+            repo_path: "/tmp/repo",
+            task: "test",
+            base_branch: "main",
+            branch: "agent/test",
+            worktree: "/tmp/worktree",
+        })
+        .unwrap();
+        db.insert_thread(&super::NewThread {
+            thread_id: "thread-demo",
+            session_id: "demo",
+            agent: "codex",
+            title: "test",
+            initial_prompt: "test",
+        })
+        .unwrap();
+
+        db.set_thread_upstream_id("thread-demo", "codex-upstream")
+            .unwrap();
+
+        let session = db.get_session("demo").unwrap().unwrap();
+        assert_eq!(session.thread_id.as_deref(), Some("thread-demo"));
+
+        let thread = db.get_thread_for_session("demo").unwrap().unwrap();
+        assert_eq!(thread.thread_id, "thread-demo");
+        assert_eq!(thread.upstream_thread_id.as_deref(), Some("codex-upstream"));
     }
 }

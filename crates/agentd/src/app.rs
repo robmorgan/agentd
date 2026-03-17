@@ -32,9 +32,10 @@ use agentd_shared::{
 
 use crate::{
     codex,
-    db::{Database, NewSession, SessionLaunchInfo},
+    codex_json::{CodexJsonStream, preview_line},
+    db::{Database, NewSession, NewThread, SessionLaunchInfo},
     git,
-    ids::generate_session_id,
+    ids::{generate_session_id, generate_thread_id},
     terminal_state::{GhosttyTerminalState, TerminalStateEngine},
 };
 
@@ -76,11 +77,15 @@ impl AppState {
                 serde_json::to_string(&agent.args).context("failed to serialize agent args")?;
 
             let session_id = unique_session_id(&db)?;
+            let thread_id = (agent_name == "codex")
+                .then(|| unique_thread_id(&db))
+                .transpose()?;
             let worktree = paths.worktree_path(&session_id);
             let branch = unique_branch_name(&repo_root, &task_text, &session_id)?;
 
             db.insert_session(&NewSession {
                 session_id: &session_id,
+                thread_id: thread_id.as_deref(),
                 agent: &agent_name,
                 agent_command: &agent.command,
                 agent_args_json: &agent_args_json,
@@ -92,6 +97,28 @@ impl AppState {
                 branch: &branch,
                 worktree: worktree.as_str(),
             })?;
+            if let Some(thread_id) = &thread_id {
+                db.insert_thread(&NewThread {
+                    thread_id,
+                    session_id: &session_id,
+                    agent: &agent_name,
+                    title: &task_text,
+                    initial_prompt: &task_text,
+                })?;
+                let _ = db.append_events(
+                    &session_id,
+                    &[daemon_event(
+                        "THREAD_CREATED",
+                        serde_json::json!({
+                            "source": "daemon",
+                            "thread_id": thread_id,
+                            "session_id": &session_id,
+                            "agent": &agent_name,
+                            "title": &task_text,
+                        }),
+                    )],
+                );
+            }
 
             if let Err(err) = git::create_worktree(&repo_root, &base_branch, &branch, &worktree) {
                 let _ = record_session_failure(&db, &session_id, err.to_string());
@@ -134,6 +161,7 @@ impl AppState {
                     task_text: &task_text,
                     log_path: &log_path,
                     launch: &launch,
+                    thread_id: thread_id.as_deref(),
                     resume_session_id: None,
                     mode: SessionStartMode::Create,
                 },
@@ -232,6 +260,7 @@ impl AppState {
             let worktree = session.worktree.clone();
             let branch = session.branch.clone();
             let task_text = session.task.clone();
+            let thread_id = session.thread_id.clone();
             let log_path = self.paths.log_path(&session.session_id);
             let resume_session_id = match self.resolve_resume_session_id(&session, &launch).await {
                 Ok(Some(resume_session_id)) => resume_session_id,
@@ -269,6 +298,7 @@ impl AppState {
                         task_text: &task_text,
                         log_path: &log_path,
                         launch: &launch,
+                        thread_id: thread_id.as_deref(),
                         resume_session_id: Some(&resume_session_id),
                         mode: SessionStartMode::Resume,
                     },
@@ -322,7 +352,16 @@ impl AppState {
         let db = self.db.clone();
         let session_id = session.session_id.clone();
         let worktree = session.worktree.clone();
+        let thread_id = session.thread_id.clone();
         task::spawn_blocking(move || {
+            if let Some(thread_id) = thread_id {
+                if let Some(thread) = db.get_thread(&thread_id)? {
+                    if let Some(upstream_thread_id) = thread.upstream_thread_id {
+                        db.set_resume_session_id(&session_id, &upstream_thread_id)?;
+                        return Ok(Some(upstream_thread_id));
+                    }
+                }
+            }
             if let Some(resume_session_id) = db.get_resume_session_id(&session_id)? {
                 return Ok(Some(resume_session_id));
             }
@@ -629,6 +668,7 @@ struct SessionStartRequest<'a> {
     task_text: &'a str,
     log_path: &'a Utf8PathBuf,
     launch: &'a LaunchCommand,
+    thread_id: Option<&'a str>,
     resume_session_id: Option<&'a str>,
     mode: SessionStartMode,
 }
@@ -689,6 +729,11 @@ fn start_session_runtime(
     request: SessionStartRequest<'_>,
 ) -> Result<()> {
     prepare_log_file(request.log_path, request.mode)?;
+    let use_codex_json = request.launch.agent_name == "codex" && request.thread_id.is_some();
+    let rendered_log_path = paths.rendered_log_path(request.session_id);
+    if use_codex_json {
+        prepare_log_file(&rendered_log_path, request.mode)?;
+    }
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -701,23 +746,7 @@ fn start_session_runtime(
         .context("failed to allocate PTY")?;
 
     let mut command = CommandBuilder::new(&request.launch.command);
-    command.args(request.launch.args.clone());
-    if request.mode == SessionStartMode::Resume {
-        if !is_resumable_command(&request.launch.command) {
-            bail!(
-                "agent `{}` does not support resume-based upgrades",
-                request.launch.agent_name
-            );
-        }
-        let resume_session_id = request.resume_session_id.ok_or_else(|| {
-            anyhow!(
-                "session `{}` does not have an exact Codex resume id",
-                request.session_id
-            )
-        })?;
-        command.arg("resume");
-        command.arg(resume_session_id);
-    }
+    configure_spawn_command(&mut command, &request)?;
     command.cwd(request.worktree);
     for (key, value) in std::env::vars() {
         command.env(&key, &value);
@@ -748,6 +777,7 @@ fn start_session_runtime(
                 "source": "daemon",
                 "pid": pid,
                 "agent": request.launch.agent_name,
+                "thread_id": request.thread_id,
                 "branch": request.branch,
                 "worktree": request.worktree,
                 "resume_session_id": request.resume_session_id
@@ -773,9 +803,28 @@ fn start_session_runtime(
     let writer_db = db.clone();
     let writer_session_id = request.session_id.to_string();
     let writer_log_path = request.log_path.clone();
+    let writer_rendered_log_path = rendered_log_path.clone();
+    let writer_thread_id = if use_codex_json {
+        request.thread_id.map(|value| value.to_string())
+    } else {
+        None
+    };
     let writer_runtime = runtime.clone();
     std::thread::spawn(move || {
-        if let Err(err) = pump_pty_to_log(reader, &writer_log_path, &writer_runtime) {
+        let result = if let Some(thread_id) = writer_thread_id {
+            pump_codex_json_to_logs(
+                reader,
+                &writer_log_path,
+                &writer_rendered_log_path,
+                &writer_runtime,
+                &writer_db,
+                &writer_session_id,
+                &thread_id,
+            )
+        } else {
+            pump_pty_to_log(reader, &writer_log_path, &writer_runtime)
+        };
+        if let Err(err) = result {
             let _ = record_session_failure(&writer_db, &writer_session_id, err.to_string());
         }
     });
@@ -967,6 +1016,16 @@ fn unique_session_id(db: &Database) -> Result<String> {
     bail!("failed to allocate a unique session id")
 }
 
+fn unique_thread_id(db: &Database) -> Result<String> {
+    for _ in 0..16 {
+        let candidate = generate_thread_id();
+        if db.get_thread(&candidate)?.is_none() {
+            return Ok(candidate);
+        }
+    }
+    bail!("failed to allocate a unique thread id")
+}
+
 fn daemon_event(event_type: &str, payload_json: serde_json::Value) -> NewSessionEvent {
     NewSessionEvent {
         event_type: event_type.to_string(),
@@ -1007,6 +1066,54 @@ fn unique_branch_name(
     Ok(branch)
 }
 
+fn configure_spawn_command(
+    command: &mut CommandBuilder,
+    request: &SessionStartRequest<'_>,
+) -> Result<()> {
+    command.args(request.launch.args.clone());
+    if request.launch.agent_name == "codex" && request.thread_id.is_some() {
+        command.arg("exec");
+        match request.mode {
+            SessionStartMode::Create => {
+                command.arg("--json");
+                if !request.task_text.is_empty() {
+                    command.arg(request.task_text);
+                }
+            }
+            SessionStartMode::Resume => {
+                let resume_session_id = request.resume_session_id.ok_or_else(|| {
+                    anyhow!(
+                        "session `{}` does not have an exact Codex resume id",
+                        request.session_id
+                    )
+                })?;
+                command.arg("resume");
+                command.arg("--json");
+                command.arg(resume_session_id);
+            }
+        }
+        return Ok(());
+    }
+
+    if request.mode == SessionStartMode::Resume {
+        if !is_resumable_command(&request.launch.command) {
+            bail!(
+                "agent `{}` does not support resume-based upgrades",
+                request.launch.agent_name
+            );
+        }
+        let resume_session_id = request.resume_session_id.ok_or_else(|| {
+            anyhow!(
+                "session `{}` does not have an exact Codex resume id",
+                request.session_id
+            )
+        })?;
+        command.arg("resume");
+        command.arg(resume_session_id);
+    }
+    Ok(())
+}
+
 fn pump_pty_to_log(
     mut reader: Box<dyn Read + Send>,
     log_path: &Utf8PathBuf,
@@ -1034,6 +1141,122 @@ fn pump_pty_to_log(
         runtime.publish_output(&buffer[..bytes_read])?;
     }
 
+    Ok(())
+}
+
+fn pump_codex_json_to_logs(
+    mut reader: Box<dyn Read + Send>,
+    raw_log_path: &Utf8PathBuf,
+    rendered_log_path: &Utf8PathBuf,
+    runtime: &SessionRuntime,
+    db: &Database,
+    session_id: &str,
+    thread_id: &str,
+) -> Result<()> {
+    let mut raw_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(raw_log_path.as_std_path())
+        .with_context(|| format!("failed to open {}", raw_log_path))?;
+    let mut rendered_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(rendered_log_path.as_std_path())
+        .with_context(|| format!("failed to open {}", rendered_log_path))?;
+    let mut stream = CodexJsonStream::default();
+    let mut bound_upstream_thread_id = db
+        .get_thread(thread_id)?
+        .and_then(|thread| thread.upstream_thread_id);
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let bytes_read = reader.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        raw_file.write_all(&buffer[..bytes_read])?;
+        raw_file.flush()?;
+        runtime.publish_output(&buffer[..bytes_read])?;
+
+        let (messages, issues) = stream.push_bytes(&buffer[..bytes_read]);
+        persist_codex_output(
+            db,
+            session_id,
+            thread_id,
+            &mut bound_upstream_thread_id,
+            &mut rendered_file,
+            messages,
+            issues,
+        )?;
+    }
+
+    let (messages, issues) = stream.finish();
+    persist_codex_output(
+        db,
+        session_id,
+        thread_id,
+        &mut bound_upstream_thread_id,
+        &mut rendered_file,
+        messages,
+        issues,
+    )?;
+    Ok(())
+}
+
+fn persist_codex_output(
+    db: &Database,
+    session_id: &str,
+    thread_id: &str,
+    bound_upstream_thread_id: &mut Option<String>,
+    rendered_file: &mut File,
+    messages: Vec<crate::codex_json::ParsedCodexMessage>,
+    issues: Vec<crate::codex_json::ParseIssue>,
+) -> Result<()> {
+    let mut events = Vec::with_capacity(messages.len() + issues.len() + 1);
+
+    for message in messages {
+        if let Some(upstream_thread_id) = message.upstream_thread_id.as_deref() {
+            if bound_upstream_thread_id.as_deref() != Some(upstream_thread_id) {
+                db.set_thread_upstream_id(thread_id, upstream_thread_id)?;
+                db.set_resume_session_id(session_id, upstream_thread_id)?;
+                *bound_upstream_thread_id = Some(upstream_thread_id.to_string());
+                events.push(daemon_event(
+                    "THREAD_UPSTREAM_BOUND",
+                    serde_json::json!({
+                        "source": "daemon",
+                        "thread_id": thread_id,
+                        "session_id": session_id,
+                        "upstream_thread_id": upstream_thread_id,
+                    }),
+                ));
+            }
+        }
+        rendered_file.write_all(message.rendered.as_bytes())?;
+        events.push(NewSessionEvent {
+            event_type: message.event_type,
+            payload_json: message.payload_json,
+        });
+    }
+
+    for issue in issues {
+        let rendered = format!("[invalid codex json] {}\n", preview_line(&issue.line));
+        rendered_file.write_all(rendered.as_bytes())?;
+        events.push(daemon_event(
+            "CODEX_JSON_PARSE_ERROR",
+            serde_json::json!({
+                "source": "daemon",
+                "thread_id": thread_id,
+                "line_preview": preview_line(&issue.line),
+                "error": issue.error,
+            }),
+        ));
+    }
+
+    if !events.is_empty() {
+        db.append_events(session_id, &events)?;
+        rendered_file.flush()?;
+    }
     Ok(())
 }
 
@@ -1109,12 +1332,17 @@ fn remove_worktree_if_present(session: &SessionRecord) -> Result<()> {
 }
 
 fn remove_log_if_present(paths: &AppPaths, session: &SessionRecord) -> Result<()> {
-    let log_path = paths.log_path(&session.session_id);
-    match fs::remove_file(log_path.as_std_path()) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(anyhow!(err)).context(format!("failed to remove {}", log_path)),
+    for log_path in [
+        paths.log_path(&session.session_id),
+        paths.rendered_log_path(&session.session_id),
+    ] {
+        match fs::remove_file(log_path.as_std_path()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(anyhow!(err)).context(format!("failed to remove {}", log_path)),
+        }
     }
+    Ok(())
 }
 
 fn preview_input(data: &[u8]) -> String {

@@ -16,6 +16,7 @@ pub enum SessionStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionRecord {
     pub session_id: String,
+    pub thread_id: Option<String>,
     pub agent: String,
     pub workspace: String,
     pub repo_path: String,
