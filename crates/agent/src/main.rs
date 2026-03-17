@@ -1,5 +1,7 @@
 use std::{
     io::{IsTerminal, Write},
+    mem::MaybeUninit,
+    os::fd::AsRawFd,
     path::PathBuf,
     process::Stdio,
     time::{Duration, Instant},
@@ -15,6 +17,10 @@ use crossterm::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
         enable_raw_mode,
     },
+};
+use libc::{
+    _POSIX_VDISABLE, TCSAFLUSH, TCSANOW, VLNEXT, VMIN, VQUIT, VTIME, cfmakeraw, tcgetattr,
+    tcsetattr, termios,
 };
 use tokio::{io::BufReader, net::UnixStream, sync::mpsc};
 
@@ -32,6 +38,10 @@ use agentd_shared::{
 };
 
 use crate::local::{LocalStore, normalize_session, print_log_file, remove_session_artifacts};
+
+const AGENTD_ATTACH_RESTORE_SEQUENCE: &[u8] =
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[<u\x1b[?25h";
+const AGENTD_ATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
 
 #[derive(Debug, Parser)]
 #[command(name = "agent")]
@@ -674,7 +684,7 @@ async fn send_request_no_bootstrap(paths: &AppPaths, request: &Request) -> Resul
 }
 
 fn incompatible_daemon_message() -> &'static str {
-    "agentd is incompatible with this agent build; restart or stop the running daemon and try again"
+    "agentd is out of date with the client; try upgrading the daemon"
 }
 
 async fn send_daemon_management_request(
@@ -866,10 +876,8 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
     };
 
     eprintln!("attached to {session_id}; detach with Ctrl-]");
-    let _screen = TerminalScreenGuard::enter()?;
-    let _raw_mode = RawModeGuard::new()?;
-    execute!(std::io::stdout(), MoveTo(0, 0), Clear(ClearType::All))
-        .context("failed to clear attach screen")?;
+    let _terminal = AttachTerminalGuard::enter()?;
+    write_attach_bytes(AGENTD_ATTACH_CLEAR_SEQUENCE)?;
     write_attach_bytes(&snapshot)?;
     let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel();
 
@@ -1154,6 +1162,50 @@ impl Drop for RawModeGuard {
     }
 }
 
+struct AttachTerminalGuard {
+    stdin_fd: i32,
+    orig_termios: Option<termios>,
+}
+
+impl AttachTerminalGuard {
+    fn enter() -> Result<Self> {
+        let stdin_fd = std::io::stdin().as_raw_fd();
+        let mut orig_termios = MaybeUninit::<termios>::uninit();
+        let termios = unsafe {
+            if tcgetattr(stdin_fd, orig_termios.as_mut_ptr()) == 0 {
+                let orig_termios = orig_termios.assume_init();
+                let mut raw_termios = orig_termios;
+                cfmakeraw(&mut raw_termios);
+                raw_termios.c_cc[VLNEXT] = _POSIX_VDISABLE as _;
+                raw_termios.c_cc[VQUIT] = _POSIX_VDISABLE as _;
+                raw_termios.c_cc[VMIN] = 1;
+                raw_termios.c_cc[VTIME] = 0;
+                if tcsetattr(stdin_fd, TCSANOW, &raw_termios) != 0 {
+                    bail!("failed to set raw terminal mode");
+                }
+                Some(orig_termios)
+            } else {
+                None
+            }
+        };
+        Ok(Self {
+            stdin_fd,
+            orig_termios: termios,
+        })
+    }
+}
+
+impl Drop for AttachTerminalGuard {
+    fn drop(&mut self) {
+        if let Some(orig_termios) = &self.orig_termios {
+            unsafe {
+                tcsetattr(self.stdin_fd, TCSAFLUSH, orig_termios);
+            }
+        }
+        let _ = write_attach_bytes(AGENTD_ATTACH_RESTORE_SEQUENCE);
+    }
+}
+
 struct TerminalScreenGuard;
 
 impl TerminalScreenGuard {
@@ -1394,8 +1446,9 @@ fn fuzzy_score(haystack: &str, needle: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachInput, AttachKeyBindingParser, Cli, Command, DaemonCommand, SessionEndSummary,
-        format_session_end_summary, resolve_detach_session_id, resolve_new_session_options,
+        AGENTD_ATTACH_RESTORE_SEQUENCE, AttachInput, AttachKeyBindingParser, Cli, Command,
+        DaemonCommand, SessionEndSummary, format_session_end_summary, resolve_detach_session_id,
+        resolve_new_session_options,
     };
     use agentd_shared::session::SessionStatus;
     use clap::Parser;
@@ -1627,6 +1680,14 @@ mod tests {
             ))),
             Some(AttachInput::Data(data)) if data == b"\x1bx"
         ));
+    }
+
+    #[test]
+    fn attach_restore_sequence_matches_agentd_cleanup() {
+        assert_eq!(
+            AGENTD_ATTACH_RESTORE_SEQUENCE,
+            b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[<u\x1b[?25h"
+        );
     }
 
     #[test]
