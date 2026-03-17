@@ -370,8 +370,6 @@ async fn main() -> Result<()> {
             }
             DaemonCommand::Upgrade => {
                 upgrade_daemon(&paths).await?;
-                let status = daemon_management_status(&paths).await?;
-                print_daemon_management_status(&status);
             }
         },
         (Command::Daemon { .. }, ExecutionMode::Local(reason)) => {
@@ -539,7 +537,7 @@ async fn ensure_compatible_daemon(paths: &AppPaths) -> Result<()> {
     match daemon_info(paths).await {
         Ok(info) if info.protocol_version == PROTOCOL_VERSION => Ok(()),
         Ok(info) => bail!(
-            "agentd `{}` is incompatible with agent `{}`; restart or stop the running daemon and try again",
+            "agentd `{}` is out of date with agent `{}`; try upgrading the daemon",
             info.daemon_version,
             env!("CARGO_PKG_VERSION")
         ),
@@ -633,10 +631,15 @@ async fn restart_daemon(paths: &AppPaths, force: bool) -> Result<()> {
 }
 
 async fn upgrade_daemon(paths: &AppPaths) -> Result<()> {
+    let current_status = daemon_management_status(paths).await?;
+    println!("✓ Current daemon `{}`", current_status.daemon_version);
+    println!("✓ Current client `{}`", env!("CARGO_PKG_VERSION"));
+    println!("✓ Restarting daemon to upgrade");
+
     let status = std::process::Command::new(daemon_executable()?)
         .arg("upgrade")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
         .context("failed to run agentd upgrade")?;
@@ -648,7 +651,11 @@ async fn upgrade_daemon(paths: &AppPaths) -> Result<()> {
         }
     }
 
-    ensure_compatible_daemon(paths).await
+    ensure_compatible_daemon(paths).await?;
+
+    let upgraded_status = daemon_management_status(paths).await?;
+    println!("✓ Upgraded daemon `{}`", upgraded_status.daemon_version);
+    Ok(())
 }
 
 async fn send_request(paths: &AppPaths, request: &Request) -> Result<Response> {

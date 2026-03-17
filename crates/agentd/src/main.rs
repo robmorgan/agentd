@@ -134,7 +134,10 @@ async fn upgrade_daemon() -> Result<()> {
     daemonize_self()?;
     wait_for_new_daemon(&paths).await?;
 
-    println!("upgraded agentd and resumed {} session(s)", resolved.len());
+    println!(
+        "✓ Upgraded daemon and resumed {} session(s)",
+        resolved.len()
+    );
     Ok(())
 }
 
