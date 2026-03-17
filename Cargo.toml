@@ -20,7 +20,7 @@ clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29"
 dirs = "6.0"
 futures = "0.3"
-nix = { version = "0.30", features = ["signal"] }
+nix = { version = "0.30", features = ["signal", "user"] }
 portable-pty = "0.9"
 rand = "0.9"
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }

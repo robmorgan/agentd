@@ -37,10 +37,10 @@ impl Config {
         Ok(())
     }
 
-    pub fn require_agent(&self, name: &str) -> Result<&AgentConfig> {
+    pub fn require_agent<'a>(&'a self, paths: &AppPaths, name: &str) -> Result<&'a AgentConfig> {
         match self.agents.get(name) {
             Some(agent) => Ok(agent),
-            None => bail!("agent `{name}` is not configured in ~/.agentd/config.toml"),
+            None => bail!("agent `{name}` is not configured in {}", paths.config),
         }
     }
 }
@@ -63,5 +63,35 @@ impl Default for Config {
             },
         );
         Self { agents }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use crate::paths::AppPaths;
+    use camino::Utf8PathBuf;
+
+    fn test_paths() -> AppPaths {
+        let root = Utf8PathBuf::from("/tmp/agentd-config-test");
+        AppPaths {
+            socket: root.join("agentd.sock"),
+            pid_file: root.join("agentd.pid"),
+            database: root.join("state.db"),
+            config: root.join("config.toml"),
+            logs_dir: root.join("logs"),
+            worktrees_dir: root.join("worktrees"),
+            root,
+        }
+    }
+
+    #[test]
+    fn require_agent_error_mentions_resolved_config_path() {
+        let paths = test_paths();
+        let err = Config::default()
+            .require_agent(&paths, "missing")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(paths.config.as_str()));
     }
 }

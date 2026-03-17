@@ -7,7 +7,7 @@ use crate::{
     session::{CreateSessionResult, SessionDiff, SessionRecord, SessionStatus, WorktreeRecord},
 };
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
 const FRAME_HEADER_LEN: usize = 16;
@@ -48,6 +48,10 @@ pub enum Request {
         data: Vec<u8>,
         source_session_id: Option<String>,
     },
+    SwitchAttachedSession {
+        source_session_id: String,
+        target_session_id: String,
+    },
     DiffSession {
         session_id: String,
     },
@@ -83,6 +87,7 @@ pub enum Response {
     Event { event: SessionEvent },
     LogChunk { data: String },
     PtyOutput { data: Vec<u8> },
+    SwitchSession { session_id: String },
     EndOfStream,
     Error { message: String },
     Ok,
@@ -100,6 +105,7 @@ enum MessageKind {
     AttachSessionRequest = 7,
     AttachInputRequest = 8,
     SendInputRequest = 9,
+    SwitchAttachedSessionRequest = 16,
     DiffSessionRequest = 10,
     GetSessionRequest = 11,
     ListSessionsRequest = 12,
@@ -118,6 +124,7 @@ enum MessageKind {
     EventResponse = 110,
     LogChunkResponse = 111,
     PtyOutputResponse = 112,
+    SwitchSessionResponse = 116,
     EndOfStreamResponse = 113,
     ErrorResponse = 114,
     OkResponse = 115,
@@ -135,6 +142,7 @@ impl MessageKind {
             7 => Self::AttachSessionRequest,
             8 => Self::AttachInputRequest,
             9 => Self::SendInputRequest,
+            16 => Self::SwitchAttachedSessionRequest,
             10 => Self::DiffSessionRequest,
             11 => Self::GetSessionRequest,
             12 => Self::ListSessionsRequest,
@@ -153,6 +161,7 @@ impl MessageKind {
             110 => Self::EventResponse,
             111 => Self::LogChunkResponse,
             112 => Self::PtyOutputResponse,
+            116 => Self::SwitchSessionResponse,
             113 => Self::EndOfStreamResponse,
             114 => Self::ErrorResponse,
             115 => Self::OkResponse,
@@ -302,6 +311,14 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             put_optional_string(&mut payload, source_session_id.as_deref())?;
             MessageKind::SendInputRequest
         }
+        Request::SwitchAttachedSession {
+            source_session_id,
+            target_session_id,
+        } => {
+            put_string(&mut payload, source_session_id)?;
+            put_string(&mut payload, target_session_id)?;
+            MessageKind::SwitchAttachedSessionRequest
+        }
         Request::DiffSession { session_id } => {
             put_string(&mut payload, session_id)?;
             MessageKind::DiffSessionRequest
@@ -363,6 +380,10 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
             session_id: cursor.take_string()?,
             data: cursor.take_bytes()?,
             source_session_id: cursor.take_optional_string()?,
+        },
+        MessageKind::SwitchAttachedSessionRequest => Request::SwitchAttachedSession {
+            source_session_id: cursor.take_string()?,
+            target_session_id: cursor.take_string()?,
         },
         MessageKind::DiffSessionRequest => Request::DiffSession {
             session_id: cursor.take_string()?,
@@ -449,6 +470,10 @@ fn encode_response(response: &Response) -> Result<(MessageKind, Vec<u8>)> {
             put_bytes(&mut payload, data)?;
             MessageKind::PtyOutputResponse
         }
+        Response::SwitchSession { session_id } => {
+            put_string(&mut payload, session_id)?;
+            MessageKind::SwitchSessionResponse
+        }
         Response::EndOfStream => MessageKind::EndOfStreamResponse,
         Response::Error { message } => {
             put_string(&mut payload, message)?;
@@ -501,6 +526,9 @@ fn decode_response(kind: MessageKind, payload: &[u8]) -> Result<Response> {
         },
         MessageKind::PtyOutputResponse => Response::PtyOutput {
             data: cursor.take_bytes()?,
+        },
+        MessageKind::SwitchSessionResponse => Response::SwitchSession {
+            session_id: cursor.take_string()?,
         },
         MessageKind::EndOfStreamResponse => Response::EndOfStream,
         MessageKind::ErrorResponse => Response::Error {
@@ -891,9 +919,30 @@ mod tests {
     }
 
     #[test]
+    fn switch_attached_session_round_trips() {
+        let request = Request::SwitchAttachedSession {
+            source_session_id: "source".to_string(),
+            target_session_id: "target".to_string(),
+        };
+        let (kind, payload) = encode_request(&request).unwrap();
+        let decoded = decode_request(kind, &payload).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
     fn response_round_trips_snapshot_bytes() {
         let response = Response::Attached {
             snapshot: vec![0, 1, 2, 3, 4],
+        };
+        let (kind, payload) = encode_response(&response).unwrap();
+        let decoded = decode_response(kind, &payload).unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn switch_session_response_round_trips() {
+        let response = Response::SwitchSession {
+            session_id: "target".to_string(),
         };
         let (kind, payload) = encode_response(&response).unwrap();
         let decoded = decode_response(kind, &payload).unwrap();

@@ -1,7 +1,8 @@
 # Architecture
 
 `agentd` is a local Unix-socket daemon that owns session state and PTY lifecycle. `agent` is a
-thin client that sends requests over `~/.agentd/agentd.sock` and prints or streams the responses.
+thin client that sends requests over the resolved runtime root's `agentd.sock` and prints or
+streams the responses.
 
 * Both daemon and client loops leverage `poll()`
 * Each session creates its own unix socket file
@@ -50,14 +51,14 @@ When you create a session, the daemon:
 
 1. Creates a new unix socket file 
 2. Resolves the repo root and current branch for the requested workspace.
-3. Allocates a session id, branch name, and isolated git worktree under `~/.agentd/worktrees/`.
-4. Stores session metadata in `~/.agentd/state.db`.
+3. Allocates a session id, branch name, and isolated git worktree under `<runtime-root>/worktrees/`.
+4. Stores session metadata in `<runtime-root>/state.db`.
 5. Spawns the configured agent inside a PTY with the session environment variables injected.
 
 For each running session, the daemon keeps three kinds of state:
 
 - durable metadata in SQLite for status, branch/worktree info, exit state, and structured events
-- an append-only PTY log file in `~/.agentd/logs/<session_id>.log`
+- an append-only PTY log file in `<runtime-root>/logs/<session_id>.log`
 - an in-memory PTY runtime with the live writer handle and output fan-out used by `attach` and `send`
 
 PTY output is copied into the log file and also broadcast to attached clients. PTY input can come
@@ -72,12 +73,21 @@ progress while `agent logs` remains the raw terminal transcript.
 
 ## Socket Files
 
-Each session gets its own unix socket file. The default location depends on your environment variables (checked in priority order):
+All runtime state lives under a single root directory. The root is resolved in this priority order:
 
 * AGENTD_DIR => uses exact path (e.g., /custom/path)
 * XDG_RUNTIME_DIR => uses `{XDG_RUNTIME_DIR}/agentd` (recommended on Linux, typically `/run/user/{uid}/agentd`)
-* TMPDIR => uses {TMPDIR}/agentd-{uid} (appends uid for multi-user safety)
-* /tmp => uses /tmp/agentd-{uid} (default fallback, appends uid for multi-user safety)
+* TMPDIR => uses `{TMPDIR}/agentd-{uid}` (appends uid for multi-user safety)
+* /tmp => uses `/tmp/agentd-{uid}` (default fallback, appends uid for multi-user safety)
+
+The selected root contains:
+
+* `config.toml`
+* `agentd.sock`
+* `agentd.pid`
+* `state.db`
+* `logs/`
+* `worktrees/`
   
 ## libghostty-vt
 

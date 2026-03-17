@@ -69,7 +69,7 @@ impl AppState {
             let workspace = Utf8PathBuf::from(workspace);
             let repo_root = git::canonical_repo_root(&workspace)?;
             let base_branch = git::current_branch(&repo_root)?;
-            let agent = config.require_agent(&agent_name)?.clone();
+            let agent = config.require_agent(&paths, &agent_name)?.clone();
 
             let session_id = unique_session_id(&db)?;
             let worktree = paths.worktree_path(&session_id);
@@ -495,7 +495,12 @@ impl AppState {
     pub async fn attach_session(
         &self,
         session_id: &str,
-    ) -> Result<(AttachLease, Vec<u8>, broadcast::Receiver<Vec<u8>>)> {
+    ) -> Result<(
+        AttachLease,
+        Vec<u8>,
+        broadcast::Receiver<Vec<u8>>,
+        broadcast::Receiver<AttachControl>,
+    )> {
         let session = self
             .get_session(session_id)
             .await?
@@ -506,10 +511,41 @@ impl AppState {
             .runtimes
             .get(session_id)
             .ok_or_else(|| anyhow!("session `{session_id}` does not have a live PTY"))?;
-        let (lease, snapshot, receiver) = runtime
+        let (lease, snapshot, receiver, control_rx) = runtime
             .try_attach()
             .ok_or_else(|| anyhow!("session `{session_id}` already has an attached client"))?;
-        Ok((lease, snapshot, receiver))
+        Ok((lease, snapshot, receiver, control_rx))
+    }
+
+    pub async fn switch_attached_session(
+        &self,
+        source_session_id: &str,
+        target_session_id: &str,
+    ) -> Result<()> {
+        if source_session_id == target_session_id {
+            bail!("source and target sessions must differ");
+        }
+
+        let source = self
+            .get_session(source_session_id)
+            .await?
+            .ok_or_else(|| anyhow!("session `{source_session_id}` not found"))?;
+        ensure_session_running(&source)?;
+        let source_runtime = self
+            .runtimes
+            .get(source_session_id)
+            .ok_or_else(|| anyhow!("session `{source_session_id}` does not have a live PTY"))?;
+
+        let target = self
+            .get_session(target_session_id)
+            .await?
+            .ok_or_else(|| anyhow!("session `{target_session_id}` not found"))?;
+        ensure_session_running(&target)?;
+        self.runtimes
+            .get(target_session_id)
+            .ok_or_else(|| anyhow!("session `{target_session_id}` does not have a live PTY"))?;
+
+        source_runtime.request_switch(target_session_id)
     }
 }
 
@@ -555,6 +591,7 @@ struct SessionRuntime {
     writer: Mutex<Box<dyn Write + Send>>,
     state: Mutex<SessionRuntimeState>,
     output_tx: broadcast::Sender<Vec<u8>>,
+    control_tx: broadcast::Sender<AttachControl>,
     attached: AtomicBool,
 }
 
@@ -565,10 +602,12 @@ impl SessionRuntime {
         output_buffer_capacity: usize,
     ) -> Self {
         let (output_tx, _) = broadcast::channel(output_buffer_capacity);
+        let (control_tx, _) = broadcast::channel(4);
         Self {
             writer: Mutex::new(writer),
             state: Mutex::new(SessionRuntimeState { terminal_state }),
             output_tx,
+            control_tx,
             attached: AtomicBool::new(false),
         }
     }
@@ -595,20 +634,37 @@ impl SessionRuntime {
 
     fn try_attach(
         self: &Arc<Self>,
-    ) -> Option<(AttachLease, Vec<u8>, broadcast::Receiver<Vec<u8>>)> {
+    ) -> Option<(
+        AttachLease,
+        Vec<u8>,
+        broadcast::Receiver<Vec<u8>>,
+        broadcast::Receiver<AttachControl>,
+    )> {
         self.attached
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
         let mut state = self.state.lock().ok()?;
         let snapshot = state.terminal_state.snapshot().ok()?;
         let receiver = self.output_tx.subscribe();
+        let control_rx = self.control_tx.subscribe();
         Some((
             AttachLease {
                 runtime: self.clone(),
             },
             snapshot,
             receiver,
+            control_rx,
         ))
+    }
+
+    fn request_switch(&self, target_session_id: &str) -> Result<()> {
+        if !self.attached.load(Ordering::Acquire) {
+            bail!("session does not have an attached client");
+        }
+        self.control_tx
+            .send(AttachControl::SwitchSession(target_session_id.to_string()))
+            .map_err(|_| anyhow!("session does not have an attached client"))?;
+        Ok(())
     }
 }
 
@@ -618,6 +674,11 @@ struct SessionRuntimeState {
 
 pub struct AttachLease {
     runtime: Arc<SessionRuntime>,
+}
+
+#[derive(Clone, Debug)]
+pub enum AttachControl {
+    SwitchSession(String),
 }
 
 impl Drop for AttachLease {

@@ -105,9 +105,9 @@ Clients surface tasks based on attention instead of raw output.
 `agentd` is not a terminal multiplexer. Terminal layout (splits, panes, tabs) should remain the responsibility of the host terminal or multiplexer. Instead, it focuses purely on agent runtime semantics.
 
 - durable PTY-backed agent sessions that outlive the client connection that started them
-- built-in Git worktree isolation under `~/.agentd/worktrees/`
-- session metadata and structured events stored in SQLite at `~/.agentd/state.db`
-- raw PTY logs stored per session in `~/.agentd/logs/`
+- built-in Git worktree isolation under the resolved runtime root
+- session metadata and structured events stored in `state.db` under the resolved runtime root
+- raw PTY logs stored in `logs/` under the resolved runtime root
 - interactive reattach with `agent attach`
 - background PTY input with `agent send`
 - diff inspection against the base branch with `agent diff`
@@ -137,7 +137,7 @@ make install
 
 ## Configure Agents
 
-Create `~/.agentd/config.toml`:
+Create `<runtime-root>/config.toml`:
 
 ```toml
 [agents.claude]
@@ -161,6 +161,16 @@ The daemon injects:
 Instrumented agents can send structured event batches back to the daemon over the Unix socket
 named by `AGENTD_SOCKET` using the `append_session_events` request. Consumers can read them with
 `stream_events` or `agent events`.
+
+Runtime paths are resolved in this order:
+
+- `AGENTD_DIR` as the exact runtime root
+- `XDG_RUNTIME_DIR/agentd`
+- `TMPDIR/agentd-<uid>`
+- `/tmp/agentd-<uid>`
+
+The selected root contains `config.toml`, `agentd.sock`, `agentd.pid`, `state.db`, `logs/`, and
+`worktrees/`.
 
 Interactive PTY attach is available with `agent attach <session_id>`. Detach with `Ctrl-]`.
 Only one interactive attacher is allowed per session. Background PTY writes are available with
