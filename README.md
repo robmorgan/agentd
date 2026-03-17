@@ -185,6 +185,7 @@ Try restarting the daemon:
 ```sh
 agent daemon info
 agent daemon restart
+agent daemon upgrade
 ```
 
 ## Status And Limitations

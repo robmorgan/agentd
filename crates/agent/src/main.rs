@@ -121,6 +121,7 @@ enum DaemonCommand {
         #[arg(long)]
         force: bool,
     },
+    Upgrade,
 }
 
 #[tokio::main]
@@ -367,6 +368,11 @@ async fn main() -> Result<()> {
                 let status = daemon_management_status(&paths).await?;
                 print_daemon_management_status(&status);
             }
+            DaemonCommand::Upgrade => {
+                upgrade_daemon(&paths).await?;
+                let status = daemon_management_status(&paths).await?;
+                print_daemon_management_status(&status);
+            }
         },
         (Command::Daemon { .. }, ExecutionMode::Local(reason)) => {
             bail!("{reason}. daemon management requires a reachable daemon");
@@ -388,6 +394,15 @@ struct NewSessionOptions {
 }
 
 async fn resolve_execution_mode(paths: &AppPaths, command: &Command) -> Result<ExecutionMode> {
+    if matches!(
+        command,
+        Command::Daemon {
+            command: DaemonCommand::Upgrade
+        }
+    ) {
+        return Ok(ExecutionMode::Daemon);
+    }
+
     if matches!(command, Command::Daemon { .. }) {
         if try_connect(paths).await.is_err() {
             spawn_daemon(paths).await?;
@@ -489,11 +504,7 @@ async fn ensure_daemon(paths: &AppPaths) -> Result<()> {
 }
 
 async fn spawn_daemon(paths: &AppPaths) -> Result<()> {
-    let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
-    let daemon_exe = current_exe
-        .parent()
-        .map(|path| path.join("agentd"))
-        .context("failed to resolve agentd executable path")?;
+    let daemon_exe = daemon_executable()?;
 
     std::process::Command::new(daemon_exe)
         .arg("serve")
@@ -514,6 +525,14 @@ async fn spawn_daemon(paths: &AppPaths) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+fn daemon_executable() -> Result<PathBuf> {
+    let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
+    current_exe
+        .parent()
+        .map(|path| path.join("agentd"))
+        .context("failed to resolve agentd executable path")
 }
 
 async fn ensure_compatible_daemon(paths: &AppPaths) -> Result<()> {
@@ -611,6 +630,25 @@ async fn restart_daemon(paths: &AppPaths, force: bool) -> Result<()> {
             ensure_compatible_daemon(paths).await
         }
     }
+}
+
+async fn upgrade_daemon(paths: &AppPaths) -> Result<()> {
+    let status = std::process::Command::new(daemon_executable()?)
+        .arg("upgrade")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("failed to run agentd upgrade")?;
+
+    if !status.success() {
+        match status.code() {
+            Some(code) => bail!("agentd upgrade exited with status {code}"),
+            None => bail!("agentd upgrade terminated by signal"),
+        }
+    }
+
+    ensure_compatible_daemon(paths).await
 }
 
 async fn send_request(paths: &AppPaths, request: &Request) -> Result<Response> {
@@ -1439,6 +1477,17 @@ mod tests {
             Command::Daemon {
                 command: DaemonCommand::Restart { force },
             } => assert!(force),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_upgrade_parses() {
+        let cli = Cli::try_parse_from(["agent", "daemon", "upgrade"]).unwrap();
+        match cli.command {
+            Command::Daemon {
+                command: DaemonCommand::Upgrade,
+            } => {}
             other => panic!("unexpected command: {other:?}"),
         }
     }
