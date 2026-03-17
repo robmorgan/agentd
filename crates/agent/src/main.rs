@@ -8,9 +8,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, Subcommand};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use serde::Deserialize;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::BufReader,
     net::{UnixStream, unix::OwnedReadHalf},
     sync::mpsc,
 };
@@ -88,21 +87,6 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum LegacyResponse {
-    DaemonInfo { info: LegacyDaemonInfo },
-    Sessions { sessions: Vec<SessionRecord> },
-    Error { message: String },
-    Ok,
-}
-
-#[derive(Debug, Deserialize)]
-struct LegacyDaemonInfo {
-    daemon_version: String,
-    protocol_version: u32,
 }
 
 #[derive(Debug, Subcommand)]
@@ -434,30 +418,10 @@ async fn spawn_daemon(paths: &AppPaths) -> Result<()> {
 async fn ensure_compatible_daemon(paths: &AppPaths) -> Result<()> {
     match daemon_info(paths).await {
         Ok(info) if info.protocol_version == PROTOCOL_VERSION => Ok(()),
-        Ok(info) => restart_incompatible_daemon(paths, Some(info)).await,
-        Err(_) => restart_incompatible_daemon(paths, None).await,
-    }
-}
-
-async fn restart_incompatible_daemon(paths: &AppPaths, info: Option<DaemonInfo>) -> Result<()> {
-    if daemon_has_running_sessions(paths).await? {
-        let daemon_version = info
-            .map(|value| value.daemon_version)
-            .unwrap_or_else(|| "legacy".to_string());
-        bail!(
-            "agentd `{daemon_version}` is incompatible with agent `{}` and cannot be restarted while sessions are running",
-            env!("CARGO_PKG_VERSION")
-        );
-    }
-
-    shutdown_or_kill_daemon(paths).await?;
-    spawn_daemon(paths).await?;
-    match daemon_info(paths).await {
-        Ok(info) if info.protocol_version == PROTOCOL_VERSION => Ok(()),
         Ok(info) => bail!(
-            "agentd `{}` still reports incompatible protocol version {}",
+            "agentd `{}` is incompatible with agent `{}`; restart or stop the running daemon and try again",
             info.daemon_version,
-            info.protocol_version
+            env!("CARGO_PKG_VERSION")
         ),
         Err(err) => Err(err),
     }
@@ -473,7 +437,8 @@ async fn daemon_info(paths: &AppPaths) -> Result<DaemonInfo> {
         Ok(Ok(Response::DaemonInfo { info })) => Ok(info),
         Ok(Ok(Response::Error { message })) => bail!(message),
         Ok(Ok(other)) => bail!("unexpected response: {:?}", other),
-        Ok(Err(_)) | Err(_) => legacy_daemon_info(paths).await,
+        Ok(Err(err)) => Err(err).context(incompatible_daemon_message()),
+        Err(_) => bail!(incompatible_daemon_message()),
     }
 }
 
@@ -489,7 +454,8 @@ async fn daemon_has_running_sessions(paths: &AppPaths) -> Result<bool> {
             .any(|session| session.status_string() == "running")),
         Ok(Ok(Response::Error { message })) => bail!(message),
         Ok(Ok(other)) => bail!("unexpected response: {:?}", other),
-        Ok(Err(_)) | Err(_) => legacy_daemon_has_running_sessions(paths).await,
+        Ok(Err(err)) => Err(err).context(incompatible_daemon_message()),
+        Err(_) => bail!(incompatible_daemon_message()),
     }
 }
 
@@ -502,26 +468,11 @@ async fn shutdown_or_kill_daemon(paths: &AppPaths) -> Result<()> {
     match shutdown_result {
         Ok(Ok(Response::Ok)) => {}
         Ok(Ok(Response::Error { message })) => bail!(message),
-        Ok(Ok(_)) => {}
-        Ok(Err(_)) | Err(_) => {
-            if legacy_shutdown_daemon(paths).await.is_err() {
-                kill_daemon_from_pid_file(paths)?;
-            }
-        }
+        Ok(Ok(_)) => bail!(incompatible_daemon_message()),
+        Ok(Err(err)) => return Err(err).context(incompatible_daemon_message()),
+        Err(_) => bail!(incompatible_daemon_message()),
     }
     wait_for_daemon_stop(paths).await
-}
-
-fn kill_daemon_from_pid_file(paths: &AppPaths) -> Result<()> {
-    let pid = std::fs::read_to_string(paths.pid_file.as_std_path())
-        .with_context(|| format!("failed to read {}", paths.pid_file))?;
-    let pid: i32 = pid.trim().parse().context("invalid daemon pid file")?;
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid),
-        Some(nix::sys::signal::Signal::SIGTERM),
-    )
-    .context("failed to terminate agentd")?;
-    Ok(())
 }
 
 async fn wait_for_daemon_stop(paths: &AppPaths) -> Result<()> {
@@ -569,47 +520,8 @@ async fn send_request_no_bootstrap(paths: &AppPaths, request: &Request) -> Resul
     Ok(response)
 }
 
-async fn legacy_request(paths: &AppPaths, payload: &str) -> Result<LegacyResponse> {
-    let mut stream = try_connect(paths).await?;
-    stream.write_all(payload.as_bytes()).await?;
-    stream.write_all(b"\n").await?;
-    stream.flush().await?;
-
-    let mut lines = BufReader::new(stream).lines();
-    let Some(line) = lines.next_line().await? else {
-        bail!("agentd closed the connection");
-    };
-    Ok(serde_json::from_str(&line)?)
-}
-
-async fn legacy_daemon_info(paths: &AppPaths) -> Result<DaemonInfo> {
-    match legacy_request(paths, r#"{"type":"get_daemon_info"}"#).await? {
-        LegacyResponse::DaemonInfo { info } => Ok(DaemonInfo {
-            daemon_version: info.daemon_version,
-            protocol_version: u16::try_from(info.protocol_version)
-                .context("legacy daemon reported invalid protocol version")?,
-        }),
-        LegacyResponse::Error { message } => bail!(message),
-        other => bail!("unexpected legacy response: {:?}", other),
-    }
-}
-
-async fn legacy_daemon_has_running_sessions(paths: &AppPaths) -> Result<bool> {
-    match legacy_request(paths, r#"{"type":"list_sessions"}"#).await? {
-        LegacyResponse::Sessions { sessions } => Ok(sessions
-            .iter()
-            .any(|session| session.status_string() == "running")),
-        LegacyResponse::Error { message } => bail!(message),
-        other => bail!("unexpected legacy response: {:?}", other),
-    }
-}
-
-async fn legacy_shutdown_daemon(paths: &AppPaths) -> Result<()> {
-    match legacy_request(paths, r#"{"type":"shutdown_daemon"}"#).await? {
-        LegacyResponse::Ok => Ok(()),
-        LegacyResponse::Error { message } => bail!(message),
-        other => bail!("unexpected legacy response: {:?}", other),
-    }
+fn incompatible_daemon_message() -> &'static str {
+    "agentd is incompatible with this agent build; restart or stop the running daemon and try again"
 }
 
 async fn stream_logs(paths: &AppPaths, session_id: &str, follow: bool) -> Result<()> {

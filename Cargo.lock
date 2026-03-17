@@ -8,14 +8,12 @@ version = "0.1.0"
 dependencies = [
  "agentd-shared",
  "anyhow",
- "base64",
  "camino",
  "chrono",
  "clap",
  "crossterm",
  "nix 0.30.1",
  "rusqlite",
- "serde",
  "serde_json",
  "tokio",
 ]
