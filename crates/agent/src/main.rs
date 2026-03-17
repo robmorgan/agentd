@@ -61,6 +61,9 @@ enum Command {
     Attach {
         session_id: String,
     },
+    Detach {
+        session_id: Option<String>,
+    },
     SendInput {
         session_id: String,
         #[arg(long)]
@@ -211,6 +214,25 @@ async fn main() -> Result<()> {
             attach_session(&paths, &session_id).await?;
         }
         (Command::Attach { .. }, ExecutionMode::Local(reason)) => {
+            bail_live_command(&reason)?;
+        }
+        (Command::Detach { session_id }, ExecutionMode::Daemon) => {
+            let session_id = resolve_detach_session_id(session_id)?;
+            let response = send_request(
+                &paths,
+                &Request::DetachSession {
+                    session_id: session_id.clone(),
+                },
+            )
+            .await?;
+
+            match response {
+                Response::Ok => println!("detached session {session_id}"),
+                Response::Error { message } => bail!(message),
+                other => bail!("unexpected response: {:?}", other),
+            }
+        }
+        (Command::Detach { .. }, ExecutionMode::Local(reason)) => {
             bail_live_command(&reason)?;
         }
         (
@@ -429,6 +451,14 @@ fn resolve_new_session_options(
         task: task.unwrap_or_default(),
         agent: agent.unwrap_or_else(|| "codex".to_string()),
     })
+}
+
+fn resolve_detach_session_id(session_id: Option<String>) -> Result<String> {
+    match session_id {
+        Some(session_id) => Ok(session_id),
+        None => std::env::var("AGENTD_SESSION_ID")
+            .context("`agent detach` without a session id only works inside a managed session"),
+    }
 }
 
 fn ensure_config(paths: &AppPaths) -> Result<()> {
@@ -1130,7 +1160,7 @@ fn fuzzy_score(haystack: &str, needle: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, resolve_new_session_options};
+    use super::{Cli, Command, resolve_detach_session_id, resolve_new_session_options};
     use clap::Parser;
     use std::path::PathBuf;
 
@@ -1196,5 +1226,46 @@ mod tests {
         assert_eq!(options.workspace, PathBuf::from("/tmp/repo"));
         assert_eq!(options.task, "fix tests");
         assert_eq!(options.agent, "claude");
+    }
+
+    #[test]
+    fn detach_command_parses_optional_session_id() {
+        let cli = Cli::try_parse_from(["agent", "detach", "demo"]).unwrap();
+        match cli.command {
+            Command::Detach { session_id } => {
+                assert_eq!(session_id.as_deref(), Some("demo"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_detach_session_id_prefers_explicit_value() {
+        unsafe {
+            std::env::set_var("AGENTD_SESSION_ID", "env-session");
+        }
+        let session_id = resolve_detach_session_id(Some("explicit-session".to_string())).unwrap();
+        assert_eq!(session_id, "explicit-session");
+    }
+
+    #[test]
+    fn resolve_detach_session_id_uses_environment() {
+        unsafe {
+            std::env::set_var("AGENTD_SESSION_ID", "env-session");
+        }
+        let session_id = resolve_detach_session_id(None).unwrap();
+        assert_eq!(session_id, "env-session");
+    }
+
+    #[test]
+    fn resolve_detach_session_id_errors_without_environment() {
+        unsafe {
+            std::env::remove_var("AGENTD_SESSION_ID");
+        }
+        let err = resolve_detach_session_id(None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only works inside a managed session")
+        );
     }
 }

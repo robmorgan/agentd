@@ -547,6 +547,21 @@ impl AppState {
 
         source_runtime.request_switch(target_session_id)
     }
+
+    pub async fn detach_session(&self, session_id: &str) -> Result<()> {
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+        ensure_session_running(&session)?;
+
+        let runtime = self
+            .runtimes
+            .get(session_id)
+            .ok_or_else(|| anyhow!("session `{session_id}` does not have a live PTY"))?;
+
+        runtime.request_detach()
+    }
 }
 
 const OUTPUT_BUFFER_CAPACITY: usize = 256;
@@ -666,6 +681,16 @@ impl SessionRuntime {
             .map_err(|_| anyhow!("session does not have an attached client"))?;
         Ok(())
     }
+
+    fn request_detach(&self) -> Result<()> {
+        if !self.attached.load(Ordering::Acquire) {
+            bail!("session does not have an attached client");
+        }
+        self.control_tx
+            .send(AttachControl::Detach)
+            .map_err(|_| anyhow!("session does not have an attached client"))?;
+        Ok(())
+    }
 }
 
 struct SessionRuntimeState {
@@ -676,9 +701,10 @@ pub struct AttachLease {
     runtime: Arc<SessionRuntime>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttachControl {
     SwitchSession(String),
+    Detach,
 }
 
 impl Drop for AttachLease {
@@ -870,4 +896,47 @@ fn ensure_session_not_running(session: &SessionRecord) -> Result<()> {
         bail!("session `{}` is still running", session.session_id);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AttachControl, SessionRuntime};
+    use crate::terminal_state::TerminalStateEngine;
+    use anyhow::Result;
+    use std::sync::Arc;
+
+    struct StubTerminalState;
+
+    impl TerminalStateEngine for StubTerminalState {
+        fn feed(&mut self, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        fn snapshot(&mut self) -> Result<Vec<u8>> {
+            Ok(b"snapshot".to_vec())
+        }
+    }
+
+    #[test]
+    fn request_detach_requires_active_attacher() {
+        let runtime = SessionRuntime::new(Box::new(Vec::new()), Box::new(StubTerminalState), 8);
+        let err = runtime.request_detach().unwrap_err();
+        assert_eq!(err.to_string(), "session does not have an attached client");
+    }
+
+    #[test]
+    fn request_detach_notifies_attached_client() {
+        let runtime = Arc::new(SessionRuntime::new(
+            Box::new(Vec::new()),
+            Box::new(StubTerminalState),
+            8,
+        ));
+        let (_lease, snapshot, _output_rx, mut control_rx) = runtime.try_attach().unwrap();
+        assert_eq!(snapshot, b"snapshot".to_vec());
+
+        runtime.request_detach().unwrap();
+
+        let control = control_rx.try_recv().unwrap();
+        assert_eq!(control, AttachControl::Detach);
+    }
 }

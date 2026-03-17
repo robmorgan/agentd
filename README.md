@@ -172,7 +172,9 @@ Runtime paths are resolved in this order:
 The selected root contains `config.toml`, `agentd.sock`, `agentd.pid`, `state.db`, `logs/`, and
 `worktrees/`.
 
-Interactive PTY attach is available with `agent attach <session_id>`. Detach with `Ctrl-]`.
+Interactive PTY attach is available with `agent attach <session_id>`. Detach with `Ctrl-]` or
+`agent detach <session_id>`. When run inside a managed session, `agent detach` uses
+`AGENTD_SESSION_ID` automatically.
 Only one interactive attacher is allowed per session. Background PTY writes are available with
 `agent send-input <session_id> -- <text>`.
 

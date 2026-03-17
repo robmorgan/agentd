@@ -7,7 +7,7 @@ use crate::{
     session::{CreateSessionResult, SessionDiff, SessionRecord, SessionStatus, WorktreeRecord},
 };
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
 const FRAME_HEADER_LEN: usize = 16;
@@ -38,6 +38,9 @@ pub enum Request {
         remove: bool,
     },
     AttachSession {
+        session_id: String,
+    },
+    DetachSession {
         session_id: String,
     },
     AttachInput {
@@ -105,6 +108,7 @@ enum MessageKind {
     AttachSessionRequest = 7,
     AttachInputRequest = 8,
     SendInputRequest = 9,
+    DetachSessionRequest = 17,
     SwitchAttachedSessionRequest = 16,
     DiffSessionRequest = 10,
     GetSessionRequest = 11,
@@ -142,6 +146,7 @@ impl MessageKind {
             7 => Self::AttachSessionRequest,
             8 => Self::AttachInputRequest,
             9 => Self::SendInputRequest,
+            17 => Self::DetachSessionRequest,
             16 => Self::SwitchAttachedSessionRequest,
             10 => Self::DiffSessionRequest,
             11 => Self::GetSessionRequest,
@@ -297,6 +302,10 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             put_string(&mut payload, session_id)?;
             MessageKind::AttachSessionRequest
         }
+        Request::DetachSession { session_id } => {
+            put_string(&mut payload, session_id)?;
+            MessageKind::DetachSessionRequest
+        }
         Request::AttachInput { data } => {
             put_bytes(&mut payload, data)?;
             MessageKind::AttachInputRequest
@@ -371,6 +380,9 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
             remove: cursor.take_bool()?,
         },
         MessageKind::AttachSessionRequest => Request::AttachSession {
+            session_id: cursor.take_string()?,
+        },
+        MessageKind::DetachSessionRequest => Request::DetachSession {
             session_id: cursor.take_string()?,
         },
         MessageKind::AttachInputRequest => Request::AttachInput {
@@ -923,6 +935,16 @@ mod tests {
         let request = Request::SwitchAttachedSession {
             source_session_id: "source".to_string(),
             target_session_id: "target".to_string(),
+        };
+        let (kind, payload) = encode_request(&request).unwrap();
+        let decoded = decode_request(kind, &payload).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn detach_session_round_trips() {
+        let request = Request::DetachSession {
+            session_id: "demo".to_string(),
         };
         let (kind, payload) = encode_request(&request).unwrap();
         let decoded = decode_request(kind, &payload).unwrap();

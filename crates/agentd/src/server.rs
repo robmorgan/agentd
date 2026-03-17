@@ -167,6 +167,18 @@ async fn handle_connection(
         Request::AttachSession { session_id } => {
             attach_session(&state, &session_id, &mut reader, &mut writer).await?;
         }
+        Request::DetachSession { session_id } => match state.detach_session(&session_id).await {
+            Ok(()) => send_response(&mut writer, &Response::Ok).await?,
+            Err(err) => {
+                send_response(
+                    &mut writer,
+                    &Response::Error {
+                        message: err.to_string(),
+                    },
+                )
+                .await?
+            }
+        },
         Request::AttachInput { .. } => {
             send_response(
                 &mut writer,
@@ -330,6 +342,7 @@ async fn attach_session(
                     send_end_of_stream = false;
                     break;
                 }
+                Ok(crate::app::AttachControl::Detach) => break,
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,
             },
