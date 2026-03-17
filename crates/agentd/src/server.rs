@@ -192,6 +192,24 @@ async fn handle_connection(
                 .await?
             }
         },
+        Request::SwitchAttachedSession {
+            source_session_id,
+            target_session_id,
+        } => match state
+            .switch_attached_session(&source_session_id, &target_session_id)
+            .await
+        {
+            Ok(()) => send_response(&mut writer, &Response::Ok).await?,
+            Err(err) => {
+                send_response(
+                    &mut writer,
+                    &Response::Error {
+                        message: err.to_string(),
+                    },
+                )
+                .await?
+            }
+        },
         Request::DiffSession { session_id } => match state.diff_session(&session_id).await {
             Ok(diff) => send_response(&mut writer, &Response::Diff { diff }).await?,
             Err(err) => {
@@ -271,21 +289,23 @@ async fn attach_session(
     reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: &mut OwnedWriteHalf,
 ) -> Result<()> {
-    let (_lease, snapshot, mut output_rx) = match state.attach_session(session_id).await {
-        Ok(attached) => attached,
-        Err(err) => {
-            send_response(
-                writer,
-                &Response::Error {
-                    message: err.to_string(),
-                },
-            )
-            .await?;
-            return Ok(());
-        }
-    };
+    let (_lease, snapshot, mut output_rx, mut control_rx) =
+        match state.attach_session(session_id).await {
+            Ok(attached) => attached,
+            Err(err) => {
+                send_response(
+                    writer,
+                    &Response::Error {
+                        message: err.to_string(),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+        };
 
     send_response(writer, &Response::Attached { snapshot }).await?;
+    let mut send_end_of_stream = true;
 
     loop {
         tokio::select! {
@@ -296,6 +316,19 @@ async fn attach_session(
                         &Response::PtyOutput { data },
                     )
                     .await?
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            control = control_rx.recv() => match control {
+                Ok(crate::app::AttachControl::SwitchSession(target_session_id)) => {
+                    send_response(
+                        writer,
+                        &Response::SwitchSession { session_id: target_session_id },
+                    )
+                    .await?;
+                    send_end_of_stream = false;
+                    break;
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -332,7 +365,9 @@ async fn attach_session(
         }
     }
 
-    send_response(writer, &Response::EndOfStream).await?;
+    if send_end_of_stream {
+        send_response(writer, &Response::EndOfStream).await?;
+    }
     Ok(())
 }
 

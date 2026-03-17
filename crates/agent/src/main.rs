@@ -1,5 +1,5 @@
 use std::{
-    io::{Read, Write},
+    io::{IsTerminal, Read, Write},
     path::PathBuf,
     process::Stdio,
     time::{Duration, Instant},
@@ -7,12 +7,16 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, Subcommand};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use tokio::{
-    io::BufReader,
-    net::{UnixStream, unix::OwnedReadHalf},
-    sync::mpsc,
+use crossterm::{
+    cursor::{Hide, MoveTo, Show},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
+    },
 };
+use tokio::{io::BufReader, net::UnixStream, sync::mpsc};
 
 mod local;
 
@@ -34,6 +38,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    New {
+        task: Option<String>,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        agent: Option<String>,
+    },
     Create {
         #[arg(long)]
         workspace: PathBuf,
@@ -72,7 +83,8 @@ enum Command {
         #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true", default_value_t = true)]
         follow: bool,
     },
-    Sessions,
+    #[command(visible_alias = "ls", alias = "sessions")]
+    List,
     Status {
         session_id: String,
     },
@@ -110,6 +122,36 @@ async fn main() -> Result<()> {
     let execution = resolve_execution_mode(&paths, &cli.command).await?;
 
     match (cli.command, execution) {
+        (
+            Command::New {
+                task,
+                workspace,
+                agent,
+            },
+            ExecutionMode::Daemon,
+        ) => {
+            let options = resolve_new_session_options(workspace, task, agent)?;
+            let response = send_request(
+                &paths,
+                &Request::CreateSession {
+                    workspace: options.workspace.to_string_lossy().to_string(),
+                    task: options.task,
+                    agent: options.agent,
+                },
+            )
+            .await?;
+
+            match response {
+                Response::CreateSession { session } => {
+                    attach_session(&paths, &session.session_id).await?;
+                }
+                Response::Error { message } => bail!(message),
+                other => bail!("unexpected response: {:?}", other),
+            }
+        }
+        (Command::New { .. }, ExecutionMode::Local(reason)) => {
+            bail_live_command(&reason)?;
+        }
         (
             Command::Create {
                 workspace,
@@ -212,15 +254,13 @@ async fn main() -> Result<()> {
             print_degraded_notice(&reason);
             local_events(&paths, &session_id, follow).await?;
         }
-        (Command::Sessions, ExecutionMode::Daemon) => {
-            let response = send_request(&paths, &Request::ListSessions).await?;
-            match response {
-                Response::Sessions { sessions } => print_sessions(&sessions),
-                Response::Error { message } => bail!(message),
-                other => bail!("unexpected response: {:?}", other),
+        (Command::List, ExecutionMode::Daemon) => {
+            let sessions = daemon_list_sessions(&paths).await?;
+            if !maybe_switch_attached_session(&paths, &sessions).await? {
+                print_sessions(&sessions);
             }
         }
-        (Command::Sessions, ExecutionMode::Local(reason)) => {
+        (Command::List, ExecutionMode::Local(reason)) => {
             print_degraded_notice(&reason);
             let store = LocalStore::open(&paths)?;
             let sessions = store
@@ -316,6 +356,12 @@ enum ExecutionMode {
     Local(String),
 }
 
+struct NewSessionOptions {
+    workspace: PathBuf,
+    task: String,
+    agent: String,
+}
+
 async fn resolve_execution_mode(paths: &AppPaths, command: &Command) -> Result<ExecutionMode> {
     if command_supports_local_mode(command) {
         if let Some(reason) = degraded_mode_reason(paths).await? {
@@ -334,7 +380,7 @@ fn command_supports_local_mode(command: &Command) -> bool {
         Command::Kill { .. }
             | Command::Logs { .. }
             | Command::Events { .. }
-            | Command::Sessions
+            | Command::List
             | Command::Status { .. }
     )
 }
@@ -368,6 +414,21 @@ fn bail_live_command(reason: &str) -> Result<()> {
     bail!(
         "{reason}. this command needs a compatible daemon with a live PTY; use `agent sessions` and `agent kill` first"
     )
+}
+
+fn resolve_new_session_options(
+    workspace: Option<PathBuf>,
+    task: Option<String>,
+    agent: Option<String>,
+) -> Result<NewSessionOptions> {
+    Ok(NewSessionOptions {
+        workspace: match workspace {
+            Some(workspace) => workspace,
+            None => std::env::current_dir().context("failed to resolve current directory")?,
+        },
+        task: task.unwrap_or_default(),
+        agent: agent.unwrap_or_else(|| "codex".to_string()),
+    })
 }
 
 fn ensure_config(paths: &AppPaths) -> Result<()> {
@@ -638,6 +699,16 @@ fn local_kill(paths: &AppPaths, session_id: &str, remove: bool) -> Result<()> {
 }
 
 async fn attach_session(paths: &AppPaths, session_id: &str) -> Result<()> {
+    let mut next_session_id = session_id.to_string();
+    loop {
+        match attach_session_once(paths, &next_session_id).await? {
+            AttachOutcome::Detached => return Ok(()),
+            AttachOutcome::SwitchSession(session_id) => next_session_id = session_id,
+        }
+    }
+}
+
+async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<AttachOutcome> {
     let mut stream = try_connect(paths).await?;
     write_request(
         &mut stream,
@@ -653,20 +724,21 @@ async fn attach_session(paths: &AppPaths, session_id: &str) -> Result<()> {
         bail!("agentd closed the connection");
     };
 
-    match response {
-        Response::Attached { snapshot } => {
-            write_attach_bytes(&snapshot)?;
-        }
+    let snapshot = match response {
+        Response::Attached { snapshot } => snapshot,
         Response::Error { message } => bail!(message),
         other => bail!("unexpected response: {:?}", other),
-    }
+    };
 
     eprintln!("attached to {session_id}; detach with Ctrl-]");
+    let _screen = TerminalScreenGuard::enter()?;
     let _raw_mode = RawModeGuard::new()?;
+    execute!(std::io::stdout(), MoveTo(0, 0), Clear(ClearType::All))
+        .context("failed to clear attach screen")?;
+    write_attach_bytes(&snapshot)?;
     let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel();
 
     let stdin_task = tokio::task::spawn_blocking(move || read_attach_stdin(stdin_tx));
-    let mut output_task = tokio::spawn(async move { stream_attach_output(reader).await });
 
     loop {
         tokio::select! {
@@ -676,16 +748,28 @@ async fn attach_session(paths: &AppPaths, session_id: &str) -> Result<()> {
                 }
                 Some(AttachInput::Detach) | None => break,
             },
-            result = &mut output_task => {
-                result??;
-                break;
+            response = read_response(&mut reader) => {
+                let Some(response) = response? else {
+                    break;
+                };
+                match response {
+                    Response::PtyOutput { data } => write_attach_bytes(&data)?,
+                    Response::SwitchSession { session_id } => {
+                        drop(write_half);
+                        stdin_task.abort();
+                        return Ok(AttachOutcome::SwitchSession(session_id));
+                    }
+                    Response::EndOfStream => break,
+                    Response::Error { message } => bail!(message),
+                    other => bail!("unexpected response: {:?}", other),
+                }
             }
         }
     }
 
     drop(write_half);
     stdin_task.abort();
-    Ok(())
+    Ok(AttachOutcome::Detached)
 }
 
 async fn try_connect(paths: &AppPaths) -> Result<UnixStream> {
@@ -753,18 +837,6 @@ fn print_kill_result(session_id: &str, was_running: bool, removed: bool) {
     }
 }
 
-async fn stream_attach_output(mut reader: BufReader<OwnedReadHalf>) -> Result<()> {
-    while let Some(response) = read_response(&mut reader).await? {
-        match response {
-            Response::PtyOutput { data } => write_attach_bytes(&data)?,
-            Response::EndOfStream => break,
-            Response::Error { message } => bail!(message),
-            other => bail!("unexpected response: {:?}", other),
-        }
-    }
-    Ok(())
-}
-
 fn read_attach_stdin(tx: mpsc::UnboundedSender<AttachInput>) -> Result<()> {
     let mut stdin = std::io::stdin();
     let mut buffer = [0_u8; 1024];
@@ -800,6 +872,11 @@ enum AttachInput {
     Detach,
 }
 
+enum AttachOutcome {
+    Detached,
+    SwitchSession(String),
+}
+
 struct RawModeGuard;
 
 impl RawModeGuard {
@@ -812,6 +889,22 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+    }
+}
+
+struct TerminalScreenGuard;
+
+impl TerminalScreenGuard {
+    fn enter() -> Result<Self> {
+        execute!(std::io::stdout(), EnterAlternateScreen, Hide)
+            .context("failed to enter alternate screen")?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalScreenGuard {
+    fn drop(&mut self) {
+        let _ = execute!(std::io::stdout(), Show, LeaveAlternateScreen);
     }
 }
 
@@ -836,4 +929,272 @@ fn write_attach_bytes(data: &[u8]) -> Result<()> {
     stdout.write_all(data)?;
     stdout.flush()?;
     Ok(())
+}
+
+async fn daemon_list_sessions(paths: &AppPaths) -> Result<Vec<SessionRecord>> {
+    let response = send_request(paths, &Request::ListSessions).await?;
+    match response {
+        Response::Sessions { sessions } => Ok(sessions),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {:?}", other),
+    }
+}
+
+async fn maybe_switch_attached_session(
+    paths: &AppPaths,
+    sessions: &[SessionRecord],
+) -> Result<bool> {
+    let Some(current_session_id) = in_session_switch_context() else {
+        return Ok(false);
+    };
+
+    let choices = sessions
+        .iter()
+        .filter(|session| {
+            session.status == SessionStatus::Running && session.session_id != current_session_id
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if choices.is_empty() {
+        return Ok(true);
+    }
+
+    let Some(selected) = pick_session(&choices)? else {
+        return Ok(true);
+    };
+
+    let response = send_request(
+        paths,
+        &Request::SwitchAttachedSession {
+            source_session_id: current_session_id,
+            target_session_id: selected.session_id,
+        },
+    )
+    .await?;
+    match response {
+        Response::Ok => Ok(true),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {:?}", other),
+    }
+}
+
+fn in_session_switch_context() -> Option<String> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return None;
+    }
+    std::env::var("AGENTD_SESSION_ID").ok()
+}
+
+fn pick_session(sessions: &[SessionRecord]) -> Result<Option<SessionRecord>> {
+    let _raw_mode = RawModeGuard::new()?;
+    let _screen = TerminalScreenGuard::enter()?;
+    let mut stdout = std::io::stdout();
+    let mut query = String::new();
+    let mut selected = 0_usize;
+
+    loop {
+        let matches = filtered_sessions(sessions, &query);
+        if selected >= matches.len() && !matches.is_empty() {
+            selected = matches.len() - 1;
+        }
+        render_session_picker(&mut stdout, &query, &matches, selected)?;
+
+        let Event::Key(key) = event::read().context("failed to read terminal input")? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Esc => return Ok(None),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(None),
+            KeyCode::Enter => {
+                if let Some((_, session)) = matches.get(selected) {
+                    return Ok(Some((*session).clone()));
+                }
+            }
+            KeyCode::Up => {
+                selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if selected + 1 < matches.len() {
+                    selected += 1;
+                }
+            }
+            KeyCode::Backspace => {
+                query.pop();
+                selected = 0;
+            }
+            KeyCode::Char(ch)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                query.push(ch);
+                selected = 0;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn render_session_picker(
+    stdout: &mut std::io::Stdout,
+    query: &str,
+    matches: &[(i64, &SessionRecord)],
+    selected: usize,
+) -> Result<()> {
+    execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
+    writeln!(stdout, "Switch session")?;
+    writeln!(stdout, "Query: {query}")?;
+    writeln!(stdout, "Enter switches, Esc cancels")?;
+    writeln!(stdout)?;
+
+    if matches.is_empty() {
+        writeln!(stdout, "No matching running sessions.")?;
+    } else {
+        for (index, (_, session)) in matches.iter().take(10).enumerate() {
+            let marker = if index == selected { ">" } else { " " };
+            writeln!(
+                stdout,
+                "{marker} {}  {}  {}  {}",
+                session.session_id,
+                session.agent,
+                session.status_string(),
+                session.branch
+            )?;
+            writeln!(stdout, "  {}", session.task)?;
+        }
+    }
+
+    stdout.flush()?;
+    Ok(())
+}
+
+fn filtered_sessions<'a>(
+    sessions: &'a [SessionRecord],
+    query: &str,
+) -> Vec<(i64, &'a SessionRecord)> {
+    let mut matches = sessions
+        .iter()
+        .filter_map(|session| {
+            fuzzy_score(&session_search_text(session), query).map(|score| (score, session))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.created_at.cmp(&right.1.created_at))
+    });
+    matches
+}
+
+fn session_search_text(session: &SessionRecord) -> String {
+    format!(
+        "{} {} {} {} {}",
+        session.session_id, session.agent, session.branch, session.task, session.workspace
+    )
+}
+
+fn fuzzy_score(haystack: &str, needle: &str) -> Option<i64> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+
+    let haystack = haystack.to_lowercase();
+    let needle = needle.to_lowercase();
+    let mut score = 0_i64;
+    let mut last_match = None;
+    let mut position = 0_usize;
+
+    for needle_char in needle.chars() {
+        let remainder = &haystack[position..];
+        let offset = remainder.find(needle_char)?;
+        let absolute = position + offset;
+        score += 10;
+        if let Some(previous) = last_match {
+            if absolute == previous + needle_char.len_utf8() {
+                score += 15;
+            }
+            score -= (absolute.saturating_sub(previous + 1)) as i64;
+        } else {
+            score -= absolute as i64;
+        }
+        last_match = Some(absolute);
+        position = absolute + needle_char.len_utf8();
+    }
+
+    Some(score)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command, resolve_new_session_options};
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    #[test]
+    fn new_command_parses_optional_positional_task() {
+        let cli = Cli::try_parse_from(["agent", "new", "fix failing tests"]).unwrap();
+        match cli.command {
+            Command::New {
+                task,
+                workspace,
+                agent,
+            } => {
+                assert_eq!(task.as_deref(), Some("fix failing tests"));
+                assert!(workspace.is_none());
+                assert!(agent.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_command_parses_optional_flags() {
+        let cli = Cli::try_parse_from([
+            "agent",
+            "new",
+            "--workspace",
+            "/tmp/repo",
+            "--agent",
+            "claude",
+            "fix",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::New {
+                task,
+                workspace,
+                agent,
+            } => {
+                assert_eq!(task.as_deref(), Some("fix"));
+                assert_eq!(workspace, Some(PathBuf::from("/tmp/repo")));
+                assert_eq!(agent.as_deref(), Some("claude"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_new_session_options_uses_defaults() {
+        let options = resolve_new_session_options(None, None, None).unwrap();
+        assert_eq!(options.workspace, std::env::current_dir().unwrap());
+        assert_eq!(options.task, "");
+        assert_eq!(options.agent, "codex");
+    }
+
+    #[test]
+    fn resolve_new_session_options_preserves_explicit_values() {
+        let options = resolve_new_session_options(
+            Some(PathBuf::from("/tmp/repo")),
+            Some("fix tests".to_string()),
+            Some("claude".to_string()),
+        )
+        .unwrap();
+        assert_eq!(options.workspace, PathBuf::from("/tmp/repo"));
+        assert_eq!(options.task, "fix tests");
+        assert_eq!(options.agent, "claude");
+    }
 }
