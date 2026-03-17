@@ -10,7 +10,11 @@ use tokio::{
 use agentd_shared::{
     config::Config,
     paths::AppPaths,
-    protocol::{DaemonInfo, PROTOCOL_VERSION, Request, Response, read_request, write_response},
+    protocol::{
+        DaemonInfo, DaemonManagementRequest, DaemonManagementResponse, DaemonManagementStatus,
+        IncomingRequest, PROTOCOL_VERSION, Request, Response, read_incoming_request, read_request,
+        write_daemon_management_response, write_response,
+    },
     session::{SessionRecord, SessionStatus},
 };
 
@@ -32,6 +36,7 @@ pub async fn serve() -> Result<()> {
     let config = Config::load(&paths)?;
     let state = AppState::new(paths.clone(), db, config);
     state.reconcile_sessions().await?;
+    state.resume_paused_sessions().await?;
 
     let listener =
         UnixListener::bind(paths.socket.as_std_path()).context("failed to bind agentd socket")?;
@@ -72,18 +77,21 @@ async fn handle_connection(
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    let Some(request) = read_request(&mut reader).await? else {
+    let Some(request) = read_incoming_request(&mut reader).await? else {
         return Ok(());
     };
     match request {
-        Request::GetDaemonInfo => {
+        IncomingRequest::DaemonManagement(request) => {
+            handle_daemon_management_request(&state, shutdown_tx, &mut writer, request).await?;
+        }
+        IncomingRequest::Standard(Request::GetDaemonInfo) => {
             let info = DaemonInfo {
                 daemon_version: env!("CARGO_PKG_VERSION").to_string(),
                 protocol_version: PROTOCOL_VERSION,
             };
             send_response(&mut writer, &Response::DaemonInfo { info }).await?;
         }
-        Request::ShutdownDaemon => {
+        IncomingRequest::Standard(Request::ShutdownDaemon) => {
             if state.has_running_sessions().await? {
                 send_response(
                     &mut writer,
@@ -97,11 +105,11 @@ async fn handle_connection(
                 let _ = shutdown_tx.send(true);
             }
         }
-        Request::CreateSession {
+        IncomingRequest::Standard(Request::CreateSession {
             workspace,
             task,
             agent,
-        } => match state.create_session(workspace, task, agent).await {
+        }) => match state.create_session(workspace, task, agent).await {
             Ok(session) => send_response(&mut writer, &Response::CreateSession { session }).await?,
             Err(err) => {
                 send_response(
@@ -113,19 +121,23 @@ async fn handle_connection(
                 .await?
             }
         },
-        Request::CreateWorktree { session_id } => match state.create_worktree(&session_id).await {
-            Ok(worktree) => send_response(&mut writer, &Response::Worktree { worktree }).await?,
-            Err(err) => {
-                send_response(
-                    &mut writer,
-                    &Response::Error {
-                        message: err.to_string(),
-                    },
-                )
-                .await?
+        IncomingRequest::Standard(Request::CreateWorktree { session_id }) => {
+            match state.create_worktree(&session_id).await {
+                Ok(worktree) => {
+                    send_response(&mut writer, &Response::Worktree { worktree }).await?
+                }
+                Err(err) => {
+                    send_response(
+                        &mut writer,
+                        &Response::Error {
+                            message: err.to_string(),
+                        },
+                    )
+                    .await?
+                }
             }
-        },
-        Request::CleanupWorktree { session_id } => {
+        }
+        IncomingRequest::Standard(Request::CleanupWorktree { session_id }) => {
             match state.cleanup_worktree(&session_id).await {
                 Ok(worktree) => {
                     send_response(&mut writer, &Response::Worktree { worktree }).await?
@@ -141,7 +153,7 @@ async fn handle_connection(
                 }
             }
         }
-        Request::KillSession { session_id, remove } => {
+        IncomingRequest::Standard(Request::KillSession { session_id, remove }) => {
             match state.kill_session(&session_id, remove).await {
                 Ok((removed, was_running)) => {
                     send_response(
@@ -164,22 +176,24 @@ async fn handle_connection(
                 }
             }
         }
-        Request::AttachSession { session_id } => {
+        IncomingRequest::Standard(Request::AttachSession { session_id }) => {
             attach_session(&state, &session_id, &mut reader, &mut writer).await?;
         }
-        Request::DetachSession { session_id } => match state.detach_session(&session_id).await {
-            Ok(()) => send_response(&mut writer, &Response::Ok).await?,
-            Err(err) => {
-                send_response(
-                    &mut writer,
-                    &Response::Error {
-                        message: err.to_string(),
-                    },
-                )
-                .await?
+        IncomingRequest::Standard(Request::DetachSession { session_id }) => {
+            match state.detach_session(&session_id).await {
+                Ok(()) => send_response(&mut writer, &Response::Ok).await?,
+                Err(err) => {
+                    send_response(
+                        &mut writer,
+                        &Response::Error {
+                            message: err.to_string(),
+                        },
+                    )
+                    .await?
+                }
             }
-        },
-        Request::AttachInput { .. } => {
+        }
+        IncomingRequest::Standard(Request::AttachInput { .. }) => {
             send_response(
                 &mut writer,
                 &Response::Error {
@@ -188,11 +202,11 @@ async fn handle_connection(
             )
             .await?;
         }
-        Request::SendInput {
+        IncomingRequest::Standard(Request::SendInput {
             session_id,
             data,
             source_session_id,
-        } => match state.send_input(&session_id, data, source_session_id).await {
+        }) => match state.send_input(&session_id, data, source_session_id).await {
             Ok(()) => send_response(&mut writer, &Response::InputAccepted).await?,
             Err(err) => {
                 send_response(
@@ -204,10 +218,10 @@ async fn handle_connection(
                 .await?
             }
         },
-        Request::SwitchAttachedSession {
+        IncomingRequest::Standard(Request::SwitchAttachedSession {
             source_session_id,
             target_session_id,
-        } => match state
+        }) => match state
             .switch_attached_session(&source_session_id, &target_session_id)
             .await
         {
@@ -222,35 +236,39 @@ async fn handle_connection(
                 .await?
             }
         },
-        Request::DiffSession { session_id } => match state.diff_session(&session_id).await {
-            Ok(diff) => send_response(&mut writer, &Response::Diff { diff }).await?,
-            Err(err) => {
-                send_response(
-                    &mut writer,
-                    &Response::Error {
-                        message: err.to_string(),
-                    },
-                )
-                .await?
+        IncomingRequest::Standard(Request::DiffSession { session_id }) => {
+            match state.diff_session(&session_id).await {
+                Ok(diff) => send_response(&mut writer, &Response::Diff { diff }).await?,
+                Err(err) => {
+                    send_response(
+                        &mut writer,
+                        &Response::Error {
+                            message: err.to_string(),
+                        },
+                    )
+                    .await?
+                }
             }
-        },
-        Request::GetSession { session_id } => match state.get_session(&session_id).await? {
-            Some(session) => send_response(&mut writer, &Response::Session { session }).await?,
-            None => {
-                send_response(
-                    &mut writer,
-                    &Response::Error {
-                        message: format!("session `{session_id}` not found"),
-                    },
-                )
-                .await?
+        }
+        IncomingRequest::Standard(Request::GetSession { session_id }) => {
+            match state.get_session(&session_id).await? {
+                Some(session) => send_response(&mut writer, &Response::Session { session }).await?,
+                None => {
+                    send_response(
+                        &mut writer,
+                        &Response::Error {
+                            message: format!("session `{session_id}` not found"),
+                        },
+                    )
+                    .await?
+                }
             }
-        },
-        Request::ListSessions => {
+        }
+        IncomingRequest::Standard(Request::ListSessions) => {
             let sessions = state.list_sessions().await?;
             send_response(&mut writer, &Response::Sessions { sessions }).await?;
         }
-        Request::AppendSessionEvents { session_id, events } => {
+        IncomingRequest::Standard(Request::AppendSessionEvents { session_id, events }) => {
             match state.append_session_events(&session_id, events).await {
                 Ok(_) => send_response(&mut writer, &Response::Ok).await?,
                 Err(err) => {
@@ -264,7 +282,7 @@ async fn handle_connection(
                 }
             }
         }
-        Request::StreamLogs { session_id, follow } => {
+        IncomingRequest::Standard(Request::StreamLogs { session_id, follow }) => {
             if let Err(err) = stream_logs(&state, &session_id, follow, &mut writer).await {
                 send_response(
                     &mut writer,
@@ -277,7 +295,7 @@ async fn handle_connection(
                 send_response(&mut writer, &Response::EndOfStream).await?;
             }
         }
-        Request::StreamEvents { session_id, follow } => {
+        IncomingRequest::Standard(Request::StreamEvents { session_id, follow }) => {
             if let Err(err) = stream_events(&state, &session_id, follow, &mut writer).await {
                 send_response(
                     &mut writer,
@@ -292,6 +310,55 @@ async fn handle_connection(
         }
     }
 
+    Ok(())
+}
+
+async fn handle_daemon_management_request(
+    state: &AppState,
+    shutdown_tx: watch::Sender<bool>,
+    writer: &mut OwnedWriteHalf,
+    request: DaemonManagementRequest,
+) -> Result<()> {
+    match request {
+        DaemonManagementRequest::Status => {
+            let response = DaemonManagementResponse::Status {
+                status: DaemonManagementStatus {
+                    daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    pid: std::process::id(),
+                    root: state.paths.root.to_string(),
+                    socket: state.paths.socket.to_string(),
+                    running_sessions: state.has_running_sessions().await?,
+                },
+            };
+            write_daemon_management_response(writer, &response).await?;
+        }
+        DaemonManagementRequest::Shutdown { force } => {
+            let running_sessions = state.has_running_sessions().await?;
+            if running_sessions && !force {
+                write_daemon_management_response(
+                    writer,
+                    &DaemonManagementResponse::Shutdown {
+                        stopped: false,
+                        running_sessions: true,
+                        message: "cannot shut down agentd while sessions are running".to_string(),
+                    },
+                )
+                .await?;
+            } else {
+                write_daemon_management_response(
+                    writer,
+                    &DaemonManagementResponse::Shutdown {
+                        stopped: true,
+                        running_sessions,
+                        message: "agentd stopping".to_string(),
+                    },
+                )
+                .await?;
+                let _ = shutdown_tx.send(true);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -407,7 +474,7 @@ fn session_ended_response(session: &SessionRecord) -> Option<Response> {
                 error: session.error.clone(),
             })
         }
-        SessionStatus::Creating | SessionStatus::Running => None,
+        SessionStatus::Creating | SessionStatus::Running | SessionStatus::Paused => None,
     }
 }
 

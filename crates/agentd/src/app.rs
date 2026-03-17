@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -30,7 +31,7 @@ use agentd_shared::{
 };
 
 use crate::{
-    db::{Database, NewSession},
+    db::{Database, NewSession, SessionLaunchInfo},
     git,
     ids::generate_session_id,
     terminal_state::{GhosttyTerminalState, TerminalStateEngine},
@@ -70,6 +71,8 @@ impl AppState {
             let repo_root = git::canonical_repo_root(&workspace)?;
             let base_branch = git::current_branch(&repo_root)?;
             let agent = config.require_agent(&paths, &agent_name)?.clone();
+            let agent_args_json =
+                serde_json::to_string(&agent.args).context("failed to serialize agent args")?;
 
             let session_id = unique_session_id(&db)?;
             let worktree = paths.worktree_path(&session_id);
@@ -78,6 +81,8 @@ impl AppState {
             db.insert_session(&NewSession {
                 session_id: &session_id,
                 agent: &agent_name,
+                agent_command: &agent.command,
+                agent_args_json: &agent_args_json,
                 workspace: repo_root.as_str(),
                 repo_path: repo_root.as_str(),
                 task: &task_text,
@@ -105,121 +110,34 @@ impl AppState {
             );
 
             let log_path = paths.log_path(&session_id);
-            if let Err(err) = File::create(log_path.as_std_path()) {
+            if let Err(err) = prepare_log_file(&log_path, SessionStartMode::Create) {
                 let err = anyhow!(err).context("failed to create session log file");
                 let _ = record_session_failure(&db, &session_id, err.to_string());
                 return Err(err);
             }
-
-            let pty_system = native_pty_system();
-            let pair = pty_system
-                .openpty(PtySize {
-                    rows: DEFAULT_PTY_ROWS,
-                    cols: DEFAULT_PTY_COLS,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .context("failed to allocate PTY")?;
-
-            let mut command = CommandBuilder::new(agent.command);
-            command.args(agent.args);
-            command.cwd(worktree.as_std_path());
-            for (key, value) in std::env::vars() {
-                command.env(&key, &value);
-            }
-            command.env("AGENTD_SESSION_ID", &session_id);
-            command.env("AGENTD_SOCKET", paths.socket.as_str());
-            command.env("AGENTD_WORKSPACE", repo_root.as_str());
-            command.env("AGENTD_WORKTREE", worktree.as_str());
-            command.env("AGENTD_BRANCH", &branch);
-            command.env("AGENTD_TASK", &task_text);
-
-            let mut child = match pair.slave.spawn_command(command) {
-                Ok(child) => child,
-                Err(err) => {
-                    let err = anyhow!(err).context("failed to spawn agent process");
-                    let _ = record_session_failure(&db, &session_id, err.to_string());
-                    return Err(err);
-                }
+            let launch = LaunchCommand {
+                agent_name: agent_name.clone(),
+                command: agent.command,
+                args: agent.args,
             };
-
-            let pid = child.process_id().map(|value| value as u32);
-            if let Some(pid) = pid {
-                db.mark_running(&session_id, pid)?;
-                let _ = db.append_events(
-                    &session_id,
-                    &[daemon_event(
-                        "SESSION_STARTED",
-                        serde_json::json!({
-                            "source": "daemon",
-                            "pid": pid,
-                            "agent": agent_name,
-                            "branch": branch,
-                            "worktree": worktree.as_str()
-                        }),
-                    )],
-                );
-            } else {
-                db.mark_running(&session_id, 0)?;
-                let _ = db.append_events(
-                    &session_id,
-                    &[daemon_event(
-                        "SESSION_STARTED",
-                        serde_json::json!({
-                            "source": "daemon",
-                            "pid": 0,
-                            "agent": agent_name,
-                            "branch": branch,
-                            "worktree": worktree.as_str()
-                        }),
-                    )],
-                );
+            if let Err(err) = start_session_runtime(
+                &paths,
+                &db,
+                &runtimes,
+                SessionStartRequest {
+                    session_id: &session_id,
+                    repo_root: repo_root.as_str(),
+                    worktree: worktree.as_str(),
+                    branch: &branch,
+                    task_text: &task_text,
+                    log_path: &log_path,
+                    launch: &launch,
+                    mode: SessionStartMode::Create,
+                },
+            ) {
+                let _ = record_session_failure(&db, &session_id, err.to_string());
+                return Err(err);
             }
-
-            let reader = pair
-                .master
-                .try_clone_reader()
-                .context("failed to clone PTY reader")?;
-            let writer = pair
-                .master
-                .take_writer()
-                .context("failed to clone PTY writer")?;
-            let terminal_state =
-                GhosttyTerminalState::new(DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS, MAX_SCROLLBACK_BYTES)
-                    .context("failed to initialize libghostty-vt state")?;
-            let runtime = runtimes.insert(
-                session_id.clone(),
-                SessionRuntime::new(writer, Box::new(terminal_state), OUTPUT_BUFFER_CAPACITY),
-            );
-            let writer_db = db.clone();
-            let writer_session_id = session_id.clone();
-            let writer_log_path = log_path.clone();
-            let writer_runtime = runtime.clone();
-            std::thread::spawn(move || {
-                if let Err(err) = pump_pty_to_log(reader, &writer_log_path, &writer_runtime) {
-                    let _ = record_session_failure(&writer_db, &writer_session_id, err.to_string());
-                }
-            });
-
-            let exit_db = db.clone();
-            let exit_session_id = session_id.clone();
-            let exit_runtimes = runtimes.clone();
-            std::thread::spawn(move || {
-                let status = child.wait();
-                let code = status.ok().map(|value| value.exit_code() as i32);
-                exit_runtimes.remove(&exit_session_id);
-                let _ = exit_db.mark_exited(&exit_session_id, code);
-                let _ = exit_db.append_events(
-                    &exit_session_id,
-                    &[daemon_event(
-                        "SESSION_FINISHED",
-                        serde_json::json!({
-                            "source": "daemon",
-                            "exit_code": code
-                        }),
-                    )],
-                );
-            });
 
             Ok(CreateSessionResult {
                 session_id,
@@ -285,11 +203,85 @@ impl AppState {
         Ok(())
     }
 
+    pub async fn resume_paused_sessions(&self) -> Result<()> {
+        let sessions = self.list_sessions().await?;
+        for session in sessions {
+            if session.status != SessionStatus::Paused {
+                continue;
+            }
+
+            let launch = match self.resolve_launch_command(&session).await {
+                Ok(launch) => launch,
+                Err(err) => {
+                    let error = err.to_string();
+                    let db = self.db.clone();
+                    let session_id = session.session_id.clone();
+                    task::spawn_blocking(move || record_session_failure(&db, &session_id, error))
+                        .await??;
+                    continue;
+                }
+            };
+            let paths = self.paths.clone();
+            let db = self.db.clone();
+            let runtimes = self.runtimes.clone();
+            let session_id = session.session_id.clone();
+            let repo_path = session.repo_path.clone();
+            let worktree = session.worktree.clone();
+            let branch = session.branch.clone();
+            let task_text = session.task.clone();
+            let log_path = self.paths.log_path(&session.session_id);
+
+            let result = task::spawn_blocking(move || {
+                start_session_runtime(
+                    &paths,
+                    &db,
+                    &runtimes,
+                    SessionStartRequest {
+                        session_id: &session_id,
+                        repo_root: &repo_path,
+                        worktree: &worktree,
+                        branch: &branch,
+                        task_text: &task_text,
+                        log_path: &log_path,
+                        launch: &launch,
+                        mode: SessionStartMode::Resume,
+                    },
+                )
+            })
+            .await?;
+
+            if let Err(err) = result {
+                let error = err.to_string();
+                let db = self.db.clone();
+                let session_id = session.session_id.clone();
+                task::spawn_blocking(move || record_session_failure(&db, &session_id, error))
+                    .await??;
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn has_running_sessions(&self) -> Result<bool> {
         let sessions = self.list_sessions().await?;
         Ok(sessions
             .into_iter()
             .any(|session| session.status == SessionStatus::Running && process_exists(session.pid)))
+    }
+
+    pub async fn resolve_launch_command(&self, session: &SessionRecord) -> Result<LaunchCommand> {
+        let db = self.db.clone();
+        let config = self.config.clone();
+        let paths = self.paths.clone();
+        let session_id = session.session_id.clone();
+        let agent_name = session.agent.clone();
+        task::spawn_blocking(move || {
+            let launch = db
+                .get_launch_info(&session_id)?
+                .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+            resolve_launch_command(&config, &paths, &agent_name, launch)
+        })
+        .await?
     }
 
     pub async fn create_worktree(&self, session_id: &str) -> Result<WorktreeRecord> {
@@ -562,6 +554,198 @@ impl AppState {
 
         runtime.request_detach()
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchCommand {
+    pub agent_name: String,
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionStartMode {
+    Create,
+    Resume,
+}
+
+struct SessionStartRequest<'a> {
+    session_id: &'a str,
+    repo_root: &'a str,
+    worktree: &'a str,
+    branch: &'a str,
+    task_text: &'a str,
+    log_path: &'a Utf8PathBuf,
+    launch: &'a LaunchCommand,
+    mode: SessionStartMode,
+}
+
+pub fn is_resumable_command(command: &str) -> bool {
+    Path::new(command)
+        .file_name()
+        .and_then(|value| value.to_str())
+        == Some("codex")
+}
+
+fn resolve_launch_command(
+    config: &Config,
+    paths: &AppPaths,
+    agent_name: &str,
+    launch: SessionLaunchInfo,
+) -> Result<LaunchCommand> {
+    let command = match launch.command {
+        Some(command) => command,
+        None => config.require_agent(paths, agent_name)?.command.clone(),
+    };
+    let args = match launch.args {
+        Some(args) => args,
+        None => config
+            .agents
+            .get(agent_name)
+            .map(|agent| agent.args.clone())
+            .unwrap_or_default(),
+    };
+    Ok(LaunchCommand {
+        agent_name: agent_name.to_string(),
+        command,
+        args,
+    })
+}
+
+fn prepare_log_file(log_path: &Utf8PathBuf, mode: SessionStartMode) -> Result<()> {
+    match mode {
+        SessionStartMode::Create => {
+            File::create(log_path.as_std_path())
+                .with_context(|| format!("failed to create {}", log_path))?;
+        }
+        SessionStartMode::Resume => {
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_path.as_std_path())
+                .with_context(|| format!("failed to open {}", log_path))?;
+        }
+    }
+    Ok(())
+}
+
+fn start_session_runtime(
+    paths: &AppPaths,
+    db: &Database,
+    runtimes: &SessionRuntimeRegistry,
+    request: SessionStartRequest<'_>,
+) -> Result<()> {
+    prepare_log_file(request.log_path, request.mode)?;
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: DEFAULT_PTY_ROWS,
+            cols: DEFAULT_PTY_COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("failed to allocate PTY")?;
+
+    let mut command = CommandBuilder::new(&request.launch.command);
+    command.args(request.launch.args.clone());
+    if request.mode == SessionStartMode::Resume {
+        if !is_resumable_command(&request.launch.command) {
+            bail!(
+                "agent `{}` does not support resume-based upgrades",
+                request.launch.agent_name
+            );
+        }
+        command.arg("resume");
+        command.arg("--last");
+    }
+    command.cwd(request.worktree);
+    for (key, value) in std::env::vars() {
+        command.env(&key, &value);
+    }
+    command.env("AGENTD_SESSION_ID", request.session_id);
+    command.env("AGENTD_SOCKET", paths.socket.as_str());
+    command.env("AGENTD_WORKSPACE", request.repo_root);
+    command.env("AGENTD_WORKTREE", request.worktree);
+    command.env("AGENTD_BRANCH", request.branch);
+    command.env("AGENTD_TASK", request.task_text);
+
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|err| anyhow!(err).context("failed to spawn agent process"))?;
+
+    let pid = child.process_id().map(|value| value as u32).unwrap_or(0);
+    db.mark_running(request.session_id, pid)?;
+    let start_event = match request.mode {
+        SessionStartMode::Create => "SESSION_STARTED",
+        SessionStartMode::Resume => "SESSION_RESUMED",
+    };
+    db.append_events(
+        request.session_id,
+        &[daemon_event(
+            start_event,
+            serde_json::json!({
+                "source": "daemon",
+                "pid": pid,
+                "agent": request.launch.agent_name,
+                "branch": request.branch,
+                "worktree": request.worktree
+            }),
+        )],
+    )?;
+
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .context("failed to clone PTY reader")?;
+    let writer = pair
+        .master
+        .take_writer()
+        .context("failed to clone PTY writer")?;
+    let terminal_state =
+        GhosttyTerminalState::new(DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS, MAX_SCROLLBACK_BYTES)
+            .context("failed to initialize libghostty-vt state")?;
+    let runtime = runtimes.insert(
+        request.session_id.to_string(),
+        SessionRuntime::new(writer, Box::new(terminal_state), OUTPUT_BUFFER_CAPACITY),
+    );
+    let writer_db = db.clone();
+    let writer_session_id = request.session_id.to_string();
+    let writer_log_path = request.log_path.clone();
+    let writer_runtime = runtime.clone();
+    std::thread::spawn(move || {
+        if let Err(err) = pump_pty_to_log(reader, &writer_log_path, &writer_runtime) {
+            let _ = record_session_failure(&writer_db, &writer_session_id, err.to_string());
+        }
+    });
+
+    let exit_db = db.clone();
+    let exit_session_id = request.session_id.to_string();
+    let exit_runtimes = runtimes.clone();
+    let start_mode = request.mode;
+    std::thread::spawn(move || {
+        let status = child.wait();
+        let code = status.ok().map(|value| value.exit_code() as i32);
+        exit_runtimes.remove(&exit_session_id);
+        let _ = exit_db.mark_exited(&exit_session_id, code);
+        let _ = exit_db.append_events(
+            &exit_session_id,
+            &[daemon_event(
+                "SESSION_FINISHED",
+                serde_json::json!({
+                    "source": "daemon",
+                    "exit_code": code,
+                    "mode": match start_mode {
+                        SessionStartMode::Create => "create",
+                        SessionStartMode::Resume => "resume",
+                    }
+                }),
+            )],
+        );
+    });
+
+    Ok(())
 }
 
 const OUTPUT_BUFFER_CAPACITY: usize = 256;

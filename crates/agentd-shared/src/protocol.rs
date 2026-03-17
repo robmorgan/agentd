@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::{DateTime, TimeZone, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
@@ -7,15 +8,58 @@ use crate::{
     session::{CreateSessionResult, SessionDiff, SessionRecord, SessionStatus, WorktreeRecord},
 };
 
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
+pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
 const FRAME_HEADER_LEN: usize = 16;
+const DAEMON_STATUS_REQUEST_KIND: u16 = 20_001;
+const DAEMON_SHUTDOWN_REQUEST_KIND: u16 = 20_002;
+const DAEMON_STATUS_RESPONSE_KIND: u16 = 21_001;
+const DAEMON_SHUTDOWN_RESPONSE_KIND: u16 = 21_002;
+const DAEMON_ERROR_RESPONSE_KIND: u16 = 21_099;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonInfo {
     pub daemon_version: String,
     pub protocol_version: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonManagementStatus {
+    pub daemon_version: String,
+    pub protocol_version: u16,
+    pub pid: u32,
+    pub root: String,
+    pub socket: String,
+    pub running_sessions: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DaemonManagementRequest {
+    Status,
+    Shutdown { force: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DaemonManagementResponse {
+    Status {
+        status: DaemonManagementStatus,
+    },
+    Shutdown {
+        stopped: bool,
+        running_sessions: bool,
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum IncomingRequest {
+    Standard(Request),
+    DaemonManagement(DaemonManagementRequest),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -215,7 +259,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let (kind, payload) = encode_request(request)?;
-    write_frame(writer, kind, &payload).await
+    write_frame(writer, PROTOCOL_VERSION, kind as u16, &payload).await
 }
 
 pub async fn write_response<W>(writer: &mut W, response: &Response) -> Result<()>
@@ -223,14 +267,14 @@ where
     W: AsyncWrite + Unpin,
 {
     let (kind, payload) = encode_response(response)?;
-    write_frame(writer, kind, &payload).await
+    write_frame(writer, PROTOCOL_VERSION, kind as u16, &payload).await
 }
 
 pub async fn read_request<R>(reader: &mut R) -> Result<Option<Request>>
 where
     R: AsyncRead + Unpin,
 {
-    let Some((kind, payload)) = read_frame(reader).await? else {
+    let Some((kind, payload)) = read_standard_frame(reader).await? else {
         return Ok(None);
     };
     decode_request(kind, &payload).map(Some)
@@ -240,13 +284,76 @@ pub async fn read_response<R>(reader: &mut R) -> Result<Option<Response>>
 where
     R: AsyncRead + Unpin,
 {
-    let Some((kind, payload)) = read_frame(reader).await? else {
+    let Some((kind, payload)) = read_standard_frame(reader).await? else {
         return Ok(None);
     };
     decode_response(kind, &payload).map(Some)
 }
 
-async fn write_frame<W>(writer: &mut W, kind: MessageKind, payload: &[u8]) -> Result<()>
+pub async fn read_incoming_request<R>(reader: &mut R) -> Result<Option<IncomingRequest>>
+where
+    R: AsyncRead + Unpin,
+{
+    let Some((header, payload)) = read_raw_frame(reader).await? else {
+        return Ok(None);
+    };
+
+    if header.version == DAEMON_MANAGEMENT_VERSION {
+        let request = decode_daemon_management_request(header.kind, &payload)?;
+        return Ok(Some(IncomingRequest::DaemonManagement(request)));
+    }
+
+    ensure!(
+        header.version == PROTOCOL_VERSION,
+        "unsupported protocol version `{}`",
+        header.version
+    );
+    let kind = MessageKind::from_u16(header.kind)?;
+    Ok(Some(IncomingRequest::Standard(decode_request(
+        kind, &payload,
+    )?)))
+}
+
+pub async fn write_daemon_management_request<W>(
+    writer: &mut W,
+    request: &DaemonManagementRequest,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let (kind, payload) = encode_daemon_management_request(request)?;
+    write_frame(writer, DAEMON_MANAGEMENT_VERSION, kind, &payload).await
+}
+
+pub async fn read_daemon_management_response<R>(
+    reader: &mut R,
+) -> Result<Option<DaemonManagementResponse>>
+where
+    R: AsyncRead + Unpin,
+{
+    let Some((header, payload)) = read_raw_frame(reader).await? else {
+        return Ok(None);
+    };
+    ensure!(
+        header.version == DAEMON_MANAGEMENT_VERSION,
+        "unsupported daemon management protocol version `{}`",
+        header.version
+    );
+    decode_daemon_management_response(header.kind, &payload).map(Some)
+}
+
+pub async fn write_daemon_management_response<W>(
+    writer: &mut W,
+    response: &DaemonManagementResponse,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let (kind, payload) = encode_daemon_management_response(response)?;
+    write_frame(writer, DAEMON_MANAGEMENT_VERSION, kind, &payload).await
+}
+
+async fn write_frame<W>(writer: &mut W, version: u16, kind: u16, payload: &[u8]) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -258,8 +365,8 @@ where
 
     let mut header = [0_u8; FRAME_HEADER_LEN];
     header[0..4].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
-    header[4..6].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-    header[6..8].copy_from_slice(&(kind as u16).to_le_bytes());
+    header[4..6].copy_from_slice(&version.to_le_bytes());
+    header[6..8].copy_from_slice(&kind.to_le_bytes());
     header[8..10].copy_from_slice(&0_u16.to_le_bytes());
     header[10..12].copy_from_slice(&0_u16.to_le_bytes());
     header[12..16].copy_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -270,7 +377,30 @@ where
     Ok(())
 }
 
-async fn read_frame<R>(reader: &mut R) -> Result<Option<(MessageKind, Vec<u8>)>>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameHeader {
+    version: u16,
+    kind: u16,
+}
+
+async fn read_standard_frame<R>(reader: &mut R) -> Result<Option<(MessageKind, Vec<u8>)>>
+where
+    R: AsyncRead + Unpin,
+{
+    let Some((header, payload)) = read_raw_frame(reader).await? else {
+        return Ok(None);
+    };
+
+    ensure!(
+        header.version == PROTOCOL_VERSION,
+        "unsupported protocol version `{}`",
+        header.version
+    );
+    let kind = MessageKind::from_u16(header.kind)?;
+    Ok(Some((kind, payload)))
+}
+
+async fn read_raw_frame<R>(reader: &mut R) -> Result<Option<(FrameHeader, Vec<u8>)>>
 where
     R: AsyncRead + Unpin,
 {
@@ -290,19 +420,14 @@ where
     ensure!(magic == FRAME_MAGIC, "invalid frame magic");
 
     let version = u16::from_le_bytes(header[4..6].try_into().unwrap());
-    ensure!(
-        version == PROTOCOL_VERSION,
-        "unsupported protocol version `{version}`"
-    );
-
-    let kind = MessageKind::from_u16(u16::from_le_bytes(header[6..8].try_into().unwrap()))?;
+    let kind = u16::from_le_bytes(header[6..8].try_into().unwrap());
     let _flags = u16::from_le_bytes(header[8..10].try_into().unwrap());
     let _reserved = u16::from_le_bytes(header[10..12].try_into().unwrap());
     let payload_len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
 
     let mut payload = vec![0_u8; payload_len];
     reader.read_exact(&mut payload).await?;
-    Ok(Some((kind, payload)))
+    Ok(Some((FrameHeader { version, kind }, payload)))
 }
 
 fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
@@ -606,6 +731,103 @@ fn decode_response(kind: MessageKind, payload: &[u8]) -> Result<Response> {
     Ok(response)
 }
 
+fn encode_daemon_management_request(request: &DaemonManagementRequest) -> Result<(u16, Vec<u8>)> {
+    let (kind, payload) = match request {
+        DaemonManagementRequest::Status => (DAEMON_STATUS_REQUEST_KIND, Vec::new()),
+        DaemonManagementRequest::Shutdown { force } => (
+            DAEMON_SHUTDOWN_REQUEST_KIND,
+            serde_json::to_vec(&serde_json::json!({ "force": force }))?,
+        ),
+    };
+    Ok((kind, payload))
+}
+
+fn decode_daemon_management_request(kind: u16, payload: &[u8]) -> Result<DaemonManagementRequest> {
+    match kind {
+        DAEMON_STATUS_REQUEST_KIND => {
+            ensure!(payload.is_empty(), "unexpected status request payload");
+            Ok(DaemonManagementRequest::Status)
+        }
+        DAEMON_SHUTDOWN_REQUEST_KIND => {
+            #[derive(Deserialize)]
+            struct ShutdownPayload {
+                force: bool,
+            }
+
+            let payload: ShutdownPayload = serde_json::from_slice(payload)?;
+            Ok(DaemonManagementRequest::Shutdown {
+                force: payload.force,
+            })
+        }
+        other => bail!("unknown daemon management request kind `{other}`"),
+    }
+}
+
+fn encode_daemon_management_response(
+    response: &DaemonManagementResponse,
+) -> Result<(u16, Vec<u8>)> {
+    let (kind, payload) = match response {
+        DaemonManagementResponse::Status { status } => {
+            (DAEMON_STATUS_RESPONSE_KIND, serde_json::to_vec(status)?)
+        }
+        DaemonManagementResponse::Shutdown {
+            stopped,
+            running_sessions,
+            message,
+        } => (
+            DAEMON_SHUTDOWN_RESPONSE_KIND,
+            serde_json::to_vec(&serde_json::json!({
+                "stopped": stopped,
+                "running_sessions": running_sessions,
+                "message": message,
+            }))?,
+        ),
+        DaemonManagementResponse::Error { message } => (
+            DAEMON_ERROR_RESPONSE_KIND,
+            serde_json::to_vec(&serde_json::json!({ "message": message }))?,
+        ),
+    };
+    Ok((kind, payload))
+}
+
+fn decode_daemon_management_response(
+    kind: u16,
+    payload: &[u8],
+) -> Result<DaemonManagementResponse> {
+    match kind {
+        DAEMON_STATUS_RESPONSE_KIND => Ok(DaemonManagementResponse::Status {
+            status: serde_json::from_slice(payload)?,
+        }),
+        DAEMON_SHUTDOWN_RESPONSE_KIND => {
+            #[derive(Deserialize)]
+            struct ShutdownPayload {
+                stopped: bool,
+                running_sessions: bool,
+                message: String,
+            }
+
+            let payload: ShutdownPayload = serde_json::from_slice(payload)?;
+            Ok(DaemonManagementResponse::Shutdown {
+                stopped: payload.stopped,
+                running_sessions: payload.running_sessions,
+                message: payload.message,
+            })
+        }
+        DAEMON_ERROR_RESPONSE_KIND => {
+            #[derive(Deserialize)]
+            struct ErrorPayload {
+                message: String,
+            }
+
+            let payload: ErrorPayload = serde_json::from_slice(payload)?;
+            Ok(DaemonManagementResponse::Error {
+                message: payload.message,
+            })
+        }
+        other => bail!("unknown daemon management response kind `{other}`"),
+    }
+}
+
 fn put_daemon_info(buf: &mut Vec<u8>, info: &DaemonInfo) -> Result<()> {
     put_string(buf, &info.daemon_version)?;
     buf.extend_from_slice(&info.protocol_version.to_le_bytes());
@@ -616,9 +838,10 @@ fn put_session_status(buf: &mut Vec<u8>, status: SessionStatus) {
     buf.push(match status {
         SessionStatus::Creating => 1,
         SessionStatus::Running => 2,
-        SessionStatus::Exited => 3,
-        SessionStatus::Failed => 4,
-        SessionStatus::UnknownRecovered => 5,
+        SessionStatus::Paused => 3,
+        SessionStatus::Exited => 4,
+        SessionStatus::Failed => 5,
+        SessionStatus::UnknownRecovered => 6,
     });
 }
 
@@ -824,9 +1047,10 @@ impl<'a> Cursor<'a> {
         Ok(match self.take_u8()? {
             1 => SessionStatus::Creating,
             2 => SessionStatus::Running,
-            3 => SessionStatus::Exited,
-            4 => SessionStatus::Failed,
-            5 => SessionStatus::UnknownRecovered,
+            3 => SessionStatus::Paused,
+            4 => SessionStatus::Exited,
+            5 => SessionStatus::Failed,
+            6 => SessionStatus::UnknownRecovered,
             other => bail!("invalid session status `{other}`"),
         })
     }
@@ -960,8 +1184,11 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonInfo, PROTOCOL_VERSION, Request, Response, decode_request, decode_response,
-        encode_request, encode_response, read_request,
+        DAEMON_MANAGEMENT_VERSION, DaemonInfo, DaemonManagementRequest,
+        DaemonManagementResponse, DaemonManagementStatus, IncomingRequest, PROTOCOL_VERSION,
+        Request, Response, decode_request, decode_response, encode_request, encode_response,
+        read_incoming_request, read_request, write_daemon_management_request,
+        write_daemon_management_response,
     };
     use crate::{
         event::{NewSessionEvent, SessionEvent},
@@ -1091,6 +1318,71 @@ mod tests {
         let (kind, payload) = encode_response(&response).unwrap();
         let decoded = decode_response(kind, &payload).unwrap();
         assert_eq!(decoded, response);
+    }
+
+    #[tokio::test]
+    async fn daemon_management_status_round_trips() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let request = DaemonManagementRequest::Shutdown { force: true };
+        write_daemon_management_request(&mut writer, &request)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let incoming = read_incoming_request(&mut reader).await.unwrap().unwrap();
+        assert_eq!(incoming, IncomingRequest::DaemonManagement(request));
+    }
+
+    #[tokio::test]
+    async fn daemon_management_response_round_trips() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let response = DaemonManagementResponse::Status {
+            status: DaemonManagementStatus {
+                daemon_version: "1.2.3".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                pid: 42,
+                root: "/tmp/agentd".to_string(),
+                socket: "/tmp/agentd/agentd.sock".to_string(),
+                running_sessions: false,
+            },
+        };
+        write_daemon_management_response(&mut writer, &response)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let decoded = super::read_daemon_management_response(&mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[tokio::test]
+    async fn incoming_request_accepts_daemon_management_version() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        writer
+            .write_all(&super::FRAME_MAGIC.to_le_bytes())
+            .await
+            .unwrap();
+        writer
+            .write_all(&DAEMON_MANAGEMENT_VERSION.to_le_bytes())
+            .await
+            .unwrap();
+        writer
+            .write_all(&super::DAEMON_STATUS_REQUEST_KIND.to_le_bytes())
+            .await
+            .unwrap();
+        writer.write_all(&0_u16.to_le_bytes()).await.unwrap();
+        writer.write_all(&0_u16.to_le_bytes()).await.unwrap();
+        writer.write_all(&0_u32.to_le_bytes()).await.unwrap();
+        drop(writer);
+
+        let incoming = read_incoming_request(&mut reader).await.unwrap().unwrap();
+        assert_eq!(
+            incoming,
+            IncomingRequest::DaemonManagement(DaemonManagementRequest::Status)
+        );
     }
 
     #[test]

@@ -17,12 +17,20 @@ pub struct Database {
 pub struct NewSession<'a> {
     pub session_id: &'a str,
     pub agent: &'a str,
+    pub agent_command: &'a str,
+    pub agent_args_json: &'a str,
     pub workspace: &'a str,
     pub repo_path: &'a str,
     pub task: &'a str,
     pub base_branch: &'a str,
     pub branch: &'a str,
     pub worktree: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLaunchInfo {
+    pub command: Option<String>,
+    pub args: Option<Vec<String>>,
 }
 
 impl Database {
@@ -44,6 +52,8 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 agent TEXT NOT NULL,
+                agent_command TEXT,
+                agent_args_json TEXT,
                 workspace TEXT NOT NULL,
                 repo_path TEXT,
                 task TEXT NOT NULL,
@@ -73,6 +83,16 @@ impl Database {
             &conn,
             "repo_path",
             "ALTER TABLE sessions ADD COLUMN repo_path TEXT",
+        )?;
+        self.ensure_column(
+            &conn,
+            "agent_command",
+            "ALTER TABLE sessions ADD COLUMN agent_command TEXT",
+        )?;
+        self.ensure_column(
+            &conn,
+            "agent_args_json",
+            "ALTER TABLE sessions ADD COLUMN agent_args_json TEXT",
         )?;
         self.ensure_column(
             &conn,
@@ -107,12 +127,14 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO sessions (
-                session_id, agent, workspace, repo_path, task, base_branch, branch, worktree,
-                status, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                session_id, agent, agent_command, agent_args_json, workspace, repo_path, task,
+                base_branch, branch, worktree, status, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
             params![
                 new_session.session_id,
                 new_session.agent,
+                new_session.agent_command,
+                new_session.agent_args_json,
                 new_session.workspace,
                 new_session.repo_path,
                 new_session.task,
@@ -127,11 +149,49 @@ impl Database {
     }
 
     pub fn mark_running(&self, session_id: &str, pid: u32) -> Result<()> {
-        self.update_state(session_id, SessionStatus::Running, Some(pid), None, None)
+        let conn = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE sessions
+             SET status = ?2,
+                 pid = ?3,
+                 exit_code = NULL,
+                 error = NULL,
+                 updated_at = ?4,
+                 exited_at = NULL
+             WHERE session_id = ?1",
+            params![session_id, status_to_str(SessionStatus::Running), pid, now],
+        )?;
+        Ok(())
     }
 
     pub fn mark_failed(&self, session_id: &str, error: String) -> Result<()> {
-        self.update_state(session_id, SessionStatus::Failed, None, None, Some(error))
+        let conn = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE sessions
+             SET status = ?2, pid = NULL, error = ?3, updated_at = ?4
+             WHERE session_id = ?1",
+            params![session_id, status_to_str(SessionStatus::Failed), error, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_paused(&self, session_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE sessions
+             SET status = ?2,
+                 pid = NULL,
+                 exit_code = NULL,
+                 error = NULL,
+                 updated_at = ?3,
+                 exited_at = NULL
+             WHERE session_id = ?1",
+            params![session_id, status_to_str(SessionStatus::Paused), now],
+        )?;
+        Ok(())
     }
 
     pub fn mark_exited(&self, session_id: &str, exit_code: Option<i32>) -> Result<()> {
@@ -139,7 +199,7 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE sessions
-             SET status = ?2, exit_code = ?3, updated_at = ?4, exited_at = ?4
+             SET status = ?2, pid = NULL, exit_code = ?3, updated_at = ?4, exited_at = ?4
              WHERE session_id = ?1",
             params![
                 session_id,
@@ -152,39 +212,15 @@ impl Database {
     }
 
     pub fn mark_unknown_recovered(&self, session_id: &str) -> Result<()> {
-        self.update_state(
-            session_id,
-            SessionStatus::UnknownRecovered,
-            None,
-            None,
-            None,
-        )
-    }
-
-    fn update_state(
-        &self,
-        session_id: &str,
-        status: SessionStatus,
-        pid: Option<u32>,
-        exit_code: Option<i32>,
-        error: Option<String>,
-    ) -> Result<()> {
         let conn = self.connect()?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE sessions
-             SET status = ?2,
-                 pid = COALESCE(?3, pid),
-                 exit_code = COALESCE(?4, exit_code),
-                 error = COALESCE(?5, error),
-                 updated_at = ?6
+             SET status = ?2, pid = NULL, updated_at = ?3
              WHERE session_id = ?1",
             params![
                 session_id,
-                status_to_str(status),
-                pid,
-                exit_code,
-                error,
+                status_to_str(SessionStatus::UnknownRecovered),
                 now
             ],
         )?;
@@ -214,6 +250,36 @@ impl Database {
         let rows = stmt.query_map([], row_to_session)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    pub fn set_launch_info(&self, session_id: &str, command: &str, args_json: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE sessions
+             SET agent_command = ?2, agent_args_json = ?3, updated_at = ?4
+             WHERE session_id = ?1",
+            params![session_id, command, args_json, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_launch_info(&self, session_id: &str) -> Result<Option<SessionLaunchInfo>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT agent_command, agent_args_json
+             FROM sessions
+             WHERE session_id = ?1",
+            params![session_id],
+            |row| {
+                Ok(SessionLaunchInfo {
+                    command: row.get(0)?,
+                    args: parse_agent_args_json(row.get(1)?)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
@@ -327,6 +393,15 @@ fn parse_payload(value: String) -> rusqlite::Result<Value> {
     })
 }
 
+fn parse_agent_args_json(value: Option<String>) -> rusqlite::Result<Option<Vec<String>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    serde_json::from_str(&value).map(Some).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
+}
+
 fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
     Ok(SessionEvent {
         id: row.get(0)?,
@@ -351,6 +426,7 @@ fn status_to_str(status: SessionStatus) -> &'static str {
     match status {
         SessionStatus::Creating => "creating",
         SessionStatus::Running => "running",
+        SessionStatus::Paused => "paused",
         SessionStatus::Exited => "exited",
         SessionStatus::Failed => "failed",
         SessionStatus::UnknownRecovered => "unknown_recovered",
@@ -361,6 +437,7 @@ fn str_to_status(value: &str) -> std::result::Result<SessionStatus, std::io::Err
     match value {
         "creating" => Ok(SessionStatus::Creating),
         "running" => Ok(SessionStatus::Running),
+        "paused" => Ok(SessionStatus::Paused),
         "exited" => Ok(SessionStatus::Exited),
         "failed" => Ok(SessionStatus::Failed),
         "unknown_recovered" => Ok(SessionStatus::UnknownRecovered),
@@ -403,6 +480,8 @@ mod tests {
         db.insert_session(&super::NewSession {
             session_id: "demo",
             agent: "codex",
+            agent_command: "codex",
+            agent_args_json: "[]",
             workspace: "/tmp/repo",
             repo_path: "/tmp/repo",
             task: "test",
@@ -445,6 +524,8 @@ mod tests {
         db.insert_session(&super::NewSession {
             session_id: "demo",
             agent: "codex",
+            agent_command: "codex",
+            agent_args_json: "[]",
             workspace: "/tmp/repo",
             repo_path: "/tmp/repo",
             task: "test",

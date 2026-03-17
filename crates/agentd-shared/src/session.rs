@@ -7,6 +7,7 @@ use slug::slugify;
 pub enum SessionStatus {
     Creating,
     Running,
+    Paused,
     Exited,
     Failed,
     UnknownRecovered,

@@ -1,5 +1,5 @@
 use std::{
-    io::{IsTerminal, Read, Write},
+    io::{IsTerminal, Write},
     path::PathBuf,
     process::Stdio,
     time::{Duration, Instant},
@@ -23,7 +23,11 @@ mod local;
 use agentd_shared::{
     config::Config,
     paths::AppPaths,
-    protocol::{DaemonInfo, PROTOCOL_VERSION, Request, Response, read_response, write_request},
+    protocol::{
+        DaemonInfo, DaemonManagementRequest, DaemonManagementResponse, DaemonManagementStatus,
+        PROTOCOL_VERSION, Request, Response, read_daemon_management_response, read_response,
+        write_daemon_management_request, write_request,
+    },
     session::{SessionDiff, SessionRecord, SessionStatus, WorktreeRecord},
 };
 
@@ -113,7 +117,10 @@ enum WorktreeCommand {
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
     Info,
-    Restart,
+    Restart {
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[tokio::main]
@@ -352,21 +359,17 @@ async fn main() -> Result<()> {
         }
         (Command::Daemon { command }, ExecutionMode::Daemon) => match command {
             DaemonCommand::Info => {
-                let info = daemon_info(&paths).await?;
-                println!("daemon_version: {}", info.daemon_version);
-                println!("protocol_version: {}", info.protocol_version);
-                println!("client_version: {}", env!("CARGO_PKG_VERSION"));
-                println!("expected_protocol_version: {}", PROTOCOL_VERSION);
+                let status = daemon_management_status(&paths).await?;
+                print_daemon_management_status(&status);
             }
-            DaemonCommand::Restart => {
-                restart_daemon(&paths).await?;
-                let info = daemon_info(&paths).await?;
-                println!("daemon_version: {}", info.daemon_version);
-                println!("protocol_version: {}", info.protocol_version);
+            DaemonCommand::Restart { force } => {
+                restart_daemon(&paths, force).await?;
+                let status = daemon_management_status(&paths).await?;
+                print_daemon_management_status(&status);
             }
         },
         (Command::Daemon { .. }, ExecutionMode::Local(reason)) => {
-            bail!("{reason}. daemon management requires a compatible daemon");
+            bail!("{reason}. daemon management requires a reachable daemon");
         }
     }
 
@@ -385,6 +388,13 @@ struct NewSessionOptions {
 }
 
 async fn resolve_execution_mode(paths: &AppPaths, command: &Command) -> Result<ExecutionMode> {
+    if matches!(command, Command::Daemon { .. }) {
+        if try_connect(paths).await.is_err() {
+            spawn_daemon(paths).await?;
+        }
+        return Ok(ExecutionMode::Daemon);
+    }
+
     if command_supports_local_mode(command) {
         if let Some(reason) = degraded_mode_reason(paths).await? {
             return Ok(ExecutionMode::Local(reason));
@@ -533,35 +543,41 @@ async fn daemon_info(paths: &AppPaths) -> Result<DaemonInfo> {
     }
 }
 
-async fn daemon_has_running_sessions(paths: &AppPaths) -> Result<bool> {
-    let binary_result = tokio::time::timeout(
+async fn daemon_management_status(paths: &AppPaths) -> Result<DaemonManagementStatus> {
+    let response = tokio::time::timeout(
         Duration::from_millis(250),
-        send_request_no_bootstrap(paths, &Request::ListSessions),
+        send_daemon_management_request(paths, &DaemonManagementRequest::Status),
     )
     .await;
-    match binary_result {
-        Ok(Ok(Response::Sessions { sessions })) => Ok(sessions
-            .iter()
-            .any(|session| session.status_string() == "running")),
-        Ok(Ok(Response::Error { message })) => bail!(message),
-        Ok(Ok(other)) => bail!("unexpected response: {:?}", other),
-        Ok(Err(err)) => Err(err).context(incompatible_daemon_message()),
-        Err(_) => bail!(incompatible_daemon_message()),
+    match response {
+        Ok(Ok(DaemonManagementResponse::Status { status })) => Ok(status),
+        Ok(Ok(DaemonManagementResponse::Error { message })) => bail!(message),
+        Ok(Ok(other)) => bail!("unexpected daemon management response: {:?}", other),
+        Ok(Err(err)) => Err(err).context("daemon management status request failed"),
+        Err(_) => bail!("timed out waiting for daemon management status"),
     }
 }
 
-async fn shutdown_or_kill_daemon(paths: &AppPaths) -> Result<()> {
+async fn request_daemon_shutdown(paths: &AppPaths, force: bool) -> Result<()> {
     let shutdown_result = tokio::time::timeout(
         Duration::from_millis(250),
-        send_request_no_bootstrap(paths, &Request::ShutdownDaemon),
+        send_daemon_management_request(paths, &DaemonManagementRequest::Shutdown { force }),
     )
     .await;
     match shutdown_result {
-        Ok(Ok(Response::Ok)) => {}
-        Ok(Ok(Response::Error { message })) => bail!(message),
-        Ok(Ok(_)) => bail!(incompatible_daemon_message()),
-        Ok(Err(err)) => return Err(err).context(incompatible_daemon_message()),
-        Err(_) => bail!(incompatible_daemon_message()),
+        Ok(Ok(DaemonManagementResponse::Shutdown {
+            stopped,
+            running_sessions: _,
+            message,
+        })) => {
+            if !stopped {
+                bail!(message);
+            }
+        }
+        Ok(Ok(DaemonManagementResponse::Error { message })) => bail!(message),
+        Ok(Ok(other)) => bail!("unexpected daemon management response: {:?}", other),
+        Ok(Err(err)) => return Err(err).context("daemon management shutdown request failed"),
+        Err(_) => bail!("timed out waiting for daemon management shutdown"),
     }
     wait_for_daemon_stop(paths).await
 }
@@ -579,13 +595,14 @@ async fn wait_for_daemon_stop(paths: &AppPaths) -> Result<()> {
     }
 }
 
-async fn restart_daemon(paths: &AppPaths) -> Result<()> {
+async fn restart_daemon(paths: &AppPaths, force: bool) -> Result<()> {
     match try_connect(paths).await {
         Ok(_) => {
-            if daemon_has_running_sessions(paths).await? {
+            let status = daemon_management_status(paths).await?;
+            if status.running_sessions && !force {
                 bail!("cannot restart agentd while sessions are running");
             }
-            shutdown_or_kill_daemon(paths).await?;
+            request_daemon_shutdown(paths, force).await?;
             spawn_daemon(paths).await?;
             ensure_compatible_daemon(paths).await
         }
@@ -613,6 +630,32 @@ async fn send_request_no_bootstrap(paths: &AppPaths, request: &Request) -> Resul
 
 fn incompatible_daemon_message() -> &'static str {
     "agentd is incompatible with this agent build; restart or stop the running daemon and try again"
+}
+
+async fn send_daemon_management_request(
+    paths: &AppPaths,
+    request: &DaemonManagementRequest,
+) -> Result<DaemonManagementResponse> {
+    let mut stream = try_connect(paths).await?;
+    write_daemon_management_request(&mut stream, request).await?;
+
+    let mut reader = BufReader::new(stream);
+    let Some(response) = read_daemon_management_response(&mut reader).await? else {
+        bail!("agentd closed the management connection");
+    };
+    Ok(response)
+}
+
+fn print_daemon_management_status(status: &DaemonManagementStatus) {
+    println!("source: daemon_management");
+    println!("daemon_version: {}", status.daemon_version);
+    println!("daemon_protocol_version: {}", status.protocol_version);
+    println!("client_version: {}", env!("CARGO_PKG_VERSION"));
+    println!("expected_protocol_version: {}", PROTOCOL_VERSION);
+    println!("pid: {}", status.pid);
+    println!("root: {}", status.root);
+    println!("socket: {}", status.socket);
+    println!("running_sessions: {}", status.running_sessions);
 }
 
 async fn stream_logs(paths: &AppPaths, session_id: &str, follow: bool) -> Result<()> {
@@ -777,7 +820,7 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
         other => bail!("unexpected response: {:?}", other),
     };
 
-    eprintln!("attached to {session_id}; detach with Ctrl-] or Enter ~.");
+    eprintln!("attached to {session_id}; detach with Ctrl-]");
     let _screen = TerminalScreenGuard::enter()?;
     let _raw_mode = RawModeGuard::new()?;
     execute!(std::io::stdout(), MoveTo(0, 0), Clear(ClearType::All))
@@ -900,109 +943,113 @@ fn print_kill_result(session_id: &str, was_running: bool, removed: bool) {
 }
 
 fn read_attach_stdin(tx: mpsc::UnboundedSender<AttachInput>) -> Result<()> {
-    let mut stdin = std::io::stdin();
-    let mut buffer = [0_u8; 1024];
-    let mut parser = AttachDetachParser::default();
+    let mut parser = AttachKeyBindingParser;
     loop {
-        let count = stdin.read(&mut buffer)?;
-        if count == 0 {
-            if let Some(data) = parser.finish() {
-                let _ = tx.send(AttachInput::Data(data));
-            }
-            let _ = tx.send(AttachInput::Detach);
-            break;
-        }
+        let event = event::read().context("failed to read attach input")?;
+        let Some(input) = parser.parse_event(event) else {
+            continue;
+        };
 
-        match parser.push_bytes(&buffer[..count]) {
-            ParsedAttachInput::None => {}
-            ParsedAttachInput::Data(data) => {
+        match input {
+            AttachInput::Data(data) => {
                 if tx.send(AttachInput::Data(data)).is_err() {
                     break;
                 }
             }
-            ParsedAttachInput::DetachWithData(data) => {
-                if !data.is_empty() && tx.send(AttachInput::Data(data)).is_err() {
-                    break;
-                }
+            AttachInput::Detach => {
                 let _ = tx.send(AttachInput::Detach);
                 break;
             }
-            ParsedAttachInput::Detach => {
-                let _ = tx.send(AttachInput::Detach);
-                break;
-            }
-        }
+        };
     }
     Ok(())
 }
 
-#[derive(Default)]
-struct AttachDetachParser {
-    line_start: bool,
-    pending_tilde: bool,
-}
+struct AttachKeyBindingParser;
 
-impl AttachDetachParser {
-    fn push_bytes(&mut self, bytes: &[u8]) -> ParsedAttachInput {
-        let mut output = Vec::with_capacity(bytes.len());
-
-        for &byte in bytes {
-            if self.pending_tilde {
-                self.pending_tilde = false;
-                if byte == b'.' {
-                    return if output.is_empty() {
-                        ParsedAttachInput::Detach
-                    } else {
-                        ParsedAttachInput::DetachWithData(output)
-                    };
-                }
-
-                output.push(b'~');
-            }
-
-            if byte == DETACH_BYTE {
-                return if output.is_empty() {
-                    ParsedAttachInput::Detach
-                } else {
-                    ParsedAttachInput::DetachWithData(output)
-                };
-            }
-
-            if self.line_start && byte == b'~' {
-                self.pending_tilde = true;
-                self.line_start = false;
-                continue;
-            }
-
-            output.push(byte);
-            self.line_start = byte == b'\n' || byte == b'\r';
-        }
-
-        if output.is_empty() {
-            ParsedAttachInput::None
-        } else {
-            ParsedAttachInput::Data(output)
+impl AttachKeyBindingParser {
+    fn parse_event(&mut self, event: Event) -> Option<AttachInput> {
+        match event {
+            Event::Key(key) => self.parse_key_event(key),
+            Event::Paste(data) => Some(AttachInput::Data(data.into_bytes())),
+            Event::FocusGained | Event::FocusLost | Event::Mouse(_) | Event::Resize(_, _) => None,
         }
     }
 
-    fn finish(&mut self) -> Option<Vec<u8>> {
-        if self.pending_tilde {
-            self.pending_tilde = false;
-            Some(vec![b'~'])
-        } else {
-            None
+    fn parse_key_event(&mut self, key: crossterm::event::KeyEvent) -> Option<AttachInput> {
+        if key.kind != KeyEventKind::Press {
+            return None;
         }
+
+        if is_attach_detach_key(&key) {
+            return Some(AttachInput::Detach);
+        }
+
+        encode_attach_key(key).map(AttachInput::Data)
     }
 }
 
-enum ParsedAttachInput {
-    None,
-    Data(Vec<u8>),
-    DetachWithData(Vec<u8>),
-    Detach,
+fn is_attach_detach_key(key: &crossterm::event::KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char(']'))
 }
 
-const DETACH_BYTE: u8 = 29;
+fn encode_attach_key(key: crossterm::event::KeyEvent) -> Option<Vec<u8>> {
+    let mut bytes = match key.code {
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Left => b"\x1b[D".to_vec(),
+        KeyCode::Right => b"\x1b[C".to_vec(),
+        KeyCode::Up => b"\x1b[A".to_vec(),
+        KeyCode::Down => b"\x1b[B".to_vec(),
+        KeyCode::Home => b"\x1b[H".to_vec(),
+        KeyCode::End => b"\x1b[F".to_vec(),
+        KeyCode::PageUp => b"\x1b[5~".to_vec(),
+        KeyCode::PageDown => b"\x1b[6~".to_vec(),
+        KeyCode::Tab => {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                b"\x1b[Z".to_vec()
+            } else {
+                vec![b'\t']
+            }
+        }
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
+        KeyCode::Delete => b"\x1b[3~".to_vec(),
+        KeyCode::Insert => b"\x1b[2~".to_vec(),
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::Char(ch) => encode_attach_char(ch, key.modifiers)?,
+        _ => return None,
+    };
+
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        bytes.insert(0, 0x1b);
+    }
+
+    Some(bytes)
+}
+
+fn encode_attach_char(ch: char, modifiers: KeyModifiers) -> Option<Vec<u8>> {
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        return control_char_byte(ch).map(|byte| vec![byte]);
+    }
+
+    let mut bytes = [0_u8; 4];
+    Some(ch.encode_utf8(&mut bytes).as_bytes().to_vec())
+}
+
+fn control_char_byte(ch: char) -> Option<u8> {
+    match ch {
+        '@' | ' ' => Some(0),
+        'a'..='z' => Some((ch as u8) - b'a' + 1),
+        'A'..='Z' => Some((ch as u8) - b'A' + 1),
+        '[' => Some(27),
+        '\\' => Some(28),
+        ']' => Some(29),
+        '^' => Some(30),
+        '_' => Some(31),
+        '?' => Some(127),
+        _ => None,
+    }
+}
 
 enum AttachInput {
     Data(Vec<u8>),
@@ -1033,6 +1080,7 @@ fn format_session_end_summary(summary: &SessionEndSummary) -> String {
             Some(error) => format!("session {} failed: {error}", summary.session_id),
             None => format!("session {} failed", summary.session_id),
         },
+        SessionStatus::Paused => format!("session {} paused", summary.session_id),
         SessionStatus::Exited | SessionStatus::UnknownRecovered => match summary.exit_code {
             Some(code) => format!("session {} finished (exit {code})", summary.session_id),
             None => format!("session {} finished", summary.session_id),
@@ -1083,6 +1131,7 @@ impl StatusString for SessionRecord {
         match self.status {
             SessionStatus::Creating => "creating",
             SessionStatus::Running => "running",
+            SessionStatus::Paused => "paused",
             SessionStatus::Exited => "exited",
             SessionStatus::Failed => "failed",
             SessionStatus::UnknownRecovered => "unknown_recovered",
@@ -1297,11 +1346,12 @@ fn fuzzy_score(haystack: &str, needle: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachDetachParser, Cli, Command, ParsedAttachInput, SessionEndSummary,
+        AttachInput, AttachKeyBindingParser, Cli, Command, DaemonCommand, SessionEndSummary,
         format_session_end_summary, resolve_detach_session_id, resolve_new_session_options,
     };
     use agentd_shared::session::SessionStatus;
     use clap::Parser;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::path::PathBuf;
 
     #[test]
@@ -1380,6 +1430,17 @@ mod tests {
     }
 
     #[test]
+    fn daemon_restart_parses_force_flag() {
+        let cli = Cli::try_parse_from(["agent", "daemon", "restart", "--force"]).unwrap();
+        match cli.command {
+            Command::Daemon {
+                command: DaemonCommand::Restart { force },
+            } => assert!(force),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn resolve_detach_session_id_prefers_explicit_value() {
         unsafe {
             std::env::set_var("AGENTD_SESSION_ID", "env-session");
@@ -1411,41 +1472,101 @@ mod tests {
 
     #[test]
     fn attach_parser_detaches_on_ctrl_right_bracket() {
-        let mut parser = AttachDetachParser::default();
+        let mut parser = AttachKeyBindingParser;
         assert!(matches!(
-            parser.push_bytes(&[29]),
-            ParsedAttachInput::Detach
+            parser.parse_event(Event::Key(key_event(
+                KeyCode::Char(']'),
+                KeyModifiers::CONTROL
+            ))),
+            Some(AttachInput::Detach)
         ));
     }
 
     #[test]
-    fn attach_parser_detaches_on_ssh_style_escape() {
-        let mut parser = AttachDetachParser::default();
+    fn attach_parser_emits_printable_bytes() {
+        let mut parser = AttachKeyBindingParser;
         assert!(matches!(
-            parser.push_bytes(b"hello\r~."),
-            ParsedAttachInput::DetachWithData(data) if data == b"hello\r"
+            parser.parse_event(Event::Key(key_event(KeyCode::Char('x'), KeyModifiers::NONE))),
+            Some(AttachInput::Data(data)) if data == b"x"
         ));
     }
 
     #[test]
-    fn attach_parser_preserves_non_detach_tilde_sequences() {
-        let mut parser = AttachDetachParser::default();
+    fn attach_parser_encodes_special_keys() {
+        let mut parser = AttachKeyBindingParser;
         assert!(matches!(
-            parser.push_bytes(b"\r~x"),
-            ParsedAttachInput::Data(data) if data == b"\r~x"
+            parser.parse_event(Event::Key(key_event(KeyCode::Enter, KeyModifiers::NONE))),
+            Some(AttachInput::Data(data)) if data == b"\r"
+        ));
+        assert!(matches!(
+            parser.parse_event(Event::Key(key_event(KeyCode::Backspace, KeyModifiers::NONE))),
+            Some(AttachInput::Data(data)) if data == [0x7f]
+        ));
+        assert!(matches!(
+            parser.parse_event(Event::Key(key_event(KeyCode::Tab, KeyModifiers::NONE))),
+            Some(AttachInput::Data(data)) if data == b"\t"
+        ));
+        assert!(matches!(
+            parser.parse_event(Event::Key(key_event(KeyCode::Esc, KeyModifiers::NONE))),
+            Some(AttachInput::Data(data)) if data == [0x1b]
         ));
     }
 
     #[test]
-    fn attach_parser_handles_split_escape_sequence() {
-        let mut parser = AttachDetachParser::default();
+    fn attach_parser_encodes_navigation_keys_as_ansi() {
+        let mut parser = AttachKeyBindingParser;
         assert!(matches!(
-            parser.push_bytes(b"\r~"),
-            ParsedAttachInput::Data(data) if data == b"\r"
+            parser.parse_event(Event::Key(key_event(KeyCode::Up, KeyModifiers::NONE))),
+            Some(AttachInput::Data(data)) if data == b"\x1b[A"
         ));
         assert!(matches!(
-            parser.push_bytes(b"."),
-            ParsedAttachInput::Detach
+            parser.parse_event(Event::Key(key_event(KeyCode::Left, KeyModifiers::NONE))),
+            Some(AttachInput::Data(data)) if data == b"\x1b[D"
+        ));
+    }
+
+    #[test]
+    fn attach_parser_forwards_paste_bytes() {
+        let mut parser = AttachKeyBindingParser;
+        assert!(matches!(
+            parser.parse_event(Event::Paste("hello".to_string())),
+            Some(AttachInput::Data(data)) if data == b"hello"
+        ));
+    }
+
+    #[test]
+    fn attach_parser_ignores_non_press_events() {
+        let mut parser = AttachKeyBindingParser;
+        assert!(
+            parser
+                .parse_event(Event::Key(KeyEvent {
+                    code: KeyCode::Char('x'),
+                    modifiers: KeyModifiers::NONE,
+                    kind: KeyEventKind::Release,
+                    state: KeyEventState::empty(),
+                }))
+                .is_none()
+        );
+    }
+
+    fn key_event(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
+    #[test]
+    fn attach_parser_encodes_alt_modified_input() {
+        let mut parser = AttachKeyBindingParser;
+        assert!(matches!(
+            parser.parse_event(Event::Key(key_event(
+                KeyCode::Char('x'),
+                KeyModifiers::ALT
+            ))),
+            Some(AttachInput::Data(data)) if data == b"\x1bx"
         ));
     }
 
