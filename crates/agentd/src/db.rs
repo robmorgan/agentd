@@ -19,6 +19,7 @@ pub struct NewSession<'a> {
     pub agent: &'a str,
     pub agent_command: &'a str,
     pub agent_args_json: &'a str,
+    pub resume_session_id: Option<&'a str>,
     pub workspace: &'a str,
     pub repo_path: &'a str,
     pub task: &'a str,
@@ -54,6 +55,7 @@ impl Database {
                 agent TEXT NOT NULL,
                 agent_command TEXT,
                 agent_args_json TEXT,
+                resume_session_id TEXT,
                 workspace TEXT NOT NULL,
                 repo_path TEXT,
                 task TEXT NOT NULL,
@@ -96,6 +98,11 @@ impl Database {
         )?;
         self.ensure_column(
             &conn,
+            "resume_session_id",
+            "ALTER TABLE sessions ADD COLUMN resume_session_id TEXT",
+        )?;
+        self.ensure_column(
+            &conn,
             "base_branch",
             "ALTER TABLE sessions ADD COLUMN base_branch TEXT",
         )?;
@@ -127,14 +134,15 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO sessions (
-                session_id, agent, agent_command, agent_args_json, workspace, repo_path, task,
-                base_branch, branch, worktree, status, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+                session_id, agent, agent_command, agent_args_json, resume_session_id, workspace,
+                repo_path, task, base_branch, branch, worktree, status, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
             params![
                 new_session.session_id,
                 new_session.agent,
                 new_session.agent_command,
                 new_session.agent_args_json,
+                new_session.resume_session_id,
                 new_session.workspace,
                 new_session.repo_path,
                 new_session.task,
@@ -280,6 +288,30 @@ impl Database {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    pub fn set_resume_session_id(&self, session_id: &str, resume_session_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE sessions
+             SET resume_session_id = ?2, updated_at = ?3
+             WHERE session_id = ?1",
+            params![session_id, resume_session_id, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_resume_session_id(&self, session_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let resume_session_id = conn
+            .query_row(
+            "SELECT resume_session_id FROM sessions WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+        Ok(resume_session_id.flatten())
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
@@ -482,6 +514,7 @@ mod tests {
             agent: "codex",
             agent_command: "codex",
             agent_args_json: "[]",
+            resume_session_id: None,
             workspace: "/tmp/repo",
             repo_path: "/tmp/repo",
             task: "test",
@@ -526,6 +559,7 @@ mod tests {
             agent: "codex",
             agent_command: "codex",
             agent_args_json: "[]",
+            resume_session_id: None,
             workspace: "/tmp/repo",
             repo_path: "/tmp/repo",
             task: "test",
@@ -546,5 +580,33 @@ mod tests {
         db.delete_session("demo").unwrap();
 
         assert!(db.list_events_since("demo", None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn resume_session_id_round_trips() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        db.insert_session(&super::NewSession {
+            session_id: "demo",
+            agent: "codex",
+            agent_command: "codex",
+            agent_args_json: "[]",
+            resume_session_id: None,
+            workspace: "/tmp/repo",
+            repo_path: "/tmp/repo",
+            task: "test",
+            base_branch: "main",
+            branch: "agent/test",
+            worktree: "/tmp/worktree",
+        })
+        .unwrap();
+
+        assert!(db.get_resume_session_id("demo").unwrap().is_none());
+        db.set_resume_session_id("demo", "thread-123").unwrap();
+        assert_eq!(
+            db.get_resume_session_id("demo").unwrap().as_deref(),
+            Some("thread-123")
+        );
     }
 }

@@ -31,6 +31,7 @@ use agentd_shared::{
 };
 
 use crate::{
+    codex,
     db::{Database, NewSession, SessionLaunchInfo},
     git,
     ids::generate_session_id,
@@ -83,6 +84,7 @@ impl AppState {
                 agent: &agent_name,
                 agent_command: &agent.command,
                 agent_args_json: &agent_args_json,
+                resume_session_id: None,
                 workspace: repo_root.as_str(),
                 repo_path: repo_root.as_str(),
                 task: &task_text,
@@ -132,6 +134,7 @@ impl AppState {
                     task_text: &task_text,
                     log_path: &log_path,
                     launch: &launch,
+                    resume_session_id: None,
                     mode: SessionStartMode::Create,
                 },
             ) {
@@ -230,6 +233,28 @@ impl AppState {
             let branch = session.branch.clone();
             let task_text = session.task.clone();
             let log_path = self.paths.log_path(&session.session_id);
+            let resume_session_id = match self.resolve_resume_session_id(&session, &launch).await {
+                Ok(Some(resume_session_id)) => resume_session_id,
+                Ok(None) => {
+                    let error = format!(
+                        "session `{}` does not have an exact Codex resume id",
+                        session.session_id
+                    );
+                    let db = self.db.clone();
+                    let session_id = session.session_id.clone();
+                    task::spawn_blocking(move || record_session_failure(&db, &session_id, error))
+                        .await??;
+                    continue;
+                }
+                Err(err) => {
+                    let error = err.to_string();
+                    let db = self.db.clone();
+                    let session_id = session.session_id.clone();
+                    task::spawn_blocking(move || record_session_failure(&db, &session_id, error))
+                        .await??;
+                    continue;
+                }
+            };
 
             let result = task::spawn_blocking(move || {
                 start_session_runtime(
@@ -244,6 +269,7 @@ impl AppState {
                         task_text: &task_text,
                         log_path: &log_path,
                         launch: &launch,
+                        resume_session_id: Some(&resume_session_id),
                         mode: SessionStartMode::Resume,
                     },
                 )
@@ -280,6 +306,32 @@ impl AppState {
                 .get_launch_info(&session_id)?
                 .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
             resolve_launch_command(&config, &paths, &agent_name, launch)
+        })
+        .await?
+    }
+
+    async fn resolve_resume_session_id(
+        &self,
+        session: &SessionRecord,
+        launch: &LaunchCommand,
+    ) -> Result<Option<String>> {
+        if !is_resumable_command(&launch.command) {
+            return Ok(None);
+        }
+
+        let db = self.db.clone();
+        let session_id = session.session_id.clone();
+        let worktree = session.worktree.clone();
+        task::spawn_blocking(move || {
+            if let Some(resume_session_id) = db.get_resume_session_id(&session_id)? {
+                return Ok(Some(resume_session_id));
+            }
+
+            let discovered = codex::discover_resume_session_id(&worktree)?;
+            if let Some(ref resume_session_id) = discovered {
+                db.set_resume_session_id(&session_id, resume_session_id)?;
+            }
+            Ok(discovered)
         })
         .await?
     }
@@ -577,6 +629,7 @@ struct SessionStartRequest<'a> {
     task_text: &'a str,
     log_path: &'a Utf8PathBuf,
     launch: &'a LaunchCommand,
+    resume_session_id: Option<&'a str>,
     mode: SessionStartMode,
 }
 
@@ -656,8 +709,14 @@ fn start_session_runtime(
                 request.launch.agent_name
             );
         }
+        let resume_session_id = request.resume_session_id.ok_or_else(|| {
+            anyhow!(
+                "session `{}` does not have an exact Codex resume id",
+                request.session_id
+            )
+        })?;
         command.arg("resume");
-        command.arg("--last");
+        command.arg(resume_session_id);
     }
     command.cwd(request.worktree);
     for (key, value) in std::env::vars() {
@@ -690,7 +749,8 @@ fn start_session_runtime(
                 "pid": pid,
                 "agent": request.launch.agent_name,
                 "branch": request.branch,
-                "worktree": request.worktree
+                "worktree": request.worktree,
+                "resume_session_id": request.resume_session_id
             }),
         )],
     )?;

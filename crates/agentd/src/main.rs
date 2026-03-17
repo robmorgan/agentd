@@ -1,4 +1,5 @@
 mod app;
+mod codex;
 mod db;
 mod git;
 mod ids;
@@ -87,7 +88,14 @@ async fn upgrade_daemon() -> Result<()> {
             unsupported.push(format!("{} ({})", session.session_id, session.agent));
             continue;
         }
-        resolved.push((session.clone(), launch));
+        let resume_session_id = resolve_resume_session_id_for_upgrade(&db, session, &launch)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "session `{}` does not have an exact Codex resume id yet",
+                    session.session_id
+                )
+            })?;
+        resolved.push((session.clone(), launch, resume_session_id));
     }
 
     if !unsupported.is_empty() {
@@ -97,15 +105,16 @@ async fn upgrade_daemon() -> Result<()> {
         );
     }
 
-    for (session, launch) in &resolved {
+    for (session, launch, resume_session_id) in &resolved {
         let args_json =
             serde_json::to_string(&launch.args).context("failed to serialize agent args")?;
         db.set_launch_info(&session.session_id, &launch.command, &args_json)?;
+        db.set_resume_session_id(&session.session_id, resume_session_id)?;
     }
 
     stop_existing_daemon(&paths).await?;
 
-    for (session, launch) in &resolved {
+    for (session, launch, resume_session_id) in &resolved {
         db.mark_paused(&session.session_id)?;
         db.append_events(
             &session.session_id,
@@ -114,6 +123,7 @@ async fn upgrade_daemon() -> Result<()> {
                 payload_json: serde_json::json!({
                     "source": "daemon",
                     "agent": launch.agent_name,
+                    "resume_session_id": resume_session_id,
                 }),
             }],
         )?;
@@ -160,6 +170,26 @@ fn resolve_launch_for_upgrade(
         command,
         args,
     })
+}
+
+fn resolve_resume_session_id_for_upgrade(
+    db: &Database,
+    session: &SessionRecord,
+    launch: &LaunchCommand,
+) -> Result<Option<String>> {
+    if !is_resumable_command(&launch.command) {
+        return Ok(None);
+    }
+
+    if let Some(resume_session_id) = db.get_resume_session_id(&session.session_id)? {
+        return Ok(Some(resume_session_id));
+    }
+
+    let discovered = codex::discover_resume_session_id(&session.worktree)?;
+    if let Some(ref resume_session_id) = discovered {
+        db.set_resume_session_id(&session.session_id, resume_session_id)?;
+    }
+    Ok(discovered)
 }
 
 async fn stop_existing_daemon(paths: &AppPaths) -> Result<()> {
