@@ -733,6 +733,10 @@ async fn attach_session(paths: &AppPaths, session_id: &str) -> Result<()> {
     loop {
         match attach_session_once(paths, &next_session_id).await? {
             AttachOutcome::Detached => return Ok(()),
+            AttachOutcome::SessionEnded(summary) => {
+                print_session_end_summary(&summary);
+                return Ok(());
+            }
             AttachOutcome::SwitchSession(session_id) => next_session_id = session_id,
         }
     }
@@ -756,11 +760,24 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
 
     let snapshot = match response {
         Response::Attached { snapshot } => snapshot,
+        Response::SessionEnded {
+            session_id,
+            status,
+            exit_code,
+            error,
+        } => {
+            return Ok(AttachOutcome::SessionEnded(SessionEndSummary {
+                session_id,
+                status,
+                exit_code,
+                error,
+            }));
+        }
         Response::Error { message } => bail!(message),
         other => bail!("unexpected response: {:?}", other),
     };
 
-    eprintln!("attached to {session_id}; detach with Ctrl-]");
+    eprintln!("attached to {session_id}; detach with Ctrl-] or Enter ~.");
     let _screen = TerminalScreenGuard::enter()?;
     let _raw_mode = RawModeGuard::new()?;
     execute!(std::io::stdout(), MoveTo(0, 0), Clear(ClearType::All))
@@ -788,6 +805,21 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
                         drop(write_half);
                         stdin_task.abort();
                         return Ok(AttachOutcome::SwitchSession(session_id));
+                    }
+                    Response::SessionEnded {
+                        session_id,
+                        status,
+                        exit_code,
+                        error,
+                    } => {
+                        drop(write_half);
+                        stdin_task.abort();
+                        return Ok(AttachOutcome::SessionEnded(SessionEndSummary {
+                            session_id,
+                            status,
+                            exit_code,
+                            error,
+                        }));
                     }
                     Response::EndOfStream => break,
                     Response::Error { message } => bail!(message),
@@ -870,29 +902,104 @@ fn print_kill_result(session_id: &str, was_running: bool, removed: bool) {
 fn read_attach_stdin(tx: mpsc::UnboundedSender<AttachInput>) -> Result<()> {
     let mut stdin = std::io::stdin();
     let mut buffer = [0_u8; 1024];
+    let mut parser = AttachDetachParser::default();
     loop {
         let count = stdin.read(&mut buffer)?;
         if count == 0 {
-            let _ = tx.send(AttachInput::Detach);
-            break;
-        }
-
-        let bytes = &buffer[..count];
-        if let Some(index) = bytes.iter().position(|byte| *byte == DETACH_BYTE) {
-            if index > 0 {
-                let data = bytes[..index].to_vec();
+            if let Some(data) = parser.finish() {
                 let _ = tx.send(AttachInput::Data(data));
             }
             let _ = tx.send(AttachInput::Detach);
             break;
         }
 
-        let data = bytes.to_vec();
-        if tx.send(AttachInput::Data(data)).is_err() {
-            break;
+        match parser.push_bytes(&buffer[..count]) {
+            ParsedAttachInput::None => {}
+            ParsedAttachInput::Data(data) => {
+                if tx.send(AttachInput::Data(data)).is_err() {
+                    break;
+                }
+            }
+            ParsedAttachInput::DetachWithData(data) => {
+                if !data.is_empty() && tx.send(AttachInput::Data(data)).is_err() {
+                    break;
+                }
+                let _ = tx.send(AttachInput::Detach);
+                break;
+            }
+            ParsedAttachInput::Detach => {
+                let _ = tx.send(AttachInput::Detach);
+                break;
+            }
         }
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct AttachDetachParser {
+    line_start: bool,
+    pending_tilde: bool,
+}
+
+impl AttachDetachParser {
+    fn push_bytes(&mut self, bytes: &[u8]) -> ParsedAttachInput {
+        let mut output = Vec::with_capacity(bytes.len());
+
+        for &byte in bytes {
+            if self.pending_tilde {
+                self.pending_tilde = false;
+                if byte == b'.' {
+                    return if output.is_empty() {
+                        ParsedAttachInput::Detach
+                    } else {
+                        ParsedAttachInput::DetachWithData(output)
+                    };
+                }
+
+                output.push(b'~');
+            }
+
+            if byte == DETACH_BYTE {
+                return if output.is_empty() {
+                    ParsedAttachInput::Detach
+                } else {
+                    ParsedAttachInput::DetachWithData(output)
+                };
+            }
+
+            if self.line_start && byte == b'~' {
+                self.pending_tilde = true;
+                self.line_start = false;
+                continue;
+            }
+
+            output.push(byte);
+            self.line_start = byte == b'\n' || byte == b'\r';
+        }
+
+        if output.is_empty() {
+            ParsedAttachInput::None
+        } else {
+            ParsedAttachInput::Data(output)
+        }
+    }
+
+    fn finish(&mut self) -> Option<Vec<u8>> {
+        if self.pending_tilde {
+            self.pending_tilde = false;
+            Some(vec![b'~'])
+        } else {
+            None
+        }
+    }
+}
+
+enum ParsedAttachInput {
+    None,
+    Data(Vec<u8>),
+    DetachWithData(Vec<u8>),
+    Detach,
 }
 
 const DETACH_BYTE: u8 = 29;
@@ -904,7 +1011,36 @@ enum AttachInput {
 
 enum AttachOutcome {
     Detached,
+    SessionEnded(SessionEndSummary),
     SwitchSession(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionEndSummary {
+    session_id: String,
+    status: SessionStatus,
+    exit_code: Option<i32>,
+    error: Option<String>,
+}
+
+fn print_session_end_summary(summary: &SessionEndSummary) {
+    println!("{}", format_session_end_summary(summary));
+}
+
+fn format_session_end_summary(summary: &SessionEndSummary) -> String {
+    match summary.status {
+        SessionStatus::Failed => match &summary.error {
+            Some(error) => format!("session {} failed: {error}", summary.session_id),
+            None => format!("session {} failed", summary.session_id),
+        },
+        SessionStatus::Exited | SessionStatus::UnknownRecovered => match summary.exit_code {
+            Some(code) => format!("session {} finished (exit {code})", summary.session_id),
+            None => format!("session {} finished", summary.session_id),
+        },
+        SessionStatus::Creating | SessionStatus::Running => {
+            format!("session {} ended", summary.session_id)
+        }
+    }
 }
 
 struct RawModeGuard;
@@ -1160,7 +1296,11 @@ fn fuzzy_score(haystack: &str, needle: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, resolve_detach_session_id, resolve_new_session_options};
+    use super::{
+        AttachDetachParser, Cli, Command, ParsedAttachInput, SessionEndSummary,
+        format_session_end_summary, resolve_detach_session_id, resolve_new_session_options,
+    };
+    use agentd_shared::session::SessionStatus;
     use clap::Parser;
     use std::path::PathBuf;
 
@@ -1266,6 +1406,74 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("only works inside a managed session")
+        );
+    }
+
+    #[test]
+    fn attach_parser_detaches_on_ctrl_right_bracket() {
+        let mut parser = AttachDetachParser::default();
+        assert!(matches!(
+            parser.push_bytes(&[29]),
+            ParsedAttachInput::Detach
+        ));
+    }
+
+    #[test]
+    fn attach_parser_detaches_on_ssh_style_escape() {
+        let mut parser = AttachDetachParser::default();
+        assert!(matches!(
+            parser.push_bytes(b"hello\r~."),
+            ParsedAttachInput::DetachWithData(data) if data == b"hello\r"
+        ));
+    }
+
+    #[test]
+    fn attach_parser_preserves_non_detach_tilde_sequences() {
+        let mut parser = AttachDetachParser::default();
+        assert!(matches!(
+            parser.push_bytes(b"\r~x"),
+            ParsedAttachInput::Data(data) if data == b"\r~x"
+        ));
+    }
+
+    #[test]
+    fn attach_parser_handles_split_escape_sequence() {
+        let mut parser = AttachDetachParser::default();
+        assert!(matches!(
+            parser.push_bytes(b"\r~"),
+            ParsedAttachInput::Data(data) if data == b"\r"
+        ));
+        assert!(matches!(
+            parser.push_bytes(b"."),
+            ParsedAttachInput::Detach
+        ));
+    }
+
+    #[test]
+    fn format_session_end_summary_reports_exit_code() {
+        let summary = SessionEndSummary {
+            session_id: "demo".to_string(),
+            status: SessionStatus::Exited,
+            exit_code: Some(0),
+            error: None,
+        };
+        assert_eq!(
+            format_session_end_summary(&summary),
+            "session demo finished (exit 0)"
+        );
+    }
+
+    #[test]
+    fn format_session_end_summary_reports_failure_message() {
+        let summary = SessionEndSummary {
+            session_id: "demo".to_string(),
+            status: SessionStatus::Failed,
+            exit_code: Some(1),
+            error: Some("spawn failed".to_string()),
+        };
+        assert_eq!(
+            format_session_end_summary(&summary),
+            "session demo failed: spawn failed"
         );
     }
 }

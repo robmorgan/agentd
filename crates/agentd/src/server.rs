@@ -11,7 +11,7 @@ use agentd_shared::{
     config::Config,
     paths::AppPaths,
     protocol::{DaemonInfo, PROTOCOL_VERSION, Request, Response, read_request, write_response},
-    session::SessionStatus,
+    session::{SessionRecord, SessionStatus},
 };
 
 use crate::{app::AppState, db::Database};
@@ -305,19 +305,19 @@ async fn attach_session(
         match state.attach_session(session_id).await {
             Ok(attached) => attached,
             Err(err) => {
-                send_response(
-                    writer,
-                    &Response::Error {
+                let response = match ended_session_response(state, session_id).await? {
+                    Some(response) => response,
+                    None => Response::Error {
                         message: err.to_string(),
                     },
-                )
-                .await?;
+                };
+                send_response(writer, &response).await?;
                 return Ok(());
             }
         };
 
     send_response(writer, &Response::Attached { snapshot }).await?;
-    let mut send_end_of_stream = true;
+    let mut final_response = Some(Response::EndOfStream);
 
     loop {
         tokio::select! {
@@ -330,7 +330,10 @@ async fn attach_session(
                     .await?
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Closed) => {
+                    final_response = end_of_attach_response(state, session_id).await?;
+                    break;
+                }
             },
             control = control_rx.recv() => match control {
                 Ok(crate::app::AttachControl::SwitchSession(target_session_id)) => {
@@ -339,12 +342,15 @@ async fn attach_session(
                         &Response::SwitchSession { session_id: target_session_id },
                     )
                     .await?;
-                    send_end_of_stream = false;
+                    final_response = None;
                     break;
                 }
                 Ok(crate::app::AttachControl::Detach) => break,
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Closed) => {
+                    final_response = end_of_attach_response(state, session_id).await?;
+                    break;
+                }
             },
             request = read_request(reader) => {
                 let Some(request) = request? else {
@@ -353,24 +359,19 @@ async fn attach_session(
                 match request {
                     Request::AttachInput { data } => {
                         if let Err(err) = state.write_attached_input(session_id, data).await {
-                            send_response(
-                                writer,
-                                &Response::Error {
+                            final_response = Some(match ended_session_response(state, session_id).await? {
+                                Some(response) => response,
+                                None => Response::Error {
                                     message: err.to_string(),
                                 },
-                            )
-                            .await?;
+                            });
                             break;
                         }
                     }
                     other => {
-                        send_response(
-                            writer,
-                            &Response::Error {
-                                message: format!("unexpected request during attach: {other:?}"),
-                            },
-                        )
-                        .await?;
+                        final_response = Some(Response::Error {
+                            message: format!("unexpected request during attach: {other:?}"),
+                        });
                         break;
                     }
                 }
@@ -378,10 +379,36 @@ async fn attach_session(
         }
     }
 
-    if send_end_of_stream {
-        send_response(writer, &Response::EndOfStream).await?;
+    if let Some(response) = final_response {
+        send_response(writer, &response).await?;
     }
     Ok(())
+}
+
+async fn end_of_attach_response(state: &AppState, session_id: &str) -> Result<Option<Response>> {
+    Ok(match ended_session_response(state, session_id).await? {
+        Some(response) => Some(response),
+        None => Some(Response::EndOfStream),
+    })
+}
+
+async fn ended_session_response(state: &AppState, session_id: &str) -> Result<Option<Response>> {
+    let session = state.get_session(session_id).await?;
+    Ok(session.as_ref().and_then(session_ended_response))
+}
+
+fn session_ended_response(session: &SessionRecord) -> Option<Response> {
+    match session.status {
+        SessionStatus::Exited | SessionStatus::Failed | SessionStatus::UnknownRecovered => {
+            Some(Response::SessionEnded {
+                session_id: session.session_id.clone(),
+                status: session.status,
+                exit_code: session.exit_code,
+                error: session.error.clone(),
+            })
+        }
+        SessionStatus::Creating | SessionStatus::Running => None,
+    }
 }
 
 async fn send_response(writer: &mut OwnedWriteHalf, response: &Response) -> Result<()> {
@@ -466,4 +493,54 @@ fn read_from_offset(log_path: &camino::Utf8PathBuf, position: u64) -> Result<(St
     let start = position.min(bytes.len() as u64) as usize;
     let chunk = String::from_utf8_lossy(&bytes[start..]).to_string();
     Ok((chunk, bytes.len() as u64))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_ended_response;
+    use agentd_shared::{
+        protocol::Response,
+        session::{SessionRecord, SessionStatus},
+    };
+    use chrono::Utc;
+
+    fn session(status: SessionStatus) -> SessionRecord {
+        let now = Utc::now();
+        SessionRecord {
+            session_id: "demo".to_string(),
+            agent: "codex".to_string(),
+            workspace: "/tmp/workspace".to_string(),
+            repo_path: "/tmp/workspace".to_string(),
+            task: "task".to_string(),
+            base_branch: "main".to_string(),
+            branch: "agent/task".to_string(),
+            worktree: "/tmp/worktree".to_string(),
+            status,
+            pid: Some(123),
+            exit_code: Some(0),
+            error: None,
+            created_at: now,
+            updated_at: now,
+            exited_at: Some(now),
+        }
+    }
+
+    #[test]
+    fn ended_sessions_map_to_session_ended_response() {
+        let response = session_ended_response(&session(SessionStatus::Exited)).unwrap();
+        assert_eq!(
+            response,
+            Response::SessionEnded {
+                session_id: "demo".to_string(),
+                status: SessionStatus::Exited,
+                exit_code: Some(0),
+                error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn running_sessions_do_not_map_to_session_ended_response() {
+        assert!(session_ended_response(&session(SessionStatus::Running)).is_none());
+    }
 }

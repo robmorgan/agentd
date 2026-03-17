@@ -7,7 +7,7 @@ use crate::{
     session::{CreateSessionResult, SessionDiff, SessionRecord, SessionStatus, WorktreeRecord},
 };
 
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
 const FRAME_HEADER_LEN: usize = 16;
@@ -78,21 +78,54 @@ pub enum Request {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Response {
-    DaemonInfo { info: DaemonInfo },
-    CreateSession { session: CreateSessionResult },
-    KillSession { removed: bool, was_running: bool },
-    Attached { snapshot: Vec<u8> },
+    DaemonInfo {
+        info: DaemonInfo,
+    },
+    CreateSession {
+        session: CreateSessionResult,
+    },
+    KillSession {
+        removed: bool,
+        was_running: bool,
+    },
+    Attached {
+        snapshot: Vec<u8>,
+    },
+    SessionEnded {
+        session_id: String,
+        status: SessionStatus,
+        exit_code: Option<i32>,
+        error: Option<String>,
+    },
     InputAccepted,
-    Worktree { worktree: WorktreeRecord },
-    Diff { diff: SessionDiff },
-    Session { session: SessionRecord },
-    Sessions { sessions: Vec<SessionRecord> },
-    Event { event: SessionEvent },
-    LogChunk { data: String },
-    PtyOutput { data: Vec<u8> },
-    SwitchSession { session_id: String },
+    Worktree {
+        worktree: WorktreeRecord,
+    },
+    Diff {
+        diff: SessionDiff,
+    },
+    Session {
+        session: SessionRecord,
+    },
+    Sessions {
+        sessions: Vec<SessionRecord>,
+    },
+    Event {
+        event: SessionEvent,
+    },
+    LogChunk {
+        data: String,
+    },
+    PtyOutput {
+        data: Vec<u8>,
+    },
+    SwitchSession {
+        session_id: String,
+    },
     EndOfStream,
-    Error { message: String },
+    Error {
+        message: String,
+    },
     Ok,
 }
 
@@ -120,6 +153,7 @@ enum MessageKind {
     CreateSessionResponse = 102,
     KillSessionResponse = 103,
     AttachedResponse = 104,
+    SessionEndedResponse = 117,
     InputAcceptedResponse = 105,
     WorktreeResponse = 106,
     DiffResponse = 107,
@@ -158,6 +192,7 @@ impl MessageKind {
             102 => Self::CreateSessionResponse,
             103 => Self::KillSessionResponse,
             104 => Self::AttachedResponse,
+            117 => Self::SessionEndedResponse,
             105 => Self::InputAcceptedResponse,
             106 => Self::WorktreeResponse,
             107 => Self::DiffResponse,
@@ -450,6 +485,18 @@ fn encode_response(response: &Response) -> Result<(MessageKind, Vec<u8>)> {
             put_bytes(&mut payload, snapshot)?;
             MessageKind::AttachedResponse
         }
+        Response::SessionEnded {
+            session_id,
+            status,
+            exit_code,
+            error,
+        } => {
+            put_string(&mut payload, session_id)?;
+            put_session_status(&mut payload, *status);
+            put_optional_i32(&mut payload, *exit_code);
+            put_optional_string(&mut payload, error.as_deref())?;
+            MessageKind::SessionEndedResponse
+        }
         Response::InputAccepted => MessageKind::InputAcceptedResponse,
         Response::Worktree { worktree } => {
             put_worktree_record(&mut payload, worktree)?;
@@ -511,6 +558,12 @@ fn decode_response(kind: MessageKind, payload: &[u8]) -> Result<Response> {
         },
         MessageKind::AttachedResponse => Response::Attached {
             snapshot: cursor.take_bytes()?,
+        },
+        MessageKind::SessionEndedResponse => Response::SessionEnded {
+            session_id: cursor.take_string()?,
+            status: cursor.take_session_status()?,
+            exit_code: cursor.take_optional_i32()?,
+            error: cursor.take_optional_string()?,
         },
         MessageKind::InputAcceptedResponse => Response::InputAccepted,
         MessageKind::WorktreeResponse => Response::Worktree {
@@ -1021,6 +1074,19 @@ mod tests {
                 daemon_version: "1.2.3".to_string(),
                 protocol_version: PROTOCOL_VERSION,
             },
+        };
+        let (kind, payload) = encode_response(&response).unwrap();
+        let decoded = decode_response(kind, &payload).unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn session_ended_response_round_trips() {
+        let response = Response::SessionEnded {
+            session_id: "demo".to_string(),
+            status: SessionStatus::Exited,
+            exit_code: Some(0),
+            error: None,
         };
         let (kind, payload) = encode_response(&response).unwrap();
         let decoded = decode_response(kind, &payload).unwrap();
