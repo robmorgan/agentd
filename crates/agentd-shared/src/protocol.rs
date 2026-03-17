@@ -1184,11 +1184,10 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DAEMON_MANAGEMENT_VERSION, DaemonInfo, DaemonManagementRequest,
-        DaemonManagementResponse, DaemonManagementStatus, IncomingRequest, PROTOCOL_VERSION,
-        Request, Response, decode_request, decode_response, encode_request, encode_response,
-        read_incoming_request, read_request, write_daemon_management_request,
-        write_daemon_management_response,
+        DAEMON_MANAGEMENT_VERSION, DaemonInfo, DaemonManagementRequest, DaemonManagementResponse,
+        DaemonManagementStatus, IncomingRequest, PROTOCOL_VERSION, Request, Response,
+        decode_request, decode_response, encode_request, encode_response, read_incoming_request,
+        read_request, write_daemon_management_request, write_daemon_management_response,
     };
     use crate::{
         event::{NewSessionEvent, SessionEvent},
