@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionEvent {
     pub id: i64,
     pub session_id: String,
@@ -12,7 +12,7 @@ pub struct SessionEvent {
     pub payload_json: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NewSessionEvent {
     #[serde(rename = "type")]
     pub event_type: String,

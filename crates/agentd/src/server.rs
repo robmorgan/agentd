@@ -1,9 +1,8 @@
 use std::{io, path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::BufReader,
     net::{UnixListener, UnixStream, unix::OwnedWriteHalf},
     sync::{broadcast, watch},
 };
@@ -11,7 +10,7 @@ use tokio::{
 use agentd_shared::{
     config::Config,
     paths::AppPaths,
-    protocol::{DaemonInfo, PROTOCOL_VERSION, Request, Response},
+    protocol::{DaemonInfo, PROTOCOL_VERSION, Request, Response, read_request, write_response},
     session::SessionStatus,
 };
 
@@ -72,12 +71,10 @@ async fn handle_connection(
     stream: UnixStream,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-    let Some(line) = lines.next_line().await? else {
+    let mut reader = BufReader::new(reader);
+    let Some(request) = read_request(&mut reader).await? else {
         return Ok(());
     };
-
-    let request: Request = serde_json::from_str(&line).context("invalid request payload")?;
     match request {
         Request::GetDaemonInfo => {
             let info = DaemonInfo {
@@ -168,7 +165,7 @@ async fn handle_connection(
             }
         }
         Request::AttachSession { session_id } => {
-            attach_session(&state, &session_id, &mut lines, &mut writer).await?;
+            attach_session(&state, &session_id, &mut reader, &mut writer).await?;
         }
         Request::AttachInput { .. } => {
             send_response(
@@ -181,16 +178,9 @@ async fn handle_connection(
         }
         Request::SendInput {
             session_id,
-            data_b64,
+            data,
             source_session_id,
-        } => match state
-            .send_input(
-                &session_id,
-                decode_b64(&data_b64).context("invalid send_input payload")?,
-                source_session_id,
-            )
-            .await
-        {
+        } => match state.send_input(&session_id, data, source_session_id).await {
             Ok(()) => send_response(&mut writer, &Response::InputAccepted).await?,
             Err(err) => {
                 send_response(
@@ -278,7 +268,7 @@ async fn handle_connection(
 async fn attach_session(
     state: &AppState,
     session_id: &str,
-    lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: &mut OwnedWriteHalf,
 ) -> Result<()> {
     let (_lease, snapshot, mut output_rx) = match state.attach_session(session_id).await {
@@ -295,13 +285,7 @@ async fn attach_session(
         }
     };
 
-    send_response(
-        writer,
-        &Response::Attached {
-            snapshot_b64: STANDARD.encode(snapshot),
-        },
-    )
-    .await?;
+    send_response(writer, &Response::Attached { snapshot }).await?;
 
     loop {
         tokio::select! {
@@ -309,34 +293,19 @@ async fn attach_session(
                 Ok(data) => {
                     send_response(
                         writer,
-                        &Response::PtyOutput {
-                            data_b64: STANDARD.encode(data),
-                        },
+                        &Response::PtyOutput { data },
                     )
                     .await?
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,
             },
-            line = lines.next_line() => {
-                let Some(line) = line? else {
+            request = read_request(reader) => {
+                let Some(request) = request? else {
                     break;
                 };
-                match serde_json::from_str::<Request>(&line).context("invalid attach request payload")? {
-                    Request::AttachInput { data_b64 } => {
-                        let data = match decode_b64(&data_b64).context("invalid attach_input payload") {
-                            Ok(data) => data,
-                            Err(err) => {
-                                send_response(
-                                    writer,
-                                    &Response::Error {
-                                        message: err.to_string(),
-                                    },
-                                )
-                                .await?;
-                                break;
-                            }
-                        };
+                match request {
+                    Request::AttachInput { data } => {
                         if let Err(err) = state.write_attached_input(session_id, data).await {
                             send_response(
                                 writer,
@@ -368,11 +337,7 @@ async fn attach_session(
 }
 
 async fn send_response(writer: &mut OwnedWriteHalf, response: &Response) -> Result<()> {
-    let payload = serde_json::to_vec(response)?;
-    writer.write_all(&payload).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-    Ok(())
+    write_response(writer, response).await
 }
 
 async fn stream_logs(
@@ -453,8 +418,4 @@ fn read_from_offset(log_path: &camino::Utf8PathBuf, position: u64) -> Result<(St
     let start = position.min(bytes.len() as u64) as usize;
     let chunk = String::from_utf8_lossy(&bytes[start..]).to_string();
     Ok((chunk, bytes.len() as u64))
-}
-
-fn decode_b64(data: &str) -> Result<Vec<u8>> {
-    STANDARD.decode(data).map_err(Into::into)
 }

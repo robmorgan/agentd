@@ -5,7 +5,44 @@ thin client that sends requests over `~/.agentd/agentd.sock` and prints or strea
 
 * Both daemon and client loops leverage `poll()`
 * Each session creates its own unix socket file
+* Control traffic uses a framed binary protocol
 * We restore terminal state and output using `libghostty-vt`
+
+## Wire Protocol
+
+`agent` and `agentd` communicate over a custom framed binary protocol defined in
+`crates/agentd-shared/src/protocol.rs`.
+
+Each frame has a fixed 16-byte header followed by a payload:
+
+* `magic` (`u32`, little-endian) identifies an `agentd` protocol frame
+* `version` (`u16`, little-endian) must match the current protocol version
+* `message_type` (`u16`, little-endian) identifies the request or response variant
+* `flags` (`u16`, currently unused and set to `0`)
+* `reserved` (`u16`, currently unused and set to `0`)
+* `payload_len` (`u32`, little-endian) gives the number of payload bytes that follow
+
+Payloads are binary-encoded field-by-field rather than serialized as JSON:
+
+* strings => `u32 len` + UTF-8 bytes
+* byte blobs => `u32 len` + raw bytes
+* booleans => single `u8`
+* optional values => presence `u8` followed by the encoded value
+* lists => `u32 count` followed by elements
+
+PTY snapshots, PTY output, and interactive input are sent as raw bytes. Structured events still
+carry JSON payloads in the event body, but the socket transport itself is binary.
+
+Most commands use a simple request/response exchange:
+
+1. client connects to the daemon socket
+2. client writes one request frame
+3. daemon writes one response frame or a stream of response frames
+4. streaming commands terminate with an explicit `EndOfStream` frame
+
+`attach` is the bidirectional case. After the initial `AttachSession` request and `Attached`
+response, the daemon streams `PtyOutput` frames while the client sends `AttachInput` frames on the
+same socket until either side closes or the daemon emits `EndOfStream`.
 
 ## Creating a Session
 
@@ -38,7 +75,7 @@ progress while `agent logs` remains the raw terminal transcript.
 Each session gets its own unix socket file. The default location depends on your environment variables (checked in priority order):
 
 * AGENTD_DIR => uses exact path (e.g., /custom/path)
-* XDG_RUNTIME_DIR => uses {XDG_RUNTIME_DIR}/zmx (recommended on Linux, typically results in /run/user/{uid}/agentd)
+* XDG_RUNTIME_DIR => uses `{XDG_RUNTIME_DIR}/agentd` (recommended on Linux, typically `/run/user/{uid}/agentd`)
 * TMPDIR => uses {TMPDIR}/agentd-{uid} (appends uid for multi-user safety)
 * /tmp => uses /tmp/agentd-{uid} (default fallback, appends uid for multi-user safety)
   
@@ -48,7 +85,7 @@ We use `libghostty-vt` to restore the previous state of the terminal when a clie
 
 How it works:
 
-* user creates session `zmx attach `
+* user creates or re-attaches to a session with `agent attach <session_id>`
 * user interacts with terminal stdin
 * stdin gets sent to pty via daemon
 * daemon sends pty output to client and `ghostty-vt`

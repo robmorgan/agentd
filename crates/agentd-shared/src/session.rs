@@ -12,7 +12,7 @@ pub enum SessionStatus {
     UnknownRecovered,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionRecord {
     pub session_id: String,
     pub agent: String,
@@ -31,7 +31,7 @@ pub struct SessionRecord {
     pub exited_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CreateSessionResult {
     pub session_id: String,
     pub base_branch: String,
@@ -40,7 +40,7 @@ pub struct CreateSessionResult {
     pub status: SessionStatus,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorktreeRecord {
     pub session_id: String,
     pub repo_path: String,
@@ -49,7 +49,7 @@ pub struct WorktreeRecord {
     pub worktree: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionDiff {
     pub session_id: String,
     pub base_branch: String,

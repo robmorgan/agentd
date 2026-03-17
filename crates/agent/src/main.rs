@@ -6,9 +6,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{ArgAction, Parser, Subcommand};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use serde::Deserialize;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixStream, unix::OwnedReadHalf},
@@ -20,7 +20,7 @@ mod local;
 use agentd_shared::{
     config::Config,
     paths::AppPaths,
-    protocol::{DaemonInfo, PROTOCOL_VERSION, Request, Response},
+    protocol::{DaemonInfo, PROTOCOL_VERSION, Request, Response, read_response, write_request},
     session::{SessionDiff, SessionRecord, SessionStatus, WorktreeRecord},
 };
 
@@ -88,6 +88,21 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum LegacyResponse {
+    DaemonInfo { info: LegacyDaemonInfo },
+    Sessions { sessions: Vec<SessionRecord> },
+    Error { message: String },
+    Ok,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyDaemonInfo {
+    daemon_version: String,
+    protocol_version: u32,
 }
 
 #[derive(Debug, Subcommand)]
@@ -184,7 +199,7 @@ async fn main() -> Result<()> {
                 &paths,
                 &Request::SendInput {
                     session_id,
-                    data_b64: STANDARD.encode(data.join(" ").into_bytes()),
+                    data: data.join(" ").into_bytes(),
                     source_session_id,
                 },
             )
@@ -449,29 +464,50 @@ async fn restart_incompatible_daemon(paths: &AppPaths, info: Option<DaemonInfo>)
 }
 
 async fn daemon_info(paths: &AppPaths) -> Result<DaemonInfo> {
-    match send_request_no_bootstrap(paths, &Request::GetDaemonInfo).await? {
-        Response::DaemonInfo { info } => Ok(info),
-        Response::Error { message } => bail!(message),
-        other => bail!("unexpected response: {:?}", other),
+    let binary_result = tokio::time::timeout(
+        Duration::from_millis(250),
+        send_request_no_bootstrap(paths, &Request::GetDaemonInfo),
+    )
+    .await;
+    match binary_result {
+        Ok(Ok(Response::DaemonInfo { info })) => Ok(info),
+        Ok(Ok(Response::Error { message })) => bail!(message),
+        Ok(Ok(other)) => bail!("unexpected response: {:?}", other),
+        Ok(Err(_)) | Err(_) => legacy_daemon_info(paths).await,
     }
 }
 
 async fn daemon_has_running_sessions(paths: &AppPaths) -> Result<bool> {
-    match send_request_no_bootstrap(paths, &Request::ListSessions).await? {
-        Response::Sessions { sessions } => Ok(sessions
+    let binary_result = tokio::time::timeout(
+        Duration::from_millis(250),
+        send_request_no_bootstrap(paths, &Request::ListSessions),
+    )
+    .await;
+    match binary_result {
+        Ok(Ok(Response::Sessions { sessions })) => Ok(sessions
             .iter()
             .any(|session| session.status_string() == "running")),
-        Response::Error { message } => bail!(message),
-        other => bail!("unexpected response: {:?}", other),
+        Ok(Ok(Response::Error { message })) => bail!(message),
+        Ok(Ok(other)) => bail!("unexpected response: {:?}", other),
+        Ok(Err(_)) | Err(_) => legacy_daemon_has_running_sessions(paths).await,
     }
 }
 
 async fn shutdown_or_kill_daemon(paths: &AppPaths) -> Result<()> {
-    let shutdown_result = send_request_no_bootstrap(paths, &Request::ShutdownDaemon).await;
+    let shutdown_result = tokio::time::timeout(
+        Duration::from_millis(250),
+        send_request_no_bootstrap(paths, &Request::ShutdownDaemon),
+    )
+    .await;
     match shutdown_result {
-        Ok(Response::Ok) => {}
-        Ok(Response::Error { message }) => bail!(message),
-        Ok(_) | Err(_) => kill_daemon_from_pid_file(paths)?,
+        Ok(Ok(Response::Ok)) => {}
+        Ok(Ok(Response::Error { message })) => bail!(message),
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) | Err(_) => {
+            if legacy_shutdown_daemon(paths).await.is_err() {
+                kill_daemon_from_pid_file(paths)?;
+            }
+        }
     }
     wait_for_daemon_stop(paths).await
 }
@@ -524,8 +560,18 @@ async fn send_request(paths: &AppPaths, request: &Request) -> Result<Response> {
 
 async fn send_request_no_bootstrap(paths: &AppPaths, request: &Request) -> Result<Response> {
     let mut stream = try_connect(paths).await?;
-    let payload = serde_json::to_vec(request)?;
-    stream.write_all(&payload).await?;
+    write_request(&mut stream, request).await?;
+
+    let mut reader = BufReader::new(stream);
+    let Some(response) = read_response(&mut reader).await? else {
+        bail!("agentd closed the connection");
+    };
+    Ok(response)
+}
+
+async fn legacy_request(paths: &AppPaths, payload: &str) -> Result<LegacyResponse> {
+    let mut stream = try_connect(paths).await?;
+    stream.write_all(payload.as_bytes()).await?;
     stream.write_all(b"\n").await?;
     stream.flush().await?;
 
@@ -536,19 +582,50 @@ async fn send_request_no_bootstrap(paths: &AppPaths, request: &Request) -> Resul
     Ok(serde_json::from_str(&line)?)
 }
 
+async fn legacy_daemon_info(paths: &AppPaths) -> Result<DaemonInfo> {
+    match legacy_request(paths, r#"{"type":"get_daemon_info"}"#).await? {
+        LegacyResponse::DaemonInfo { info } => Ok(DaemonInfo {
+            daemon_version: info.daemon_version,
+            protocol_version: u16::try_from(info.protocol_version)
+                .context("legacy daemon reported invalid protocol version")?,
+        }),
+        LegacyResponse::Error { message } => bail!(message),
+        other => bail!("unexpected legacy response: {:?}", other),
+    }
+}
+
+async fn legacy_daemon_has_running_sessions(paths: &AppPaths) -> Result<bool> {
+    match legacy_request(paths, r#"{"type":"list_sessions"}"#).await? {
+        LegacyResponse::Sessions { sessions } => Ok(sessions
+            .iter()
+            .any(|session| session.status_string() == "running")),
+        LegacyResponse::Error { message } => bail!(message),
+        other => bail!("unexpected legacy response: {:?}", other),
+    }
+}
+
+async fn legacy_shutdown_daemon(paths: &AppPaths) -> Result<()> {
+    match legacy_request(paths, r#"{"type":"shutdown_daemon"}"#).await? {
+        LegacyResponse::Ok => Ok(()),
+        LegacyResponse::Error { message } => bail!(message),
+        other => bail!("unexpected legacy response: {:?}", other),
+    }
+}
+
 async fn stream_logs(paths: &AppPaths, session_id: &str, follow: bool) -> Result<()> {
     let mut stream = try_connect(paths).await?;
-    let payload = serde_json::to_vec(&Request::StreamLogs {
-        session_id: session_id.to_string(),
-        follow,
-    })?;
-    stream.write_all(&payload).await?;
-    stream.write_all(b"\n").await?;
-    stream.flush().await?;
+    write_request(
+        &mut stream,
+        &Request::StreamLogs {
+            session_id: session_id.to_string(),
+            follow,
+        },
+    )
+    .await?;
 
-    let mut lines = BufReader::new(stream).lines();
-    while let Some(line) = lines.next_line().await? {
-        match serde_json::from_str::<Response>(&line)? {
+    let mut reader = BufReader::new(stream);
+    while let Some(response) = read_response(&mut reader).await? {
+        match response {
             Response::LogChunk { data } => {
                 print!("{data}");
             }
@@ -562,17 +639,18 @@ async fn stream_logs(paths: &AppPaths, session_id: &str, follow: bool) -> Result
 
 async fn stream_events(paths: &AppPaths, session_id: &str, follow: bool) -> Result<()> {
     let mut stream = try_connect(paths).await?;
-    let payload = serde_json::to_vec(&Request::StreamEvents {
-        session_id: session_id.to_string(),
-        follow,
-    })?;
-    stream.write_all(&payload).await?;
-    stream.write_all(b"\n").await?;
-    stream.flush().await?;
+    write_request(
+        &mut stream,
+        &Request::StreamEvents {
+            session_id: session_id.to_string(),
+            follow,
+        },
+    )
+    .await?;
 
-    let mut lines = BufReader::new(stream).lines();
-    while let Some(line) = lines.next_line().await? {
-        match serde_json::from_str::<Response>(&line)? {
+    let mut reader = BufReader::new(stream);
+    while let Some(response) = read_response(&mut reader).await? {
+        match response {
             Response::Event { event } => {
                 println!("{}", serde_json::to_string(&event)?);
             }
@@ -649,22 +727,23 @@ fn local_kill(paths: &AppPaths, session_id: &str, remove: bool) -> Result<()> {
 
 async fn attach_session(paths: &AppPaths, session_id: &str) -> Result<()> {
     let mut stream = try_connect(paths).await?;
-    let payload = serde_json::to_vec(&Request::AttachSession {
-        session_id: session_id.to_string(),
-    })?;
-    stream.write_all(&payload).await?;
-    stream.write_all(b"\n").await?;
-    stream.flush().await?;
+    write_request(
+        &mut stream,
+        &Request::AttachSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .await?;
 
     let (read_half, mut write_half) = stream.into_split();
-    let mut lines = BufReader::new(read_half).lines();
-    let Some(line) = lines.next_line().await? else {
+    let mut reader = BufReader::new(read_half);
+    let Some(response) = read_response(&mut reader).await? else {
         bail!("agentd closed the connection");
     };
 
-    match serde_json::from_str::<Response>(&line)? {
-        Response::Attached { snapshot_b64 } => {
-            write_attach_bytes(&decode_b64(&snapshot_b64)?)?;
+    match response {
+        Response::Attached { snapshot } => {
+            write_attach_bytes(&snapshot)?;
         }
         Response::Error { message } => bail!(message),
         other => bail!("unexpected response: {:?}", other),
@@ -675,18 +754,13 @@ async fn attach_session(paths: &AppPaths, session_id: &str) -> Result<()> {
     let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel();
 
     let stdin_task = tokio::task::spawn_blocking(move || read_attach_stdin(stdin_tx));
-    let mut output_task = tokio::spawn(async move { stream_attach_output(lines).await });
+    let mut output_task = tokio::spawn(async move { stream_attach_output(reader).await });
 
     loop {
         tokio::select! {
             event = stdin_rx.recv() => match event {
                 Some(AttachInput::Data(data)) => {
-                    let payload = serde_json::to_vec(&Request::AttachInput {
-                        data_b64: STANDARD.encode(data),
-                    })?;
-                    write_half.write_all(&payload).await?;
-                    write_half.write_all(b"\n").await?;
-                    write_half.flush().await?;
+                    write_request(&mut write_half, &Request::AttachInput { data }).await?;
                 }
                 Some(AttachInput::Detach) | None => break,
             },
@@ -767,10 +841,10 @@ fn print_kill_result(session_id: &str, was_running: bool, removed: bool) {
     }
 }
 
-async fn stream_attach_output(mut lines: tokio::io::Lines<BufReader<OwnedReadHalf>>) -> Result<()> {
-    while let Some(line) = lines.next_line().await? {
-        match serde_json::from_str::<Response>(&line)? {
-            Response::PtyOutput { data_b64 } => write_attach_bytes(&decode_b64(&data_b64)?)?,
+async fn stream_attach_output(mut reader: BufReader<OwnedReadHalf>) -> Result<()> {
+    while let Some(response) = read_response(&mut reader).await? {
+        match response {
+            Response::PtyOutput { data } => write_attach_bytes(&data)?,
             Response::EndOfStream => break,
             Response::Error { message } => bail!(message),
             other => bail!("unexpected response: {:?}", other),
@@ -843,10 +917,6 @@ impl StatusString for SessionRecord {
             SessionStatus::UnknownRecovered => "unknown_recovered",
         }
     }
-}
-
-fn decode_b64(data: &str) -> Result<Vec<u8>> {
-    STANDARD.decode(data).map_err(Into::into)
 }
 
 fn write_attach_bytes(data: &[u8]) -> Result<()> {

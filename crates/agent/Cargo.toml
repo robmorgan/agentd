@@ -14,5 +14,6 @@ clap.workspace = true
 crossterm.workspace = true
 nix.workspace = true
 rusqlite.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
