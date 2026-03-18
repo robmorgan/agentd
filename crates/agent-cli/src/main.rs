@@ -1509,10 +1509,12 @@ async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
                     .await?;
                     composer.clear();
                     focus_session(paths, &created.session_id).await?;
+                    terminal.clear()?;
                 } else if focus == DashboardFocus::SessionList
                     && let Some(session) = sessions.get(selected)
                 {
                     focus_session(paths, &session.session_id).await?;
+                    terminal.clear()?;
                 }
             }
             KeyCode::Char('k')
