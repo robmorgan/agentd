@@ -58,6 +58,7 @@ const AGENTD_ATTACH_RESTORE_SEQUENCE: &[u8] =
 const AGENTD_ATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
 const CODEX_COMPOSER_BG: Color = Color::Rgb(11, 15, 20);
 const CODEX_MODELS: &[&str] = &[
+    "gpt-5.4-codex",
     "gpt-5.3-codex",
     "gpt-5.1-codex-max",
     "gpt-5.1-codex",
