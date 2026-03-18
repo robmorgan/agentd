@@ -12,12 +12,13 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, Subcommand};
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind},
     execute,
     terminal::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
         enable_raw_mode,
     },
+    event::{DisableMouseCapture, EnableMouseCapture},
 };
 use libc::{
     _POSIX_VDISABLE, TCSAFLUSH, TCSANOW, VLNEXT, VMIN, VQUIT, VTIME, cfmakeraw, tcgetattr,
@@ -31,6 +32,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear as WidgetClear, List, ListItem, Paragraph, Wrap},
 };
+use serde_json::Value;
 use tokio::{io::BufReader, net::UnixStream, sync::mpsc};
 
 mod local;
@@ -1272,7 +1274,12 @@ struct TerminalScreenGuard;
 
 impl TerminalScreenGuard {
     fn enter() -> Result<Self> {
-        execute!(std::io::stdout(), EnterAlternateScreen, Hide)
+        execute!(
+            std::io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            Hide
+        )
             .context("failed to enter alternate screen")?;
         Ok(Self)
     }
@@ -1280,7 +1287,12 @@ impl TerminalScreenGuard {
 
 impl Drop for TerminalScreenGuard {
     fn drop(&mut self) {
-        let _ = execute!(std::io::stdout(), Show, LeaveAlternateScreen);
+        let _ = execute!(
+            std::io::stdout(),
+            Show,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
     }
 }
 
@@ -1346,6 +1358,45 @@ async fn daemon_get_session(paths: &AppPaths, session_id: &str) -> Result<Sessio
 enum DashboardFocus {
     Composer,
     SessionList,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusSessionPane {
+    Transcript,
+    Activity,
+    ReplyComposer,
+}
+
+#[derive(Debug, Default)]
+struct FocusSessionViewState {
+    active_pane: FocusSessionPane,
+    previous_pane: FocusSessionPane,
+    transcript_text: String,
+    transcript_lines: Vec<Line<'static>>,
+    transcript_line_count: usize,
+    transcript_path: Option<String>,
+    transcript_bytes: u64,
+    transcript_scroll: usize,
+    events: Vec<agentd_shared::event::SessionEvent>,
+    activity_lines: Vec<Line<'static>>,
+    activity_line_count: usize,
+    activity_scroll: usize,
+    last_event_id: Option<i64>,
+    show_verbose: bool,
+}
+
+impl Default for FocusSessionPane {
+    fn default() -> Self {
+        Self::Transcript
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FocusSessionLayout {
+    transcript_rect: Rect,
+    activity_rect: Rect,
+    transcript_height: usize,
+    activity_height: usize,
 }
 
 async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
@@ -1506,79 +1557,924 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
     let mut status = String::new();
     let mut reply_open = false;
     let mut reply = String::new();
+    let mut view_state = FocusSessionViewState::default();
 
     loop {
         let session = daemon_get_session(paths, session_id).await?;
-        let events = store.list_events_since(session_id, None)?;
-        let log_tail = read_log_tail(paths, session_id, 12)?;
-        let focus_events = events.into_iter().rev().take(8).collect::<Vec<_>>();
+        let size = terminal.size()?;
+        let layout = focus_session_layout(Rect::new(0, 0, size.width, size.height));
+        refresh_focus_session_view(paths, &store, &session, &mut view_state, &layout)?;
+        clamp_focus_session_scroll(&mut view_state, &layout);
         terminal.draw(|frame| {
-            render_focus_session(frame, &session, &focus_events, &log_tail, &status, reply_open, &reply);
+            render_focus_session(
+                frame,
+                &session,
+                &view_state,
+                &status,
+                reply_open,
+                &reply,
+            );
         })?;
         status.clear();
 
         if !event::poll(Duration::from_millis(250)).context("failed to poll terminal input")? {
             continue;
         }
-        let Event::Key(key) = event::read().context("failed to read terminal input")? else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
 
-        match key.code {
-            KeyCode::Esc => {
-                if reply_open {
-                    reply_open = false;
-                    reply.clear();
-                    status = "reply canceled".to_string();
-                } else {
-                    return Ok(());
+        match event::read().context("failed to read terminal input")? {
+            Event::Mouse(mouse) if !reply_open => match mouse.kind {
+                MouseEventKind::Down(_) => {
+                    if let Some(pane) = pane_at_position(&layout, mouse.column, mouse.row) {
+                        view_state.active_pane = pane;
+                    }
                 }
-            }
-            KeyCode::Char('q') if !reply_open => return Ok(()),
-            KeyCode::Backspace if reply_open => {
-                reply.pop();
-            }
-            KeyCode::Enter if reply_open => {
-                if reply.trim().is_empty() {
-                    status = "reply is empty".to_string();
-                } else {
-                    reply_session(paths, session_id, reply.trim()).await?;
-                    reply_open = false;
-                    reply.clear();
-                    status = format!("replied to {}", session_id);
+                MouseEventKind::ScrollUp => {
+                    if let Some(pane) = pane_at_position(&layout, mouse.column, mouse.row) {
+                        view_state.active_pane = pane;
+                        scroll_focus_session_pane(&mut view_state, &layout, -3);
+                    }
                 }
-            }
-            KeyCode::Char('a') if !reply_open => {
-                if session.status == SessionStatus::Running {
-                    drop(terminal);
-                    drop(screen);
-                    drop(raw_mode);
-                    return attach_session(paths, session_id).await;
+                MouseEventKind::ScrollDown => {
+                    if let Some(pane) = pane_at_position(&layout, mouse.column, mouse.row) {
+                        view_state.active_pane = pane;
+                        scroll_focus_session_pane(&mut view_state, &layout, 3);
+                    }
                 }
-                status = "session is not running".to_string();
-            }
-            KeyCode::Char('k') if !reply_open => {
-                kill_session(paths, session_id).await?;
-                status = format!("terminated {}", session_id);
-            }
-            KeyCode::Char('r') if !reply_open => {
-                let retried = retry_session(paths, &session).await?;
-                status = format!("created retry {}", retried.session_id);
-            }
-            KeyCode::Char('y') if !reply_open && session.status == SessionStatus::NeedsInput => {
-                reply_open = true;
-                reply.clear();
-            }
-            KeyCode::Char(ch)
-                if reply_open && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
-            {
-                reply.push(ch);
+                _ => {}
+            },
+            Event::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+
+                match key.code {
+                    KeyCode::Esc => {
+                        if reply_open {
+                            reply_open = false;
+                            reply.clear();
+                            view_state.active_pane = view_state.previous_pane;
+                            status = "reply canceled".to_string();
+                        } else {
+                            return Ok(());
+                        }
+                    }
+                    KeyCode::Char('q') if !reply_open => return Ok(()),
+                    KeyCode::Tab if !reply_open => {
+                        view_state.active_pane = match view_state.active_pane {
+                            FocusSessionPane::Transcript => FocusSessionPane::Activity,
+                            FocusSessionPane::Activity | FocusSessionPane::ReplyComposer => {
+                                FocusSessionPane::Transcript
+                            }
+                        };
+                    }
+                    KeyCode::Up if !reply_open => {
+                        scroll_focus_session_pane(&mut view_state, &layout, -1);
+                    }
+                    KeyCode::Down if !reply_open => {
+                        scroll_focus_session_pane(&mut view_state, &layout, 1);
+                    }
+                    KeyCode::PageUp if !reply_open => {
+                        scroll_focus_session_page(&mut view_state, &layout, -1);
+                    }
+                    KeyCode::PageDown if !reply_open => {
+                        scroll_focus_session_page(&mut view_state, &layout, 1);
+                    }
+                    KeyCode::Home if !reply_open => {
+                        focus_session_home(&mut view_state);
+                    }
+                    KeyCode::End if !reply_open => {
+                        focus_session_end(&mut view_state, &layout);
+                    }
+                    KeyCode::Char('v') if !reply_open => {
+                        view_state.show_verbose = !view_state.show_verbose;
+                        status = if view_state.show_verbose {
+                            "verbose events shown".to_string()
+                        } else {
+                            "verbose events hidden".to_string()
+                        };
+                    }
+                    KeyCode::Backspace if reply_open => {
+                        reply.pop();
+                    }
+                    KeyCode::Enter if reply_open => {
+                        if reply.trim().is_empty() {
+                            status = "reply is empty".to_string();
+                        } else {
+                            reply_session(paths, session_id, reply.trim()).await?;
+                            reply_open = false;
+                            reply.clear();
+                            view_state.active_pane = view_state.previous_pane;
+                            status = format!("replied to {}", session_id);
+                        }
+                    }
+                    KeyCode::Char('a') if !reply_open => {
+                        if session.status == SessionStatus::Running {
+                            drop(terminal);
+                            drop(screen);
+                            drop(raw_mode);
+                            return attach_session(paths, session_id).await;
+                        }
+                        status = "session is not running".to_string();
+                    }
+                    KeyCode::Char('k') if !reply_open => {
+                        kill_session(paths, session_id).await?;
+                        status = format!("terminated {}", session_id);
+                    }
+                    KeyCode::Char('r') if !reply_open => {
+                        let retried = retry_session(paths, &session).await?;
+                        status = format!("created retry {}", retried.session_id);
+                    }
+                    KeyCode::Char('y')
+                        if !reply_open && session.status == SessionStatus::NeedsInput =>
+                    {
+                        reply_open = true;
+                        reply.clear();
+                        view_state.previous_pane = view_state.active_pane;
+                        view_state.active_pane = FocusSessionPane::ReplyComposer;
+                    }
+                    KeyCode::Char(ch)
+                        if reply_open
+                            && (key.modifiers.is_empty()
+                                || key.modifiers == KeyModifiers::SHIFT) =>
+                    {
+                        reply.push(ch);
+                    }
+                    _ => {}
+                }
             }
             _ => {}
         }
+    }
+}
+
+fn focus_session_layout(area: Rect) -> FocusSessionLayout {
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(10),
+            Constraint::Length(2),
+        ])
+        .split(area);
+    let middle = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+        .split(outer[1]);
+    FocusSessionLayout {
+        transcript_rect: middle[0],
+        activity_rect: middle[1],
+        transcript_height: middle[0].height.saturating_sub(2) as usize,
+        activity_height: middle[1].height.saturating_sub(2) as usize,
+    }
+}
+
+fn pane_at_position(layout: &FocusSessionLayout, column: u16, row: u16) -> Option<FocusSessionPane> {
+    let point_in_rect = |rect: Rect| {
+        column >= rect.x
+            && column < rect.x.saturating_add(rect.width)
+            && row >= rect.y
+            && row < rect.y.saturating_add(rect.height)
+    };
+    if point_in_rect(layout.transcript_rect) {
+        Some(FocusSessionPane::Transcript)
+    } else if point_in_rect(layout.activity_rect) {
+        Some(FocusSessionPane::Activity)
+    } else {
+        None
+    }
+}
+
+fn refresh_focus_session_view(
+    paths: &AppPaths,
+    store: &LocalStore,
+    session: &SessionRecord,
+    state: &mut FocusSessionViewState,
+    layout: &FocusSessionLayout,
+) -> Result<()> {
+    let log_path = resolve_focus_log_path(paths, session);
+    let log_path_string = log_path.to_string();
+    let metadata = fs::metadata(log_path.as_std_path()).ok();
+    let log_bytes = metadata.as_ref().map(|item| item.len()).unwrap_or(0);
+    let transcript_was_at_bottom = state.transcript_scroll
+        >= max_scroll(state.transcript_line_count, layout.transcript_height);
+    let activity_was_at_bottom = state.activity_scroll
+        >= max_scroll(state.activity_line_count, layout.activity_height);
+
+    if state.transcript_path.as_deref() != Some(log_path_string.as_str())
+        || state.transcript_bytes != log_bytes
+    {
+        state.transcript_text = read_focus_log_contents(&log_path)?;
+        state.transcript_path = Some(log_path_string);
+        state.transcript_bytes = log_bytes;
+    }
+
+    let new_events = store.list_events_since(&session.session_id, state.last_event_id)?;
+    if let Some(last) = new_events.last() {
+        state.last_event_id = Some(last.id);
+    }
+    state.events.extend(new_events);
+
+    rebuild_focus_session_lines(state);
+
+    if transcript_was_at_bottom {
+        state.transcript_scroll = max_scroll(state.transcript_line_count, layout.transcript_height);
+    }
+    if activity_was_at_bottom {
+        state.activity_scroll = max_scroll(state.activity_line_count, layout.activity_height);
+    }
+    Ok(())
+}
+
+fn resolve_focus_log_path(paths: &AppPaths, session: &SessionRecord) -> camino::Utf8PathBuf {
+    let rendered = paths.rendered_log_path(&session.session_id);
+    if session.agent == "codex" && rendered.exists() {
+        rendered
+    } else {
+        paths.log_path(&session.session_id)
+    }
+}
+
+fn read_focus_log_contents(path: &camino::Utf8Path) -> Result<String> {
+    match fs::read_to_string(path.as_std_path()) {
+        Ok(contents) => Ok(contents),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(err).with_context(|| format!("failed to read {}", path)),
+    }
+}
+
+fn line_count(lines: &[Line<'static>]) -> usize {
+    std::cmp::max(1, lines.len())
+}
+
+fn max_scroll(total_lines: usize, visible_lines: usize) -> usize {
+    total_lines.saturating_sub(visible_lines.max(1))
+}
+
+fn clamp_focus_session_scroll(state: &mut FocusSessionViewState, layout: &FocusSessionLayout) {
+    state.transcript_scroll = state
+        .transcript_scroll
+        .min(max_scroll(line_count(&state.transcript_lines), layout.transcript_height));
+    state.activity_scroll = state
+        .activity_scroll
+        .min(max_scroll(line_count(&state.activity_lines), layout.activity_height));
+}
+
+fn scroll_focus_session_pane(
+    state: &mut FocusSessionViewState,
+    layout: &FocusSessionLayout,
+    delta: isize,
+) {
+    match state.active_pane {
+        FocusSessionPane::Transcript => {
+            state.transcript_scroll = apply_scroll_delta(
+                state.transcript_scroll,
+                max_scroll(line_count(&state.transcript_lines), layout.transcript_height),
+                delta,
+            );
+        }
+        FocusSessionPane::Activity => {
+            state.activity_scroll = apply_scroll_delta(
+                state.activity_scroll,
+                max_scroll(line_count(&state.activity_lines), layout.activity_height),
+                delta,
+            );
+        }
+        FocusSessionPane::ReplyComposer => {}
+    }
+}
+
+fn scroll_focus_session_page(
+    state: &mut FocusSessionViewState,
+    layout: &FocusSessionLayout,
+    direction: isize,
+) {
+    let delta = match state.active_pane {
+        FocusSessionPane::Transcript => layout.transcript_height.saturating_sub(1) as isize,
+        FocusSessionPane::Activity => layout.activity_height.saturating_sub(1) as isize,
+        FocusSessionPane::ReplyComposer => 0,
+    };
+    scroll_focus_session_pane(state, layout, delta.saturating_mul(direction));
+}
+
+fn focus_session_home(state: &mut FocusSessionViewState) {
+    match state.active_pane {
+        FocusSessionPane::Transcript => state.transcript_scroll = 0,
+        FocusSessionPane::Activity => state.activity_scroll = 0,
+        FocusSessionPane::ReplyComposer => {}
+    }
+}
+
+fn focus_session_end(state: &mut FocusSessionViewState, layout: &FocusSessionLayout) {
+    match state.active_pane {
+        FocusSessionPane::Transcript => {
+            state.transcript_scroll = max_scroll(line_count(&state.transcript_lines), layout.transcript_height)
+        }
+        FocusSessionPane::Activity => {
+            state.activity_scroll = max_scroll(line_count(&state.activity_lines), layout.activity_height)
+        }
+        FocusSessionPane::ReplyComposer => {}
+    }
+}
+
+fn apply_scroll_delta(current: usize, max: usize, delta: isize) -> usize {
+    if delta.is_negative() {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        current.saturating_add(delta as usize).min(max)
+    }
+}
+
+fn rebuild_focus_session_lines(state: &mut FocusSessionViewState) {
+    state.transcript_lines =
+        build_focus_transcript_lines(&state.events, &state.transcript_text, state.show_verbose);
+    state.activity_lines = build_focus_activity_lines(&state.events, state.show_verbose);
+    state.transcript_line_count = line_count(&state.transcript_lines);
+    state.activity_line_count = line_count(&state.activity_lines);
+}
+
+fn build_focus_transcript_lines(
+    events: &[agentd_shared::event::SessionEvent],
+    fallback_text: &str,
+    show_verbose: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for event in events {
+        append_timeline_lines(&mut lines, event, show_verbose);
+    }
+
+    if lines.is_empty() {
+        if fallback_text.trim().is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No structured transcript yet.",
+                muted_style(),
+            )));
+        } else {
+            append_card_header(
+                &mut lines,
+                "log fallback",
+                "rendered transcript unavailable",
+                fallback_style(),
+            );
+            append_preformatted_block(&mut lines, fallback_text, code_block_style());
+        }
+    }
+
+    lines
+}
+
+fn build_focus_activity_lines(
+    events: &[agentd_shared::event::SessionEvent],
+    show_verbose: bool,
+) -> Vec<Line<'static>> {
+    if events.is_empty() {
+        return vec![Line::from(Span::styled("No activity yet", muted_style()))];
+    }
+
+    let mut lines = Vec::new();
+    for event in events {
+        if let Some((label, detail, style)) = summarize_activity_event(event, show_verbose) {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<8}", event.timestamp.format("%H:%M:%S")),
+                    muted_style(),
+                ),
+                Span::raw(" "),
+                Span::styled(label, style.add_modifier(Modifier::BOLD)),
+            ]));
+            if !detail.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("         {}", preview_text(&detail, 48)),
+                    muted_style(),
+                )));
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No activity in current filter.",
+            muted_style(),
+        )));
+    }
+    lines
+}
+
+fn append_timeline_lines(
+    lines: &mut Vec<Line<'static>>,
+    event: &agentd_shared::event::SessionEvent,
+    show_verbose: bool,
+) {
+    match event.event_type.as_str() {
+        "SESSION_REPLY_REQUESTED" | "SESSION_INPUT_INJECTED" => {
+            let prompt = event
+                .payload_json
+                .get("prompt")
+                .and_then(Value::as_str)
+                .or_else(|| event.payload_json.get("data").and_then(Value::as_str))
+                .unwrap_or_default();
+            if !prompt.trim().is_empty() {
+                append_message_card(lines, "you", event, prompt, user_style());
+            }
+        }
+        "SESSION_NEEDS_INPUT" => {
+            let question = event
+                .payload_json
+                .get("question")
+                .and_then(Value::as_str)
+                .unwrap_or("Agent is waiting for input.");
+            append_system_card(lines, event, "needs input", question, attention_style(AttentionLevel::Action));
+        }
+        "SESSION_FAILED" => {
+            let detail = event
+                .payload_json
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("Session failed.");
+            append_system_card(lines, event, "failed", detail, attention_style(AttentionLevel::Action));
+        }
+        "SESSION_FINISHED" if show_verbose => {
+            let detail = event
+                .payload_json
+                .get("outcome")
+                .and_then(Value::as_str)
+                .unwrap_or("finished");
+            append_system_card(lines, event, "finished", detail, notice_style());
+        }
+        "THREAD_UPSTREAM_BOUND" if show_verbose => {
+            let detail = event
+                .payload_json
+                .get("upstream_thread_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            append_system_card(lines, event, "thread", detail, accent_style());
+        }
+        "CODEX_JSON_PARSE_ERROR" if show_verbose => {
+            let detail = event
+                .payload_json
+                .get("line_preview")
+                .and_then(Value::as_str)
+                .unwrap_or("invalid codex json");
+            append_system_card(lines, event, "parse error", detail, attention_style(AttentionLevel::Action));
+        }
+        _ => {
+            if let Some(item) = codex_item(&event.payload_json) {
+                match item_type(item) {
+                    Some("agent_message") => {
+                        if let Some(text) = item.get("text").and_then(Value::as_str) {
+                            append_message_card(lines, "assistant", event, text, assistant_style());
+                        }
+                    }
+                    Some("command_execution") => {
+                        append_command_card(lines, event, item);
+                    }
+                    Some("file_change") => {
+                        append_file_change_card(lines, event, item);
+                    }
+                    _ if show_verbose => append_system_card(
+                        lines,
+                        event,
+                        "event",
+                        &event_preview(event),
+                        fallback_style(),
+                    ),
+                    _ => {}
+                }
+            } else if show_verbose {
+                append_system_card(lines, event, &event.event_type, &event_preview(event), fallback_style());
+            }
+        }
+    }
+}
+
+fn append_message_card(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    event: &agentd_shared::event::SessionEvent,
+    text: &str,
+    style: Style,
+) {
+    append_card_header(
+        lines,
+        label,
+        &event.timestamp.format("%H:%M:%S").to_string(),
+        style,
+    );
+    append_rich_text(lines, text);
+    lines.push(Line::from(""));
+}
+
+fn append_command_card(
+    lines: &mut Vec<Line<'static>>,
+    event: &agentd_shared::event::SessionEvent,
+    item: &Value,
+) {
+    let status = item.get("status").and_then(Value::as_str).unwrap_or("unknown");
+    let exit_code = item
+        .get("exit_code")
+        .and_then(Value::as_i64)
+        .map(|value| format!("exit {value}"))
+        .unwrap_or_else(|| "running".to_string());
+    append_card_header(
+        lines,
+        "tool",
+        &format!(
+            "{}  {}  {}",
+            event.timestamp.format("%H:%M:%S"),
+            status,
+            exit_code
+        ),
+        tool_style(),
+    );
+
+    if let Some(command) = item.get("command").and_then(Value::as_str) {
+        lines.push(Line::from(vec![
+            Span::styled("cmd ", muted_style()),
+            Span::styled(command.to_string(), inline_code_style()),
+        ]));
+    }
+
+    let output = item
+        .get("aggregated_output")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !output.trim().is_empty() {
+        append_output_block(
+            lines,
+            output,
+            item.get("command").and_then(Value::as_str).unwrap_or_default(),
+        );
+    }
+    lines.push(Line::from(""));
+}
+
+fn append_file_change_card(
+    lines: &mut Vec<Line<'static>>,
+    event: &agentd_shared::event::SessionEvent,
+    item: &Value,
+) {
+    append_card_header(
+        lines,
+        "files",
+        &event.timestamp.format("%H:%M:%S").to_string(),
+        file_change_style(),
+    );
+    let Some(changes) = item.get("changes").and_then(Value::as_array) else {
+        lines.push(Line::from(Span::styled("No file details", muted_style())));
+        lines.push(Line::from(""));
+        return;
+    };
+
+    for change in changes {
+        let path = change
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let kind = change.get("kind").and_then(Value::as_str).unwrap_or("change");
+        let kind_style = match kind {
+            "add" | "create" => diff_add_style(),
+            "delete" | "remove" => diff_delete_style(),
+            _ => file_change_style(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<7}", kind), kind_style.add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+            Span::styled(path.to_string(), code_block_style()),
+        ]));
+    }
+    lines.push(Line::from(""));
+}
+
+fn append_system_card(
+    lines: &mut Vec<Line<'static>>,
+    event: &agentd_shared::event::SessionEvent,
+    label: &str,
+    detail: &str,
+    style: Style,
+) {
+    append_card_header(
+        lines,
+        label,
+        &event.timestamp.format("%H:%M:%S").to_string(),
+        style,
+    );
+    if !detail.trim().is_empty() {
+        lines.push(Line::from(Span::styled(detail.to_string(), muted_style())));
+    }
+    lines.push(Line::from(""));
+}
+
+fn append_card_header(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    meta: &str,
+    style: Style,
+) {
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" {} ", label.to_ascii_uppercase()),
+            style.add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(meta.to_string(), muted_style()),
+    ]));
+}
+
+fn append_output_block(lines: &mut Vec<Line<'static>>, output: &str, command: &str) {
+    if command.contains("git diff") || looks_like_diff(output) {
+        append_diff_block(lines, output);
+    } else {
+        append_preformatted_block(lines, output, code_block_style());
+    }
+}
+
+fn append_rich_text(lines: &mut Vec<Line<'static>>, text: &str) {
+    for block in parse_rich_blocks(text) {
+        match block {
+            RichTextBlock::Paragraph(paragraph) => {
+                for raw_line in paragraph.lines() {
+                    lines.push(Line::from(inline_markdown_spans(raw_line)));
+                }
+                lines.push(Line::from(""));
+            }
+            RichTextBlock::Code { language, text } => {
+                let title = language
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("code");
+                lines.push(Line::from(vec![
+                    Span::styled(" code ", code_header_style().add_modifier(Modifier::BOLD)),
+                    Span::raw(" "),
+                    Span::styled(title.to_string(), muted_style()),
+                ]));
+                append_preformatted_block(lines, &text, code_block_style());
+                lines.push(Line::from(""));
+            }
+            RichTextBlock::Diff(text) => {
+                lines.push(Line::from(Span::styled(
+                    " diff ",
+                    diff_header_style().add_modifier(Modifier::BOLD),
+                )));
+                append_diff_block(lines, &text);
+                lines.push(Line::from(""));
+            }
+        }
+    }
+}
+
+fn append_preformatted_block(lines: &mut Vec<Line<'static>>, text: &str, style: Style) {
+    for raw_line in text.lines() {
+        lines.push(Line::from(Span::styled(
+            format!("  {raw_line}"),
+            style,
+        )));
+    }
+    if text.is_empty() {
+        lines.push(Line::from(Span::styled("  ", style)));
+    }
+}
+
+fn append_diff_block(lines: &mut Vec<Line<'static>>, text: &str) {
+    for raw_line in text.lines() {
+        let style = diff_line_style(raw_line);
+        lines.push(Line::from(Span::styled(
+            format!("  {raw_line}"),
+            style,
+        )));
+    }
+}
+
+#[derive(Debug)]
+enum RichTextBlock {
+    Paragraph(String),
+    Code { language: Option<String>, text: String },
+    Diff(String),
+}
+
+fn parse_rich_blocks(text: &str) -> Vec<RichTextBlock> {
+    let mut blocks = Vec::new();
+    let mut paragraph = Vec::new();
+    let mut in_fence = false;
+    let mut fence_lang: Option<String> = None;
+    let mut fence_lines = Vec::new();
+
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("```") {
+            if in_fence {
+                let fenced_text = fence_lines.join("\n");
+                if looks_like_diff_with_lang(&fence_lang, &fenced_text) {
+                    blocks.push(RichTextBlock::Diff(fenced_text));
+                } else {
+                    blocks.push(RichTextBlock::Code {
+                        language: fence_lang.take(),
+                        text: fenced_text,
+                    });
+                }
+                fence_lines.clear();
+                in_fence = false;
+                fence_lang = None;
+            } else {
+                flush_paragraph(&mut blocks, &mut paragraph);
+                in_fence = true;
+                let lang = rest.trim();
+                if !lang.is_empty() {
+                    fence_lang = Some(lang.to_string());
+                }
+            }
+            continue;
+        }
+
+        if in_fence {
+            fence_lines.push(line.to_string());
+        } else {
+            paragraph.push(line.to_string());
+        }
+    }
+
+    if in_fence {
+        let fenced_text = fence_lines.join("\n");
+        if looks_like_diff_with_lang(&fence_lang, &fenced_text) {
+            blocks.push(RichTextBlock::Diff(fenced_text));
+        } else if !fenced_text.is_empty() {
+            blocks.push(RichTextBlock::Code {
+                language: fence_lang,
+                text: fenced_text,
+            });
+        }
+    } else {
+        flush_paragraph(&mut blocks, &mut paragraph);
+    }
+
+    if blocks.is_empty() && !text.trim().is_empty() {
+        blocks.push(RichTextBlock::Paragraph(text.to_string()));
+    }
+
+    blocks
+}
+
+fn flush_paragraph(blocks: &mut Vec<RichTextBlock>, paragraph: &mut Vec<String>) {
+    let joined = paragraph.join("\n").trim().to_string();
+    paragraph.clear();
+    if joined.is_empty() {
+        return;
+    }
+    if looks_like_diff(&joined) {
+        blocks.push(RichTextBlock::Diff(joined));
+    } else {
+        blocks.push(RichTextBlock::Paragraph(joined));
+    }
+}
+
+fn inline_markdown_spans(text: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut in_code = false;
+    for part in text.split('`') {
+        let span = if in_code {
+            Span::styled(part.to_string(), inline_code_style())
+        } else {
+            Span::styled(part.to_string(), Style::default())
+        };
+        spans.push(span);
+        in_code = !in_code;
+    }
+    spans
+}
+
+fn summarize_activity_event(
+    event: &agentd_shared::event::SessionEvent,
+    show_verbose: bool,
+) -> Option<(String, String, Style)> {
+    match event.event_type.as_str() {
+        "SESSION_REPLY_REQUESTED" => Some((
+            "reply".to_string(),
+            event_preview(event),
+            user_style(),
+        )),
+        "SESSION_NEEDS_INPUT" => Some((
+            "input".to_string(),
+            event_preview(event),
+            attention_style(AttentionLevel::Action),
+        )),
+        "SESSION_FAILED" => Some((
+            "failed".to_string(),
+            event_preview(event),
+            attention_style(AttentionLevel::Action),
+        )),
+        "SESSION_FINISHED" if show_verbose => Some((
+            "finish".to_string(),
+            event_preview(event),
+            notice_style(),
+        )),
+        _ => {
+            if let Some(item) = codex_item(&event.payload_json) {
+                match item_type(item) {
+                    Some("agent_message") => Some((
+                        "agent".to_string(),
+                        item.get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        assistant_style(),
+                    )),
+                    Some("command_execution") => Some((
+                        "tool".to_string(),
+                        item.get("command")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        tool_style(),
+                    )),
+                    Some("file_change") => Some((
+                        "files".to_string(),
+                        event_preview(event),
+                        file_change_style(),
+                    )),
+                    _ if show_verbose => Some((
+                        event.event_type.to_ascii_lowercase(),
+                        event_preview(event),
+                        fallback_style(),
+                    )),
+                    _ => None,
+                }
+            } else if show_verbose {
+                Some((
+                    event.event_type.to_ascii_lowercase(),
+                    event_preview(event),
+                    fallback_style(),
+                ))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn codex_item(payload: &Value) -> Option<&Value> {
+    payload.get("raw").and_then(|raw| raw.get("item"))
+}
+
+fn item_type(item: &Value) -> Option<&str> {
+    item.get("type").and_then(Value::as_str)
+}
+
+fn event_preview(event: &agentd_shared::event::SessionEvent) -> String {
+    for key in ["question", "error", "prompt_preview", "prompt", "data", "rendered", "text"] {
+        if let Some(value) = event.payload_json.get(key).and_then(Value::as_str) {
+            return preview_text(value, 120);
+        }
+    }
+    if let Some(item) = codex_item(&event.payload_json) {
+        for key in ["text", "command", "status"] {
+            if let Some(value) = item.get(key).and_then(Value::as_str) {
+                return preview_text(value, 120);
+            }
+        }
+    }
+    preview_text(&event.payload_json.to_string(), 120)
+}
+
+fn preview_text(text: &str, max_chars: usize) -> String {
+    let trimmed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview = trimmed.chars().take(max_chars).collect::<String>();
+    if trimmed.chars().count() > max_chars {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn looks_like_diff_with_lang(language: &Option<String>, text: &str) -> bool {
+    matches!(language.as_deref(), Some("diff" | "patch")) || looks_like_diff(text)
+}
+
+fn looks_like_diff(text: &str) -> bool {
+    let mut diff_markers = 0;
+    for line in text.lines().take(12) {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("diff --git")
+            || trimmed.starts_with("@@")
+            || trimmed.starts_with("+++ ")
+            || trimmed.starts_with("--- ")
+            || trimmed.starts_with('+')
+            || trimmed.starts_with('-')
+        {
+            diff_markers += 1;
+        }
+    }
+    diff_markers >= 2
+}
+
+fn diff_line_style(line: &str) -> Style {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("diff --git") || trimmed.starts_with("+++ ") || trimmed.starts_with("--- ")
+    {
+        diff_header_style()
+    } else if trimmed.starts_with("@@") {
+        diff_hunk_style()
+    } else if trimmed.starts_with('+') {
+        diff_add_style()
+    } else if trimmed.starts_with('-') {
+        diff_delete_style()
+    } else {
+        code_block_style()
     }
 }
 
@@ -1775,13 +2671,13 @@ fn render_focus_dashboard(
 fn render_focus_session(
     frame: &mut Frame,
     session: &SessionRecord,
-    events: &[agentd_shared::event::SessionEvent],
-    log_tail: &str,
+    view_state: &FocusSessionViewState,
     status: &str,
     reply_open: bool,
     reply: &str,
 ) {
     let area = frame.area();
+    let layout = focus_session_layout(area);
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1790,10 +2686,6 @@ fn render_focus_session(
             Constraint::Length(2),
         ])
         .split(area);
-    let middle = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-        .split(outer[1]);
 
     let mut header_lines = vec![Line::from(vec![
         Span::styled("Codex", accent_style().add_modifier(Modifier::BOLD)),
@@ -1829,51 +2721,50 @@ fn render_focus_session(
     );
 
     frame.render_widget(
-        Paragraph::new(log_tail.to_string())
+        Paragraph::new(view_state.transcript_lines.clone())
             .block(
-                Block::default().title(Span::styled(
-                    "transcript",
-                    muted_style().add_modifier(Modifier::BOLD),
-                )),
+                Block::default()
+                    .title(Span::styled(
+                        if view_state.show_verbose {
+                            "narrative [verbose]"
+                        } else {
+                            "narrative"
+                        },
+                        pane_title_style(
+                            view_state.active_pane == FocusSessionPane::Transcript && !reply_open,
+                        ),
+                    ))
+                    .borders(Borders::RIGHT),
             )
+            .scroll((view_state.transcript_scroll as u16, 0))
             .wrap(Wrap { trim: false }),
-        middle[0],
+        layout.transcript_rect,
     );
 
-    let event_items = if events.is_empty() {
-        vec![ListItem::new(Line::from(vec![Span::styled(
-            "No recent events",
-            muted_style(),
-        )]))]
-    } else {
-        events
-            .iter()
-            .rev()
-            .map(|event| {
-                ListItem::new(vec![
-                    Line::from(Span::styled(
-                        event.event_type.as_str(),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(Span::styled(event.timestamp.to_string(), muted_style())),
-                ])
-            })
-            .collect::<Vec<_>>()
-    };
     frame.render_widget(
-        List::new(event_items).block(
+        Paragraph::new(view_state.activity_lines.clone())
+            .scroll((view_state.activity_scroll as u16, 0))
+            .wrap(Wrap { trim: false })
+            .block(
             Block::default()
                 .borders(Borders::LEFT)
-                .title(Span::styled("activity", muted_style().add_modifier(Modifier::BOLD))),
+                .title(Span::styled(
+                    "activity",
+                    pane_title_style(
+                        view_state.active_pane == FocusSessionPane::Activity && !reply_open,
+                    ),
+                )),
         ),
-        middle[1],
+        layout.activity_rect,
     );
 
     let footer = Paragraph::new(if status.is_empty() {
         if session.status == SessionStatus::NeedsInput {
-            "y reply  r retry  k kill  q back".to_string()
+            "Tab pane  Wheel scroll  ↑↓ PgUp PgDn Home End  v verbose  y reply  r retry  k kill  q back"
+                .to_string()
         } else {
-            "a attach  r retry  k kill  q back".to_string()
+            "Tab pane  Wheel scroll  ↑↓ PgUp PgDn Home End  v verbose  a attach  r retry  k kill  q back"
+                .to_string()
         }
     } else {
         format!("Status: {status}")
@@ -1908,24 +2799,102 @@ fn render_focus_session(
     }
 }
 
+fn pane_title_style(active: bool) -> Style {
+    if active {
+        accent_style().add_modifier(Modifier::BOLD)
+    } else {
+        muted_style()
+    }
+}
+
 fn composer_box_style() -> Style {
     Style::default().bg(CODEX_COMPOSER_BG).fg(Color::White)
 }
 
 fn accent_style() -> Style {
-    Style::default().fg(Color::Cyan)
+    Style::default().fg(Color::Rgb(84, 173, 255))
 }
 
 fn muted_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    Style::default().fg(Color::Rgb(118, 131, 143))
+}
+
+fn notice_style() -> Style {
+    Style::default().fg(Color::Rgb(242, 201, 76))
+}
+
+fn assistant_style() -> Style {
+    Style::default()
+        .fg(Color::Rgb(223, 232, 255))
+        .bg(Color::Rgb(30, 49, 87))
+}
+
+fn user_style() -> Style {
+    Style::default()
+        .fg(Color::Rgb(16, 28, 34))
+        .bg(Color::Rgb(104, 211, 145))
+}
+
+fn tool_style() -> Style {
+    Style::default()
+        .fg(Color::Rgb(29, 21, 7))
+        .bg(Color::Rgb(255, 191, 71))
+}
+
+fn file_change_style() -> Style {
+    Style::default()
+        .fg(Color::Rgb(229, 244, 255))
+        .bg(Color::Rgb(23, 78, 115))
+}
+
+fn fallback_style() -> Style {
+    Style::default()
+        .fg(Color::Rgb(229, 229, 229))
+        .bg(Color::Rgb(66, 66, 66))
+}
+
+fn code_header_style() -> Style {
+    Style::default()
+        .fg(Color::Rgb(212, 239, 255))
+        .bg(Color::Rgb(25, 45, 65))
+}
+
+fn code_block_style() -> Style {
+    Style::default().fg(Color::Rgb(206, 214, 222))
+}
+
+fn inline_code_style() -> Style {
+    Style::default()
+        .fg(Color::Rgb(153, 214, 255))
+        .add_modifier(Modifier::BOLD)
+}
+
+fn diff_header_style() -> Style {
+    Style::default()
+        .fg(Color::Rgb(153, 214, 255))
+        .add_modifier(Modifier::BOLD)
+}
+
+fn diff_hunk_style() -> Style {
+    Style::default()
+        .fg(Color::Rgb(242, 201, 76))
+        .add_modifier(Modifier::BOLD)
+}
+
+fn diff_add_style() -> Style {
+    Style::default().fg(Color::Rgb(111, 207, 151))
+}
+
+fn diff_delete_style() -> Style {
+    Style::default().fg(Color::Rgb(255, 107, 107))
 }
 
 fn attention_style(attention: AttentionLevel) -> Style {
     match attention {
-        AttentionLevel::Info => Style::default().fg(Color::Gray),
-        AttentionLevel::Notice => Style::default().fg(Color::Yellow),
+        AttentionLevel::Info => muted_style(),
+        AttentionLevel::Notice => notice_style(),
         AttentionLevel::Action => Style::default()
-            .fg(Color::Red)
+            .fg(Color::Rgb(255, 107, 107))
             .add_modifier(Modifier::BOLD),
     }
 }
@@ -1943,30 +2912,6 @@ fn cursor_visible() -> bool {
         .duration_since(UNIX_EPOCH)
         .map(|duration| (duration.as_millis() / 500) % 2 == 0)
         .unwrap_or(true)
-}
-
-fn read_log_tail(paths: &AppPaths, session_id: &str, lines: usize) -> Result<String> {
-    let rendered = paths.rendered_log_path(session_id);
-    let path = if rendered.exists() {
-        rendered
-    } else {
-        paths.log_path(session_id)
-    };
-    let contents = match fs::read_to_string(path.as_std_path()) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
-        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path)),
-    };
-    let tail = contents
-        .lines()
-        .rev()
-        .take(lines)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(tail)
 }
 
 async fn kill_session(paths: &AppPaths, session_id: &str) -> Result<()> {
@@ -2255,12 +3200,16 @@ fn fuzzy_score(haystack: &str, needle: &str) -> Option<i64> {
 mod tests {
     use super::{
         AGENTD_ATTACH_RESTORE_SEQUENCE, AttachInput, AttachKeyBindingParser, Cli, Command,
-        DaemonCommand, SessionEndSummary, format_session_end_summary, resolve_detach_session_id,
+        DaemonCommand, FocusSessionLayout, FocusSessionPane, FocusSessionViewState,
+        SessionEndSummary, apply_scroll_delta, clamp_focus_session_scroll, looks_like_diff,
+        parse_rich_blocks,
+        format_session_end_summary, pane_at_position, resolve_detach_session_id,
         resolve_new_session_options,
     };
     use agentd_shared::session::SessionStatus;
     use clap::Parser;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use ratatui::layout::Rect;
     use std::path::PathBuf;
 
     #[test]
@@ -2524,5 +3473,82 @@ mod tests {
             format_session_end_summary(&summary),
             "session demo failed: spawn failed"
         );
+    }
+
+    #[test]
+    fn apply_scroll_delta_clamps_to_bounds() {
+        assert_eq!(apply_scroll_delta(5, 10, -10), 0);
+        assert_eq!(apply_scroll_delta(5, 10, 20), 10);
+        assert_eq!(apply_scroll_delta(5, 10, 2), 7);
+    }
+
+    #[test]
+    fn clamp_focus_session_scroll_clamps_both_panes() {
+        let mut state = FocusSessionViewState {
+            transcript_lines: vec![ratatui::text::Line::from("x"); 40],
+            transcript_line_count: 40,
+            transcript_scroll: 99,
+            events: vec![demo_event(1), demo_event(2), demo_event(3)],
+            activity_lines: vec![ratatui::text::Line::from("x"); 6],
+            activity_line_count: 6,
+            activity_scroll: 99,
+            ..Default::default()
+        };
+        let layout = FocusSessionLayout {
+            transcript_rect: Rect::new(0, 0, 10, 10),
+            activity_rect: Rect::new(10, 0, 10, 10),
+            transcript_height: 6,
+            activity_height: 4,
+        };
+
+        clamp_focus_session_scroll(&mut state, &layout);
+
+        assert_eq!(state.transcript_scroll, 34);
+        assert_eq!(state.activity_scroll, 2);
+    }
+
+    #[test]
+    fn pane_at_position_returns_matching_pane() {
+        let layout = FocusSessionLayout {
+            transcript_rect: Rect::new(0, 0, 20, 10),
+            activity_rect: Rect::new(20, 0, 10, 10),
+            transcript_height: 8,
+            activity_height: 8,
+        };
+
+        assert_eq!(
+            pane_at_position(&layout, 5, 5),
+            Some(FocusSessionPane::Transcript)
+        );
+        assert_eq!(
+            pane_at_position(&layout, 25, 5),
+            Some(FocusSessionPane::Activity)
+        );
+        assert_eq!(pane_at_position(&layout, 31, 5), None);
+    }
+
+    #[test]
+    fn rich_text_parser_detects_fenced_diff_blocks() {
+        let blocks = parse_rich_blocks("before\n```diff\n+added\n-removed\n```\nafter");
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(&blocks[1], super::RichTextBlock::Diff(text) if text.contains("+added")));
+    }
+
+    #[test]
+    fn diff_detection_accepts_unified_diff_markers() {
+        assert!(looks_like_diff(
+            "diff --git a/demo b/demo\n--- a/demo\n+++ b/demo\n@@ -1 +1 @@\n-old\n+new"
+        ));
+        assert!(!looks_like_diff("plain output\nwith no patch markers"));
+    }
+
+    fn demo_event(id: i64) -> agentd_shared::event::SessionEvent {
+        agentd_shared::event::SessionEvent {
+            id,
+            session_id: "demo".to_string(),
+            timestamp: chrono::Utc::now(),
+            event_type: format!("EVENT_{id}"),
+            payload_json: serde_json::json!({}),
+        }
     }
 }
