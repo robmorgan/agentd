@@ -31,12 +31,20 @@ pub enum IntegrationState {
     Discarded,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+    Execute,
+    Plan,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionRecord {
     pub session_id: String,
     pub thread_id: Option<String>,
     pub agent: String,
     pub model: Option<String>,
+    pub mode: SessionMode,
     pub workspace: String,
     pub repo_path: String,
     pub task: String,
@@ -62,6 +70,7 @@ pub struct CreateSessionResult {
     pub branch: String,
     pub worktree: String,
     pub status: SessionStatus,
+    pub mode: SessionMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -80,6 +89,16 @@ pub struct SessionDiff {
     pub branch: String,
     pub worktree: String,
     pub diff: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanRecord {
+    pub session_id: String,
+    pub version: u32,
+    pub summary: String,
+    pub body_markdown: String,
+    pub source_event_id: i64,
+    pub created_at: DateTime<Utc>,
 }
 
 pub fn branch_name_from_task(task: &str) -> String {
@@ -110,6 +129,15 @@ impl IntegrationState {
             Self::PendingReview => "pending_review",
             Self::Applied => "applied",
             Self::Discarded => "discarded",
+        }
+    }
+}
+
+impl SessionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Execute => "execute",
+            Self::Plan => "plan",
         }
     }
 }

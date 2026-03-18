@@ -6,7 +6,7 @@ use serde_json::Value;
 use agentd_shared::{
     event::{NewSessionEvent, SessionEvent},
     paths::AppPaths,
-    session::{AttentionLevel, IntegrationState, SessionRecord, SessionStatus},
+    session::{AttentionLevel, IntegrationState, PlanRecord, SessionMode, SessionRecord, SessionStatus},
 };
 
 #[derive(Clone)]
@@ -19,6 +19,7 @@ pub struct NewSession<'a> {
     pub thread_id: Option<&'a str>,
     pub agent: &'a str,
     pub model: Option<&'a str>,
+    pub mode: SessionMode,
     pub agent_command: &'a str,
     pub agent_args_json: &'a str,
     pub resume_session_id: Option<&'a str>,
@@ -77,6 +78,7 @@ impl Database {
                 thread_id TEXT,
                 agent TEXT NOT NULL,
                 model TEXT,
+                mode TEXT NOT NULL DEFAULT 'execute',
                 agent_command TEXT,
                 agent_args_json TEXT,
                 resume_session_id TEXT,
@@ -114,10 +116,21 @@ impl Database {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS plans (
+                session_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                summary TEXT NOT NULL,
+                body_markdown TEXT NOT NULL,
+                source_event_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (session_id, version)
+            );
             CREATE INDEX IF NOT EXISTS idx_events_session_id_id
                 ON events (session_id, id);
             CREATE INDEX IF NOT EXISTS idx_threads_session_id
                 ON threads (session_id);
+            CREATE INDEX IF NOT EXISTS idx_plans_session_id_version
+                ON plans (session_id, version DESC);
             ",
         )?;
         self.ensure_column(
@@ -126,6 +139,11 @@ impl Database {
             "ALTER TABLE sessions ADD COLUMN thread_id TEXT",
         )?;
         self.ensure_column(&conn, "model", "ALTER TABLE sessions ADD COLUMN model TEXT")?;
+        self.ensure_column(
+            &conn,
+            "mode",
+            "ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'execute'",
+        )?;
         self.ensure_column(
             &conn,
             "repo_path",
@@ -168,12 +186,13 @@ impl Database {
         )?;
         conn.execute(
             "UPDATE sessions
-             SET repo_path = COALESCE(repo_path, workspace),
+             SET mode = COALESCE(mode, 'execute'),
+                 repo_path = COALESCE(repo_path, workspace),
                  base_branch = COALESCE(base_branch, 'HEAD'),
                  integration_state = COALESCE(integration_state, 'clean'),
                  attention = COALESCE(attention, 'info'),
                  attention_summary = COALESCE(attention_summary, task)
-             WHERE repo_path IS NULL OR base_branch IS NULL OR integration_state IS NULL OR attention IS NULL OR attention_summary IS NULL",
+             WHERE mode IS NULL OR repo_path IS NULL OR base_branch IS NULL OR integration_state IS NULL OR attention IS NULL OR attention_summary IS NULL",
             [],
         )?;
         Ok(())
@@ -197,15 +216,16 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO sessions (
-                session_id, thread_id, agent, model, agent_command, agent_args_json, resume_session_id, workspace,
+                session_id, thread_id, agent, model, mode, agent_command, agent_args_json, resume_session_id, workspace,
                 repo_path, task, base_branch, branch, worktree, status, attention, attention_summary,
                 integration_state, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?18)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?19)",
             params![
                 new_session.session_id,
                 new_session.thread_id,
                 new_session.agent,
                 new_session.model,
+                session_mode_to_str(new_session.mode),
                 new_session.agent_command,
                 new_session.agent_args_json,
                 new_session.resume_session_id,
@@ -433,7 +453,7 @@ impl Database {
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT session_id, thread_id, agent, model, workspace, repo_path, task, base_branch, branch,
+            "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, task, base_branch, branch,
                     worktree, status, integration_state, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
@@ -447,7 +467,7 @@ impl Database {
     pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT session_id, thread_id, agent, model, workspace, repo_path, task, base_branch, branch,
+            "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, task, base_branch, branch,
                     worktree, status, integration_state, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
@@ -520,6 +540,57 @@ impl Database {
             params![thread_id],
             row_to_thread,
         )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn insert_plan(
+        &self,
+        session_id: &str,
+        summary: &str,
+        body_markdown: &str,
+        source_event_id: i64,
+    ) -> Result<PlanRecord> {
+        let conn = self.connect()?;
+        let version = conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM plans WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get::<_, u32>(0),
+        )?;
+        let created_at = Utc::now();
+        conn.execute(
+            "INSERT INTO plans (session_id, version, summary, body_markdown, source_event_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                session_id,
+                version,
+                summary,
+                body_markdown,
+                source_event_id,
+                created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(PlanRecord {
+            session_id: session_id.to_string(),
+            version,
+            summary: summary.to_string(),
+            body_markdown: body_markdown.to_string(),
+            source_event_id,
+            created_at,
+        })
+    }
+
+    pub fn latest_plan(&self, session_id: &str) -> Result<Option<PlanRecord>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT session_id, version, summary, body_markdown, source_event_id, created_at
+             FROM plans
+             WHERE session_id = ?1
+             ORDER BY version DESC
+             LIMIT 1",
+            params![session_id],
+            row_to_plan,
+        )
         .optional()
         .map_err(Into::into)
     }
@@ -544,6 +615,10 @@ impl Database {
         )?;
         conn.execute(
             "DELETE FROM threads WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        conn.execute(
+            "DELETE FROM plans WHERE session_id = ?1",
             params![session_id],
         )?;
         conn.execute(
@@ -618,45 +693,63 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         thread_id: row.get(1)?,
         agent: row.get(2)?,
         model: row.get(3)?,
-        workspace: row.get(4)?,
-        repo_path: row.get(5)?,
-        task: row.get(6)?,
-        base_branch: row.get(7)?,
-        branch: row.get(8)?,
-        worktree: row.get(9)?,
-        status: str_to_status(&row.get::<_, String>(10)?).map_err(|err| {
+        mode: str_to_session_mode(&row.get::<_, String>(4)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                10,
+                4,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        integration_state: str_to_integration_state(&row.get::<_, String>(11)?).map_err(
+        workspace: row.get(5)?,
+        repo_path: row.get(6)?,
+        task: row.get(7)?,
+        base_branch: row.get(8)?,
+        branch: row.get(9)?,
+        worktree: row.get(10)?,
+        status: str_to_status(&row.get::<_, String>(11)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                11,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?,
+        integration_state: str_to_integration_state(&row.get::<_, String>(12)?).map_err(
             |err| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    11,
+                    12,
                     rusqlite::types::Type::Text,
                     Box::new(err),
                 )
             },
         )?,
-        pid: row.get::<_, Option<u32>>(12)?,
-        exit_code: row.get(13)?,
-        error: row.get(14)?,
-        attention: str_to_attention(&row.get::<_, String>(15)?).map_err(|err| {
+        pid: row.get::<_, Option<u32>>(13)?,
+        exit_code: row.get(14)?,
+        error: row.get(15)?,
+        attention: str_to_attention(&row.get::<_, String>(16)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                15,
+                16,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        attention_summary: row.get(16)?,
-        created_at: parse_time(row.get::<_, String>(17)?)?,
-        updated_at: parse_time(row.get::<_, String>(18)?)?,
+        attention_summary: row.get(17)?,
+        created_at: parse_time(row.get::<_, String>(18)?)?,
+        updated_at: parse_time(row.get::<_, String>(19)?)?,
         exited_at: row
-            .get::<_, Option<String>>(19)?
+            .get::<_, Option<String>>(20)?
             .map(parse_time)
             .transpose()?,
+    })
+}
+
+fn row_to_plan(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanRecord> {
+    Ok(PlanRecord {
+        session_id: row.get(0)?,
+        version: row.get(1)?,
+        summary: row.get(2)?,
+        body_markdown: row.get(3)?,
+        source_event_id: row.get(4)?,
+        created_at: parse_time(row.get::<_, String>(5)?)?,
     })
 }
 
@@ -756,6 +849,10 @@ fn integration_state_to_str(state: IntegrationState) -> &'static str {
     state.as_str()
 }
 
+fn session_mode_to_str(mode: SessionMode) -> &'static str {
+    mode.as_str()
+}
+
 fn str_to_integration_state(value: &str) -> std::result::Result<IntegrationState, std::io::Error> {
     match value {
         "clean" => Ok(IntegrationState::Clean),
@@ -781,10 +878,21 @@ fn str_to_attention(value: &str) -> std::result::Result<AttentionLevel, std::io:
     }
 }
 
+fn str_to_session_mode(value: &str) -> std::result::Result<SessionMode, std::io::Error> {
+    match value {
+        "execute" => Ok(SessionMode::Execute),
+        "plan" => Ok(SessionMode::Plan),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown session mode `{value}`"),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Database;
-    use agentd_shared::{event::NewSessionEvent, paths::AppPaths};
+    use agentd_shared::{event::NewSessionEvent, paths::AppPaths, session::SessionMode};
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -815,6 +923,7 @@ mod tests {
             thread_id: None,
             agent: "codex",
             model: None,
+            mode: SessionMode::Execute,
             agent_command: "codex",
             agent_args_json: "[]",
             resume_session_id: None,
@@ -862,6 +971,7 @@ mod tests {
             thread_id: None,
             agent: "codex",
             model: None,
+            mode: SessionMode::Execute,
             agent_command: "codex",
             agent_args_json: "[]",
             resume_session_id: None,
@@ -897,6 +1007,7 @@ mod tests {
             thread_id: None,
             agent: "codex",
             model: None,
+            mode: SessionMode::Execute,
             agent_command: "codex",
             agent_args_json: "[]",
             resume_session_id: None,
@@ -927,6 +1038,7 @@ mod tests {
             thread_id: None,
             agent: "codex",
             model: None,
+            mode: SessionMode::Execute,
             agent_command: "codex",
             agent_args_json: "[]",
             resume_session_id: None,
@@ -962,6 +1074,7 @@ mod tests {
             thread_id: Some("thread-demo"),
             agent: "codex",
             model: Some("gpt-5.3-codex"),
+            mode: SessionMode::Execute,
             agent_command: "codex",
             agent_args_json: "[]",
             resume_session_id: None,
@@ -992,5 +1105,43 @@ mod tests {
         let thread = db.get_thread("thread-demo").unwrap().unwrap();
         assert_eq!(thread.thread_id, "thread-demo");
         assert_eq!(thread.upstream_thread_id.as_deref(), Some("codex-upstream"));
+    }
+
+    #[test]
+    fn plan_rows_version_and_round_trip() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        db.insert_session(&super::NewSession {
+            session_id: "demo",
+            thread_id: None,
+            agent: "codex",
+            model: None,
+            mode: SessionMode::Plan,
+            agent_command: "codex",
+            agent_args_json: "[]",
+            resume_session_id: None,
+            workspace: "/tmp/repo",
+            repo_path: "/tmp/repo",
+            task: "plan",
+            base_branch: "main",
+            branch: "agent/plan",
+            worktree: "/tmp/worktree",
+        })
+        .unwrap();
+
+        let first = db
+            .insert_plan("demo", "First plan", "first body", 10)
+            .unwrap();
+        let second = db
+            .insert_plan("demo", "Second plan", "second body", 11)
+            .unwrap();
+
+        assert_eq!(first.version, 1);
+        assert_eq!(second.version, 2);
+        assert_eq!(
+            db.latest_plan("demo").unwrap().map(|plan| plan.summary),
+            Some("Second plan".to_string())
+        );
     }
 }

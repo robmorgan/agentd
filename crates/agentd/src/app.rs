@@ -26,8 +26,8 @@ use agentd_shared::{
     event::{NewSessionEvent, SessionEvent},
     paths::AppPaths,
     session::{
-        AttentionLevel, CreateSessionResult, IntegrationState, SessionDiff, SessionRecord,
-        SessionStatus, WorktreeRecord, branch_name_from_task,
+        AttentionLevel, CreateSessionResult, IntegrationState, SessionDiff, SessionMode,
+        SessionRecord, SessionStatus, WorktreeRecord, branch_name_from_task,
     },
 };
 
@@ -64,6 +64,7 @@ impl AppState {
         task_text: String,
         agent_name: String,
         model: Option<String>,
+        mode: SessionMode,
     ) -> Result<CreateSessionResult> {
         let paths = self.paths.clone();
         let db = self.db.clone();
@@ -77,6 +78,7 @@ impl AppState {
             let agent = config.require_agent(&paths, &agent_name)?.clone();
             let agent_args_json =
                 serde_json::to_string(&agent.args).context("failed to serialize agent args")?;
+            let prompt_text = build_initial_prompt(&task_text, mode);
 
             let session_id = unique_session_id(&db)?;
             let thread_id = (agent_name == "codex")
@@ -90,6 +92,7 @@ impl AppState {
                 thread_id: thread_id.as_deref(),
                 agent: &agent_name,
                 model: model.as_deref(),
+                mode,
                 agent_command: &agent.command,
                 agent_args_json: &agent_args_json,
                 resume_session_id: None,
@@ -106,7 +109,7 @@ impl AppState {
                     session_id: &session_id,
                     agent: &agent_name,
                     title: &task_text,
-                    initial_prompt: &task_text,
+                    initial_prompt: &prompt_text,
                 })?;
                 let _ = db.append_events(
                     &session_id,
@@ -118,6 +121,7 @@ impl AppState {
                             "session_id": &session_id,
                             "agent": &agent_name,
                             "title": &task_text,
+                            "session_mode": mode.as_str(),
                         }),
                     )],
                 );
@@ -162,9 +166,11 @@ impl AppState {
                     worktree: worktree.as_str(),
                     branch: &branch,
                     task_text: &task_text,
+                    prompt_text: &prompt_text,
                     log_path: &log_path,
                     launch: &launch,
                     model: model.as_deref(),
+                    session_mode: mode,
                     thread_id: thread_id.as_deref(),
                     resume_session_id: None,
                     resume_prompt: None,
@@ -181,6 +187,7 @@ impl AppState {
                 branch,
                 worktree: worktree.to_string(),
                 status: SessionStatus::Running,
+                mode,
             })
         })
         .await?
@@ -301,9 +308,11 @@ impl AppState {
                         worktree: &worktree,
                         branch: &branch,
                         task_text: &task_text,
+                        prompt_text: &task_text,
                         log_path: &log_path,
                         launch: &launch,
                         model: session.model.as_deref(),
+                        session_mode: session.mode,
                         thread_id: thread_id.as_deref(),
                         resume_session_id: Some(&resume_session_id),
                         resume_prompt: None,
@@ -696,9 +705,11 @@ impl AppState {
                             worktree: &worktree,
                             branch: &branch,
                             task_text: &task_text,
+                            prompt_text: &task_text,
                             log_path: &log_path,
                             launch: &launch,
                             model: model.as_deref(),
+                            session_mode: session.mode,
                             thread_id: thread_id.as_deref(),
                             resume_session_id: Some(&resume_session_id),
                             resume_prompt: Some(&resume_prompt),
@@ -866,9 +877,11 @@ struct SessionStartRequest<'a> {
     worktree: &'a str,
     branch: &'a str,
     task_text: &'a str,
+    prompt_text: &'a str,
     log_path: &'a Utf8PathBuf,
     launch: &'a LaunchCommand,
     model: Option<&'a str>,
+    session_mode: SessionMode,
     thread_id: Option<&'a str>,
     resume_session_id: Option<&'a str>,
     resume_prompt: Option<&'a str>,
@@ -979,6 +992,7 @@ fn start_session_runtime(
                 "source": "daemon",
                 "pid": pid,
                 "agent": request.launch.agent_name,
+                "session_mode": request.session_mode.as_str(),
                 "thread_id": request.thread_id,
                 "branch": request.branch,
                 "worktree": request.worktree,
@@ -1023,6 +1037,7 @@ fn start_session_runtime(
                 &writer_db,
                 &writer_session_id,
                 &thread_id,
+                request.session_mode == SessionMode::Plan,
             )
         } else {
             pump_pty_to_log(reader, &writer_log_path, &writer_runtime)
@@ -1224,6 +1239,24 @@ fn daemon_event(event_type: &str, payload_json: serde_json::Value) -> NewSession
     }
 }
 
+fn build_initial_prompt(task_text: &str, mode: SessionMode) -> String {
+    match mode {
+        SessionMode::Execute => task_text.to_string(),
+        SessionMode::Plan => format!(
+            "You are in planning mode for this repository.\n\
+             \n\
+             Task:\n\
+             {task_text}\n\
+             \n\
+             Requirements:\n\
+             - Ask follow-up questions if you need clarification before finalizing the plan.\n\
+             - Do not edit files, run implementation commands, or apply changes.\n\
+             - When you have enough information, reply with exactly one <proposed_plan>...</proposed_plan> block in Markdown.\n\
+             - Stop after producing the plan.\n"
+        ),
+    }
+}
+
 fn record_session_failure(db: &Database, session_id: &str, error: String) -> Result<()> {
     db.mark_failed(session_id, error.clone())?;
     db.append_events(
@@ -1254,6 +1287,11 @@ fn finalize_session_exit(
 
     let outcome = classify_session_outcome(db, &session, exit_code)?;
     let has_changes = session_has_pending_changes(&session)?;
+    let latest_plan = if session.mode == SessionMode::Plan {
+        db.latest_plan(session_id)?
+    } else {
+        None
+    };
     match &outcome {
         SessionOutcome::Finished => {
             db.mark_exited(session_id, exit_code)?;
@@ -1274,6 +1312,24 @@ fn finalize_session_exit(
                             "base_branch": session.base_branch,
                             "branch": session.branch,
                             "worktree": session.worktree,
+                        }),
+                    )],
+                )?;
+            } else if session.mode == SessionMode::Plan && latest_plan.is_none() {
+                db.set_integration_state(
+                    session_id,
+                    IntegrationState::Clean,
+                    AttentionLevel::Action,
+                    "planning finished without a final plan",
+                )?;
+                db.append_events(
+                    session_id,
+                    &[daemon_event(
+                        "SESSION_PLAN_MISSING",
+                        serde_json::json!({
+                            "source": "daemon",
+                            "reason": "missing_proposed_plan_block",
+                            "exit_code": exit_code,
                         }),
                     )],
                 )?;
@@ -1360,15 +1416,23 @@ fn classify_session_outcome(
     }
 
     let events = db.list_events_since(&session.session_id, None)?;
-    if events
+    let boundary_id = events
         .iter()
-        .any(|event| event.event_type == "SESSION_INPUT_INJECTED")
-    {
-        return Ok(SessionOutcome::Finished);
-    }
+        .rev()
+        .find(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "SESSION_STARTED" | "SESSION_RESUMED" | "SESSION_REPLY_REQUESTED"
+            )
+        })
+        .map(|event| event.id)
+        .unwrap_or(0);
 
     let mut agent_messages = Vec::new();
     for event in &events {
+        if event.id <= boundary_id {
+            continue;
+        }
         if event.event_type != "CODEX_ITEM_COMPLETED" {
             continue;
         }
@@ -1420,6 +1484,79 @@ fn looks_like_blocking_question(text: &str) -> bool {
     .any(|prefix| normalized.contains(prefix))
 }
 
+fn persist_extracted_plans(
+    db: &Database,
+    session_id: &str,
+    events: &[SessionEvent],
+) -> Result<()> {
+    for event in events {
+        let Some(body_markdown) = extract_plan_markdown(event) else {
+            continue;
+        };
+        if db
+            .latest_plan(session_id)?
+            .as_ref()
+            .is_some_and(|plan| plan.body_markdown == body_markdown)
+        {
+            continue;
+        }
+        let summary = summarize_plan(&body_markdown);
+        let plan = db.insert_plan(session_id, &summary, &body_markdown, event.id)?;
+        db.set_integration_state(
+            session_id,
+            IntegrationState::Clean,
+            AttentionLevel::Notice,
+            &format!("plan ready v{}: {}", plan.version, plan.summary),
+        )?;
+        db.append_events(
+            session_id,
+            &[daemon_event(
+                "SESSION_PLAN_READY",
+                serde_json::json!({
+                    "source": "daemon",
+                    "version": plan.version,
+                    "summary": plan.summary,
+                    "body_markdown": plan.body_markdown,
+                    "source_event_id": plan.source_event_id,
+                }),
+            )],
+        )?;
+    }
+    Ok(())
+}
+
+fn extract_plan_markdown(event: &SessionEvent) -> Option<String> {
+    let item = event.payload_json.get("raw")?.get("item")?;
+    if item.get("type").and_then(|value| value.as_str()) != Some("agent_message") {
+        return None;
+    }
+    let text = item.get("text").and_then(|value| value.as_str())?;
+    let start_tag = "<proposed_plan>";
+    let end_tag = "</proposed_plan>";
+    let start = text.find(start_tag)? + start_tag.len();
+    let end = text[start..].find(end_tag)? + start;
+    let body = text[start..end].trim();
+    if body.is_empty() {
+        return None;
+    }
+    Some(body.to_string())
+}
+
+fn summarize_plan(body_markdown: &str) -> String {
+    for line in body_markdown.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let trimmed = trimmed.trim_start_matches('#').trim();
+        let trimmed = trimmed.trim_start_matches(['-', '*', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', ' ']).trim();
+        if !trimmed.is_empty() {
+            return preview_text(trimmed, 80);
+        }
+    }
+    "plan ready".to_string()
+}
+
 fn unique_branch_name(
     repo_root: &camino::Utf8Path,
     task_text: &str,
@@ -1452,8 +1589,8 @@ fn configure_spawn_command(
         match request.mode {
             SessionStartMode::Create => {
                 command.arg("--json");
-                if !request.task_text.is_empty() {
-                    command.arg(request.task_text);
+                if !request.prompt_text.is_empty() {
+                    command.arg(request.prompt_text);
                 }
             }
             SessionStartMode::Resume => {
@@ -1531,6 +1668,7 @@ fn pump_codex_json_to_logs(
     db: &Database,
     session_id: &str,
     thread_id: &str,
+    is_plan_session: bool,
 ) -> Result<()> {
     let mut raw_file = OpenOptions::new()
         .create(true)
@@ -1567,6 +1705,7 @@ fn pump_codex_json_to_logs(
             &mut rendered_file,
             messages,
             issues,
+            is_plan_session,
         )?;
     }
 
@@ -1579,6 +1718,7 @@ fn pump_codex_json_to_logs(
         &mut rendered_file,
         messages,
         issues,
+        is_plan_session,
     )?;
     Ok(())
 }
@@ -1591,6 +1731,7 @@ fn persist_codex_output(
     rendered_file: &mut File,
     messages: Vec<crate::codex_json::ParsedCodexMessage>,
     issues: Vec<crate::codex_json::ParseIssue>,
+    is_plan_session: bool,
 ) -> Result<()> {
     let mut events = Vec::with_capacity(messages.len() + issues.len() + 1);
 
@@ -1633,7 +1774,10 @@ fn persist_codex_output(
     }
 
     if !events.is_empty() {
-        db.append_events(session_id, &events)?;
+        let inserted = db.append_events(session_id, &events)?;
+        if is_plan_session {
+            persist_extracted_plans(db, session_id, &inserted)?;
+        }
         rendered_file.flush()?;
     }
     Ok(())
@@ -1783,10 +1927,10 @@ fn ensure_not_pending_review(session: &SessionRecord, action: &str) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::{AttachControl, SessionOutcome, SessionRuntime, classify_session_outcome};
+    use super::{AttachControl, SessionOutcome, SessionRuntime, classify_session_outcome, daemon_event};
     use crate::db::{Database, NewSession, NewThread};
     use crate::terminal_state::TerminalStateEngine;
-    use agentd_shared::{event::NewSessionEvent, paths::AppPaths};
+    use agentd_shared::{event::NewSessionEvent, paths::AppPaths, session::SessionMode};
     use anyhow::Result;
     use serde_json::json;
     use std::{
@@ -1906,6 +2050,7 @@ mod tests {
             thread_id: Some("thread-demo"),
             agent: "codex",
             model: Some("gpt-5.3-codex"),
+            mode: SessionMode::Execute,
             agent_command: "codex",
             agent_args_json: "[]",
             resume_session_id: Some("resume-1"),
@@ -1947,6 +2092,80 @@ mod tests {
             outcome,
             SessionOutcome::NeedsInput { ref question }
                 if question == "Do you want me to make the change?"
+        ));
+    }
+
+    #[test]
+    fn classify_session_outcome_uses_latest_resume_boundary() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        let repo = paths.root.join("repo");
+        init_git_repo(repo.as_str());
+
+        db.insert_session(&NewSession {
+            session_id: "demo",
+            thread_id: Some("thread-demo"),
+            agent: "codex",
+            model: Some("gpt-5.3-codex"),
+            mode: SessionMode::Plan,
+            agent_command: "codex",
+            agent_args_json: "[]",
+            resume_session_id: Some("resume-1"),
+            workspace: repo.as_str(),
+            repo_path: repo.as_str(),
+            task: "plan",
+            base_branch: "main",
+            branch: "agent/plan",
+            worktree: repo.as_str(),
+        })
+        .unwrap();
+        db.insert_thread(&NewThread {
+            thread_id: "thread-demo",
+            session_id: "demo",
+            agent: "codex",
+            title: "plan",
+            initial_prompt: "plan",
+        })
+        .unwrap();
+        db.append_events(
+            "demo",
+            &[
+                daemon_event("SESSION_STARTED", json!({"source":"daemon"})),
+                NewSessionEvent {
+                    event_type: "CODEX_ITEM_COMPLETED".to_string(),
+                    payload_json: json!({
+                        "raw": {
+                            "item": {
+                                "type": "agent_message",
+                                "text": "What area should I focus on?"
+                            }
+                        }
+                    }),
+                },
+                daemon_event("SESSION_REPLY_REQUESTED", json!({"source":"daemon"})),
+                daemon_event("SESSION_RESUMED", json!({"source":"daemon"})),
+                NewSessionEvent {
+                    event_type: "CODEX_ITEM_COMPLETED".to_string(),
+                    payload_json: json!({
+                        "raw": {
+                            "item": {
+                                "type": "agent_message",
+                                "text": "Should I optimize for speed or correctness?"
+                            }
+                        }
+                    }),
+                },
+            ],
+        )
+        .unwrap();
+
+        let session = db.get_session("demo").unwrap().unwrap();
+        let outcome = classify_session_outcome(&db, &session, Some(0)).unwrap();
+        assert!(matches!(
+            outcome,
+            SessionOutcome::NeedsInput { ref question }
+                if question == "Should I optimize for speed or correctness?"
         ));
     }
 }

@@ -6,12 +6,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::{
     event::{NewSessionEvent, SessionEvent},
     session::{
-        AttentionLevel, CreateSessionResult, IntegrationState, SessionDiff, SessionRecord,
-        SessionStatus, WorktreeRecord,
+        AttentionLevel, CreateSessionResult, IntegrationState, SessionDiff, SessionMode,
+        SessionRecord, SessionStatus, WorktreeRecord,
     },
 };
 
-pub const PROTOCOL_VERSION: u16 = 15;
+pub const PROTOCOL_VERSION: u16 = 16;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
@@ -74,6 +74,7 @@ pub enum Request {
         task: String,
         agent: String,
         model: Option<String>,
+        mode: SessionMode,
     },
     CreateWorktree {
         session_id: String,
@@ -464,11 +465,13 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             task,
             agent,
             model,
+            mode,
         } => {
             put_string(&mut payload, workspace)?;
             put_string(&mut payload, task)?;
             put_string(&mut payload, agent)?;
             put_optional_string(&mut payload, model.as_deref())?;
+            put_session_mode(&mut payload, *mode);
             MessageKind::CreateSessionRequest
         }
         Request::CreateWorktree { session_id } => {
@@ -569,6 +572,7 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
             task: cursor.take_string()?,
             agent: cursor.take_string()?,
             model: cursor.take_optional_string()?,
+            mode: cursor.take_session_mode()?,
         },
         MessageKind::CreateWorktreeRequest => Request::CreateWorktree {
             session_id: cursor.take_string()?,
@@ -924,12 +928,20 @@ fn put_integration_state(buf: &mut Vec<u8>, state: IntegrationState) {
     });
 }
 
+fn put_session_mode(buf: &mut Vec<u8>, mode: SessionMode) {
+    buf.push(match mode {
+        SessionMode::Execute => 1,
+        SessionMode::Plan => 2,
+    });
+}
+
 fn put_create_session_result(buf: &mut Vec<u8>, session: &CreateSessionResult) -> Result<()> {
     put_string(buf, &session.session_id)?;
     put_string(buf, &session.base_branch)?;
     put_string(buf, &session.branch)?;
     put_string(buf, &session.worktree)?;
     put_session_status(buf, session.status);
+    put_session_mode(buf, session.mode);
     Ok(())
 }
 
@@ -956,6 +968,7 @@ fn put_session_record(buf: &mut Vec<u8>, session: &SessionRecord) -> Result<()> 
     put_optional_string(buf, session.thread_id.as_deref())?;
     put_string(buf, &session.agent)?;
     put_optional_string(buf, session.model.as_deref())?;
+    put_session_mode(buf, session.mode);
     put_string(buf, &session.workspace)?;
     put_string(buf, &session.repo_path)?;
     put_string(buf, &session.task)?;
@@ -1159,6 +1172,14 @@ impl<'a> Cursor<'a> {
         })
     }
 
+    fn take_session_mode(&mut self) -> Result<SessionMode> {
+        Ok(match self.take_u8()? {
+            1 => SessionMode::Execute,
+            2 => SessionMode::Plan,
+            other => bail!("invalid session mode `{other}`"),
+        })
+    }
+
     fn take_datetime(&mut self) -> Result<DateTime<Utc>> {
         let seconds = self.take_i64()?;
         let nanos = self.take_u32()?;
@@ -1193,6 +1214,7 @@ impl<'a> Cursor<'a> {
             branch: self.take_string()?,
             worktree: self.take_string()?,
             status: self.take_session_status()?,
+            mode: self.take_session_mode()?,
         })
     }
 
@@ -1222,6 +1244,7 @@ impl<'a> Cursor<'a> {
             thread_id: self.take_optional_string()?,
             agent: self.take_string()?,
             model: self.take_optional_string()?,
+            mode: self.take_session_mode()?,
             workspace: self.take_string()?,
             repo_path: self.take_string()?,
             task: self.take_string()?,
@@ -1301,7 +1324,8 @@ mod tests {
     use crate::{
         event::{NewSessionEvent, SessionEvent},
         session::{
-            AttentionLevel, CreateSessionResult, IntegrationState, SessionRecord, SessionStatus,
+            AttentionLevel, CreateSessionResult, IntegrationState, SessionMode, SessionRecord,
+            SessionStatus,
         },
     };
     use chrono::Utc;
@@ -1418,6 +1442,7 @@ mod tests {
                 thread_id: Some("thread-demo".to_string()),
                 agent: "codex".to_string(),
                 model: Some("gpt-5.3-codex".to_string()),
+                mode: SessionMode::Execute,
                 workspace: "/tmp/demo".to_string(),
                 repo_path: "/tmp/demo".to_string(),
                 task: "fix".to_string(),
@@ -1558,6 +1583,7 @@ mod tests {
                 branch: "agent/demo".to_string(),
                 worktree: "/tmp/demo".to_string(),
                 status: SessionStatus::Running,
+                mode: SessionMode::Execute,
             },
         };
         let (kind, payload) = encode_response(&response).unwrap();

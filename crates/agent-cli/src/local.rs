@@ -18,7 +18,7 @@ use serde_json::Value;
 use agentd_shared::{
     event::SessionEvent,
     paths::AppPaths,
-    session::{AttentionLevel, IntegrationState, SessionRecord, SessionStatus},
+    session::{AttentionLevel, IntegrationState, SessionMode, SessionRecord, SessionStatus},
 };
 
 pub struct LocalStore {
@@ -37,7 +37,7 @@ impl LocalStore {
     pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT session_id, thread_id, agent, model, workspace, repo_path, task, base_branch, branch,
+            "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, task, base_branch, branch,
                     worktree, status, integration_state, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
@@ -50,7 +50,7 @@ impl LocalStore {
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT session_id, thread_id, agent, model, workspace, repo_path, task, base_branch, branch,
+            "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, task, base_branch, branch,
                     worktree, status, integration_state, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
@@ -141,6 +141,7 @@ impl LocalStore {
                 thread_id TEXT,
                 agent TEXT NOT NULL,
                 model TEXT,
+                mode TEXT NOT NULL DEFAULT 'execute',
                 workspace TEXT NOT NULL,
                 repo_path TEXT,
                 task TEXT NOT NULL,
@@ -190,6 +191,11 @@ impl LocalStore {
         )?;
         ensure_column(
             &conn,
+            "mode",
+            "ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'execute'",
+        )?;
+        ensure_column(
+            &conn,
             "repo_path",
             "ALTER TABLE sessions ADD COLUMN repo_path TEXT",
         )?;
@@ -215,12 +221,13 @@ impl LocalStore {
         )?;
         conn.execute(
             "UPDATE sessions
-             SET repo_path = COALESCE(repo_path, workspace),
+             SET mode = COALESCE(mode, 'execute'),
+                 repo_path = COALESCE(repo_path, workspace),
                  base_branch = COALESCE(base_branch, 'HEAD'),
                  integration_state = COALESCE(integration_state, 'clean'),
                  attention = COALESCE(attention, 'info'),
                  attention_summary = COALESCE(attention_summary, task)
-             WHERE repo_path IS NULL OR base_branch IS NULL OR integration_state IS NULL OR attention IS NULL OR attention_summary IS NULL",
+             WHERE mode IS NULL OR repo_path IS NULL OR base_branch IS NULL OR integration_state IS NULL OR attention IS NULL OR attention_summary IS NULL",
             [],
         )?;
         Ok(())
@@ -332,43 +339,50 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         thread_id: row.get(1)?,
         agent: row.get(2)?,
         model: row.get(3)?,
-        workspace: row.get(4)?,
-        repo_path: row.get(5)?,
-        task: row.get(6)?,
-        base_branch: row.get(7)?,
-        branch: row.get(8)?,
-        worktree: row.get(9)?,
-        status: str_to_status(&row.get::<_, String>(10)?).map_err(|err| {
+        mode: str_to_mode(&row.get::<_, String>(4)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                10,
+                4,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        integration_state: str_to_integration_state(&row.get::<_, String>(11)?).map_err(
+        workspace: row.get(5)?,
+        repo_path: row.get(6)?,
+        task: row.get(7)?,
+        base_branch: row.get(8)?,
+        branch: row.get(9)?,
+        worktree: row.get(10)?,
+        status: str_to_status(&row.get::<_, String>(11)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                11,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?,
+        integration_state: str_to_integration_state(&row.get::<_, String>(12)?).map_err(
             |err| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    11,
+                    12,
                     rusqlite::types::Type::Text,
                     Box::new(err),
                 )
             },
         )?,
-        pid: row.get::<_, Option<u32>>(12)?,
-        exit_code: row.get(13)?,
-        error: row.get(14)?,
-        attention: str_to_attention(&row.get::<_, String>(15)?).map_err(|err| {
+        pid: row.get::<_, Option<u32>>(13)?,
+        exit_code: row.get(14)?,
+        error: row.get(15)?,
+        attention: str_to_attention(&row.get::<_, String>(16)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                15,
+                16,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        attention_summary: row.get(16)?,
-        created_at: parse_time(row.get::<_, String>(17)?)?,
-        updated_at: parse_time(row.get::<_, String>(18)?)?,
+        attention_summary: row.get(17)?,
+        created_at: parse_time(row.get::<_, String>(18)?)?,
+        updated_at: parse_time(row.get::<_, String>(19)?)?,
         exited_at: row
-            .get::<_, Option<String>>(19)?
+            .get::<_, Option<String>>(20)?
             .map(parse_time)
             .transpose()?,
     })
@@ -447,6 +461,17 @@ fn str_to_attention(value: &str) -> std::result::Result<AttentionLevel, std::io:
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown attention level `{value}`"),
+        )),
+    }
+}
+
+fn str_to_mode(value: &str) -> std::result::Result<SessionMode, std::io::Error> {
+    match value {
+        "execute" => Ok(SessionMode::Execute),
+        "plan" => Ok(SessionMode::Plan),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown session mode `{value}`"),
         )),
     }
 }

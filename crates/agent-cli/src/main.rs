@@ -47,8 +47,8 @@ use agentd_shared::{
         write_daemon_management_request, write_request,
     },
     session::{
-        AttentionLevel, IntegrationState, SessionDiff, SessionRecord, SessionStatus,
-        WorktreeRecord,
+        AttentionLevel, IntegrationState, SessionDiff, SessionMode, SessionRecord,
+        SessionStatus, WorktreeRecord,
     },
 };
 
@@ -215,6 +215,7 @@ async fn main() -> Result<()> {
                     task: options.task,
                     agent: options.agent,
                     model: None,
+                    mode: SessionMode::Execute,
                 },
             )
             .await?;
@@ -245,6 +246,7 @@ async fn main() -> Result<()> {
                     task,
                     agent,
                     model: None,
+                    mode: SessionMode::Execute,
                 },
             )
             .await?;
@@ -1441,6 +1443,14 @@ enum DashboardFocus {
     SessionList,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum DashboardComposerAction<'a> {
+    OpenModelPicker,
+    CreateExecuteSession(&'a str),
+    CreatePlanSession(&'a str),
+    InvalidCommand(&'a str),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FocusSessionPane {
     Transcript,
@@ -1468,6 +1478,39 @@ struct FocusSessionViewState {
 
 fn session_has_pending_review(session: &SessionRecord) -> bool {
     session.integration_state == IntegrationState::PendingReview
+}
+
+fn session_mode_label(mode: SessionMode) -> &'static str {
+    match mode {
+        SessionMode::Execute => "exec",
+        SessionMode::Plan => "plan",
+    }
+}
+
+fn parse_dashboard_composer_action(composer: &str) -> Option<DashboardComposerAction<'_>> {
+    let trimmed = composer.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed == "/model" {
+        return Some(DashboardComposerAction::OpenModelPicker);
+    }
+    if let Some(task) = trimmed.strip_prefix("/plan") {
+        let task = task.trim();
+        return if task.is_empty() {
+            Some(DashboardComposerAction::InvalidCommand(
+                "usage: /plan <task>",
+            ))
+        } else {
+            Some(DashboardComposerAction::CreatePlanSession(task))
+        };
+    }
+    if trimmed.starts_with('/') {
+        return Some(DashboardComposerAction::InvalidCommand(
+            "unknown command",
+        ));
+    }
+    Some(DashboardComposerAction::CreateExecuteSession(trimmed))
 }
 
 impl Default for FocusSessionPane {
@@ -1618,19 +1661,41 @@ async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
                 if model_picker_open {
                     model_picker_open = false;
                     status = format!("model set to {}", CODEX_MODELS[selected_model]);
-                } else if composer.trim() == "/model" {
-                    model_picker_open = true;
-                    status = "choose a model".to_string();
-                } else if focus == DashboardFocus::Composer && !composer.trim().is_empty() {
-                    let created = create_dashboard_session(
-                        paths,
-                        composer.trim(),
-                        Some(CODEX_MODELS[selected_model]),
-                    )
-                    .await?;
-                    composer.clear();
-                    focus_session(paths, &created.session_id).await?;
-                    terminal.clear()?;
+                } else if focus == DashboardFocus::Composer {
+                    match parse_dashboard_composer_action(&composer) {
+                        Some(DashboardComposerAction::OpenModelPicker) => {
+                            model_picker_open = true;
+                            status = "choose a model".to_string();
+                        }
+                        Some(DashboardComposerAction::CreateExecuteSession(task)) => {
+                            let created = create_dashboard_session(
+                                paths,
+                                task,
+                                Some(CODEX_MODELS[selected_model]),
+                                SessionMode::Execute,
+                            )
+                            .await?;
+                            composer.clear();
+                            focus_session(paths, &created.session_id).await?;
+                            terminal.clear()?;
+                        }
+                        Some(DashboardComposerAction::CreatePlanSession(task)) => {
+                            let created = create_dashboard_session(
+                                paths,
+                                task,
+                                Some(CODEX_MODELS[selected_model]),
+                                SessionMode::Plan,
+                            )
+                            .await?;
+                            composer.clear();
+                            focus_session(paths, &created.session_id).await?;
+                            terminal.clear()?;
+                        }
+                        Some(DashboardComposerAction::InvalidCommand(message)) => {
+                            status = message.to_string();
+                        }
+                        None => {}
+                    }
                 } else if focus == DashboardFocus::SessionList
                     && let Some(session) = sessions.get(selected)
                 {
@@ -2173,6 +2238,17 @@ fn append_timeline_lines(
                 .unwrap_or("Agent is waiting for input.");
             append_system_card(lines, event, "needs input", question, attention_style(AttentionLevel::Action));
         }
+        "SESSION_PLAN_READY" => {
+            append_plan_card(lines, event);
+        }
+        "SESSION_PLAN_MISSING" => {
+            let detail = event
+                .payload_json
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("planning finished without a final plan");
+            append_system_card(lines, event, "plan missing", detail, attention_style(AttentionLevel::Action));
+        }
         "SESSION_FAILED" => {
             let detail = event
                 .payload_json
@@ -2292,6 +2368,30 @@ fn append_command_card(
             output,
             item.get("command").and_then(Value::as_str).unwrap_or_default(),
         );
+    }
+    lines.push(Line::from(""));
+}
+
+fn append_plan_card(lines: &mut Vec<Line<'static>>, event: &agentd_shared::event::SessionEvent) {
+    let version = event
+        .payload_json
+        .get("version")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    let summary = event
+        .payload_json
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or("plan ready");
+    append_card_header(
+        lines,
+        "plan",
+        &format!("{}  v{}", event.timestamp.format("%H:%M:%S"), version),
+        notice_style(),
+    );
+    lines.push(Line::from(Span::styled(summary.to_string(), Style::default().add_modifier(Modifier::BOLD))));
+    if let Some(body) = event.payload_json.get("body_markdown").and_then(Value::as_str) {
+        append_preformatted_block(lines, body, code_block_style());
     }
     lines.push(Line::from(""));
 }
@@ -2546,6 +2646,20 @@ fn summarize_activity_event(
         "SESSION_FAILED" => Some((
             "failed".to_string(),
             event_preview(event),
+            attention_style(AttentionLevel::Action),
+        )),
+        "SESSION_PLAN_READY" => Some((
+            "plan".to_string(),
+            event.payload_json
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("plan ready")
+                .to_string(),
+            notice_style(),
+        )),
+        "SESSION_PLAN_MISSING" => Some((
+            "plan".to_string(),
+            "planning finished without a final plan".to_string(),
             attention_style(AttentionLevel::Action),
         )),
         "SESSION_FINISHED" if show_verbose => Some((
@@ -2844,8 +2958,9 @@ fn render_focus_dashboard(
                         Span::raw("  "),
                         Span::styled(
                             format!(
-                                "{}  {}{}",
+                                "{}  {}  {}{}",
                                 session.branch,
+                                session_mode_label(session.mode),
                                 session.agent,
                                 session
                                     .model
@@ -2886,7 +3001,10 @@ fn render_focus_dashboard(
     let composer_prompt = if composer.is_empty() {
         Line::from(vec![
             Span::styled("> ", accent_style()),
-            Span::styled("describe the task or type /model", muted_style()),
+            Span::styled(
+                "describe the task or type /model or /plan <task>",
+                muted_style(),
+            ),
             cursor,
         ])
     } else {
@@ -2986,6 +3104,8 @@ fn render_focus_session(
         Span::styled("Codex", accent_style().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(&session.session_id, Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled(session_mode_label(session.mode), notice_style()),
         Span::raw("  "),
         Span::styled(session.attention_string(), attention_style(session.attention)),
         Span::raw("  "),
@@ -3115,7 +3235,7 @@ fn dashboard_footer_text(
 
     match focus {
         DashboardFocus::Composer => {
-            "Enter create  /model picker  Tab sessions  Esc clear/quit".to_string()
+            "Enter create  /model picker  /plan task  Tab sessions  Esc clear/quit".to_string()
         }
         DashboardFocus::SessionList => {
             if selected_session.is_some_and(session_has_pending_review) {
@@ -3366,6 +3486,7 @@ async fn retry_session(paths: &AppPaths, session: &SessionRecord) -> Result<Sess
             task: session.task.clone(),
             agent: session.agent.clone(),
             model: session.model.clone(),
+            mode: session.mode,
         },
     )
     .await?;
@@ -3381,6 +3502,7 @@ async fn create_dashboard_session(
     paths: &AppPaths,
     task: &str,
     model: Option<&str>,
+    mode: SessionMode,
 ) -> Result<SessionRecord> {
     let workspace = std::env::current_dir().context("failed to determine current directory")?;
     let response = send_request(
@@ -3390,6 +3512,7 @@ async fn create_dashboard_session(
             task: task.to_string(),
             agent: "codex".to_string(),
             model: model.map(str::to_string),
+            mode,
         },
     )
     .await?;
@@ -3612,14 +3735,16 @@ fn fuzzy_score(haystack: &str, needle: &str) -> Option<i64> {
 mod tests {
     use super::{
         AGENTD_ATTACH_RESTORE_SEQUENCE, AttachInput, AttachKeyBindingParser, Cli, Command,
-        DaemonCommand, DashboardFocus, FocusSessionLayout, FocusSessionPane, FocusSessionViewState,
-        SessionEndSummary, apply_scroll_delta, clamp_focus_session_scroll, dashboard_footer_text,
-        focus_session_footer_text, looks_like_diff, parse_rich_blocks, render_diff_text,
-        should_colorize_diff_output,
-        format_session_end_summary, pane_at_position, resolve_detach_session_id,
-        resolve_new_session_options,
+        DaemonCommand, DashboardComposerAction, DashboardFocus, FocusSessionLayout,
+        FocusSessionPane, FocusSessionViewState, SessionEndSummary, apply_scroll_delta,
+        clamp_focus_session_scroll, dashboard_footer_text, focus_session_footer_text,
+        format_session_end_summary, looks_like_diff, pane_at_position,
+        parse_dashboard_composer_action, parse_rich_blocks, render_diff_text,
+        resolve_detach_session_id, resolve_new_session_options, should_colorize_diff_output,
     };
-    use agentd_shared::session::{AttentionLevel, IntegrationState, SessionRecord, SessionStatus};
+    use agentd_shared::session::{
+        AttentionLevel, IntegrationState, SessionMode, SessionRecord, SessionStatus,
+    };
     use chrono::Utc;
     use clap::Parser;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
@@ -4035,6 +4160,26 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_composer_parses_plan_command() {
+        assert_eq!(
+            parse_dashboard_composer_action("/plan add a plan mode"),
+            Some(DashboardComposerAction::CreatePlanSession(
+                "add a plan mode"
+            ))
+        );
+    }
+
+    #[test]
+    fn dashboard_composer_rejects_blank_plan_command() {
+        assert_eq!(
+            parse_dashboard_composer_action("/plan"),
+            Some(DashboardComposerAction::InvalidCommand(
+                "usage: /plan <task>"
+            ))
+        );
+    }
+
+    #[test]
     fn focus_footer_advertises_accept_and_discard_for_pending_review() {
         let session = demo_session(SessionStatus::Exited, IntegrationState::PendingReview);
         let footer = focus_session_footer_text(&session, "", false);
@@ -4066,6 +4211,7 @@ mod tests {
             thread_id: Some("thread-demo".to_string()),
             agent: "codex".to_string(),
             model: Some("gpt-5.4-codex".to_string()),
+            mode: SessionMode::Execute,
             workspace: "/tmp/workspace".to_string(),
             repo_path: "/tmp/workspace".to_string(),
             task: "task".to_string(),
