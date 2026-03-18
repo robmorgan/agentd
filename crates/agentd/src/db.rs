@@ -310,6 +310,37 @@ impl Database {
         Ok(())
     }
 
+    pub fn mark_needs_input(
+        &self,
+        session_id: &str,
+        exit_code: Option<i32>,
+        summary: String,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE sessions
+             SET status = ?2,
+                 pid = NULL,
+                 exit_code = ?3,
+                 error = NULL,
+                 attention = ?4,
+                 attention_summary = ?5,
+                 updated_at = ?6,
+                 exited_at = ?6
+             WHERE session_id = ?1",
+            params![
+                session_id,
+                status_to_str(SessionStatus::NeedsInput),
+                exit_code,
+                attention_to_str(AttentionLevel::Action),
+                summary,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn mark_exited(&self, session_id: &str, exit_code: Option<i32>) -> Result<()> {
         let conn = self.connect()?;
         let now = Utc::now().to_rfc3339();
@@ -642,6 +673,7 @@ fn status_to_str(status: SessionStatus) -> &'static str {
         SessionStatus::Creating => "creating",
         SessionStatus::Running => "running",
         SessionStatus::Paused => "paused",
+        SessionStatus::NeedsInput => "needs_input",
         SessionStatus::Exited => "exited",
         SessionStatus::Failed => "failed",
         SessionStatus::UnknownRecovered => "unknown_recovered",
@@ -653,6 +685,7 @@ fn str_to_status(value: &str) -> std::result::Result<SessionStatus, std::io::Err
         "creating" => Ok(SessionStatus::Creating),
         "running" => Ok(SessionStatus::Running),
         "paused" => Ok(SessionStatus::Paused),
+        "needs_input" => Ok(SessionStatus::NeedsInput),
         "exited" => Ok(SessionStatus::Exited),
         "failed" => Ok(SessionStatus::Failed),
         "unknown_recovered" => Ok(SessionStatus::UnknownRecovered),
@@ -817,6 +850,41 @@ mod tests {
             db.get_resume_session_id("demo").unwrap().as_deref(),
             Some("thread-123")
         );
+    }
+
+    #[test]
+    fn mark_needs_input_persists_status_and_summary() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        db.insert_session(&super::NewSession {
+            session_id: "demo",
+            thread_id: None,
+            agent: "codex",
+            model: None,
+            agent_command: "codex",
+            agent_args_json: "[]",
+            resume_session_id: None,
+            workspace: "/tmp/repo",
+            repo_path: "/tmp/repo",
+            task: "test",
+            base_branch: "main",
+            branch: "agent/test",
+            worktree: "/tmp/worktree",
+        })
+        .unwrap();
+
+        db.mark_needs_input("demo", Some(0), "Can you clarify?".to_string())
+            .unwrap();
+
+        let session = db.get_session("demo").unwrap().unwrap();
+        assert_eq!(session.status, agentd_shared::session::SessionStatus::NeedsInput);
+        assert_eq!(
+            session.attention,
+            agentd_shared::session::AttentionLevel::Action
+        );
+        assert_eq!(session.attention_summary.as_deref(), Some("Can you clarify?"));
+        assert_eq!(session.exit_code, Some(0));
     }
 
     #[test]

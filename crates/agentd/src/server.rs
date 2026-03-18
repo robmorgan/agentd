@@ -219,6 +219,20 @@ async fn handle_connection(
                 .await?
             }
         },
+        IncomingRequest::Standard(Request::ReplyToSession { session_id, prompt }) => {
+            match state.reply_to_session(&session_id, prompt).await {
+                Ok(session) => send_response(&mut writer, &Response::Session { session }).await?,
+                Err(err) => {
+                    send_response(
+                        &mut writer,
+                        &Response::Error {
+                            message: err.to_string(),
+                        },
+                    )
+                    .await?
+                }
+            }
+        }
         IncomingRequest::Standard(Request::SwitchAttachedSession {
             source_session_id,
             target_session_id,
@@ -467,7 +481,10 @@ async fn ended_session_response(state: &AppState, session_id: &str) -> Result<Op
 
 fn session_ended_response(session: &SessionRecord) -> Option<Response> {
     match session.status {
-        SessionStatus::Exited | SessionStatus::Failed | SessionStatus::UnknownRecovered => {
+        SessionStatus::NeedsInput
+        | SessionStatus::Exited
+        | SessionStatus::Failed
+        | SessionStatus::UnknownRecovered => {
             Some(Response::SessionEnded {
                 session_id: session.session_id.clone(),
                 status: session.status,

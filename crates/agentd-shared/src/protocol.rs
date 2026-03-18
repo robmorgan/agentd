@@ -11,7 +11,7 @@ use crate::{
     },
 };
 
-pub const PROTOCOL_VERSION: u16 = 13;
+pub const PROTOCOL_VERSION: u16 = 14;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
@@ -98,6 +98,10 @@ pub enum Request {
         session_id: String,
         data: Vec<u8>,
         source_session_id: Option<String>,
+    },
+    ReplyToSession {
+        session_id: String,
+        prompt: String,
     },
     SwitchAttachedSession {
         source_session_id: String,
@@ -189,6 +193,7 @@ enum MessageKind {
     AttachSessionRequest = 7,
     AttachInputRequest = 8,
     SendInputRequest = 9,
+    ReplyToSessionRequest = 18,
     DetachSessionRequest = 17,
     SwitchAttachedSessionRequest = 16,
     DiffSessionRequest = 10,
@@ -228,6 +233,7 @@ impl MessageKind {
             7 => Self::AttachSessionRequest,
             8 => Self::AttachInputRequest,
             9 => Self::SendInputRequest,
+            18 => Self::ReplyToSessionRequest,
             17 => Self::DetachSessionRequest,
             16 => Self::SwitchAttachedSessionRequest,
             10 => Self::DiffSessionRequest,
@@ -486,6 +492,11 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             put_optional_string(&mut payload, source_session_id.as_deref())?;
             MessageKind::SendInputRequest
         }
+        Request::ReplyToSession { session_id, prompt } => {
+            put_string(&mut payload, session_id)?;
+            put_string(&mut payload, prompt)?;
+            MessageKind::ReplyToSessionRequest
+        }
         Request::SwitchAttachedSession {
             source_session_id,
             target_session_id,
@@ -559,6 +570,10 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
             session_id: cursor.take_string()?,
             data: cursor.take_bytes()?,
             source_session_id: cursor.take_optional_string()?,
+        },
+        MessageKind::ReplyToSessionRequest => Request::ReplyToSession {
+            session_id: cursor.take_string()?,
+            prompt: cursor.take_string()?,
         },
         MessageKind::SwitchAttachedSessionRequest => Request::SwitchAttachedSession {
             source_session_id: cursor.take_string()?,
@@ -846,9 +861,10 @@ fn put_session_status(buf: &mut Vec<u8>, status: SessionStatus) {
         SessionStatus::Creating => 1,
         SessionStatus::Running => 2,
         SessionStatus::Paused => 3,
-        SessionStatus::Exited => 4,
-        SessionStatus::Failed => 5,
-        SessionStatus::UnknownRecovered => 6,
+        SessionStatus::NeedsInput => 4,
+        SessionStatus::Exited => 5,
+        SessionStatus::Failed => 6,
+        SessionStatus::UnknownRecovered => 7,
     });
 }
 
@@ -1067,9 +1083,10 @@ impl<'a> Cursor<'a> {
             1 => SessionStatus::Creating,
             2 => SessionStatus::Running,
             3 => SessionStatus::Paused,
-            4 => SessionStatus::Exited,
-            5 => SessionStatus::Failed,
-            6 => SessionStatus::UnknownRecovered,
+            4 => SessionStatus::NeedsInput,
+            5 => SessionStatus::Exited,
+            6 => SessionStatus::Failed,
+            7 => SessionStatus::UnknownRecovered,
             other => bail!("invalid session status `{other}`"),
         })
     }
@@ -1235,6 +1252,17 @@ mod tests {
             session_id: "demo".to_string(),
             data: vec![0, 1, 2, 255],
             source_session_id: Some("origin".to_string()),
+        };
+        let (kind, payload) = encode_request(&request).unwrap();
+        let decoded = decode_request(kind, &payload).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn reply_to_session_round_trips() {
+        let request = Request::ReplyToSession {
+            session_id: "demo".to_string(),
+            prompt: "answer the question and continue".to_string(),
         };
         let (kind, payload) = encode_request(&request).unwrap();
         let decoded = decode_request(kind, &payload).unwrap();

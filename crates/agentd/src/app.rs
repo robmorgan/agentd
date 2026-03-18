@@ -4,6 +4,7 @@ use std::{
     io::{Read, Write},
     path::Path,
     sync::{
+        mpsc,
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
@@ -166,6 +167,7 @@ impl AppState {
                     model: model.as_deref(),
                     thread_id: thread_id.as_deref(),
                     resume_session_id: None,
+                    resume_prompt: None,
                     mode: SessionStartMode::Create,
                 },
             ) {
@@ -304,6 +306,7 @@ impl AppState {
                         model: session.model.as_deref(),
                         thread_id: thread_id.as_deref(),
                         resume_session_id: Some(&resume_session_id),
+                        resume_prompt: None,
                         mode: SessionStartMode::Resume,
                     },
                 )
@@ -526,6 +529,89 @@ impl AppState {
         .await?
     }
 
+    pub async fn reply_to_session(&self, session_id: &str, prompt: String) -> Result<SessionRecord> {
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+
+        match session.status {
+            SessionStatus::Running => {
+                let mut data = prompt.into_bytes();
+                data.push(b'\n');
+                self.send_input(session_id, data, None).await?;
+            }
+            SessionStatus::NeedsInput => {
+                let launch = self.resolve_launch_command(&session).await?;
+                let resume_session_id = self
+                    .resolve_resume_session_id(&session, &launch)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "session `{}` does not have an exact Codex resume id",
+                            session.session_id
+                        )
+                    })?;
+                let paths = self.paths.clone();
+                let db = self.db.clone();
+                let runtimes = self.runtimes.clone();
+                let session_id = session.session_id.clone();
+                let repo_path = session.repo_path.clone();
+                let worktree = session.worktree.clone();
+                let branch = session.branch.clone();
+                let task_text = session.task.clone();
+                let thread_id = session.thread_id.clone();
+                let model = session.model.clone();
+                let prompt_preview = preview_text(&prompt, 160);
+                let resume_prompt = prompt.clone();
+                let log_path = self.paths.log_path(&session.session_id);
+                task::spawn_blocking(move || {
+                    db.append_events(
+                        &session_id,
+                        &[daemon_event(
+                            "SESSION_REPLY_REQUESTED",
+                            serde_json::json!({
+                                "source": "daemon",
+                                "prompt_preview": prompt_preview,
+                            }),
+                        )],
+                    )?;
+                    start_session_runtime(
+                        &paths,
+                        &db,
+                        &runtimes,
+                        SessionStartRequest {
+                            session_id: &session_id,
+                            repo_root: &repo_path,
+                            worktree: &worktree,
+                            branch: &branch,
+                            task_text: &task_text,
+                            log_path: &log_path,
+                            launch: &launch,
+                            model: model.as_deref(),
+                            thread_id: thread_id.as_deref(),
+                            resume_session_id: Some(&resume_session_id),
+                            resume_prompt: Some(&resume_prompt),
+                            mode: SessionStartMode::Resume,
+                        },
+                    )
+                })
+                .await??;
+            }
+            SessionStatus::Creating
+            | SessionStatus::Paused
+            | SessionStatus::Exited
+            | SessionStatus::Failed
+            | SessionStatus::UnknownRecovered => {
+                bail!("session `{}` is not accepting replies", session.session_id);
+            }
+        }
+
+        self.get_session(session_id)
+            .await?
+            .ok_or_else(|| anyhow!("session `{session_id}` not found after reply"))
+    }
+
     pub async fn send_input(
         &self,
         session_id: &str,
@@ -675,6 +761,7 @@ struct SessionStartRequest<'a> {
     model: Option<&'a str>,
     thread_id: Option<&'a str>,
     resume_session_id: Option<&'a str>,
+    resume_prompt: Option<&'a str>,
     mode: SessionStartMode,
 }
 
@@ -815,6 +902,7 @@ fn start_session_runtime(
         None
     };
     let writer_runtime = runtime.clone();
+    let (writer_done_tx, writer_done_rx) = mpsc::channel();
     std::thread::spawn(move || {
         let result = if let Some(thread_id) = writer_thread_id {
             pump_codex_json_to_logs(
@@ -832,6 +920,7 @@ fn start_session_runtime(
         if let Err(err) = result {
             let _ = record_session_failure(&writer_db, &writer_session_id, err.to_string());
         }
+        let _ = writer_done_tx.send(());
     });
 
     let exit_db = db.clone();
@@ -842,21 +931,8 @@ fn start_session_runtime(
         let status = child.wait();
         let code = status.ok().map(|value| value.exit_code() as i32);
         exit_runtimes.remove(&exit_session_id);
-        let _ = exit_db.mark_exited(&exit_session_id, code);
-        let _ = exit_db.append_events(
-            &exit_session_id,
-            &[daemon_event(
-                "SESSION_FINISHED",
-                serde_json::json!({
-                    "source": "daemon",
-                    "exit_code": code,
-                    "mode": match start_mode {
-                        SessionStartMode::Create => "create",
-                        SessionStartMode::Resume => "resume",
-                    }
-                }),
-            )],
-        );
+        let _ = writer_done_rx.recv();
+        let _ = finalize_session_exit(&exit_db, &exit_session_id, code, start_mode);
     });
 
     Ok(())
@@ -1053,6 +1129,150 @@ fn record_session_failure(db: &Database, session_id: &str, error: String) -> Res
     Ok(())
 }
 
+fn finalize_session_exit(
+    db: &Database,
+    session_id: &str,
+    exit_code: Option<i32>,
+    start_mode: SessionStartMode,
+) -> Result<()> {
+    let Some(session) = db.get_session(session_id)? else {
+        return Ok(());
+    };
+    if session.status == SessionStatus::Failed {
+        return Ok(());
+    }
+
+    let outcome = classify_session_outcome(db, &session, exit_code)?;
+    match &outcome {
+        SessionOutcome::Finished => db.mark_exited(session_id, exit_code)?,
+        SessionOutcome::NeedsInput { question } => {
+            db.mark_needs_input(session_id, exit_code, question.clone())?;
+            db.append_events(
+                session_id,
+                &[daemon_event(
+                    "SESSION_NEEDS_INPUT",
+                    serde_json::json!({
+                        "source": "daemon",
+                        "reason": "clarification_only_noop",
+                        "question": question,
+                        "exit_code": exit_code,
+                        "has_tool_use": false,
+                        "has_worktree_changes": false,
+                    }),
+                )],
+            )?;
+        }
+    }
+
+    db.append_events(
+        session_id,
+        &[daemon_event(
+            "SESSION_FINISHED",
+            serde_json::json!({
+                "source": "daemon",
+                "exit_code": exit_code,
+                "mode": match start_mode {
+                    SessionStartMode::Create => "create",
+                    SessionStartMode::Resume => "resume",
+                },
+                "outcome": outcome.as_str(),
+            }),
+        )],
+    )?;
+    Ok(())
+}
+
+enum SessionOutcome {
+    Finished,
+    NeedsInput { question: String },
+}
+
+impl SessionOutcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Finished => "finished",
+            Self::NeedsInput { .. } => "needs_input",
+        }
+    }
+}
+
+fn classify_session_outcome(
+    db: &Database,
+    session: &SessionRecord,
+    exit_code: Option<i32>,
+) -> Result<SessionOutcome> {
+    if exit_code != Some(0) || session.agent != "codex" || session.thread_id.is_none() {
+        return Ok(SessionOutcome::Finished);
+    }
+
+    let worktree = Utf8PathBuf::from(&session.worktree);
+    if git::has_worktree_changes(&worktree)?
+        || git::has_committed_diff_against_base(&worktree, &session.base_branch)?
+    {
+        return Ok(SessionOutcome::Finished);
+    }
+
+    let events = db.list_events_since(&session.session_id, None)?;
+    if events
+        .iter()
+        .any(|event| event.event_type == "SESSION_INPUT_INJECTED")
+    {
+        return Ok(SessionOutcome::Finished);
+    }
+
+    let mut agent_messages = Vec::new();
+    for event in &events {
+        if event.event_type != "CODEX_ITEM_COMPLETED" {
+            continue;
+        }
+        let Some(item) = event.payload_json.get("raw").and_then(|raw| raw.get("item")) else {
+            continue;
+        };
+        let Some(item_type) = item.get("type").and_then(|value| value.as_str()) else {
+            return Ok(SessionOutcome::Finished);
+        };
+        if item_type != "agent_message" {
+            return Ok(SessionOutcome::Finished);
+        }
+        if let Some(text) = item.get("text").and_then(|value| value.as_str()) {
+            agent_messages.push(text.to_string());
+        }
+    }
+
+    if agent_messages.len() != 1 {
+        return Ok(SessionOutcome::Finished);
+    }
+    let question = agent_messages.pop().unwrap_or_default();
+    if !looks_like_blocking_question(&question) {
+        return Ok(SessionOutcome::Finished);
+    }
+
+    Ok(SessionOutcome::NeedsInput {
+        question: preview_text(&question, 240),
+    })
+}
+
+fn looks_like_blocking_question(text: &str) -> bool {
+    let trimmed = text.trim();
+    if !trimmed.ends_with('?') {
+        return false;
+    }
+
+    let normalized = trimmed.to_ascii_lowercase();
+    [
+        "do you want",
+        "can you",
+        "could you",
+        "which",
+        "what",
+        "if yes",
+        "if so",
+        "should i",
+    ]
+    .iter()
+    .any(|prefix| normalized.contains(prefix))
+}
+
 fn unique_branch_name(
     repo_root: &camino::Utf8Path,
     task_text: &str,
@@ -1099,6 +1319,9 @@ fn configure_spawn_command(
                 command.arg("resume");
                 command.arg("--json");
                 command.arg(resume_session_id);
+                if let Some(prompt) = request.resume_prompt.filter(|value| !value.is_empty()) {
+                    command.arg(prompt);
+                }
             }
         }
         return Ok(());
@@ -1365,6 +1588,15 @@ fn preview_input(data: &[u8]) -> String {
     preview
 }
 
+fn preview_text(text: &str, limit: usize) -> String {
+    let mut preview = text.replace('\n', "\\n").replace('\r', "\\r");
+    if preview.len() > limit {
+        preview.truncate(limit);
+        preview.push_str("...");
+    }
+    preview
+}
+
 fn ensure_session_running(session: &SessionRecord) -> Result<()> {
     if session.status != SessionStatus::Running || !process_exists(session.pid) {
         bail!("session `{}` is not running", session.session_id);
@@ -1381,10 +1613,18 @@ fn ensure_session_not_running(session: &SessionRecord) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AttachControl, SessionRuntime};
+    use super::{AttachControl, SessionOutcome, SessionRuntime, classify_session_outcome};
+    use crate::db::{Database, NewSession, NewThread};
     use crate::terminal_state::TerminalStateEngine;
+    use agentd_shared::{event::NewSessionEvent, paths::AppPaths};
     use anyhow::Result;
-    use std::sync::Arc;
+    use serde_json::json;
+    use std::{
+        fs,
+        process::Command,
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     struct StubTerminalState;
 
@@ -1419,5 +1659,124 @@ mod tests {
 
         let control = control_rx.try_recv().unwrap();
         assert_eq!(control, AttachControl::Detach);
+    }
+
+    fn test_paths() -> AppPaths {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = camino::Utf8PathBuf::from(format!("/tmp/agentd-app-test-{suffix}"));
+        AppPaths {
+            socket: root.join("agentd.sock"),
+            pid_file: root.join("agentd.pid"),
+            database: root.join("state.db"),
+            config: root.join("config.toml"),
+            logs_dir: root.join("logs"),
+            worktrees_dir: root.join("worktrees"),
+            root,
+        }
+    }
+
+    fn init_git_repo(path: &str) {
+        fs::create_dir_all(path).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-b", "main", path])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["-C", path, "config", "user.email", "agentd@example.com"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["-C", path, "config", "user.name", "agentd"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        fs::write(format!("{path}/README.md"), "hello\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["-C", path, "add", "README.md"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["-C", path, "commit", "-m", "init"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+
+    #[test]
+    fn classify_session_outcome_marks_clarification_only_run_as_needs_input() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        let repo = paths.root.join("repo");
+        init_git_repo(repo.as_str());
+
+        db.insert_session(&NewSession {
+            session_id: "demo",
+            thread_id: Some("thread-demo"),
+            agent: "codex",
+            model: Some("gpt-5.3-codex"),
+            agent_command: "codex",
+            agent_args_json: "[]",
+            resume_session_id: Some("resume-1"),
+            workspace: repo.as_str(),
+            repo_path: repo.as_str(),
+            task: "clarify",
+            base_branch: "main",
+            branch: "agent/clarify",
+            worktree: repo.as_str(),
+        })
+        .unwrap();
+        db.insert_thread(&NewThread {
+            thread_id: "thread-demo",
+            session_id: "demo",
+            agent: "codex",
+            title: "clarify",
+            initial_prompt: "clarify",
+        })
+        .unwrap();
+        db.append_events(
+            "demo",
+            &[NewSessionEvent {
+                event_type: "CODEX_ITEM_COMPLETED".to_string(),
+                payload_json: json!({
+                    "raw": {
+                        "item": {
+                            "type": "agent_message",
+                            "text": "Do you want me to make the change?"
+                        }
+                    }
+                }),
+            }],
+        )
+        .unwrap();
+
+        let session = db.get_session("demo").unwrap().unwrap();
+        let outcome = classify_session_outcome(&db, &session, Some(0)).unwrap();
+        assert!(matches!(
+            outcome,
+            SessionOutcome::NeedsInput { ref question }
+                if question == "Do you want me to make the change?"
+        ));
     }
 }

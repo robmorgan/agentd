@@ -8,6 +8,7 @@ pub enum SessionStatus {
     Creating,
     Running,
     Paused,
+    NeedsInput,
     Exited,
     Failed,
     UnknownRecovered,

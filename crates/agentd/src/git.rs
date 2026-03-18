@@ -194,6 +194,16 @@ pub fn diff_against_base(worktree: &Utf8Path, base_branch: &str) -> Result<Strin
     Ok(output)
 }
 
+pub fn has_worktree_changes(worktree: &Utf8Path) -> Result<bool> {
+    Ok(!run_git(worktree, &["status", "--porcelain"])?.trim().is_empty())
+}
+
+pub fn has_committed_diff_against_base(worktree: &Utf8Path, base_branch: &str) -> Result<bool> {
+    Ok(!run_git(worktree, &["diff", "--stat", &format!("{base_branch}...HEAD")])?
+        .trim()
+        .is_empty())
+}
+
 fn run_git(worktree: &Utf8Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
