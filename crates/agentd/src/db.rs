@@ -18,6 +18,7 @@ pub struct NewSession<'a> {
     pub session_id: &'a str,
     pub thread_id: Option<&'a str>,
     pub agent: &'a str,
+    pub model: Option<&'a str>,
     pub agent_command: &'a str,
     pub agent_args_json: &'a str,
     pub resume_session_id: Option<&'a str>,
@@ -75,6 +76,7 @@ impl Database {
                 session_id TEXT PRIMARY KEY,
                 thread_id TEXT,
                 agent TEXT NOT NULL,
+                model TEXT,
                 agent_command TEXT,
                 agent_args_json TEXT,
                 resume_session_id TEXT,
@@ -122,6 +124,7 @@ impl Database {
             "thread_id",
             "ALTER TABLE sessions ADD COLUMN thread_id TEXT",
         )?;
+        self.ensure_column(&conn, "model", "ALTER TABLE sessions ADD COLUMN model TEXT")?;
         self.ensure_column(
             &conn,
             "repo_path",
@@ -187,14 +190,15 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO sessions (
-                session_id, thread_id, agent, agent_command, agent_args_json, resume_session_id, workspace,
+                session_id, thread_id, agent, model, agent_command, agent_args_json, resume_session_id, workspace,
                 repo_path, task, base_branch, branch, worktree, status, attention, attention_summary,
                 created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
             params![
                 new_session.session_id,
                 new_session.thread_id,
                 new_session.agent,
+                new_session.model,
                 new_session.agent_command,
                 new_session.agent_args_json,
                 new_session.resume_session_id,
@@ -359,7 +363,7 @@ impl Database {
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT session_id, thread_id, agent, workspace, repo_path, task, base_branch, branch,
+            "SELECT session_id, thread_id, agent, model, workspace, repo_path, task, base_branch, branch,
                     worktree, status, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
@@ -373,7 +377,7 @@ impl Database {
     pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT session_id, thread_id, agent, workspace, repo_path, task, base_branch, branch,
+            "SELECT session_id, thread_id, agent, model, workspace, repo_path, task, base_branch, branch,
                     worktree, status, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
@@ -444,19 +448,6 @@ impl Database {
                     created_at, updated_at
              FROM threads WHERE thread_id = ?1",
             params![thread_id],
-            row_to_thread,
-        )
-        .optional()
-        .map_err(Into::into)
-    }
-
-    pub fn get_thread_for_session(&self, session_id: &str) -> Result<Option<ThreadRecord>> {
-        let conn = self.connect()?;
-        conn.query_row(
-            "SELECT thread_id, session_id, agent, title, initial_prompt, upstream_thread_id,
-                    created_at, updated_at
-             FROM threads WHERE session_id = ?1",
-            params![session_id],
             row_to_thread,
         )
         .optional()
@@ -556,30 +547,35 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         session_id: row.get(0)?,
         thread_id: row.get(1)?,
         agent: row.get(2)?,
-        workspace: row.get(3)?,
-        repo_path: row.get(4)?,
-        task: row.get(5)?,
-        base_branch: row.get(6)?,
-        branch: row.get(7)?,
-        worktree: row.get(8)?,
-        status: str_to_status(&row.get::<_, String>(9)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(err))
-        })?,
-        pid: row.get::<_, Option<u32>>(10)?,
-        exit_code: row.get(11)?,
-        error: row.get(12)?,
-        attention: str_to_attention(&row.get::<_, String>(13)?).map_err(|err| {
+        model: row.get(3)?,
+        workspace: row.get(4)?,
+        repo_path: row.get(5)?,
+        task: row.get(6)?,
+        base_branch: row.get(7)?,
+        branch: row.get(8)?,
+        worktree: row.get(9)?,
+        status: str_to_status(&row.get::<_, String>(10)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                13,
+                10,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        attention_summary: row.get(14)?,
-        created_at: parse_time(row.get::<_, String>(15)?)?,
-        updated_at: parse_time(row.get::<_, String>(16)?)?,
+        pid: row.get::<_, Option<u32>>(11)?,
+        exit_code: row.get(12)?,
+        error: row.get(13)?,
+        attention: str_to_attention(&row.get::<_, String>(14)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                14,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?,
+        attention_summary: row.get(15)?,
+        created_at: parse_time(row.get::<_, String>(16)?)?,
+        updated_at: parse_time(row.get::<_, String>(17)?)?,
         exited_at: row
-            .get::<_, Option<String>>(17)?
+            .get::<_, Option<String>>(18)?
             .map(parse_time)
             .transpose()?,
     })
@@ -720,6 +716,7 @@ mod tests {
             session_id: "demo",
             thread_id: None,
             agent: "codex",
+            model: None,
             agent_command: "codex",
             agent_args_json: "[]",
             resume_session_id: None,
@@ -766,6 +763,7 @@ mod tests {
             session_id: "demo",
             thread_id: None,
             agent: "codex",
+            model: None,
             agent_command: "codex",
             agent_args_json: "[]",
             resume_session_id: None,
@@ -800,6 +798,7 @@ mod tests {
             session_id: "demo",
             thread_id: None,
             agent: "codex",
+            model: None,
             agent_command: "codex",
             agent_args_json: "[]",
             resume_session_id: None,
@@ -829,6 +828,7 @@ mod tests {
             session_id: "demo",
             thread_id: Some("thread-demo"),
             agent: "codex",
+            model: Some("gpt-5.3-codex"),
             agent_command: "codex",
             agent_args_json: "[]",
             resume_session_id: None,
@@ -854,8 +854,9 @@ mod tests {
 
         let session = db.get_session("demo").unwrap().unwrap();
         assert_eq!(session.thread_id.as_deref(), Some("thread-demo"));
+        assert_eq!(session.model.as_deref(), Some("gpt-5.3-codex"));
 
-        let thread = db.get_thread_for_session("demo").unwrap().unwrap();
+        let thread = db.get_thread("thread-demo").unwrap().unwrap();
         assert_eq!(thread.thread_id, "thread-demo");
         assert_eq!(thread.upstream_thread_id.as_deref(), Some("codex-upstream"));
     }

@@ -37,7 +37,7 @@ impl LocalStore {
     pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT session_id, thread_id, agent, workspace, repo_path, task, base_branch, branch,
+            "SELECT session_id, thread_id, agent, model, workspace, repo_path, task, base_branch, branch,
                     worktree, status, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
@@ -50,7 +50,7 @@ impl LocalStore {
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT session_id, thread_id, agent, workspace, repo_path, task, base_branch, branch,
+            "SELECT session_id, thread_id, agent, model, workspace, repo_path, task, base_branch, branch,
                     worktree, status, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
@@ -140,6 +140,7 @@ impl LocalStore {
                 session_id TEXT PRIMARY KEY,
                 thread_id TEXT,
                 agent TEXT NOT NULL,
+                model TEXT,
                 workspace TEXT NOT NULL,
                 repo_path TEXT,
                 task TEXT NOT NULL,
@@ -180,6 +181,11 @@ impl LocalStore {
             &conn,
             "thread_id",
             "ALTER TABLE sessions ADD COLUMN thread_id TEXT",
+        )?;
+        ensure_column(
+            &conn,
+            "model",
+            "ALTER TABLE sessions ADD COLUMN model TEXT",
         )?;
         ensure_column(
             &conn,
@@ -318,30 +324,35 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         session_id: row.get(0)?,
         thread_id: row.get(1)?,
         agent: row.get(2)?,
-        workspace: row.get(3)?,
-        repo_path: row.get(4)?,
-        task: row.get(5)?,
-        base_branch: row.get(6)?,
-        branch: row.get(7)?,
-        worktree: row.get(8)?,
-        status: str_to_status(&row.get::<_, String>(9)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(err))
-        })?,
-        pid: row.get::<_, Option<u32>>(10)?,
-        exit_code: row.get(11)?,
-        error: row.get(12)?,
-        attention: str_to_attention(&row.get::<_, String>(13)?).map_err(|err| {
+        model: row.get(3)?,
+        workspace: row.get(4)?,
+        repo_path: row.get(5)?,
+        task: row.get(6)?,
+        base_branch: row.get(7)?,
+        branch: row.get(8)?,
+        worktree: row.get(9)?,
+        status: str_to_status(&row.get::<_, String>(10)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                13,
+                10,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        attention_summary: row.get(14)?,
-        created_at: parse_time(row.get::<_, String>(15)?)?,
-        updated_at: parse_time(row.get::<_, String>(16)?)?,
+        pid: row.get::<_, Option<u32>>(11)?,
+        exit_code: row.get(12)?,
+        error: row.get(13)?,
+        attention: str_to_attention(&row.get::<_, String>(14)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                14,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?,
+        attention_summary: row.get(15)?,
+        created_at: parse_time(row.get::<_, String>(16)?)?,
+        updated_at: parse_time(row.get::<_, String>(17)?)?,
         exited_at: row
-            .get::<_, Option<String>>(17)?
+            .get::<_, Option<String>>(18)?
             .map(parse_time)
             .transpose()?,
     })

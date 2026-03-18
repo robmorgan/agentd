@@ -26,6 +26,7 @@ pub struct SessionRecord {
     pub session_id: String,
     pub thread_id: Option<String>,
     pub agent: String,
+    pub model: Option<String>,
     pub workspace: String,
     pub repo_path: String,
     pub task: String,

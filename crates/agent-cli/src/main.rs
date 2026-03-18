@@ -5,7 +5,7 @@ use std::{
     os::fd::AsRawFd,
     path::PathBuf,
     process::Stdio,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -26,10 +26,10 @@ use libc::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear as WidgetClear, List, ListItem, Paragraph, Wrap},
 };
 use tokio::{io::BufReader, net::UnixStream, sync::mpsc};
 
@@ -51,6 +51,14 @@ use crate::local::{LocalStore, normalize_session, print_log_file, remove_session
 const AGENTD_ATTACH_RESTORE_SEQUENCE: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[<u\x1b[?25h";
 const AGENTD_ATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
+const CODEX_COMPOSER_BG: Color = Color::Rgb(11, 15, 20);
+const CODEX_MODELS: &[&str] = &[
+    "gpt-5.3-codex",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex",
+    "gpt-5.1-codex-mini",
+    "gpt-5-codex",
+];
 
 #[derive(Debug, Parser)]
 #[command(name = "agent")]
@@ -181,6 +189,7 @@ async fn main() -> Result<()> {
                     workspace: options.workspace.to_string_lossy().to_string(),
                     task: options.task,
                     agent: options.agent,
+                    model: None,
                 },
             )
             .await?;
@@ -210,6 +219,7 @@ async fn main() -> Result<()> {
                     workspace: workspace.to_string_lossy().to_string(),
                     task,
                     agent,
+                    model: None,
                 },
             )
             .await?;
@@ -981,6 +991,9 @@ fn print_session(session: &SessionRecord) {
         println!("thread_id: {thread_id}");
     }
     println!("agent: {}", session.agent);
+    if let Some(model) = &session.model {
+        println!("model: {model}");
+    }
     println!("status: {}", session.status_string());
     println!("attention: {}", session.attention_string());
     if let Some(summary) = &session.attention_summary {
@@ -1315,22 +1328,29 @@ async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
     let _screen = TerminalScreenGuard::enter()?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend).context("failed to initialize terminal")?;
-    let mut query = String::new();
+    let mut composer = String::new();
     let mut selected = 0_usize;
+    let mut selected_model = 0_usize;
+    let mut model_picker_open = false;
     let mut status = String::new();
 
     loop {
         let sessions = daemon_list_sessions(paths).await?;
-        let matches = filtered_sessions(&sessions, &query)
-            .into_iter()
-            .map(|(_, session)| session.clone())
-            .collect::<Vec<_>>();
-        if selected >= matches.len() && !matches.is_empty() {
-            selected = matches.len() - 1;
+        if selected >= sessions.len() && !sessions.is_empty() {
+            selected = sessions.len() - 1;
         }
 
         terminal.draw(|frame| {
-            render_focus_dashboard(frame, &query, &matches, selected, &status);
+            render_focus_dashboard(
+                frame,
+                &sessions,
+                selected,
+                &composer,
+                CODEX_MODELS[selected_model],
+                model_picker_open,
+                selected_model,
+                &status,
+            );
         })?;
         status.clear();
 
@@ -1345,32 +1365,76 @@ async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
         }
 
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+            KeyCode::Esc => {
+                if model_picker_open {
+                    model_picker_open = false;
+                    status = "model picker closed".to_string();
+                } else if !composer.is_empty() {
+                    composer.clear();
+                    status = "composer cleared".to_string();
+                } else {
+                    return Ok(());
+                }
+            }
+            KeyCode::Char('q') if composer.is_empty() && !model_picker_open => return Ok(()),
             KeyCode::Up => {
-                selected = selected.saturating_sub(1);
+                if model_picker_open {
+                    selected_model = selected_model.saturating_sub(1);
+                } else {
+                    selected = selected.saturating_sub(1);
+                }
             }
             KeyCode::Down => {
-                if selected + 1 < matches.len() {
+                if model_picker_open {
+                    if selected_model + 1 < CODEX_MODELS.len() {
+                        selected_model += 1;
+                    }
+                } else if selected + 1 < sessions.len() {
                     selected += 1;
                 }
             }
             KeyCode::Backspace => {
-                query.pop();
-                selected = 0;
+                if model_picker_open {
+                    model_picker_open = false;
+                    status = "model picker closed".to_string();
+                } else {
+                    composer.pop();
+                }
             }
             KeyCode::Enter => {
-                if let Some(session) = matches.get(selected) {
+                if model_picker_open {
+                    model_picker_open = false;
+                    status = format!("model set to {}", CODEX_MODELS[selected_model]);
+                } else if composer.trim() == "/model" {
+                    model_picker_open = true;
+                    status = "choose a model".to_string();
+                } else if !composer.trim().is_empty() {
+                    let created = create_dashboard_session(
+                        paths,
+                        composer.trim(),
+                        Some(CODEX_MODELS[selected_model]),
+                    )
+                    .await?;
+                    composer.clear();
+                    focus_session(paths, &created.session_id).await?;
+                } else if let Some(session) = sessions.get(selected) {
                     focus_session(paths, &session.session_id).await?;
                 }
             }
             KeyCode::Char('k') => {
-                if let Some(session) = matches.get(selected) {
+                if model_picker_open {
+                    continue;
+                }
+                if let Some(session) = sessions.get(selected) {
                     kill_session(paths, &session.session_id).await?;
                     status = format!("terminated {}", session.session_id);
                 }
             }
             KeyCode::Char('r') => {
-                if let Some(session) = matches.get(selected) {
+                if model_picker_open {
+                    continue;
+                }
+                if let Some(session) = sessions.get(selected) {
                     let retried = retry_session(paths, session).await?;
                     status = format!("created retry {}", retried.session_id);
                 }
@@ -1378,8 +1442,9 @@ async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
             KeyCode::Char(ch)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
-                query.push(ch);
-                selected = 0;
+                if !model_picker_open {
+                    composer.push(ch);
+                }
             }
             _ => {}
         }
@@ -1440,9 +1505,12 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
 
 fn render_focus_dashboard(
     frame: &mut Frame,
-    query: &str,
     sessions: &[SessionRecord],
     selected: usize,
+    composer: &str,
+    selected_model: &str,
+    model_picker_open: bool,
+    model_picker_selected: usize,
     status: &str,
 ) {
     let area = frame.area();
@@ -1450,30 +1518,20 @@ fn render_focus_dashboard(
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(6),
+            Constraint::Min(8),
+            Constraint::Length(5),
+            Constraint::Length(1),
             Constraint::Length(2),
         ])
         .split(area);
 
     let header = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("Codex Sessions", accent_style().add_modifier(Modifier::BOLD)),
+            Span::styled("Codex", accent_style().add_modifier(Modifier::BOLD)),
             Span::raw("  "),
-            Span::styled("type to filter", muted_style()),
-        ]),
-        Line::from(vec![
-            Span::styled("> ", accent_style()),
             Span::styled(
-                if query.is_empty() {
-                    "search sessions".to_string()
-                } else {
-                    query.to_string()
-                },
-                if query.is_empty() {
-                    muted_style()
-                } else {
-                    Style::default()
-                },
+                "new task below, sessions above",
+                muted_style(),
             ),
         ]),
     ])
@@ -1482,7 +1540,7 @@ fn render_focus_dashboard(
 
     let items = if sessions.is_empty() {
         vec![ListItem::new(Line::from(vec![Span::styled(
-            "No matching sessions.",
+            "No sessions yet.",
             muted_style(),
         )]))]
     } else {
@@ -1518,7 +1576,19 @@ fn render_focus_dashboard(
                     ]),
                     Line::from(vec![
                         Span::raw("  "),
-                        Span::styled(&session.branch, muted_style()),
+                        Span::styled(
+                            format!(
+                                "{}  {}{}",
+                                session.branch,
+                                session.agent,
+                                session
+                                    .model
+                                    .as_deref()
+                                    .map(|model| format!("  {model}"))
+                                    .unwrap_or_default()
+                            ),
+                            muted_style(),
+                        ),
                     ]),
                 ])
             })
@@ -1526,14 +1596,87 @@ fn render_focus_dashboard(
     };
     frame.render_widget(List::new(items).block(Block::default()), chunks[1]);
 
-    let footer = Paragraph::new(if status.is_empty() {
-        "Enter open  ↑↓ move  r retry  k kill  q quit".to_string()
+    let cursor = blinking_cursor_span();
+    let composer_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(chunks[2]);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::TOP | Borders::BOTTOM)
+            .style(composer_box_style()),
+        chunks[2],
+    );
+    let composer_prompt = if composer.is_empty() {
+        Line::from(vec![
+            Span::styled("> ", accent_style()),
+            Span::styled("describe the task or type /model", muted_style()),
+            cursor,
+        ])
     } else {
-        format!("Status: {status}")
+        Line::from(vec![
+            Span::styled("> ", accent_style()),
+            Span::raw(composer),
+            cursor,
+        ])
+    };
+    frame.render_widget(
+        Paragraph::new(composer_prompt)
+            .style(composer_box_style())
+            .alignment(Alignment::Left),
+        composer_chunks[2],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("model ", muted_style()),
+            Span::styled(selected_model, accent_style()),
+        ]))
+        .style(composer_box_style()),
+        chunks[3],
+    );
+
+    let footer = Paragraph::new(if status.is_empty() {
+        "Enter create/open  /model picker  ↑↓ sessions  r retry  k kill  Esc clear/quit".to_string()
+    } else {
+        status.to_string()
     })
-    .style(muted_style())
-    .block(Block::default().borders(Borders::TOP));
-    frame.render_widget(footer, chunks[2]);
+    .style(muted_style());
+    frame.render_widget(footer, chunks[4]);
+
+    if model_picker_open {
+        let picker_area = centered_rect(50, 40, area);
+        frame.render_widget(WidgetClear, picker_area);
+        let model_items = CODEX_MODELS
+            .iter()
+            .enumerate()
+            .map(|(index, model)| {
+                let style = if index == model_picker_selected {
+                    accent_style().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(if index == model_picker_selected { "› " } else { "  " }, style),
+                    Span::styled(*model, style),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            List::new(model_items).block(
+                Block::default()
+                    .title(Span::styled("Select Model", muted_style()))
+                    .borders(Borders::ALL)
+                    .style(composer_box_style()),
+            ),
+            picker_area,
+        );
+    }
 }
 
 fn render_focus_session(
@@ -1570,6 +1713,11 @@ fn render_focus_session(
         Span::styled(&session.task, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(&session.branch, muted_style()),
+        Span::raw("  "),
+        Span::styled(
+            session.model.as_deref().unwrap_or("default model"),
+            muted_style(),
+        ),
     ]));
     if let Some(summary) = &session.attention_summary {
         header_lines.push(Line::from(vec![
@@ -1636,6 +1784,10 @@ fn render_focus_session(
     frame.render_widget(footer, outer[2]);
 }
 
+fn composer_box_style() -> Style {
+    Style::default().bg(CODEX_COMPOSER_BG).fg(Color::White)
+}
+
 fn accent_style() -> Style {
     Style::default().fg(Color::Cyan)
 }
@@ -1652,6 +1804,21 @@ fn attention_style(attention: AttentionLevel) -> Style {
             .fg(Color::Red)
             .add_modifier(Modifier::BOLD),
     }
+}
+
+fn blinking_cursor_span() -> Span<'static> {
+    if cursor_visible() {
+        Span::styled("|", accent_style().add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled(" ", composer_box_style())
+    }
+}
+
+fn cursor_visible() -> bool {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| (duration.as_millis() / 500) % 2 == 0)
+        .unwrap_or(true)
 }
 
 fn read_log_tail(paths: &AppPaths, session_id: &str, lines: usize) -> Result<String> {
@@ -1701,6 +1868,7 @@ async fn retry_session(paths: &AppPaths, session: &SessionRecord) -> Result<Sess
             workspace: session.workspace.clone(),
             task: session.task.clone(),
             agent: session.agent.clone(),
+            model: session.model.clone(),
         },
     )
     .await?;
@@ -1710,6 +1878,49 @@ async fn retry_session(paths: &AppPaths, session: &SessionRecord) -> Result<Sess
         other => bail!("unexpected response: {:?}", other),
     };
     daemon_get_session(paths, &created.session_id).await
+}
+
+async fn create_dashboard_session(
+    paths: &AppPaths,
+    task: &str,
+    model: Option<&str>,
+) -> Result<SessionRecord> {
+    let workspace = std::env::current_dir().context("failed to determine current directory")?;
+    let response = send_request(
+        paths,
+        &Request::CreateSession {
+            workspace: workspace.to_string_lossy().to_string(),
+            task: task.to_string(),
+            agent: "codex".to_string(),
+            model: model.map(str::to_string),
+        },
+    )
+    .await?;
+    let created = match response {
+        Response::CreateSession { session } => session,
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {:?}", other),
+    };
+    daemon_get_session(paths, &created.session_id).await
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let popup = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup[1])[1]
 }
 
 async fn maybe_switch_attached_session(

@@ -62,6 +62,7 @@ impl AppState {
         workspace: String,
         task_text: String,
         agent_name: String,
+        model: Option<String>,
     ) -> Result<CreateSessionResult> {
         let paths = self.paths.clone();
         let db = self.db.clone();
@@ -87,6 +88,7 @@ impl AppState {
                 session_id: &session_id,
                 thread_id: thread_id.as_deref(),
                 agent: &agent_name,
+                model: model.as_deref(),
                 agent_command: &agent.command,
                 agent_args_json: &agent_args_json,
                 resume_session_id: None,
@@ -161,6 +163,7 @@ impl AppState {
                     task_text: &task_text,
                     log_path: &log_path,
                     launch: &launch,
+                    model: model.as_deref(),
                     thread_id: thread_id.as_deref(),
                     resume_session_id: None,
                     mode: SessionStartMode::Create,
@@ -298,6 +301,7 @@ impl AppState {
                         task_text: &task_text,
                         log_path: &log_path,
                         launch: &launch,
+                        model: session.model.as_deref(),
                         thread_id: thread_id.as_deref(),
                         resume_session_id: Some(&resume_session_id),
                         mode: SessionStartMode::Resume,
@@ -668,6 +672,7 @@ struct SessionStartRequest<'a> {
     task_text: &'a str,
     log_path: &'a Utf8PathBuf,
     launch: &'a LaunchCommand,
+    model: Option<&'a str>,
     thread_id: Option<&'a str>,
     resume_session_id: Option<&'a str>,
     mode: SessionStartMode,
@@ -1071,6 +1076,10 @@ fn configure_spawn_command(
     request: &SessionStartRequest<'_>,
 ) -> Result<()> {
     command.args(request.launch.args.clone());
+    if let Some(model) = request.model {
+        command.arg("--model");
+        command.arg(model);
+    }
     if request.launch.agent_name == "codex" && request.thread_id.is_some() {
         command.arg("exec");
         match request.mode {

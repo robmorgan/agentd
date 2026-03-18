@@ -11,7 +11,7 @@ use crate::{
     },
 };
 
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 13;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
@@ -73,6 +73,7 @@ pub enum Request {
         workspace: String,
         task: String,
         agent: String,
+        model: Option<String>,
     },
     CreateWorktree {
         session_id: String,
@@ -442,10 +443,12 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             workspace,
             task,
             agent,
+            model,
         } => {
             put_string(&mut payload, workspace)?;
             put_string(&mut payload, task)?;
             put_string(&mut payload, agent)?;
+            put_optional_string(&mut payload, model.as_deref())?;
             MessageKind::CreateSessionRequest
         }
         Request::CreateWorktree { session_id } => {
@@ -531,6 +534,7 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
             workspace: cursor.take_string()?,
             task: cursor.take_string()?,
             agent: cursor.take_string()?,
+            model: cursor.take_optional_string()?,
         },
         MessageKind::CreateWorktreeRequest => Request::CreateWorktree {
             session_id: cursor.take_string()?,
@@ -887,6 +891,7 @@ fn put_session_record(buf: &mut Vec<u8>, session: &SessionRecord) -> Result<()> 
     put_string(buf, &session.session_id)?;
     put_optional_string(buf, session.thread_id.as_deref())?;
     put_string(buf, &session.agent)?;
+    put_optional_string(buf, session.model.as_deref())?;
     put_string(buf, &session.workspace)?;
     put_string(buf, &session.repo_path)?;
     put_string(buf, &session.task)?;
@@ -1140,6 +1145,7 @@ impl<'a> Cursor<'a> {
             session_id: self.take_string()?,
             thread_id: self.take_optional_string()?,
             agent: self.take_string()?,
+            model: self.take_optional_string()?,
             workspace: self.take_string()?,
             repo_path: self.take_string()?,
             task: self.take_string()?,
@@ -1300,6 +1306,7 @@ mod tests {
                 session_id: "demo".to_string(),
                 thread_id: Some("thread-demo".to_string()),
                 agent: "codex".to_string(),
+                model: Some("gpt-5.3-codex".to_string()),
                 workspace: "/tmp/demo".to_string(),
                 repo_path: "/tmp/demo".to_string(),
                 task: "fix".to_string(),

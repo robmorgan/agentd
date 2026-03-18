@@ -109,7 +109,8 @@ async fn handle_connection(
             workspace,
             task,
             agent,
-        }) => match state.create_session(workspace, task, agent).await {
+            model,
+        }) => match state.create_session(workspace, task, agent, model).await {
             Ok(session) => send_response(&mut writer, &Response::CreateSession { session }).await?,
             Err(err) => {
                 send_response(
@@ -586,6 +587,7 @@ mod tests {
             session_id: "demo".to_string(),
             thread_id: Some("thread-demo".to_string()),
             agent: "codex".to_string(),
+            model: Some("gpt-5.3-codex".to_string()),
             workspace: "/tmp/workspace".to_string(),
             repo_path: "/tmp/workspace".to_string(),
             task: "task".to_string(),
