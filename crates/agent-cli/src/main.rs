@@ -14,6 +14,7 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind},
     execute,
+    style::{Attribute as CrosAttribute, Color as CrosColor, Stylize},
     terminal::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
         enable_raw_mode,
@@ -1103,7 +1104,7 @@ fn print_diff(diff: &SessionDiff) {
     println!("branch: {}", diff.branch);
     println!("worktree: {}", diff.worktree);
     println!();
-    print!("{}", diff.diff);
+    print!("{}", render_diff_text(&diff.diff, diff_color_enabled()));
 }
 
 fn print_kill_result(session_id: &str, was_running: bool, removed: bool) {
@@ -2529,6 +2530,15 @@ fn looks_like_diff_with_lang(language: &Option<String>, text: &str) -> bool {
     matches!(language.as_deref(), Some("diff" | "patch")) || looks_like_diff(text)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffLineKind {
+    Header,
+    Hunk,
+    Add,
+    Delete,
+    Plain,
+}
+
 fn looks_like_diff(text: &str) -> bool {
     let mut diff_markers = 0;
     for line in text.lines().take(12) {
@@ -2546,19 +2556,107 @@ fn looks_like_diff(text: &str) -> bool {
     diff_markers >= 2
 }
 
-fn diff_line_style(line: &str) -> Style {
+fn classify_diff_line(line: &str) -> DiffLineKind {
     let trimmed = line.trim_start();
     if trimmed.starts_with("diff --git") || trimmed.starts_with("+++ ") || trimmed.starts_with("--- ")
     {
-        diff_header_style()
+        DiffLineKind::Header
     } else if trimmed.starts_with("@@") {
-        diff_hunk_style()
+        DiffLineKind::Hunk
     } else if trimmed.starts_with('+') {
-        diff_add_style()
+        DiffLineKind::Add
     } else if trimmed.starts_with('-') {
-        diff_delete_style()
+        DiffLineKind::Delete
     } else {
-        code_block_style()
+        DiffLineKind::Plain
+    }
+}
+
+fn diff_line_style(line: &str) -> Style {
+    match classify_diff_line(line) {
+        DiffLineKind::Header => diff_header_style(),
+        DiffLineKind::Hunk => diff_hunk_style(),
+        DiffLineKind::Add => diff_add_style(),
+        DiffLineKind::Delete => diff_delete_style(),
+        DiffLineKind::Plain => code_block_style(),
+    }
+}
+
+fn diff_color_enabled() -> bool {
+    should_colorize_diff_output(std::io::stdout().is_terminal(), std::env::var_os("NO_COLOR"))
+}
+
+fn should_colorize_diff_output(
+    is_terminal: bool,
+    no_color: Option<std::ffi::OsString>,
+) -> bool {
+    is_terminal && no_color.is_none()
+}
+
+fn render_diff_text(text: &str, color_enabled: bool) -> String {
+    if !color_enabled {
+        return text.to_string();
+    }
+
+    let mut rendered = String::new();
+    for chunk in text.split_inclusive('\n') {
+        let line = chunk.strip_suffix('\n').unwrap_or(chunk);
+        let has_newline = chunk.ends_with('\n');
+        rendered.push_str(&render_diff_line(line, color_enabled));
+        if has_newline {
+            rendered.push('\n');
+        }
+    }
+    if text.is_empty() {
+        return rendered;
+    }
+    if !text.ends_with('\n') && rendered.ends_with('\n') {
+        rendered.pop();
+    }
+    rendered
+}
+
+fn render_diff_line(line: &str, color_enabled: bool) -> String {
+    if !color_enabled {
+        return line.to_string();
+    }
+
+    match classify_diff_line(line) {
+        DiffLineKind::Header => format!(
+            "{}",
+            line.with(CrosColor::Rgb {
+                r: 153,
+                g: 214,
+                b: 255
+            })
+            .attribute(CrosAttribute::Bold)
+        ),
+        DiffLineKind::Hunk => format!(
+            "{}",
+            line.with(CrosColor::Rgb {
+                r: 242,
+                g: 201,
+                b: 76
+            })
+            .attribute(CrosAttribute::Bold)
+        ),
+        DiffLineKind::Add => format!(
+            "{}",
+            line.with(CrosColor::Rgb {
+                r: 111,
+                g: 207,
+                b: 151
+            })
+        ),
+        DiffLineKind::Delete => format!(
+            "{}",
+            line.with(CrosColor::Rgb {
+                r: 255,
+                g: 107,
+                b: 107
+            })
+        ),
+        DiffLineKind::Plain => line.to_string(),
     }
 }
 
@@ -3286,7 +3384,7 @@ mod tests {
         AGENTD_ATTACH_RESTORE_SEQUENCE, AttachInput, AttachKeyBindingParser, Cli, Command,
         DaemonCommand, DashboardFocus, FocusSessionLayout, FocusSessionPane, FocusSessionViewState,
         SessionEndSummary, apply_scroll_delta, clamp_focus_session_scroll, looks_like_diff,
-        parse_rich_blocks,
+        parse_rich_blocks, render_diff_text, should_colorize_diff_output,
         format_session_end_summary, pane_at_position, resolve_detach_session_id,
         resolve_new_session_options,
     };
@@ -3294,7 +3392,7 @@ mod tests {
     use clap::Parser;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use ratatui::layout::Rect;
-    use std::path::PathBuf;
+    use std::{ffi::OsString, path::PathBuf};
 
     #[test]
     fn new_command_parses_optional_positional_task() {
@@ -3644,6 +3742,31 @@ mod tests {
             "diff --git a/demo b/demo\n--- a/demo\n+++ b/demo\n@@ -1 +1 @@\n-old\n+new"
         ));
         assert!(!looks_like_diff("plain output\nwith no patch markers"));
+    }
+
+    #[test]
+    fn diff_colorization_is_disabled_without_terminal() {
+        assert!(!should_colorize_diff_output(false, None));
+    }
+
+    #[test]
+    fn diff_colorization_respects_no_color() {
+        assert!(!should_colorize_diff_output(
+            true,
+            Some(OsString::from("1"))
+        ));
+    }
+
+    #[test]
+    fn render_diff_text_keeps_plain_output_without_color() {
+        let diff = "@@ -1 +1 @@\n-old\n+new\n";
+        assert_eq!(render_diff_text(diff, false), diff);
+    }
+
+    #[test]
+    fn render_diff_text_adds_ansi_when_enabled() {
+        let rendered = render_diff_text("@@ -1 +1 @@\n-old\n+new\n", true);
+        assert!(rendered.contains("\u{1b}["));
     }
 
     #[test]
