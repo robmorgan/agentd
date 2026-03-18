@@ -1,8 +1,12 @@
 [package]
-name = "agent"
+name = "agent-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[[bin]]
+name = "agent"
+path = "src/main.rs"
 
 [dependencies]
 agentd-shared = { path = "../agentd-shared" }

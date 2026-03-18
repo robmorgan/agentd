@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "agent"
+name = "agent-cli"
 version = "0.1.0"
 dependencies = [
  "agentd-shared",
