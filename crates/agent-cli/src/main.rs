@@ -110,6 +110,16 @@ enum Command {
         )]
         data: Vec<String>,
     },
+    Reply {
+        session_id: String,
+        #[arg(
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "PROMPT"
+        )]
+        prompt: Vec<String>,
+    },
     Logs {
         session_id: String,
         #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true", default_value_t = true)]
@@ -311,6 +321,13 @@ async fn main() -> Result<()> {
             }
         }
         (Command::SendInput { .. }, ExecutionMode::Local(reason)) => {
+            bail_live_command(&reason)?;
+        }
+        (Command::Reply { session_id, prompt }, ExecutionMode::Daemon) => {
+            let session = reply_session(&paths, &session_id, &prompt.join(" ")).await?;
+            print_session(&session);
+        }
+        (Command::Reply { .. }, ExecutionMode::Local(reason)) => {
             bail_live_command(&reason)?;
         }
         (Command::Logs { session_id, follow }, ExecutionMode::Daemon) => {
@@ -1181,6 +1198,7 @@ fn format_session_end_summary(summary: &SessionEndSummary) -> String {
             None => format!("session {} failed", summary.session_id),
         },
         SessionStatus::Paused => format!("session {} paused", summary.session_id),
+        SessionStatus::NeedsInput => format!("session {} needs input", summary.session_id),
         SessionStatus::Exited | SessionStatus::UnknownRecovered => match summary.exit_code {
             Some(code) => format!("session {} finished (exit {code})", summary.session_id),
             None => format!("session {} finished", summary.session_id),
@@ -1277,6 +1295,7 @@ impl StatusString for SessionRecord {
             SessionStatus::Creating => "creating",
             SessionStatus::Running => "running",
             SessionStatus::Paused => "paused",
+            SessionStatus::NeedsInput => "needs_input",
             SessionStatus::Exited => "exited",
             SessionStatus::Failed => "failed",
             SessionStatus::UnknownRecovered => "unknown_recovered",
@@ -1485,6 +1504,8 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
     let mut terminal = Terminal::new(backend).context("failed to initialize terminal")?;
     let store = LocalStore::open(paths)?;
     let mut status = String::new();
+    let mut reply_open = false;
+    let mut reply = String::new();
 
     loop {
         let session = daemon_get_session(paths, session_id).await?;
@@ -1492,7 +1513,7 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
         let log_tail = read_log_tail(paths, session_id, 12)?;
         let focus_events = events.into_iter().rev().take(8).collect::<Vec<_>>();
         terminal.draw(|frame| {
-            render_focus_session(frame, &session, &focus_events, &log_tail, &status);
+            render_focus_session(frame, &session, &focus_events, &log_tail, &status, reply_open, &reply);
         })?;
         status.clear();
 
@@ -1507,8 +1528,30 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
         }
 
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
-            KeyCode::Char('a') => {
+            KeyCode::Esc => {
+                if reply_open {
+                    reply_open = false;
+                    reply.clear();
+                    status = "reply canceled".to_string();
+                } else {
+                    return Ok(());
+                }
+            }
+            KeyCode::Char('q') if !reply_open => return Ok(()),
+            KeyCode::Backspace if reply_open => {
+                reply.pop();
+            }
+            KeyCode::Enter if reply_open => {
+                if reply.trim().is_empty() {
+                    status = "reply is empty".to_string();
+                } else {
+                    reply_session(paths, session_id, reply.trim()).await?;
+                    reply_open = false;
+                    reply.clear();
+                    status = format!("replied to {}", session_id);
+                }
+            }
+            KeyCode::Char('a') if !reply_open => {
                 if session.status == SessionStatus::Running {
                     drop(terminal);
                     drop(screen);
@@ -1517,13 +1560,22 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
                 }
                 status = "session is not running".to_string();
             }
-            KeyCode::Char('k') => {
+            KeyCode::Char('k') if !reply_open => {
                 kill_session(paths, session_id).await?;
                 status = format!("terminated {}", session_id);
             }
-            KeyCode::Char('r') => {
+            KeyCode::Char('r') if !reply_open => {
                 let retried = retry_session(paths, &session).await?;
                 status = format!("created retry {}", retried.session_id);
+            }
+            KeyCode::Char('y') if !reply_open && session.status == SessionStatus::NeedsInput => {
+                reply_open = true;
+                reply.clear();
+            }
+            KeyCode::Char(ch)
+                if reply_open && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
+            {
+                reply.push(ch);
             }
             _ => {}
         }
@@ -1726,6 +1778,8 @@ fn render_focus_session(
     events: &[agentd_shared::event::SessionEvent],
     log_tail: &str,
     status: &str,
+    reply_open: bool,
+    reply: &str,
 ) {
     let area = frame.area();
     let outer = Layout::default()
@@ -1816,13 +1870,42 @@ fn render_focus_session(
     );
 
     let footer = Paragraph::new(if status.is_empty() {
-        "a attach  r retry  k kill  q back".to_string()
+        if session.status == SessionStatus::NeedsInput {
+            "y reply  r retry  k kill  q back".to_string()
+        } else {
+            "a attach  r retry  k kill  q back".to_string()
+        }
     } else {
         format!("Status: {status}")
     })
     .style(muted_style())
     .block(Block::default().borders(Borders::TOP));
     frame.render_widget(footer, outer[2]);
+
+    if reply_open {
+        let reply_area = centered_rect(60, 20, area);
+        frame.render_widget(WidgetClear, reply_area);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(3), Constraint::Length(1)])
+            .split(reply_area);
+        frame.render_widget(
+            Block::default()
+                .title(Span::styled("Reply", muted_style()))
+                .borders(Borders::ALL)
+                .style(composer_box_style()),
+            reply_area,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("> ", accent_style()),
+                Span::raw(reply),
+                blinking_cursor_span(),
+            ]))
+            .style(composer_box_style()),
+            chunks[1],
+        );
+    }
 }
 
 fn composer_box_style() -> Style {
@@ -1897,6 +1980,22 @@ async fn kill_session(paths: &AppPaths, session_id: &str) -> Result<()> {
     .await?;
     match response {
         Response::KillSession { .. } => Ok(()),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {:?}", other),
+    }
+}
+
+async fn reply_session(paths: &AppPaths, session_id: &str, prompt: &str) -> Result<SessionRecord> {
+    let response = send_request(
+        paths,
+        &Request::ReplyToSession {
+            session_id: session_id.to_string(),
+            prompt: prompt.to_string(),
+        },
+    )
+    .await?;
+    match response {
+        Response::Session { session } => Ok(session),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected response: {:?}", other),
     }
