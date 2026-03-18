@@ -5,10 +5,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
     event::{NewSessionEvent, SessionEvent},
-    session::{CreateSessionResult, SessionDiff, SessionRecord, SessionStatus, WorktreeRecord},
+    session::{
+        AttentionLevel, CreateSessionResult, SessionDiff, SessionRecord, SessionStatus,
+        WorktreeRecord,
+    },
 };
 
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
@@ -845,6 +848,14 @@ fn put_session_status(buf: &mut Vec<u8>, status: SessionStatus) {
     });
 }
 
+fn put_attention_level(buf: &mut Vec<u8>, attention: AttentionLevel) {
+    buf.push(match attention {
+        AttentionLevel::Info => 1,
+        AttentionLevel::Notice => 2,
+        AttentionLevel::Action => 3,
+    });
+}
+
 fn put_create_session_result(buf: &mut Vec<u8>, session: &CreateSessionResult) -> Result<()> {
     put_string(buf, &session.session_id)?;
     put_string(buf, &session.base_branch)?;
@@ -886,6 +897,8 @@ fn put_session_record(buf: &mut Vec<u8>, session: &SessionRecord) -> Result<()> 
     put_optional_u32(buf, session.pid);
     put_optional_i32(buf, session.exit_code);
     put_optional_string(buf, session.error.as_deref())?;
+    put_attention_level(buf, session.attention);
+    put_optional_string(buf, session.attention_summary.as_deref())?;
     put_datetime(buf, &session.created_at);
     put_datetime(buf, &session.updated_at);
     put_optional_datetime(buf, session.exited_at.as_ref());
@@ -1056,6 +1069,15 @@ impl<'a> Cursor<'a> {
         })
     }
 
+    fn take_attention_level(&mut self) -> Result<AttentionLevel> {
+        Ok(match self.take_u8()? {
+            1 => AttentionLevel::Info,
+            2 => AttentionLevel::Notice,
+            3 => AttentionLevel::Action,
+            other => bail!("invalid attention level `{other}`"),
+        })
+    }
+
     fn take_datetime(&mut self) -> Result<DateTime<Utc>> {
         let seconds = self.take_i64()?;
         let nanos = self.take_u32()?;
@@ -1128,6 +1150,8 @@ impl<'a> Cursor<'a> {
             pid: self.take_optional_u32()?,
             exit_code: self.take_optional_i32()?,
             error: self.take_optional_string()?,
+            attention: self.take_attention_level()?,
+            attention_summary: self.take_optional_string()?,
             created_at: self.take_datetime()?,
             updated_at: self.take_datetime()?,
             exited_at: self.take_optional_datetime()?,
@@ -1193,7 +1217,7 @@ mod tests {
     };
     use crate::{
         event::{NewSessionEvent, SessionEvent},
-        session::{CreateSessionResult, SessionRecord, SessionStatus},
+        session::{AttentionLevel, CreateSessionResult, SessionRecord, SessionStatus},
     };
     use chrono::Utc;
     use serde_json::json;
@@ -1286,6 +1310,8 @@ mod tests {
                 pid: Some(123),
                 exit_code: None,
                 error: None,
+                attention: AttentionLevel::Info,
+                attention_summary: Some("fix".to_string()),
                 created_at: now,
                 updated_at: now,
                 exited_at: None,

@@ -576,7 +576,7 @@ mod tests {
     use super::session_ended_response;
     use agentd_shared::{
         protocol::Response,
-        session::{SessionRecord, SessionStatus},
+        session::{AttentionLevel, SessionRecord, SessionStatus},
     };
     use chrono::Utc;
 
@@ -596,6 +596,8 @@ mod tests {
             pid: Some(123),
             exit_code: Some(0),
             error: None,
+            attention: AttentionLevel::Info,
+            attention_summary: Some("task".to_string()),
             created_at: now,
             updated_at: now,
             exited_at: Some(now),

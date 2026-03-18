@@ -6,7 +6,7 @@ use serde_json::Value;
 use agentd_shared::{
     event::{NewSessionEvent, SessionEvent},
     paths::AppPaths,
-    session::{SessionRecord, SessionStatus},
+    session::{AttentionLevel, SessionRecord, SessionStatus},
 };
 
 #[derive(Clone)]
@@ -88,6 +88,8 @@ impl Database {
                 pid INTEGER,
                 exit_code INTEGER,
                 error TEXT,
+                attention TEXT NOT NULL DEFAULT 'info',
+                attention_summary TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 exited_at TEXT
@@ -145,11 +147,23 @@ impl Database {
             "base_branch",
             "ALTER TABLE sessions ADD COLUMN base_branch TEXT",
         )?;
+        self.ensure_column(
+            &conn,
+            "attention",
+            "ALTER TABLE sessions ADD COLUMN attention TEXT NOT NULL DEFAULT 'info'",
+        )?;
+        self.ensure_column(
+            &conn,
+            "attention_summary",
+            "ALTER TABLE sessions ADD COLUMN attention_summary TEXT",
+        )?;
         conn.execute(
             "UPDATE sessions
              SET repo_path = COALESCE(repo_path, workspace),
-                 base_branch = COALESCE(base_branch, 'HEAD')
-             WHERE repo_path IS NULL OR base_branch IS NULL",
+                 base_branch = COALESCE(base_branch, 'HEAD'),
+                 attention = COALESCE(attention, 'info'),
+                 attention_summary = COALESCE(attention_summary, task)
+             WHERE repo_path IS NULL OR base_branch IS NULL OR attention IS NULL OR attention_summary IS NULL",
             [],
         )?;
         Ok(())
@@ -174,8 +188,9 @@ impl Database {
         conn.execute(
             "INSERT INTO sessions (
                 session_id, thread_id, agent, agent_command, agent_args_json, resume_session_id, workspace,
-                repo_path, task, base_branch, branch, worktree, status, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+                repo_path, task, base_branch, branch, worktree, status, attention, attention_summary,
+                created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)",
             params![
                 new_session.session_id,
                 new_session.thread_id,
@@ -190,6 +205,8 @@ impl Database {
                 new_session.branch,
                 new_session.worktree,
                 status_to_str(SessionStatus::Creating),
+                attention_to_str(AttentionLevel::Info),
+                new_session.task,
                 now,
             ],
         )?;
@@ -224,10 +241,19 @@ impl Database {
                  pid = ?3,
                  exit_code = NULL,
                  error = NULL,
-                 updated_at = ?4,
+                 attention = ?4,
+                 attention_summary = ?5,
+                 updated_at = ?6,
                  exited_at = NULL
              WHERE session_id = ?1",
-            params![session_id, status_to_str(SessionStatus::Running), pid, now],
+            params![
+                session_id,
+                status_to_str(SessionStatus::Running),
+                pid,
+                attention_to_str(AttentionLevel::Info),
+                "running",
+                now,
+            ],
         )?;
         Ok(())
     }
@@ -237,9 +263,20 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE sessions
-             SET status = ?2, pid = NULL, error = ?3, updated_at = ?4
+             SET status = ?2,
+                 pid = NULL,
+                 error = ?3,
+                 attention = ?4,
+                 attention_summary = ?3,
+                 updated_at = ?5
              WHERE session_id = ?1",
-            params![session_id, status_to_str(SessionStatus::Failed), error, now],
+            params![
+                session_id,
+                status_to_str(SessionStatus::Failed),
+                error,
+                attention_to_str(AttentionLevel::Action),
+                now,
+            ],
         )?;
         Ok(())
     }
@@ -253,10 +290,18 @@ impl Database {
                  pid = NULL,
                  exit_code = NULL,
                  error = NULL,
-                 updated_at = ?3,
+                 attention = ?3,
+                 attention_summary = ?4,
+                 updated_at = ?5,
                  exited_at = NULL
              WHERE session_id = ?1",
-            params![session_id, status_to_str(SessionStatus::Paused), now],
+            params![
+                session_id,
+                status_to_str(SessionStatus::Paused),
+                attention_to_str(AttentionLevel::Notice),
+                "paused",
+                now,
+            ],
         )?;
         Ok(())
     }
@@ -266,12 +311,23 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE sessions
-             SET status = ?2, pid = NULL, exit_code = ?3, updated_at = ?4, exited_at = ?4
+             SET status = ?2,
+                 pid = NULL,
+                 exit_code = ?3,
+                 attention = ?4,
+                 attention_summary = ?5,
+                 updated_at = ?6,
+                 exited_at = ?6
              WHERE session_id = ?1",
             params![
                 session_id,
                 status_to_str(SessionStatus::Exited),
                 exit_code,
+                attention_to_str(AttentionLevel::Notice),
+                match exit_code {
+                    Some(code) => format!("finished (exit {code})"),
+                    None => "finished".to_string(),
+                },
                 now
             ],
         )?;
@@ -283,11 +339,17 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE sessions
-             SET status = ?2, pid = NULL, updated_at = ?3
+             SET status = ?2,
+                 pid = NULL,
+                 attention = ?3,
+                 attention_summary = ?4,
+                 updated_at = ?5
              WHERE session_id = ?1",
             params![
                 session_id,
                 status_to_str(SessionStatus::UnknownRecovered),
+                attention_to_str(AttentionLevel::Action),
+                "daemon lost the live process",
                 now
             ],
         )?;
@@ -298,7 +360,8 @@ impl Database {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT session_id, thread_id, agent, workspace, repo_path, task, base_branch, branch,
-                    worktree, status, pid, exit_code, error, created_at, updated_at, exited_at
+                    worktree, status, pid, exit_code, error, attention, attention_summary,
+                    created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
             params![session_id],
             row_to_session,
@@ -311,7 +374,8 @@ impl Database {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT session_id, thread_id, agent, workspace, repo_path, task, base_branch, branch,
-                    worktree, status, pid, exit_code, error, created_at, updated_at, exited_at
+                    worktree, status, pid, exit_code, error, attention, attention_summary,
+                    created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
@@ -504,10 +568,18 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         pid: row.get::<_, Option<u32>>(10)?,
         exit_code: row.get(11)?,
         error: row.get(12)?,
-        created_at: parse_time(row.get::<_, String>(13)?)?,
-        updated_at: parse_time(row.get::<_, String>(14)?)?,
+        attention: str_to_attention(&row.get::<_, String>(13)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                13,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?,
+        attention_summary: row.get(14)?,
+        created_at: parse_time(row.get::<_, String>(15)?)?,
+        updated_at: parse_time(row.get::<_, String>(16)?)?,
         exited_at: row
-            .get::<_, Option<String>>(15)?
+            .get::<_, Option<String>>(17)?
             .map(parse_time)
             .transpose()?,
     })
@@ -591,6 +663,26 @@ fn str_to_status(value: &str) -> std::result::Result<SessionStatus, std::io::Err
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown session status `{value}`"),
+        )),
+    }
+}
+
+fn attention_to_str(attention: AttentionLevel) -> &'static str {
+    match attention {
+        AttentionLevel::Info => "info",
+        AttentionLevel::Notice => "notice",
+        AttentionLevel::Action => "action",
+    }
+}
+
+fn str_to_attention(value: &str) -> std::result::Result<AttentionLevel, std::io::Error> {
+    match value {
+        "info" => Ok(AttentionLevel::Info),
+        "notice" => Ok(AttentionLevel::Notice),
+        "action" => Ok(AttentionLevel::Action),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown attention level `{value}`"),
         )),
     }
 }

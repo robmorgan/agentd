@@ -1,4 +1,5 @@
 use std::{
+    fs,
     io::{IsTerminal, Write},
     mem::MaybeUninit,
     os::fd::AsRawFd,
@@ -22,6 +23,14 @@ use libc::{
     _POSIX_VDISABLE, TCSAFLUSH, TCSANOW, VLNEXT, VMIN, VQUIT, VTIME, cfmakeraw, tcgetattr,
     tcsetattr, termios,
 };
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+};
 use tokio::{io::BufReader, net::UnixStream, sync::mpsc};
 
 mod local;
@@ -34,7 +43,7 @@ use agentd_shared::{
         PROTOCOL_VERSION, Request, Response, read_daemon_management_response, read_response,
         write_daemon_management_request, write_request,
     },
-    session::{SessionDiff, SessionRecord, SessionStatus, WorktreeRecord},
+    session::{AttentionLevel, SessionDiff, SessionRecord, SessionStatus, WorktreeRecord},
 };
 
 use crate::local::{LocalStore, normalize_session, print_log_file, remove_session_artifacts};
@@ -47,11 +56,14 @@ const AGENTD_ATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
 #[command(name = "agent")]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Focus {
+        session_id: Option<String>,
+    },
     New {
         task: Option<String>,
         #[arg(long)]
@@ -140,9 +152,20 @@ async fn main() -> Result<()> {
     let paths = AppPaths::discover()?;
     paths.ensure_layout()?;
     ensure_config(&paths)?;
-    let execution = resolve_execution_mode(&paths, &cli.command).await?;
+    let command = cli.command.unwrap_or(Command::Focus { session_id: None });
+    let execution = resolve_execution_mode(&paths, &command).await?;
 
-    match (cli.command, execution) {
+    match (command, execution) {
+        (Command::Focus { session_id }, ExecutionMode::Daemon) => {
+            if let Some(session_id) = session_id {
+                focus_session(&paths, &session_id).await?;
+            } else {
+                focus_dashboard(&paths).await?;
+            }
+        }
+        (Command::Focus { .. }, ExecutionMode::Local(reason)) => {
+            bail!("{reason}. `agent focus` requires a compatible daemon");
+        }
         (
             Command::New {
                 task,
@@ -939,12 +962,16 @@ async fn try_connect(paths: &AppPaths) -> Result<UnixStream> {
 fn print_sessions(sessions: &[SessionRecord]) {
     for session in sessions {
         println!(
-            "{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}",
             session.session_id,
             session.agent,
             session.status_string(),
+            session.attention_string(),
             session.branch
         );
+        if let Some(summary) = &session.attention_summary {
+            println!("\t{summary}");
+        }
     }
 }
 
@@ -955,6 +982,10 @@ fn print_session(session: &SessionRecord) {
     }
     println!("agent: {}", session.agent);
     println!("status: {}", session.status_string());
+    println!("attention: {}", session.attention_string());
+    if let Some(summary) = &session.attention_summary {
+        println!("attention_summary: {summary}");
+    }
     println!("repo_path: {}", session.repo_path);
     println!("workspace: {}", session.workspace);
     println!("task: {}", session.task);
@@ -1224,6 +1255,7 @@ impl Drop for TerminalScreenGuard {
 
 trait StatusString {
     fn status_string(&self) -> &'static str;
+    fn attention_string(&self) -> &'static str;
 }
 
 impl StatusString for SessionRecord {
@@ -1235,6 +1267,14 @@ impl StatusString for SessionRecord {
             SessionStatus::Exited => "exited",
             SessionStatus::Failed => "failed",
             SessionStatus::UnknownRecovered => "unknown_recovered",
+        }
+    }
+
+    fn attention_string(&self) -> &'static str {
+        match self.attention {
+            AttentionLevel::Info => "info",
+            AttentionLevel::Notice => "notice",
+            AttentionLevel::Action => "action",
         }
     }
 }
@@ -1253,6 +1293,423 @@ async fn daemon_list_sessions(paths: &AppPaths) -> Result<Vec<SessionRecord>> {
         Response::Error { message } => bail!(message),
         other => bail!("unexpected response: {:?}", other),
     }
+}
+
+async fn daemon_get_session(paths: &AppPaths, session_id: &str) -> Result<SessionRecord> {
+    let response = send_request(
+        paths,
+        &Request::GetSession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .await?;
+    match response {
+        Response::Session { session } => Ok(session),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {:?}", other),
+    }
+}
+
+async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
+    let _raw_mode = RawModeGuard::new()?;
+    let _screen = TerminalScreenGuard::enter()?;
+    let backend = CrosstermBackend::new(std::io::stdout());
+    let mut terminal = Terminal::new(backend).context("failed to initialize terminal")?;
+    let mut query = String::new();
+    let mut selected = 0_usize;
+    let mut status = String::new();
+
+    loop {
+        let sessions = daemon_list_sessions(paths).await?;
+        let matches = filtered_sessions(&sessions, &query)
+            .into_iter()
+            .map(|(_, session)| session.clone())
+            .collect::<Vec<_>>();
+        if selected >= matches.len() && !matches.is_empty() {
+            selected = matches.len() - 1;
+        }
+
+        terminal.draw(|frame| {
+            render_focus_dashboard(frame, &query, &matches, selected, &status);
+        })?;
+        status.clear();
+
+        if !event::poll(Duration::from_millis(250)).context("failed to poll terminal input")? {
+            continue;
+        }
+        let Event::Key(key) = event::read().context("failed to read terminal input")? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+            KeyCode::Up => {
+                selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if selected + 1 < matches.len() {
+                    selected += 1;
+                }
+            }
+            KeyCode::Backspace => {
+                query.pop();
+                selected = 0;
+            }
+            KeyCode::Enter => {
+                if let Some(session) = matches.get(selected) {
+                    focus_session(paths, &session.session_id).await?;
+                }
+            }
+            KeyCode::Char('k') => {
+                if let Some(session) = matches.get(selected) {
+                    kill_session(paths, &session.session_id).await?;
+                    status = format!("terminated {}", session.session_id);
+                }
+            }
+            KeyCode::Char('r') => {
+                if let Some(session) = matches.get(selected) {
+                    let retried = retry_session(paths, session).await?;
+                    status = format!("created retry {}", retried.session_id);
+                }
+            }
+            KeyCode::Char(ch)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                query.push(ch);
+                selected = 0;
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
+    let raw_mode = RawModeGuard::new()?;
+    let screen = TerminalScreenGuard::enter()?;
+    let backend = CrosstermBackend::new(std::io::stdout());
+    let mut terminal = Terminal::new(backend).context("failed to initialize terminal")?;
+    let store = LocalStore::open(paths)?;
+    let mut status = String::new();
+
+    loop {
+        let session = daemon_get_session(paths, session_id).await?;
+        let events = store.list_events_since(session_id, None)?;
+        let log_tail = read_log_tail(paths, session_id, 12)?;
+        let focus_events = events.into_iter().rev().take(8).collect::<Vec<_>>();
+        terminal.draw(|frame| {
+            render_focus_session(frame, &session, &focus_events, &log_tail, &status);
+        })?;
+        status.clear();
+
+        if !event::poll(Duration::from_millis(250)).context("failed to poll terminal input")? {
+            continue;
+        }
+        let Event::Key(key) = event::read().context("failed to read terminal input")? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+            KeyCode::Char('a') => {
+                if session.status == SessionStatus::Running {
+                    drop(terminal);
+                    drop(screen);
+                    drop(raw_mode);
+                    return attach_session(paths, session_id).await;
+                }
+                status = "session is not running".to_string();
+            }
+            KeyCode::Char('k') => {
+                kill_session(paths, session_id).await?;
+                status = format!("terminated {}", session_id);
+            }
+            KeyCode::Char('r') => {
+                let retried = retry_session(paths, &session).await?;
+                status = format!("created retry {}", retried.session_id);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn render_focus_dashboard(
+    frame: &mut Frame,
+    query: &str,
+    sessions: &[SessionRecord],
+    selected: usize,
+    status: &str,
+) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(6),
+            Constraint::Length(2),
+        ])
+        .split(area);
+
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Codex Sessions", accent_style().add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled("type to filter", muted_style()),
+        ]),
+        Line::from(vec![
+            Span::styled("> ", accent_style()),
+            Span::styled(
+                if query.is_empty() {
+                    "search sessions".to_string()
+                } else {
+                    query.to_string()
+                },
+                if query.is_empty() {
+                    muted_style()
+                } else {
+                    Style::default()
+                },
+            ),
+        ]),
+    ])
+    .block(Block::default().borders(Borders::BOTTOM));
+    frame.render_widget(header, chunks[0]);
+
+    let items = if sessions.is_empty() {
+        vec![ListItem::new(Line::from(vec![Span::styled(
+            "No matching sessions.",
+            muted_style(),
+        )]))]
+    } else {
+        sessions
+            .iter()
+            .take(12)
+            .enumerate()
+            .map(|(index, session)| {
+                let selected_style = if index == selected {
+                    accent_style().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let summary = session
+                    .attention_summary
+                    .as_deref()
+                    .unwrap_or(session.task.as_str());
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(
+                            if index == selected { "› " } else { "  " },
+                            selected_style,
+                        ),
+                        Span::styled(&session.session_id, selected_style),
+                        Span::raw("  "),
+                        Span::styled(session.attention_string(), attention_style(session.attention)),
+                        Span::raw("  "),
+                        Span::styled(session.status_string(), muted_style()),
+                    ]),
+                    Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(summary, Style::default().add_modifier(Modifier::BOLD)),
+                    ]),
+                    Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(&session.branch, muted_style()),
+                    ]),
+                ])
+            })
+            .collect::<Vec<_>>()
+    };
+    frame.render_widget(List::new(items).block(Block::default()), chunks[1]);
+
+    let footer = Paragraph::new(if status.is_empty() {
+        "Enter open  ↑↓ move  r retry  k kill  q quit".to_string()
+    } else {
+        format!("Status: {status}")
+    })
+    .style(muted_style())
+    .block(Block::default().borders(Borders::TOP));
+    frame.render_widget(footer, chunks[2]);
+}
+
+fn render_focus_session(
+    frame: &mut Frame,
+    session: &SessionRecord,
+    events: &[agentd_shared::event::SessionEvent],
+    log_tail: &str,
+    status: &str,
+) {
+    let area = frame.area();
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(10),
+            Constraint::Length(2),
+        ])
+        .split(area);
+    let middle = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+        .split(outer[1]);
+
+    let mut header_lines = vec![Line::from(vec![
+        Span::styled("Codex", accent_style().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled(&session.session_id, Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled(session.attention_string(), attention_style(session.attention)),
+        Span::raw("  "),
+        Span::styled(session.status_string(), muted_style()),
+    ])];
+    header_lines.push(Line::from(vec![
+        Span::styled(&session.task, Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled(&session.branch, muted_style()),
+    ]));
+    if let Some(summary) = &session.attention_summary {
+        header_lines.push(Line::from(vec![
+            Span::styled("summary", muted_style()),
+            Span::raw("  "),
+            Span::raw(summary),
+        ]));
+    } else {
+        header_lines.push(Line::from(""));
+    }
+    frame.render_widget(
+        Paragraph::new(header_lines).block(Block::default().borders(Borders::BOTTOM)),
+        outer[0],
+    );
+
+    frame.render_widget(
+        Paragraph::new(log_tail.to_string())
+            .block(
+                Block::default().title(Span::styled(
+                    "transcript",
+                    muted_style().add_modifier(Modifier::BOLD),
+                )),
+            )
+            .wrap(Wrap { trim: false }),
+        middle[0],
+    );
+
+    let event_items = if events.is_empty() {
+        vec![ListItem::new(Line::from(vec![Span::styled(
+            "No recent events",
+            muted_style(),
+        )]))]
+    } else {
+        events
+            .iter()
+            .rev()
+            .map(|event| {
+                ListItem::new(vec![
+                    Line::from(Span::styled(
+                        event.event_type.as_str(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(event.timestamp.to_string(), muted_style())),
+                ])
+            })
+            .collect::<Vec<_>>()
+    };
+    frame.render_widget(
+        List::new(event_items).block(
+            Block::default()
+                .borders(Borders::LEFT)
+                .title(Span::styled("activity", muted_style().add_modifier(Modifier::BOLD))),
+        ),
+        middle[1],
+    );
+
+    let footer = Paragraph::new(if status.is_empty() {
+        "a attach  r retry  k kill  q back".to_string()
+    } else {
+        format!("Status: {status}")
+    })
+    .style(muted_style())
+    .block(Block::default().borders(Borders::TOP));
+    frame.render_widget(footer, outer[2]);
+}
+
+fn accent_style() -> Style {
+    Style::default().fg(Color::Cyan)
+}
+
+fn muted_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn attention_style(attention: AttentionLevel) -> Style {
+    match attention {
+        AttentionLevel::Info => Style::default().fg(Color::Gray),
+        AttentionLevel::Notice => Style::default().fg(Color::Yellow),
+        AttentionLevel::Action => Style::default()
+            .fg(Color::Red)
+            .add_modifier(Modifier::BOLD),
+    }
+}
+
+fn read_log_tail(paths: &AppPaths, session_id: &str, lines: usize) -> Result<String> {
+    let rendered = paths.rendered_log_path(session_id);
+    let path = if rendered.exists() {
+        rendered
+    } else {
+        paths.log_path(session_id)
+    };
+    let contents = match fs::read_to_string(path.as_std_path()) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path)),
+    };
+    let tail = contents
+        .lines()
+        .rev()
+        .take(lines)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(tail)
+}
+
+async fn kill_session(paths: &AppPaths, session_id: &str) -> Result<()> {
+    let response = send_request(
+        paths,
+        &Request::KillSession {
+            session_id: session_id.to_string(),
+            remove: false,
+        },
+    )
+    .await?;
+    match response {
+        Response::KillSession { .. } => Ok(()),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {:?}", other),
+    }
+}
+
+async fn retry_session(paths: &AppPaths, session: &SessionRecord) -> Result<SessionRecord> {
+    let response = send_request(
+        paths,
+        &Request::CreateSession {
+            workspace: session.workspace.clone(),
+            task: session.task.clone(),
+            agent: session.agent.clone(),
+        },
+    )
+    .await?;
+    let created = match response {
+        Response::CreateSession { session } => session,
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {:?}", other),
+    };
+    daemon_get_session(paths, &created.session_id).await
 }
 
 async fn maybe_switch_attached_session(
@@ -1459,11 +1916,11 @@ mod tests {
     fn new_command_parses_optional_positional_task() {
         let cli = Cli::try_parse_from(["agent", "new", "fix failing tests"]).unwrap();
         match cli.command {
-            Command::New {
+            Some(Command::New {
                 task,
                 workspace,
                 agent,
-            } => {
+            }) => {
                 assert_eq!(task.as_deref(), Some("fix failing tests"));
                 assert!(workspace.is_none());
                 assert!(agent.is_none());
@@ -1485,11 +1942,11 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Command::New {
+            Some(Command::New {
                 task,
                 workspace,
                 agent,
-            } => {
+            }) => {
                 assert_eq!(task.as_deref(), Some("fix"));
                 assert_eq!(workspace, Some(PathBuf::from("/tmp/repo")));
                 assert_eq!(agent.as_deref(), Some("claude"));
@@ -1523,7 +1980,7 @@ mod tests {
     fn detach_command_parses_optional_session_id() {
         let cli = Cli::try_parse_from(["agent", "detach", "demo"]).unwrap();
         match cli.command {
-            Command::Detach { session_id } => {
+            Some(Command::Detach { session_id }) => {
                 assert_eq!(session_id.as_deref(), Some("demo"));
             }
             other => panic!("unexpected command: {other:?}"),
@@ -1534,9 +1991,9 @@ mod tests {
     fn daemon_restart_parses_force_flag() {
         let cli = Cli::try_parse_from(["agent", "daemon", "restart", "--force"]).unwrap();
         match cli.command {
-            Command::Daemon {
+            Some(Command::Daemon {
                 command: DaemonCommand::Restart { force },
-            } => assert!(force),
+            }) => assert!(force),
             other => panic!("unexpected command: {other:?}"),
         }
     }
@@ -1545,9 +2002,9 @@ mod tests {
     fn daemon_upgrade_parses() {
         let cli = Cli::try_parse_from(["agent", "daemon", "upgrade"]).unwrap();
         match cli.command {
-            Command::Daemon {
+            Some(Command::Daemon {
                 command: DaemonCommand::Upgrade,
-            } => {}
+            }) => {}
             other => panic!("unexpected command: {other:?}"),
         }
     }

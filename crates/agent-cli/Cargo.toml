@@ -17,6 +17,7 @@ clap.workspace = true
 crossterm.workspace = true
 libc.workspace = true
 nix.workspace = true
+ratatui.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

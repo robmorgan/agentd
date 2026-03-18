@@ -18,7 +18,7 @@ use serde_json::Value;
 use agentd_shared::{
     event::SessionEvent,
     paths::AppPaths,
-    session::{SessionRecord, SessionStatus},
+    session::{AttentionLevel, SessionRecord, SessionStatus},
 };
 
 pub struct LocalStore {
@@ -38,7 +38,8 @@ impl LocalStore {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT session_id, thread_id, agent, workspace, repo_path, task, base_branch, branch,
-                    worktree, status, pid, exit_code, error, created_at, updated_at, exited_at
+                    worktree, status, pid, exit_code, error, attention, attention_summary,
+                    created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
@@ -50,7 +51,8 @@ impl LocalStore {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT session_id, thread_id, agent, workspace, repo_path, task, base_branch, branch,
-                    worktree, status, pid, exit_code, error, created_at, updated_at, exited_at
+                    worktree, status, pid, exit_code, error, attention, attention_summary,
+                    created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
             params![session_id],
             row_to_session,
@@ -148,6 +150,8 @@ impl LocalStore {
                 pid INTEGER,
                 exit_code INTEGER,
                 error TEXT,
+                attention TEXT NOT NULL DEFAULT 'info',
+                attention_summary TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 exited_at TEXT
@@ -187,11 +191,23 @@ impl LocalStore {
             "base_branch",
             "ALTER TABLE sessions ADD COLUMN base_branch TEXT",
         )?;
+        ensure_column(
+            &conn,
+            "attention",
+            "ALTER TABLE sessions ADD COLUMN attention TEXT NOT NULL DEFAULT 'info'",
+        )?;
+        ensure_column(
+            &conn,
+            "attention_summary",
+            "ALTER TABLE sessions ADD COLUMN attention_summary TEXT",
+        )?;
         conn.execute(
             "UPDATE sessions
              SET repo_path = COALESCE(repo_path, workspace),
-                 base_branch = COALESCE(base_branch, 'HEAD')
-             WHERE repo_path IS NULL OR base_branch IS NULL",
+                 base_branch = COALESCE(base_branch, 'HEAD'),
+                 attention = COALESCE(attention, 'info'),
+                 attention_summary = COALESCE(attention_summary, task)
+             WHERE repo_path IS NULL OR base_branch IS NULL OR attention IS NULL OR attention_summary IS NULL",
             [],
         )?;
         Ok(())
@@ -314,10 +330,18 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         pid: row.get::<_, Option<u32>>(10)?,
         exit_code: row.get(11)?,
         error: row.get(12)?,
-        created_at: parse_time(row.get::<_, String>(13)?)?,
-        updated_at: parse_time(row.get::<_, String>(14)?)?,
+        attention: str_to_attention(&row.get::<_, String>(13)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                13,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?,
+        attention_summary: row.get(14)?,
+        created_at: parse_time(row.get::<_, String>(15)?)?,
+        updated_at: parse_time(row.get::<_, String>(16)?)?,
         exited_at: row
-            .get::<_, Option<String>>(15)?
+            .get::<_, Option<String>>(17)?
             .map(parse_time)
             .transpose()?,
     })
@@ -369,6 +393,18 @@ fn str_to_status(value: &str) -> std::result::Result<SessionStatus, std::io::Err
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown session status `{value}`"),
+        )),
+    }
+}
+
+fn str_to_attention(value: &str) -> std::result::Result<AttentionLevel, std::io::Error> {
+    match value {
+        "info" => Ok(AttentionLevel::Info),
+        "notice" => Ok(AttentionLevel::Notice),
+        "action" => Ok(AttentionLevel::Action),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown attention level `{value}`"),
         )),
     }
 }

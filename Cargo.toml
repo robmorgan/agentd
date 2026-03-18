@@ -24,6 +24,7 @@ libc = "0.2"
 nix = { version = "0.30", features = ["signal", "user"] }
 portable-pty = "0.9"
 rand = "0.9"
+ratatui = "0.29"
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

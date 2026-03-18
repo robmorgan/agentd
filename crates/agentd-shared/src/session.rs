@@ -13,6 +13,14 @@ pub enum SessionStatus {
     UnknownRecovered,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionLevel {
+    Info,
+    Notice,
+    Action,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionRecord {
     pub session_id: String,
@@ -28,6 +36,8 @@ pub struct SessionRecord {
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
     pub error: Option<String>,
+    pub attention: AttentionLevel,
+    pub attention_summary: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub exited_at: Option<DateTime<Utc>>,
@@ -69,6 +79,16 @@ pub fn branch_name_from_task(task: &str) -> String {
         trimmed.to_string()
     };
     format!("agent/{branch}")
+}
+
+impl AttentionLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Notice => "notice",
+            Self::Action => "action",
+        }
+    }
 }
 
 #[cfg(test)]
