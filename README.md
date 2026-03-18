@@ -166,11 +166,15 @@ Runtime paths are resolved in this order:
 
 - `AGENTD_DIR` as the exact runtime root
 - `XDG_RUNTIME_DIR/agentd`
+- on macOS, `~/.agentd`
 - `TMPDIR/agentd-<uid>`
 - `/tmp/agentd-<uid>`
 
 The selected root contains `config.toml`, `agentd.sock`, `agentd.pid`, `state.db`, `logs/`, and
 `worktrees/`.
+
+macOS typically does not set `XDG_RUNTIME_DIR`, so the default root on macOS becomes `~/.agentd`
+unless `AGENTD_DIR` is set explicitly.
 
 Interactive PTY attach is available with `agent attach <session_id>`. Detach with `Ctrl-]` or
 `agent detach <session_id>`. When run inside a managed session, `agent detach` uses

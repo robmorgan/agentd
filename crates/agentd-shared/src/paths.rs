@@ -22,8 +22,10 @@ impl AppPaths {
         let root = discover_root(
             std::env::var_os("AGENTD_DIR"),
             std::env::var_os("XDG_RUNTIME_DIR"),
+            dirs::home_dir(),
             std::env::var_os("TMPDIR"),
             getuid().as_raw(),
+            cfg!(target_os = "macos"),
         )?;
         Ok(Self::from_root(root))
     }
@@ -68,8 +70,10 @@ impl AppPaths {
 fn discover_root(
     agentd_dir: Option<std::ffi::OsString>,
     xdg_runtime_dir: Option<std::ffi::OsString>,
+    home_dir: Option<std::path::PathBuf>,
     tmpdir: Option<std::ffi::OsString>,
     uid: u32,
+    prefer_home_root: bool,
 ) -> Result<Utf8PathBuf> {
     if let Some(root) = utf8_env_path("AGENTD_DIR", agentd_dir)? {
         return Ok(root);
@@ -77,6 +81,13 @@ fn discover_root(
 
     if let Some(runtime_dir) = utf8_env_path("XDG_RUNTIME_DIR", xdg_runtime_dir)? {
         return Ok(runtime_dir.join(APP_DIR_NAME));
+    }
+
+    if prefer_home_root
+        && let Some(home_dir) = home_dir
+    {
+        return Utf8PathBuf::from_path_buf(home_dir.join(format!(".{APP_DIR_NAME}")))
+            .map_err(|_| anyhow::anyhow!("HOME is not valid UTF-8"));
     }
 
     if let Some(tmpdir) = utf8_env_path("TMPDIR", tmpdir)? {
@@ -107,8 +118,10 @@ mod tests {
         let root = discover_root(
             Some("/custom/agentd-root".into()),
             Some("/run/user/501".into()),
+            Some(std::path::PathBuf::from("/Users/tester")),
             Some("/var/tmp".into()),
             501,
+            true,
         )
         .unwrap();
         assert_eq!(root, Utf8PathBuf::from("/custom/agentd-root"));
@@ -119,16 +132,49 @@ mod tests {
         let root = discover_root(
             None,
             Some("/run/user/501".into()),
+            Some(std::path::PathBuf::from("/Users/tester")),
             Some("/var/tmp".into()),
             501,
+            true,
         )
         .unwrap();
         assert_eq!(root, Utf8PathBuf::from("/run/user/501").join(APP_DIR_NAME));
     }
 
     #[test]
-    fn tmpdir_uses_uid_suffix_when_higher_priority_env_vars_are_unset() {
-        let root = discover_root(None, None, Some("/var/tmp".into()), 501).unwrap();
+    fn macos_prefers_home_root_when_higher_priority_env_vars_are_unset() {
+        let root = discover_root(
+            None,
+            None,
+            Some(std::path::PathBuf::from("/Users/tester")),
+            Some("/var/tmp".into()),
+            501,
+            true,
+        )
+        .unwrap();
+        assert_eq!(root, Utf8PathBuf::from("/Users/tester/.agentd"));
+    }
+
+    #[test]
+    fn tmpdir_uses_uid_suffix_when_home_root_is_not_preferred() {
+        let root = discover_root(
+            None,
+            None,
+            Some(std::path::PathBuf::from("/Users/tester")),
+            Some("/var/tmp".into()),
+            501,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            root,
+            Utf8PathBuf::from("/var/tmp").join(format!("{APP_DIR_NAME}-501"))
+        );
+    }
+
+    #[test]
+    fn tmpdir_uses_uid_suffix_when_home_root_is_unavailable() {
+        let root = discover_root(None, None, None, Some("/var/tmp".into()), 501, true).unwrap();
         assert_eq!(
             root,
             Utf8PathBuf::from("/var/tmp").join(format!("{APP_DIR_NAME}-501"))
@@ -137,36 +183,42 @@ mod tests {
 
     #[test]
     fn tmp_fallback_uses_uid_suffix() {
-        let root = discover_root(None, None, None, 501).unwrap();
+        let root = discover_root(None, None, None, None, 501, false).unwrap();
+        assert_eq!(root, Utf8PathBuf::from(format!("/tmp/{APP_DIR_NAME}-501")));
+    }
+
+    #[test]
+    fn tmp_fallback_uses_uid_suffix_when_home_root_is_preferred_but_unavailable() {
+        let root = discover_root(None, None, None, None, 501, true).unwrap();
         assert_eq!(root, Utf8PathBuf::from(format!("/tmp/{APP_DIR_NAME}-501")));
     }
 
     #[test]
     fn derived_paths_follow_selected_root() {
-        let paths = AppPaths::from_root(Utf8PathBuf::from("/run/user/501").join(APP_DIR_NAME));
+        let paths = AppPaths::from_root(Utf8PathBuf::from("/Users/tester/.agentd"));
         assert_eq!(
             paths.socket,
-            Utf8PathBuf::from("/run/user/501/agentd/agentd.sock")
+            Utf8PathBuf::from("/Users/tester/.agentd/agentd.sock")
         );
         assert_eq!(
             paths.pid_file,
-            Utf8PathBuf::from("/run/user/501/agentd/agentd.pid")
+            Utf8PathBuf::from("/Users/tester/.agentd/agentd.pid")
         );
         assert_eq!(
             paths.database,
-            Utf8PathBuf::from("/run/user/501/agentd/state.db")
+            Utf8PathBuf::from("/Users/tester/.agentd/state.db")
         );
         assert_eq!(
             paths.config,
-            Utf8PathBuf::from("/run/user/501/agentd/config.toml")
+            Utf8PathBuf::from("/Users/tester/.agentd/config.toml")
         );
         assert_eq!(
             paths.logs_dir,
-            Utf8PathBuf::from("/run/user/501/agentd/logs")
+            Utf8PathBuf::from("/Users/tester/.agentd/logs")
         );
         assert_eq!(
             paths.worktrees_dir,
-            Utf8PathBuf::from("/run/user/501/agentd/worktrees")
+            Utf8PathBuf::from("/Users/tester/.agentd/worktrees")
         );
     }
 }

@@ -77,6 +77,7 @@ All runtime state lives under a single root directory. The root is resolved in t
 
 * AGENTD_DIR => uses exact path (e.g., /custom/path)
 * XDG_RUNTIME_DIR => uses `{XDG_RUNTIME_DIR}/agentd` (recommended on Linux, typically `/run/user/{uid}/agentd`)
+* macOS default => uses `~/.agentd` when `AGENTD_DIR` and `XDG_RUNTIME_DIR` are unset
 * TMPDIR => uses `{TMPDIR}/agentd-{uid}` (appends uid for multi-user safety)
 * /tmp => uses `/tmp/agentd-{uid}` (default fallback, appends uid for multi-user safety)
 
