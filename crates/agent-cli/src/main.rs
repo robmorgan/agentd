@@ -1323,6 +1323,12 @@ async fn daemon_get_session(paths: &AppPaths, session_id: &str) -> Result<Sessio
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DashboardFocus {
+    Composer,
+    SessionList,
+}
+
 async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
     let _raw_mode = RawModeGuard::new()?;
     let _screen = TerminalScreenGuard::enter()?;
@@ -1332,6 +1338,7 @@ async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
     let mut selected = 0_usize;
     let mut selected_model = 0_usize;
     let mut model_picker_open = false;
+    let mut focus = DashboardFocus::Composer;
     let mut status = String::new();
 
     loop {
@@ -1347,6 +1354,7 @@ async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
                 selected,
                 &composer,
                 CODEX_MODELS[selected_model],
+                focus,
                 model_picker_open,
                 selected_model,
                 &status,
@@ -1365,10 +1373,20 @@ async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
         }
 
         match key.code {
+            KeyCode::Tab => {
+                if !model_picker_open {
+                    focus = match focus {
+                        DashboardFocus::Composer => DashboardFocus::SessionList,
+                        DashboardFocus::SessionList => DashboardFocus::Composer,
+                    };
+                }
+            }
             KeyCode::Esc => {
                 if model_picker_open {
                     model_picker_open = false;
                     status = "model picker closed".to_string();
+                } else if focus == DashboardFocus::SessionList {
+                    focus = DashboardFocus::Composer;
                 } else if !composer.is_empty() {
                     composer.clear();
                     status = "composer cleared".to_string();
@@ -1376,11 +1394,15 @@ async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
                     return Ok(());
                 }
             }
-            KeyCode::Char('q') if composer.is_empty() && !model_picker_open => return Ok(()),
+            KeyCode::Char('q')
+                if focus == DashboardFocus::SessionList && composer.is_empty() && !model_picker_open =>
+            {
+                return Ok(());
+            }
             KeyCode::Up => {
                 if model_picker_open {
                     selected_model = selected_model.saturating_sub(1);
-                } else {
+                } else if focus == DashboardFocus::SessionList {
                     selected = selected.saturating_sub(1);
                 }
             }
@@ -1389,7 +1411,7 @@ async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
                     if selected_model + 1 < CODEX_MODELS.len() {
                         selected_model += 1;
                     }
-                } else if selected + 1 < sessions.len() {
+                } else if focus == DashboardFocus::SessionList && selected + 1 < sessions.len() {
                     selected += 1;
                 }
             }
@@ -1397,7 +1419,7 @@ async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
                 if model_picker_open {
                     model_picker_open = false;
                     status = "model picker closed".to_string();
-                } else {
+                } else if focus == DashboardFocus::Composer {
                     composer.pop();
                 }
             }
@@ -1408,7 +1430,7 @@ async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
                 } else if composer.trim() == "/model" {
                     model_picker_open = true;
                     status = "choose a model".to_string();
-                } else if !composer.trim().is_empty() {
+                } else if focus == DashboardFocus::Composer && !composer.trim().is_empty() {
                     let created = create_dashboard_session(
                         paths,
                         composer.trim(),
@@ -1417,24 +1439,26 @@ async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
                     .await?;
                     composer.clear();
                     focus_session(paths, &created.session_id).await?;
-                } else if let Some(session) = sessions.get(selected) {
+                } else if focus == DashboardFocus::SessionList
+                    && let Some(session) = sessions.get(selected)
+                {
                     focus_session(paths, &session.session_id).await?;
                 }
             }
             KeyCode::Char('k') => {
-                if model_picker_open {
-                    continue;
-                }
-                if let Some(session) = sessions.get(selected) {
+                if focus == DashboardFocus::SessionList
+                    && !model_picker_open
+                    && let Some(session) = sessions.get(selected)
+                {
                     kill_session(paths, &session.session_id).await?;
                     status = format!("terminated {}", session.session_id);
                 }
             }
             KeyCode::Char('r') => {
-                if model_picker_open {
-                    continue;
-                }
-                if let Some(session) = sessions.get(selected) {
+                if focus == DashboardFocus::SessionList
+                    && !model_picker_open
+                    && let Some(session) = sessions.get(selected)
+                {
                     let retried = retry_session(paths, session).await?;
                     status = format!("created retry {}", retried.session_id);
                 }
@@ -1443,6 +1467,9 @@ async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
                 if !model_picker_open {
+                    if focus == DashboardFocus::SessionList {
+                        focus = DashboardFocus::Composer;
+                    }
                     composer.push(ch);
                 }
             }
@@ -1509,6 +1536,7 @@ fn render_focus_dashboard(
     selected: usize,
     composer: &str,
     selected_model: &str,
+    focus: DashboardFocus,
     model_picker_open: bool,
     model_picker_selected: usize,
     status: &str,
@@ -1549,8 +1577,10 @@ fn render_focus_dashboard(
             .take(12)
             .enumerate()
             .map(|(index, session)| {
-                let selected_style = if index == selected {
+                let selected_style = if index == selected && focus == DashboardFocus::SessionList {
                     accent_style().add_modifier(Modifier::BOLD)
+                } else if index == selected {
+                    muted_style().add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
@@ -1596,7 +1626,11 @@ fn render_focus_dashboard(
     };
     frame.render_widget(List::new(items).block(Block::default()), chunks[1]);
 
-    let cursor = blinking_cursor_span();
+    let cursor = if focus == DashboardFocus::Composer {
+        blinking_cursor_span()
+    } else {
+        Span::raw("")
+    };
     let composer_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1642,7 +1676,14 @@ fn render_focus_dashboard(
     );
 
     let footer = Paragraph::new(if status.is_empty() {
-        "Enter create/open  /model picker  ↑↓ sessions  r retry  k kill  Esc clear/quit".to_string()
+        match focus {
+            DashboardFocus::Composer => {
+                "Enter create  /model picker  Tab sessions  Esc clear/quit".to_string()
+            }
+            DashboardFocus::SessionList => {
+                "Enter open  ↑↓ move  r retry  k kill  q quit  Tab composer".to_string()
+            }
+        }
     } else {
         status.to_string()
     })
