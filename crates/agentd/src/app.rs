@@ -26,8 +26,8 @@ use agentd_shared::{
     event::{NewSessionEvent, SessionEvent},
     paths::AppPaths,
     session::{
-        CreateSessionResult, SessionDiff, SessionRecord, SessionStatus, WorktreeRecord,
-        branch_name_from_task,
+        AttentionLevel, CreateSessionResult, IntegrationState, SessionDiff, SessionRecord,
+        SessionStatus, WorktreeRecord, branch_name_from_task,
     },
 };
 
@@ -431,6 +431,7 @@ impl AppState {
                 .get_session(&session_id)?
                 .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
             ensure_session_not_running(&session)?;
+            ensure_not_pending_review(&session, "cleanup")?;
 
             let repo_root = Utf8PathBuf::from(session.repo_path.clone());
             let worktree = Utf8PathBuf::from(session.worktree.clone());
@@ -459,6 +460,114 @@ impl AppState {
                 branch: session.branch,
                 worktree: session.worktree,
             })
+        })
+        .await?
+    }
+
+    pub async fn apply_session(&self, session_id: &str) -> Result<SessionRecord> {
+        let db = self.db.clone();
+        let session_id = session_id.to_string();
+        task::spawn_blocking(move || {
+            let session = db
+                .get_session(&session_id)?
+                .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+            ensure_session_not_running(&session)?;
+            ensure_pending_review(&session, "apply")?;
+
+            let repo_root = Utf8PathBuf::from(session.repo_path.clone());
+            let worktree = Utf8PathBuf::from(session.worktree.clone());
+            if !worktree.exists() {
+                bail!("worktree `{worktree}` does not exist");
+            }
+
+            let current_branch = git::current_branch(&repo_root)?;
+            if current_branch != session.base_branch {
+                bail!(
+                    "repo `{}` is on branch `{}`, expected `{}`",
+                    repo_root,
+                    current_branch,
+                    session.base_branch
+                );
+            }
+
+            let status = git::working_tree_status(&repo_root)?;
+            if !status.trim().is_empty() {
+                bail!("repo `{repo_root}` has uncommitted changes");
+            }
+
+            let committed_patch = git::committed_patch_against_base(&worktree, &session.base_branch)?;
+            let worktree_patch = git::worktree_patch_against_head(&worktree)?;
+            if committed_patch.trim().is_empty() && worktree_patch.trim().is_empty() {
+                bail!("session `{session_id}` has no changes to apply");
+            }
+
+            git::apply_patch(&repo_root, &committed_patch)?;
+            git::apply_patch(&repo_root, &worktree_patch)?;
+            git::commit_all(
+                &repo_root,
+                &format!("{} ({})", session.task, session.session_id),
+            )?;
+
+            db.set_integration_state(
+                &session_id,
+                IntegrationState::Applied,
+                AttentionLevel::Notice,
+                "changes applied to repo",
+            )?;
+            db.append_events(
+                &session_id,
+                &[daemon_event(
+                    "SESSION_APPLIED",
+                    serde_json::json!({
+                        "source": "daemon",
+                        "repo_path": session.repo_path,
+                        "base_branch": session.base_branch,
+                        "branch": session.branch,
+                    }),
+                )],
+            )?;
+
+            db.get_session(&session_id)?
+                .ok_or_else(|| anyhow!("session `{session_id}` not found after apply"))
+        })
+        .await?
+    }
+
+    pub async fn discard_session(&self, session_id: &str, force: bool) -> Result<SessionRecord> {
+        let db = self.db.clone();
+        let paths = self.paths.clone();
+        let session_id = session_id.to_string();
+        task::spawn_blocking(move || {
+            let session = db
+                .get_session(&session_id)?
+                .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+            ensure_session_not_running(&session)?;
+            if !force {
+                ensure_pending_review(&session, "discard")?;
+            }
+
+            remove_session_artifacts(&paths, &session)?;
+            db.set_integration_state(
+                &session_id,
+                IntegrationState::Discarded,
+                AttentionLevel::Notice,
+                "changes discarded",
+            )?;
+            db.append_events(
+                &session_id,
+                &[daemon_event(
+                    "SESSION_DISCARDED",
+                    serde_json::json!({
+                        "source": "daemon",
+                        "repo_path": session.repo_path,
+                        "branch": session.branch,
+                        "force": force,
+                    }),
+                )],
+            )?;
+
+            db.get_session(&session_id)?
+                .ok_or_else(|| anyhow!("session `{session_id}` not found after discard"))
         })
         .await?
     }
@@ -496,6 +605,7 @@ impl AppState {
             }
 
             if remove {
+                ensure_not_pending_review(&session, "remove")?;
                 remove_session_artifacts(&paths, &session)?;
                 db.delete_session(&session_id)?;
             }
@@ -1143,8 +1253,32 @@ fn finalize_session_exit(
     }
 
     let outcome = classify_session_outcome(db, &session, exit_code)?;
+    let has_changes = session_has_pending_changes(&session)?;
     match &outcome {
-        SessionOutcome::Finished => db.mark_exited(session_id, exit_code)?,
+        SessionOutcome::Finished => {
+            db.mark_exited(session_id, exit_code)?;
+            if has_changes {
+                db.set_integration_state(
+                    session_id,
+                    IntegrationState::PendingReview,
+                    AttentionLevel::Notice,
+                    "changes ready to apply",
+                )?;
+                db.append_events(
+                    session_id,
+                    &[daemon_event(
+                        "SESSION_PENDING_REVIEW",
+                        serde_json::json!({
+                            "source": "daemon",
+                            "repo_path": session.repo_path,
+                            "base_branch": session.base_branch,
+                            "branch": session.branch,
+                            "worktree": session.worktree,
+                        }),
+                    )],
+                )?;
+            }
+        }
         SessionOutcome::NeedsInput { question } => {
             db.mark_needs_input(session_id, exit_code, question.clone())?;
             db.append_events(
@@ -1171,6 +1305,11 @@ fn finalize_session_exit(
             serde_json::json!({
                 "source": "daemon",
                 "exit_code": exit_code,
+                "integration_state": if has_changes {
+                    IntegrationState::PendingReview.as_str()
+                } else {
+                    IntegrationState::Clean.as_str()
+                },
                 "mode": match start_mode {
                     SessionStartMode::Create => "create",
                     SessionStartMode::Resume => "resume",
@@ -1180,6 +1319,17 @@ fn finalize_session_exit(
         )],
     )?;
     Ok(())
+}
+
+fn session_has_pending_changes(session: &SessionRecord) -> Result<bool> {
+    let worktree = Utf8PathBuf::from(&session.worktree);
+    if !worktree.exists() {
+        return Ok(false);
+    }
+    Ok(
+        git::has_worktree_changes(&worktree)?
+            || git::has_committed_diff_against_base(&worktree, &session.base_branch)?,
+    )
 }
 
 enum SessionOutcome {
@@ -1205,10 +1355,7 @@ fn classify_session_outcome(
         return Ok(SessionOutcome::Finished);
     }
 
-    let worktree = Utf8PathBuf::from(&session.worktree);
-    if git::has_worktree_changes(&worktree)?
-        || git::has_committed_diff_against_base(&worktree, &session.base_branch)?
-    {
+    if session_has_pending_changes(session)? {
         return Ok(SessionOutcome::Finished);
     }
 
@@ -1607,6 +1754,29 @@ fn ensure_session_running(session: &SessionRecord) -> Result<()> {
 fn ensure_session_not_running(session: &SessionRecord) -> Result<()> {
     if session.status == SessionStatus::Running && process_exists(session.pid) {
         bail!("session `{}` is still running", session.session_id);
+    }
+    Ok(())
+}
+
+fn ensure_pending_review(session: &SessionRecord, action: &str) -> Result<()> {
+    if session.integration_state != IntegrationState::PendingReview {
+        bail!(
+            "session `{}` is not pending review; cannot {action}",
+            session.session_id
+        );
+    }
+    Ok(())
+}
+
+fn ensure_not_pending_review(session: &SessionRecord, action: &str) -> Result<()> {
+    if session.integration_state == IntegrationState::PendingReview {
+        bail!(
+            "session `{}` has unapplied changes; use `agent diff {}` and `agent accept {}` before {action}, or `agent discard {}` to drop them",
+            session.session_id,
+            session.session_id,
+            session.session_id,
+            session.session_id
+        );
     }
     Ok(())
 }

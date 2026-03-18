@@ -6,12 +6,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::{
     event::{NewSessionEvent, SessionEvent},
     session::{
-        AttentionLevel, CreateSessionResult, SessionDiff, SessionRecord, SessionStatus,
-        WorktreeRecord,
+        AttentionLevel, CreateSessionResult, IntegrationState, SessionDiff, SessionRecord,
+        SessionStatus, WorktreeRecord,
     },
 };
 
-pub const PROTOCOL_VERSION: u16 = 14;
+pub const PROTOCOL_VERSION: u16 = 15;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
@@ -103,6 +103,13 @@ pub enum Request {
         session_id: String,
         prompt: String,
     },
+    ApplySession {
+        session_id: String,
+    },
+    DiscardSession {
+        session_id: String,
+        force: bool,
+    },
     SwitchAttachedSession {
         source_session_id: String,
         target_session_id: String,
@@ -146,6 +153,9 @@ pub enum Response {
     SessionEnded {
         session_id: String,
         status: SessionStatus,
+        integration_state: IntegrationState,
+        branch: String,
+        worktree: String,
         exit_code: Option<i32>,
         error: Option<String>,
     },
@@ -194,6 +204,8 @@ enum MessageKind {
     AttachInputRequest = 8,
     SendInputRequest = 9,
     ReplyToSessionRequest = 18,
+    ApplySessionRequest = 19,
+    DiscardSessionRequest = 20,
     DetachSessionRequest = 17,
     SwitchAttachedSessionRequest = 16,
     DiffSessionRequest = 10,
@@ -234,6 +246,8 @@ impl MessageKind {
             8 => Self::AttachInputRequest,
             9 => Self::SendInputRequest,
             18 => Self::ReplyToSessionRequest,
+            19 => Self::ApplySessionRequest,
+            20 => Self::DiscardSessionRequest,
             17 => Self::DetachSessionRequest,
             16 => Self::SwitchAttachedSessionRequest,
             10 => Self::DiffSessionRequest,
@@ -497,6 +511,15 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             put_string(&mut payload, prompt)?;
             MessageKind::ReplyToSessionRequest
         }
+        Request::ApplySession { session_id } => {
+            put_string(&mut payload, session_id)?;
+            MessageKind::ApplySessionRequest
+        }
+        Request::DiscardSession { session_id, force } => {
+            put_string(&mut payload, session_id)?;
+            put_bool(&mut payload, *force);
+            MessageKind::DiscardSessionRequest
+        }
         Request::SwitchAttachedSession {
             source_session_id,
             target_session_id,
@@ -575,6 +598,13 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
             session_id: cursor.take_string()?,
             prompt: cursor.take_string()?,
         },
+        MessageKind::ApplySessionRequest => Request::ApplySession {
+            session_id: cursor.take_string()?,
+        },
+        MessageKind::DiscardSessionRequest => Request::DiscardSession {
+            session_id: cursor.take_string()?,
+            force: cursor.take_bool()?,
+        },
         MessageKind::SwitchAttachedSessionRequest => Request::SwitchAttachedSession {
             source_session_id: cursor.take_string()?,
             target_session_id: cursor.take_string()?,
@@ -635,11 +665,17 @@ fn encode_response(response: &Response) -> Result<(MessageKind, Vec<u8>)> {
         Response::SessionEnded {
             session_id,
             status,
+            integration_state,
+            branch,
+            worktree,
             exit_code,
             error,
         } => {
             put_string(&mut payload, session_id)?;
             put_session_status(&mut payload, *status);
+            put_integration_state(&mut payload, *integration_state);
+            put_string(&mut payload, branch)?;
+            put_string(&mut payload, worktree)?;
             put_optional_i32(&mut payload, *exit_code);
             put_optional_string(&mut payload, error.as_deref())?;
             MessageKind::SessionEndedResponse
@@ -709,6 +745,9 @@ fn decode_response(kind: MessageKind, payload: &[u8]) -> Result<Response> {
         MessageKind::SessionEndedResponse => Response::SessionEnded {
             session_id: cursor.take_string()?,
             status: cursor.take_session_status()?,
+            integration_state: cursor.take_integration_state()?,
+            branch: cursor.take_string()?,
+            worktree: cursor.take_string()?,
             exit_code: cursor.take_optional_i32()?,
             error: cursor.take_optional_string()?,
         },
@@ -876,6 +915,15 @@ fn put_attention_level(buf: &mut Vec<u8>, attention: AttentionLevel) {
     });
 }
 
+fn put_integration_state(buf: &mut Vec<u8>, state: IntegrationState) {
+    buf.push(match state {
+        IntegrationState::Clean => 1,
+        IntegrationState::PendingReview => 2,
+        IntegrationState::Applied => 3,
+        IntegrationState::Discarded => 4,
+    });
+}
+
 fn put_create_session_result(buf: &mut Vec<u8>, session: &CreateSessionResult) -> Result<()> {
     put_string(buf, &session.session_id)?;
     put_string(buf, &session.base_branch)?;
@@ -915,6 +963,7 @@ fn put_session_record(buf: &mut Vec<u8>, session: &SessionRecord) -> Result<()> 
     put_string(buf, &session.branch)?;
     put_string(buf, &session.worktree)?;
     put_session_status(buf, session.status);
+    put_integration_state(buf, session.integration_state);
     put_optional_u32(buf, session.pid);
     put_optional_i32(buf, session.exit_code);
     put_optional_string(buf, session.error.as_deref())?;
@@ -1100,6 +1149,16 @@ impl<'a> Cursor<'a> {
         })
     }
 
+    fn take_integration_state(&mut self) -> Result<IntegrationState> {
+        Ok(match self.take_u8()? {
+            1 => IntegrationState::Clean,
+            2 => IntegrationState::PendingReview,
+            3 => IntegrationState::Applied,
+            4 => IntegrationState::Discarded,
+            other => bail!("invalid integration state `{other}`"),
+        })
+    }
+
     fn take_datetime(&mut self) -> Result<DateTime<Utc>> {
         let seconds = self.take_i64()?;
         let nanos = self.take_u32()?;
@@ -1170,6 +1229,7 @@ impl<'a> Cursor<'a> {
             branch: self.take_string()?,
             worktree: self.take_string()?,
             status: self.take_session_status()?,
+            integration_state: self.take_integration_state()?,
             pid: self.take_optional_u32()?,
             exit_code: self.take_optional_i32()?,
             error: self.take_optional_string()?,
@@ -1240,7 +1300,9 @@ mod tests {
     };
     use crate::{
         event::{NewSessionEvent, SessionEvent},
-        session::{AttentionLevel, CreateSessionResult, SessionRecord, SessionStatus},
+        session::{
+            AttentionLevel, CreateSessionResult, IntegrationState, SessionRecord, SessionStatus,
+        },
     };
     use chrono::Utc;
     use serde_json::json;
@@ -1284,6 +1346,27 @@ mod tests {
     fn detach_session_round_trips() {
         let request = Request::DetachSession {
             session_id: "demo".to_string(),
+        };
+        let (kind, payload) = encode_request(&request).unwrap();
+        let decoded = decode_request(kind, &payload).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn apply_session_round_trips() {
+        let request = Request::ApplySession {
+            session_id: "demo".to_string(),
+        };
+        let (kind, payload) = encode_request(&request).unwrap();
+        let decoded = decode_request(kind, &payload).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn discard_session_round_trips() {
+        let request = Request::DiscardSession {
+            session_id: "demo".to_string(),
+            force: true,
         };
         let (kind, payload) = encode_request(&request).unwrap();
         let decoded = decode_request(kind, &payload).unwrap();
@@ -1342,6 +1425,7 @@ mod tests {
                 branch: "agent/fix".to_string(),
                 worktree: "/tmp/worktree".to_string(),
                 status: SessionStatus::Running,
+                integration_state: IntegrationState::Clean,
                 pid: Some(123),
                 exit_code: None,
                 error: None,
@@ -1375,6 +1459,9 @@ mod tests {
         let response = Response::SessionEnded {
             session_id: "demo".to_string(),
             status: SessionStatus::Exited,
+            integration_state: IntegrationState::PendingReview,
+            branch: "agent/demo".to_string(),
+            worktree: "/tmp/worktree".to_string(),
             exit_code: Some(0),
             error: None,
         };

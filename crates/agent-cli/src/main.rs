@@ -45,7 +45,10 @@ use agentd_shared::{
         PROTOCOL_VERSION, Request, Response, read_daemon_management_response, read_response,
         write_daemon_management_request, write_request,
     },
-    session::{AttentionLevel, SessionDiff, SessionRecord, SessionStatus, WorktreeRecord},
+    session::{
+        AttentionLevel, IntegrationState, SessionDiff, SessionRecord, SessionStatus,
+        WorktreeRecord,
+    },
 };
 
 use crate::local::{LocalStore, normalize_session, print_log_file, remove_session_artifacts};
@@ -121,6 +124,14 @@ enum Command {
             value_name = "PROMPT"
         )]
         prompt: Vec<String>,
+    },
+    Accept {
+        session_id: String,
+    },
+    Discard {
+        session_id: String,
+        #[arg(long)]
+        force: bool,
     },
     Logs {
         session_id: String,
@@ -330,6 +341,29 @@ async fn main() -> Result<()> {
             print_session(&session);
         }
         (Command::Reply { .. }, ExecutionMode::Local(reason)) => {
+            bail_live_command(&reason)?;
+        }
+        (Command::Accept { session_id }, ExecutionMode::Daemon) => {
+            let response = send_request(&paths, &Request::ApplySession { session_id }).await?;
+            match response {
+                Response::Session { session } => print_session(&session),
+                Response::Error { message } => bail!(message),
+                other => bail!("unexpected response: {:?}", other),
+            }
+        }
+        (Command::Accept { .. }, ExecutionMode::Local(reason)) => {
+            bail_live_command(&reason)?;
+        }
+        (Command::Discard { session_id, force }, ExecutionMode::Daemon) => {
+            let response =
+                send_request(&paths, &Request::DiscardSession { session_id, force }).await?;
+            match response {
+                Response::Session { session } => print_session(&session),
+                Response::Error { message } => bail!(message),
+                other => bail!("unexpected response: {:?}", other),
+            }
+        }
+        (Command::Discard { .. }, ExecutionMode::Local(reason)) => {
             bail_live_command(&reason)?;
         }
         (Command::Logs { session_id, follow }, ExecutionMode::Daemon) => {
@@ -870,6 +904,11 @@ fn local_kill(paths: &AppPaths, session_id: &str, remove: bool) -> Result<()> {
     }
 
     if remove {
+        if session.integration_state == IntegrationState::PendingReview {
+            bail!(
+                "session `{session_id}` has unapplied changes; use `agent diff {session_id}` and `agent accept {session_id}` before removing it, or reconnect to the daemon and run `agent discard {session_id}`"
+            );
+        }
         remove_session_artifacts(paths, &session)?;
         store.delete_session(session_id)?;
     }
@@ -913,12 +952,18 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
         Response::SessionEnded {
             session_id,
             status,
+            integration_state,
+            branch,
+            worktree,
             exit_code,
             error,
         } => {
             return Ok(AttachOutcome::SessionEnded(SessionEndSummary {
                 session_id,
                 status,
+                integration_state,
+                branch,
+                worktree,
                 exit_code,
                 error,
             }));
@@ -957,6 +1002,9 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
                     Response::SessionEnded {
                         session_id,
                         status,
+                        integration_state,
+                        branch,
+                        worktree,
                         exit_code,
                         error,
                     } => {
@@ -965,6 +1013,9 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
                         return Ok(AttachOutcome::SessionEnded(SessionEndSummary {
                             session_id,
                             status,
+                            integration_state,
+                            branch,
+                            worktree,
                             exit_code,
                             error,
                         }));
@@ -991,10 +1042,11 @@ async fn try_connect(paths: &AppPaths) -> Result<UnixStream> {
 fn print_sessions(sessions: &[SessionRecord]) {
     for session in sessions {
         println!(
-            "{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}",
             session.session_id,
             session.agent,
             session.status_string(),
+            session.integration_string(),
             session.attention_string(),
             session.branch
         );
@@ -1014,6 +1066,7 @@ fn print_session(session: &SessionRecord) {
         println!("model: {model}");
     }
     println!("status: {}", session.status_string());
+    println!("integration_state: {}", session.integration_string());
     println!("attention: {}", session.attention_string());
     if let Some(summary) = &session.attention_summary {
         println!("attention_summary: {summary}");
@@ -1185,6 +1238,9 @@ enum AttachOutcome {
 struct SessionEndSummary {
     session_id: String,
     status: SessionStatus,
+    integration_state: IntegrationState,
+    branch: String,
+    worktree: String,
     exit_code: Option<i32>,
     error: Option<String>,
 }
@@ -1201,10 +1257,23 @@ fn format_session_end_summary(summary: &SessionEndSummary) -> String {
         },
         SessionStatus::Paused => format!("session {} paused", summary.session_id),
         SessionStatus::NeedsInput => format!("session {} needs input", summary.session_id),
-        SessionStatus::Exited | SessionStatus::UnknownRecovered => match summary.exit_code {
-            Some(code) => format!("session {} finished (exit {code})", summary.session_id),
-            None => format!("session {} finished", summary.session_id),
-        },
+        SessionStatus::Exited | SessionStatus::UnknownRecovered => {
+            if summary.integration_state == IntegrationState::PendingReview {
+                return format!(
+                    "session {} finished with changes on {} ({})\nrun: agent diff {} | agent accept {} | agent discard {}",
+                    summary.session_id,
+                    summary.branch,
+                    summary.worktree,
+                    summary.session_id,
+                    summary.session_id,
+                    summary.session_id
+                );
+            }
+            match summary.exit_code {
+                Some(code) => format!("session {} finished (exit {code})", summary.session_id),
+                None => format!("session {} finished", summary.session_id),
+            }
+        }
         SessionStatus::Creating | SessionStatus::Running => {
             format!("session {} ended", summary.session_id)
         }
@@ -1298,6 +1367,7 @@ impl Drop for TerminalScreenGuard {
 
 trait StatusString {
     fn status_string(&self) -> &'static str;
+    fn integration_string(&self) -> &'static str;
     fn attention_string(&self) -> &'static str;
 }
 
@@ -1311,6 +1381,15 @@ impl StatusString for SessionRecord {
             SessionStatus::Exited => "exited",
             SessionStatus::Failed => "failed",
             SessionStatus::UnknownRecovered => "unknown_recovered",
+        }
+    }
+
+    fn integration_string(&self) -> &'static str {
+        match self.integration_state {
+            IntegrationState::Clean => "clean",
+            IntegrationState::PendingReview => "pending_review",
+            IntegrationState::Applied => "applied",
+            IntegrationState::Discarded => "discarded",
         }
     }
 
@@ -3210,7 +3289,7 @@ mod tests {
         format_session_end_summary, pane_at_position, resolve_detach_session_id,
         resolve_new_session_options,
     };
-    use agentd_shared::session::SessionStatus;
+    use agentd_shared::session::{IntegrationState, SessionStatus};
     use clap::Parser;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use ratatui::layout::Rect;
@@ -3456,6 +3535,9 @@ mod tests {
         let summary = SessionEndSummary {
             session_id: "demo".to_string(),
             status: SessionStatus::Exited,
+            integration_state: IntegrationState::Clean,
+            branch: "agent/demo".to_string(),
+            worktree: "/tmp/worktree".to_string(),
             exit_code: Some(0),
             error: None,
         };
@@ -3470,6 +3552,9 @@ mod tests {
         let summary = SessionEndSummary {
             session_id: "demo".to_string(),
             status: SessionStatus::Failed,
+            integration_state: IntegrationState::Clean,
+            branch: "agent/demo".to_string(),
+            worktree: "/tmp/worktree".to_string(),
             exit_code: Some(1),
             error: Some("spawn failed".to_string()),
         };
@@ -3477,6 +3562,20 @@ mod tests {
             format_session_end_summary(&summary),
             "session demo failed: spawn failed"
         );
+    }
+
+    #[test]
+    fn format_session_end_summary_reports_pending_review_actions() {
+        let summary = SessionEndSummary {
+            session_id: "demo".to_string(),
+            status: SessionStatus::Exited,
+            integration_state: IntegrationState::PendingReview,
+            branch: "agent/demo".to_string(),
+            worktree: "/tmp/worktree".to_string(),
+            exit_code: Some(0),
+            error: None,
+        };
+        assert!(format_session_end_summary(&summary).contains("agent accept demo"));
     }
 
     #[test]

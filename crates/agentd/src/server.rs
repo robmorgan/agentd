@@ -233,6 +233,34 @@ async fn handle_connection(
                 }
             }
         }
+        IncomingRequest::Standard(Request::ApplySession { session_id }) => {
+            match state.apply_session(&session_id).await {
+                Ok(session) => send_response(&mut writer, &Response::Session { session }).await?,
+                Err(err) => {
+                    send_response(
+                        &mut writer,
+                        &Response::Error {
+                            message: err.to_string(),
+                        },
+                    )
+                    .await?
+                }
+            }
+        }
+        IncomingRequest::Standard(Request::DiscardSession { session_id, force }) => {
+            match state.discard_session(&session_id, force).await {
+                Ok(session) => send_response(&mut writer, &Response::Session { session }).await?,
+                Err(err) => {
+                    send_response(
+                        &mut writer,
+                        &Response::Error {
+                            message: err.to_string(),
+                        },
+                    )
+                    .await?
+                }
+            }
+        }
         IncomingRequest::Standard(Request::SwitchAttachedSession {
             source_session_id,
             target_session_id,
@@ -488,6 +516,9 @@ fn session_ended_response(session: &SessionRecord) -> Option<Response> {
             Some(Response::SessionEnded {
                 session_id: session.session_id.clone(),
                 status: session.status,
+                integration_state: session.integration_state,
+                branch: session.branch.clone(),
+                worktree: session.worktree.clone(),
                 exit_code: session.exit_code,
                 error: session.error.clone(),
             })
@@ -594,7 +625,7 @@ mod tests {
     use super::session_ended_response;
     use agentd_shared::{
         protocol::Response,
-        session::{AttentionLevel, SessionRecord, SessionStatus},
+        session::{AttentionLevel, IntegrationState, SessionRecord, SessionStatus},
     };
     use chrono::Utc;
 
@@ -612,6 +643,7 @@ mod tests {
             branch: "agent/task".to_string(),
             worktree: "/tmp/worktree".to_string(),
             status,
+            integration_state: IntegrationState::Clean,
             pid: Some(123),
             exit_code: Some(0),
             error: None,
@@ -631,6 +663,9 @@ mod tests {
             Response::SessionEnded {
                 session_id: "demo".to_string(),
                 status: SessionStatus::Exited,
+                integration_state: IntegrationState::Clean,
+                branch: "agent/task".to_string(),
+                worktree: "/tmp/worktree".to_string(),
                 exit_code: Some(0),
                 error: None,
             }

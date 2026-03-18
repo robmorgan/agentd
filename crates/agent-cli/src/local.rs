@@ -18,7 +18,7 @@ use serde_json::Value;
 use agentd_shared::{
     event::SessionEvent,
     paths::AppPaths,
-    session::{AttentionLevel, SessionRecord, SessionStatus},
+    session::{AttentionLevel, IntegrationState, SessionRecord, SessionStatus},
 };
 
 pub struct LocalStore {
@@ -38,7 +38,7 @@ impl LocalStore {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT session_id, thread_id, agent, model, workspace, repo_path, task, base_branch, branch,
-                    worktree, status, pid, exit_code, error, attention, attention_summary,
+                    worktree, status, integration_state, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
         )?;
@@ -51,7 +51,7 @@ impl LocalStore {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT session_id, thread_id, agent, model, workspace, repo_path, task, base_branch, branch,
-                    worktree, status, pid, exit_code, error, attention, attention_summary,
+                    worktree, status, integration_state, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
             params![session_id],
@@ -151,6 +151,7 @@ impl LocalStore {
                 pid INTEGER,
                 exit_code INTEGER,
                 error TEXT,
+                integration_state TEXT NOT NULL DEFAULT 'clean',
                 attention TEXT NOT NULL DEFAULT 'info',
                 attention_summary TEXT,
                 created_at TEXT NOT NULL,
@@ -199,6 +200,11 @@ impl LocalStore {
         )?;
         ensure_column(
             &conn,
+            "integration_state",
+            "ALTER TABLE sessions ADD COLUMN integration_state TEXT NOT NULL DEFAULT 'clean'",
+        )?;
+        ensure_column(
+            &conn,
             "attention",
             "ALTER TABLE sessions ADD COLUMN attention TEXT NOT NULL DEFAULT 'info'",
         )?;
@@ -211,9 +217,10 @@ impl LocalStore {
             "UPDATE sessions
              SET repo_path = COALESCE(repo_path, workspace),
                  base_branch = COALESCE(base_branch, 'HEAD'),
+                 integration_state = COALESCE(integration_state, 'clean'),
                  attention = COALESCE(attention, 'info'),
                  attention_summary = COALESCE(attention_summary, task)
-             WHERE repo_path IS NULL OR base_branch IS NULL OR attention IS NULL OR attention_summary IS NULL",
+             WHERE repo_path IS NULL OR base_branch IS NULL OR integration_state IS NULL OR attention IS NULL OR attention_summary IS NULL",
             [],
         )?;
         Ok(())
@@ -338,21 +345,30 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
                 Box::new(err),
             )
         })?,
-        pid: row.get::<_, Option<u32>>(11)?,
-        exit_code: row.get(12)?,
-        error: row.get(13)?,
-        attention: str_to_attention(&row.get::<_, String>(14)?).map_err(|err| {
+        integration_state: str_to_integration_state(&row.get::<_, String>(11)?).map_err(
+            |err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    11,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            },
+        )?,
+        pid: row.get::<_, Option<u32>>(12)?,
+        exit_code: row.get(13)?,
+        error: row.get(14)?,
+        attention: str_to_attention(&row.get::<_, String>(15)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                14,
+                15,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        attention_summary: row.get(15)?,
-        created_at: parse_time(row.get::<_, String>(16)?)?,
-        updated_at: parse_time(row.get::<_, String>(17)?)?,
+        attention_summary: row.get(16)?,
+        created_at: parse_time(row.get::<_, String>(17)?)?,
+        updated_at: parse_time(row.get::<_, String>(18)?)?,
         exited_at: row
-            .get::<_, Option<String>>(18)?
+            .get::<_, Option<String>>(19)?
             .map(parse_time)
             .transpose()?,
     })
@@ -406,6 +422,19 @@ fn str_to_status(value: &str) -> std::result::Result<SessionStatus, std::io::Err
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown session status `{value}`"),
+        )),
+    }
+}
+
+fn str_to_integration_state(value: &str) -> std::result::Result<IntegrationState, std::io::Error> {
+    match value {
+        "clean" => Ok(IntegrationState::Clean),
+        "pending_review" => Ok(IntegrationState::PendingReview),
+        "applied" => Ok(IntegrationState::Applied),
+        "discarded" => Ok(IntegrationState::Discarded),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown integration state `{value}`"),
         )),
     }
 }

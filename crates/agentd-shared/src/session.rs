@@ -22,6 +22,15 @@ pub enum AttentionLevel {
     Action,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationState {
+    Clean,
+    PendingReview,
+    Applied,
+    Discarded,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionRecord {
     pub session_id: String,
@@ -35,6 +44,7 @@ pub struct SessionRecord {
     pub branch: String,
     pub worktree: String,
     pub status: SessionStatus,
+    pub integration_state: IntegrationState,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
     pub error: Option<String>,
@@ -89,6 +99,17 @@ impl AttentionLevel {
             Self::Info => "info",
             Self::Notice => "notice",
             Self::Action => "action",
+        }
+    }
+}
+
+impl IntegrationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::PendingReview => "pending_review",
+            Self::Applied => "applied",
+            Self::Discarded => "discarded",
         }
     }
 }

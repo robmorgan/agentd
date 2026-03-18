@@ -6,7 +6,7 @@ use serde_json::Value;
 use agentd_shared::{
     event::{NewSessionEvent, SessionEvent},
     paths::AppPaths,
-    session::{AttentionLevel, SessionRecord, SessionStatus},
+    session::{AttentionLevel, IntegrationState, SessionRecord, SessionStatus},
 };
 
 #[derive(Clone)]
@@ -90,6 +90,7 @@ impl Database {
                 pid INTEGER,
                 exit_code INTEGER,
                 error TEXT,
+                integration_state TEXT NOT NULL DEFAULT 'clean',
                 attention TEXT NOT NULL DEFAULT 'info',
                 attention_summary TEXT,
                 created_at TEXT NOT NULL,
@@ -152,6 +153,11 @@ impl Database {
         )?;
         self.ensure_column(
             &conn,
+            "integration_state",
+            "ALTER TABLE sessions ADD COLUMN integration_state TEXT NOT NULL DEFAULT 'clean'",
+        )?;
+        self.ensure_column(
+            &conn,
             "attention",
             "ALTER TABLE sessions ADD COLUMN attention TEXT NOT NULL DEFAULT 'info'",
         )?;
@@ -164,9 +170,10 @@ impl Database {
             "UPDATE sessions
              SET repo_path = COALESCE(repo_path, workspace),
                  base_branch = COALESCE(base_branch, 'HEAD'),
+                 integration_state = COALESCE(integration_state, 'clean'),
                  attention = COALESCE(attention, 'info'),
                  attention_summary = COALESCE(attention_summary, task)
-             WHERE repo_path IS NULL OR base_branch IS NULL OR attention IS NULL OR attention_summary IS NULL",
+             WHERE repo_path IS NULL OR base_branch IS NULL OR integration_state IS NULL OR attention IS NULL OR attention_summary IS NULL",
             [],
         )?;
         Ok(())
@@ -192,8 +199,8 @@ impl Database {
             "INSERT INTO sessions (
                 session_id, thread_id, agent, model, agent_command, agent_args_json, resume_session_id, workspace,
                 repo_path, task, base_branch, branch, worktree, status, attention, attention_summary,
-                created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
+                integration_state, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?18)",
             params![
                 new_session.session_id,
                 new_session.thread_id,
@@ -211,6 +218,7 @@ impl Database {
                 status_to_str(SessionStatus::Creating),
                 attention_to_str(AttentionLevel::Info),
                 new_session.task,
+                integration_state_to_str(IntegrationState::Clean),
                 now,
             ],
         )?;
@@ -242,17 +250,19 @@ impl Database {
         conn.execute(
             "UPDATE sessions
              SET status = ?2,
-                 pid = ?3,
+                 integration_state = ?3,
+                 pid = ?4,
                  exit_code = NULL,
                  error = NULL,
-                 attention = ?4,
-                 attention_summary = ?5,
-                 updated_at = ?6,
+                 attention = ?5,
+                 attention_summary = ?6,
+                 updated_at = ?7,
                  exited_at = NULL
              WHERE session_id = ?1",
             params![
                 session_id,
                 status_to_str(SessionStatus::Running),
+                integration_state_to_str(IntegrationState::Clean),
                 pid,
                 attention_to_str(AttentionLevel::Info),
                 "running",
@@ -349,15 +359,17 @@ impl Database {
              SET status = ?2,
                  pid = NULL,
                  exit_code = ?3,
-                 attention = ?4,
-                 attention_summary = ?5,
-                 updated_at = ?6,
-                 exited_at = ?6
+                 integration_state = ?4,
+                 attention = ?5,
+                 attention_summary = ?6,
+                 updated_at = ?7,
+                 exited_at = ?7
              WHERE session_id = ?1",
             params![
                 session_id,
                 status_to_str(SessionStatus::Exited),
                 exit_code,
+                integration_state_to_str(IntegrationState::Clean),
                 attention_to_str(AttentionLevel::Notice),
                 match exit_code {
                     Some(code) => format!("finished (exit {code})"),
@@ -391,11 +403,38 @@ impl Database {
         Ok(())
     }
 
+    pub fn set_integration_state(
+        &self,
+        session_id: &str,
+        integration_state: IntegrationState,
+        attention: AttentionLevel,
+        attention_summary: &str,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE sessions
+             SET integration_state = ?2,
+                 attention = ?3,
+                 attention_summary = ?4,
+                 updated_at = ?5
+             WHERE session_id = ?1",
+            params![
+                session_id,
+                integration_state_to_str(integration_state),
+                attention_to_str(attention),
+                attention_summary,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT session_id, thread_id, agent, model, workspace, repo_path, task, base_branch, branch,
-                    worktree, status, pid, exit_code, error, attention, attention_summary,
+                    worktree, status, integration_state, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
             params![session_id],
@@ -409,7 +448,7 @@ impl Database {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT session_id, thread_id, agent, model, workspace, repo_path, task, base_branch, branch,
-                    worktree, status, pid, exit_code, error, attention, attention_summary,
+                    worktree, status, integration_state, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
         )?;
@@ -592,21 +631,30 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
                 Box::new(err),
             )
         })?,
-        pid: row.get::<_, Option<u32>>(11)?,
-        exit_code: row.get(12)?,
-        error: row.get(13)?,
-        attention: str_to_attention(&row.get::<_, String>(14)?).map_err(|err| {
+        integration_state: str_to_integration_state(&row.get::<_, String>(11)?).map_err(
+            |err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    11,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            },
+        )?,
+        pid: row.get::<_, Option<u32>>(12)?,
+        exit_code: row.get(13)?,
+        error: row.get(14)?,
+        attention: str_to_attention(&row.get::<_, String>(15)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                14,
+                15,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        attention_summary: row.get(15)?,
-        created_at: parse_time(row.get::<_, String>(16)?)?,
-        updated_at: parse_time(row.get::<_, String>(17)?)?,
+        attention_summary: row.get(16)?,
+        created_at: parse_time(row.get::<_, String>(17)?)?,
+        updated_at: parse_time(row.get::<_, String>(18)?)?,
         exited_at: row
-            .get::<_, Option<String>>(18)?
+            .get::<_, Option<String>>(19)?
             .map(parse_time)
             .transpose()?,
     })
@@ -701,6 +749,23 @@ fn attention_to_str(attention: AttentionLevel) -> &'static str {
         AttentionLevel::Info => "info",
         AttentionLevel::Notice => "notice",
         AttentionLevel::Action => "action",
+    }
+}
+
+fn integration_state_to_str(state: IntegrationState) -> &'static str {
+    state.as_str()
+}
+
+fn str_to_integration_state(value: &str) -> std::result::Result<IntegrationState, std::io::Error> {
+    match value {
+        "clean" => Ok(IntegrationState::Clean),
+        "pending_review" => Ok(IntegrationState::PendingReview),
+        "applied" => Ok(IntegrationState::Applied),
+        "discarded" => Ok(IntegrationState::Discarded),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown integration state `{value}`"),
+        )),
     }
 }
 
