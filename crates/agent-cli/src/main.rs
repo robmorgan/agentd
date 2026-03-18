@@ -1466,6 +1466,10 @@ struct FocusSessionViewState {
     show_verbose: bool,
 }
 
+fn session_has_pending_review(session: &SessionRecord) -> bool {
+    session.integration_state == IntegrationState::PendingReview
+}
+
 impl Default for FocusSessionPane {
     fn default() -> Self {
         Self::Transcript
@@ -1490,6 +1494,7 @@ async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
     let mut selected_model = 0_usize;
     let mut model_picker_open = false;
     let mut focus = DashboardFocus::Composer;
+    let mut discard_confirm_session_id: Option<String> = None;
     let mut status = String::new();
 
     loop {
@@ -1499,15 +1504,21 @@ async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
         }
 
         terminal.draw(|frame| {
+            let selected_session = sessions.get(selected);
+            let discard_confirm_session = discard_confirm_session_id
+                .as_deref()
+                .and_then(|session_id| sessions.iter().find(|session| session.session_id == session_id));
             render_focus_dashboard(
                 frame,
                 &sessions,
                 selected,
+                selected_session,
                 &composer,
                 CODEX_MODELS[selected_model],
                 focus,
                 model_picker_open,
                 selected_model,
+                discard_confirm_session,
                 &status,
             );
         })?;
@@ -1520,6 +1531,35 @@ async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
             continue;
         };
         if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        if let Some(session_id) = discard_confirm_session_id.as_deref() {
+            match key.code {
+                KeyCode::Esc => {
+                    discard_confirm_session_id = None;
+                    status = "discard canceled".to_string();
+                }
+                KeyCode::Enter => {
+                    let Some(session) = sessions
+                        .iter()
+                        .find(|session| session.session_id == session_id)
+                    else {
+                        discard_confirm_session_id = None;
+                        status = "selected session is no longer available".to_string();
+                        continue;
+                    };
+                    if !session_has_pending_review(session) {
+                        discard_confirm_session_id = None;
+                        status = format!("session {} has no pending changes", session.session_id);
+                        continue;
+                    }
+                    discard_session(paths, &session.session_id, false).await?;
+                    discard_confirm_session_id = None;
+                    status = format!("discarded changes for {}", session.session_id);
+                }
+                _ => {}
+            }
             continue;
         }
 
@@ -1618,6 +1658,33 @@ async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
                     status = format!("created retry {}", retried.session_id);
                 }
             }
+            KeyCode::Char('A')
+                if focus == DashboardFocus::SessionList
+                    && !model_picker_open
+                    && sessions.get(selected).is_some() =>
+            {
+                if let Some(session) = sessions.get(selected) {
+                    if !session_has_pending_review(session) {
+                        status = format!("session {} has no pending changes", session.session_id);
+                    } else {
+                        accept_session(paths, &session.session_id).await?;
+                        status = format!("applied changes for {}", session.session_id);
+                    }
+                }
+            }
+            KeyCode::Char('D')
+                if focus == DashboardFocus::SessionList
+                    && !model_picker_open
+                    && sessions.get(selected).is_some() =>
+            {
+                if let Some(session) = sessions.get(selected) {
+                    if !session_has_pending_review(session) {
+                        status = format!("session {} has no pending changes", session.session_id);
+                    } else {
+                        discard_confirm_session_id = Some(session.session_id.clone());
+                    }
+                }
+            }
             KeyCode::Char(ch)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
@@ -1641,6 +1708,7 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
     let store = LocalStore::open(paths)?;
     let mut status = String::new();
     let mut reply_open = false;
+    let mut discard_confirm_open = false;
     let mut reply = String::new();
     let mut view_state = FocusSessionViewState::default();
 
@@ -1657,6 +1725,7 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
                 &view_state,
                 &status,
                 reply_open,
+                discard_confirm_open,
                 &reply,
             );
         })?;
@@ -1689,6 +1758,26 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
             },
             Event::Key(key) => {
                 if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+
+                if discard_confirm_open {
+                    match key.code {
+                        KeyCode::Esc => {
+                            discard_confirm_open = false;
+                            status = "discard canceled".to_string();
+                        }
+                        KeyCode::Enter => {
+                            if !session_has_pending_review(&session) {
+                                status = format!("session {} has no pending changes", session_id);
+                            } else {
+                                discard_session(paths, session_id, false).await?;
+                                status = format!("discarded changes for {}", session_id);
+                            }
+                            discard_confirm_open = false;
+                        }
+                        _ => {}
+                    }
                     continue;
                 }
 
@@ -1760,6 +1849,21 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
                             return attach_session(paths, session_id).await;
                         }
                         status = "session is not running".to_string();
+                    }
+                    KeyCode::Char('A') if !reply_open => {
+                        if !session_has_pending_review(&session) {
+                            status = format!("session {} has no pending changes", session_id);
+                        } else {
+                            accept_session(paths, session_id).await?;
+                            status = format!("applied changes for {}", session_id);
+                        }
+                    }
+                    KeyCode::Char('D') if !reply_open => {
+                        if !session_has_pending_review(&session) {
+                            status = format!("session {} has no pending changes", session_id);
+                        } else {
+                            discard_confirm_open = true;
+                        }
                     }
                     KeyCode::Char('k') if !reply_open => {
                         kill_session(paths, session_id).await?;
@@ -2664,11 +2768,13 @@ fn render_focus_dashboard(
     frame: &mut Frame,
     sessions: &[SessionRecord],
     selected: usize,
+    selected_session: Option<&SessionRecord>,
     composer: &str,
     selected_model: &str,
     focus: DashboardFocus,
     model_picker_open: bool,
     model_picker_selected: usize,
+    discard_confirm_session: Option<&SessionRecord>,
     status: &str,
 ) {
     let area = frame.area();
@@ -2805,18 +2911,12 @@ fn render_focus_dashboard(
         chunks[3],
     );
 
-    let footer = Paragraph::new(if status.is_empty() {
-        match focus {
-            DashboardFocus::Composer => {
-                "Enter create  /model picker  Tab sessions  Esc clear/quit".to_string()
-            }
-            DashboardFocus::SessionList => {
-                "Enter open  ↑↓ move  r retry  k kill  q quit  Tab composer".to_string()
-            }
-        }
-    } else {
-        status.to_string()
-    })
+    let footer = Paragraph::new(dashboard_footer_text(
+        focus,
+        status,
+        selected_session,
+        discard_confirm_session.is_some(),
+    ))
     .style(muted_style());
     frame.render_widget(footer, chunks[4]);
 
@@ -2848,6 +2948,18 @@ fn render_focus_dashboard(
             picker_area,
         );
     }
+
+    if let Some(session) = discard_confirm_session {
+        render_confirmation_modal(
+            frame,
+            area,
+            "Discard Changes",
+            &format!(
+                "Discard pending changes for {}?\n\nEnter confirms. Esc cancels.",
+                session.session_id
+            ),
+        );
+    }
 }
 
 fn render_focus_session(
@@ -2856,6 +2968,7 @@ fn render_focus_session(
     view_state: &FocusSessionViewState,
     status: &str,
     reply_open: bool,
+    discard_confirm_open: bool,
     reply: &str,
 ) {
     let area = frame.area();
@@ -2940,20 +3053,26 @@ fn render_focus_session(
         layout.activity_rect,
     );
 
-    let footer = Paragraph::new(if status.is_empty() {
-        if session.status == SessionStatus::NeedsInput {
-            "Tab pane  Wheel scroll  ↑↓ PgUp PgDn Home End  v verbose  y reply  r retry  k kill  q back"
-                .to_string()
-        } else {
-            "Tab pane  Wheel scroll  ↑↓ PgUp PgDn Home End  v verbose  a attach  r retry  k kill  q back"
-                .to_string()
-        }
-    } else {
-        format!("Status: {status}")
-    })
+    let footer = Paragraph::new(focus_session_footer_text(
+        session,
+        status,
+        discard_confirm_open,
+    ))
     .style(muted_style())
     .block(Block::default().borders(Borders::TOP));
     frame.render_widget(footer, outer[2]);
+
+    if discard_confirm_open {
+        render_confirmation_modal(
+            frame,
+            area,
+            "Discard Changes",
+            &format!(
+                "Discard pending changes for {}?\n\nEnter confirms. Esc cancels.",
+                session.session_id
+            ),
+        );
+    }
 
     if reply_open {
         let reply_area = centered_rect(60, 20, area);
@@ -2979,6 +3098,82 @@ fn render_focus_session(
             chunks[1],
         );
     }
+}
+
+fn dashboard_footer_text(
+    focus: DashboardFocus,
+    status: &str,
+    selected_session: Option<&SessionRecord>,
+    discard_confirm_open: bool,
+) -> String {
+    if !status.is_empty() {
+        return status.to_string();
+    }
+    if discard_confirm_open {
+        return "Enter confirm discard  Esc cancel".to_string();
+    }
+
+    match focus {
+        DashboardFocus::Composer => {
+            "Enter create  /model picker  Tab sessions  Esc clear/quit".to_string()
+        }
+        DashboardFocus::SessionList => {
+            if selected_session.is_some_and(session_has_pending_review) {
+                "Enter open  ↑↓ move  A accept  D discard  r retry  k kill  q quit  Tab composer"
+                    .to_string()
+            } else {
+                "Enter open  ↑↓ move  r retry  k kill  q quit  Tab composer".to_string()
+            }
+        }
+    }
+}
+
+fn focus_session_footer_text(
+    session: &SessionRecord,
+    status: &str,
+    discard_confirm_open: bool,
+) -> String {
+    if !status.is_empty() {
+        return format!("Status: {status}");
+    }
+    if discard_confirm_open {
+        return "Enter confirm discard  Esc cancel".to_string();
+    }
+
+    let mut footer =
+        "Tab pane  Wheel scroll  ↑↓ PgUp PgDn Home End  v verbose".to_string();
+    if session.status == SessionStatus::NeedsInput {
+        footer.push_str("  y reply");
+    } else {
+        footer.push_str("  a attach");
+    }
+    if session_has_pending_review(session) {
+        footer.push_str("  A accept  D discard");
+    }
+    footer.push_str("  r retry  k kill  q back");
+    footer
+}
+
+fn render_confirmation_modal(frame: &mut Frame, area: Rect, title: &str, body: &str) {
+    let modal_area = centered_rect(60, 20, area);
+    frame.render_widget(WidgetClear, modal_area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)])
+        .split(modal_area);
+    frame.render_widget(
+        Block::default()
+            .title(Span::styled(title.to_string(), muted_style()))
+            .borders(Borders::ALL)
+            .style(composer_box_style()),
+        modal_area,
+    );
+    frame.render_widget(
+        Paragraph::new(body.to_string())
+            .style(composer_box_style())
+            .wrap(Wrap { trim: false }),
+        chunks[1],
+    );
 }
 
 fn pane_title_style(active: bool) -> Style {
@@ -3107,6 +3302,41 @@ async fn kill_session(paths: &AppPaths, session_id: &str) -> Result<()> {
     .await?;
     match response {
         Response::KillSession { .. } => Ok(()),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {:?}", other),
+    }
+}
+
+async fn accept_session(paths: &AppPaths, session_id: &str) -> Result<SessionRecord> {
+    let response = send_request(
+        paths,
+        &Request::ApplySession {
+            session_id: session_id.to_string(),
+        },
+    )
+    .await?;
+    match response {
+        Response::Session { session } => Ok(session),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {:?}", other),
+    }
+}
+
+async fn discard_session(
+    paths: &AppPaths,
+    session_id: &str,
+    force: bool,
+) -> Result<SessionRecord> {
+    let response = send_request(
+        paths,
+        &Request::DiscardSession {
+            session_id: session_id.to_string(),
+            force,
+        },
+    )
+    .await?;
+    match response {
+        Response::Session { session } => Ok(session),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected response: {:?}", other),
     }
@@ -3383,12 +3613,14 @@ mod tests {
     use super::{
         AGENTD_ATTACH_RESTORE_SEQUENCE, AttachInput, AttachKeyBindingParser, Cli, Command,
         DaemonCommand, DashboardFocus, FocusSessionLayout, FocusSessionPane, FocusSessionViewState,
-        SessionEndSummary, apply_scroll_delta, clamp_focus_session_scroll, looks_like_diff,
-        parse_rich_blocks, render_diff_text, should_colorize_diff_output,
+        SessionEndSummary, apply_scroll_delta, clamp_focus_session_scroll, dashboard_footer_text,
+        focus_session_footer_text, looks_like_diff, parse_rich_blocks, render_diff_text,
+        should_colorize_diff_output,
         format_session_end_summary, pane_at_position, resolve_detach_session_id,
         resolve_new_session_options,
     };
-    use agentd_shared::session::{IntegrationState, SessionStatus};
+    use agentd_shared::session::{AttentionLevel, IntegrationState, SessionRecord, SessionStatus};
+    use chrono::Utc;
     use clap::Parser;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use ratatui::layout::Rect;
@@ -3783,13 +4015,73 @@ mod tests {
         assert!(!should_retry);
     }
 
+    #[test]
+    fn dashboard_footer_advertises_accept_and_discard_for_pending_review() {
+        let session = demo_session(SessionStatus::Exited, IntegrationState::PendingReview);
+        let footer = dashboard_footer_text(
+            DashboardFocus::SessionList,
+            "",
+            Some(&session),
+            false,
+        );
+        assert!(footer.contains("A accept"));
+        assert!(footer.contains("D discard"));
+    }
+
+    #[test]
+    fn dashboard_footer_shows_discard_confirmation_controls() {
+        let footer = dashboard_footer_text(DashboardFocus::SessionList, "", None, true);
+        assert_eq!(footer, "Enter confirm discard  Esc cancel");
+    }
+
+    #[test]
+    fn focus_footer_advertises_accept_and_discard_for_pending_review() {
+        let session = demo_session(SessionStatus::Exited, IntegrationState::PendingReview);
+        let footer = focus_session_footer_text(&session, "", false);
+        assert!(footer.contains("A accept"));
+        assert!(footer.contains("D discard"));
+    }
+
+    #[test]
+    fn focus_footer_shows_discard_confirmation_controls() {
+        let session = demo_session(SessionStatus::Exited, IntegrationState::PendingReview);
+        let footer = focus_session_footer_text(&session, "", true);
+        assert_eq!(footer, "Enter confirm discard  Esc cancel");
+    }
+
     fn demo_event(id: i64) -> agentd_shared::event::SessionEvent {
         agentd_shared::event::SessionEvent {
             id,
             session_id: "demo".to_string(),
-            timestamp: chrono::Utc::now(),
+            timestamp: Utc::now(),
             event_type: format!("EVENT_{id}"),
             payload_json: serde_json::json!({}),
+        }
+    }
+
+    fn demo_session(status: SessionStatus, integration_state: IntegrationState) -> SessionRecord {
+        let now = Utc::now();
+        SessionRecord {
+            session_id: "demo".to_string(),
+            thread_id: Some("thread-demo".to_string()),
+            agent: "codex".to_string(),
+            model: Some("gpt-5.4-codex".to_string()),
+            workspace: "/tmp/workspace".to_string(),
+            repo_path: "/tmp/workspace".to_string(),
+            task: "task".to_string(),
+            base_branch: "main".to_string(),
+            branch: "agent/task".to_string(),
+            worktree: "/tmp/worktree".to_string(),
+            status,
+            integration_state,
+            pid: Some(123),
+            exit_code: Some(0),
+            error: None,
+            attention: AttentionLevel::Notice,
+            attention_summary: Some("changes ready to apply".to_string()),
+            created_at: now,
+            updated_at: now,
+            exited_at: Some(now),
         }
     }
 }
