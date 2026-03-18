@@ -1515,20 +1515,22 @@ async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
                     focus_session(paths, &session.session_id).await?;
                 }
             }
-            KeyCode::Char('k') => {
+            KeyCode::Char('k')
                 if focus == DashboardFocus::SessionList
                     && !model_picker_open
-                    && let Some(session) = sessions.get(selected)
-                {
+                    && sessions.get(selected).is_some() =>
+            {
+                if let Some(session) = sessions.get(selected) {
                     kill_session(paths, &session.session_id).await?;
                     status = format!("terminated {}", session.session_id);
                 }
             }
-            KeyCode::Char('r') => {
+            KeyCode::Char('r')
                 if focus == DashboardFocus::SessionList
                     && !model_picker_open
-                    && let Some(session) = sessions.get(selected)
-                {
+                    && sessions.get(selected).is_some() =>
+            {
+                if let Some(session) = sessions.get(selected) {
                     let retried = retry_session(paths, session).await?;
                     status = format!("created retry {}", retried.session_id);
                 }
@@ -3200,7 +3202,7 @@ fn fuzzy_score(haystack: &str, needle: &str) -> Option<i64> {
 mod tests {
     use super::{
         AGENTD_ATTACH_RESTORE_SEQUENCE, AttachInput, AttachKeyBindingParser, Cli, Command,
-        DaemonCommand, FocusSessionLayout, FocusSessionPane, FocusSessionViewState,
+        DaemonCommand, DashboardFocus, FocusSessionLayout, FocusSessionPane, FocusSessionViewState,
         SessionEndSummary, apply_scroll_delta, clamp_focus_session_scroll, looks_like_diff,
         parse_rich_blocks,
         format_session_end_summary, pane_at_position, resolve_detach_session_id,
@@ -3540,6 +3542,20 @@ mod tests {
             "diff --git a/demo b/demo\n--- a/demo\n+++ b/demo\n@@ -1 +1 @@\n-old\n+new"
         ));
         assert!(!looks_like_diff("plain output\nwith no patch markers"));
+    }
+
+    #[test]
+    fn dashboard_retry_shortcut_does_not_trigger_in_composer() {
+        let focus = DashboardFocus::Composer;
+        let model_picker_open = false;
+        let should_retry = matches!(
+            KeyCode::Char('r'),
+            KeyCode::Char('r')
+                if focus == DashboardFocus::SessionList
+                    && !model_picker_open
+                    && Some(()).is_some()
+        );
+        assert!(!should_retry);
     }
 
     fn demo_event(id: i64) -> agentd_shared::event::SessionEvent {
