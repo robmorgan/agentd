@@ -1455,7 +1455,7 @@ enum DashboardComposerAction<'a> {
 enum FocusSessionPane {
     Transcript,
     Activity,
-    ReplyComposer,
+    Intervention,
 }
 
 #[derive(Debug, Default)]
@@ -1474,6 +1474,8 @@ struct FocusSessionViewState {
     activity_scroll: usize,
     last_event_id: Option<i64>,
     show_verbose: bool,
+    needs_input_question: Option<String>,
+    needs_input_options: Vec<String>,
 }
 
 fn session_has_pending_review(session: &SessionRecord) -> bool {
@@ -1525,6 +1527,7 @@ struct FocusSessionLayout {
     activity_rect: Rect,
     transcript_height: usize,
     activity_height: usize,
+    intervention_rect: Option<Rect>,
 }
 
 async fn focus_dashboard(paths: &AppPaths) -> Result<()> {
@@ -1772,16 +1775,26 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
     let mut terminal = Terminal::new(backend).context("failed to initialize terminal")?;
     let store = LocalStore::open(paths)?;
     let mut status = String::new();
-    let mut reply_open = false;
     let mut discard_confirm_open = false;
     let mut reply = String::new();
+    let mut selected_option = 0_usize;
     let mut view_state = FocusSessionViewState::default();
+    let mut last_needs_input_question: Option<String> = None;
 
     loop {
         let session = daemon_get_session(paths, session_id).await?;
         let size = terminal.size()?;
-        let layout = focus_session_layout(Rect::new(0, 0, size.width, size.height));
+        let intervention_active = session.status == SessionStatus::NeedsInput || !reply.is_empty();
+        let layout = focus_session_layout(Rect::new(0, 0, size.width, size.height), intervention_active);
         refresh_focus_session_view(paths, &store, &session, &mut view_state, &layout)?;
+        if view_state.needs_input_question != last_needs_input_question {
+            last_needs_input_question = view_state.needs_input_question.clone();
+            reply.clear();
+            selected_option = 0;
+        }
+        if selected_option >= view_state.needs_input_options.len() && !view_state.needs_input_options.is_empty() {
+            selected_option = view_state.needs_input_options.len() - 1;
+        }
         clamp_focus_session_scroll(&mut view_state, &layout);
         terminal.draw(|frame| {
             render_focus_session(
@@ -1789,9 +1802,9 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
                 &session,
                 &view_state,
                 &status,
-                reply_open,
                 discard_confirm_open,
                 &reply,
+                selected_option,
             );
         })?;
         status.clear();
@@ -1801,7 +1814,7 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
         }
 
         match event::read().context("failed to read terminal input")? {
-            Event::Mouse(mouse) if !reply_open => match mouse.kind {
+            Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::Down(_) => {
                     if let Some(pane) = pane_at_position(&layout, mouse.column, mouse.row) {
                         view_state.active_pane = pane;
@@ -1848,43 +1861,60 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
 
                 match key.code {
                     KeyCode::Esc => {
-                        if reply_open {
-                            reply_open = false;
+                        if view_state.active_pane == FocusSessionPane::Intervention && !reply.is_empty() {
                             reply.clear();
+                            status = "reply cleared".to_string();
+                        } else if view_state.active_pane == FocusSessionPane::Intervention {
                             view_state.active_pane = view_state.previous_pane;
-                            status = "reply canceled".to_string();
                         } else {
                             return Ok(());
                         }
                     }
-                    KeyCode::Char('q') if !reply_open => return Ok(()),
-                    KeyCode::Tab if !reply_open => {
+                    KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Tab => {
                         view_state.active_pane = match view_state.active_pane {
                             FocusSessionPane::Transcript => FocusSessionPane::Activity,
-                            FocusSessionPane::Activity | FocusSessionPane::ReplyComposer => {
-                                FocusSessionPane::Transcript
+                            FocusSessionPane::Activity => {
+                                if intervention_active {
+                                    FocusSessionPane::Intervention
+                                } else {
+                                    FocusSessionPane::Transcript
+                                }
                             }
+                            FocusSessionPane::Intervention => FocusSessionPane::Transcript,
                         };
                     }
-                    KeyCode::Up if !reply_open => {
-                        scroll_focus_session_pane(&mut view_state, &layout, -1);
+                    KeyCode::Up => {
+                        if view_state.active_pane == FocusSessionPane::Intervention
+                            && !view_state.needs_input_options.is_empty()
+                        {
+                            selected_option = selected_option.saturating_sub(1);
+                        } else {
+                            scroll_focus_session_pane(&mut view_state, &layout, -1);
+                        }
                     }
-                    KeyCode::Down if !reply_open => {
-                        scroll_focus_session_pane(&mut view_state, &layout, 1);
+                    KeyCode::Down => {
+                        if view_state.active_pane == FocusSessionPane::Intervention
+                            && selected_option + 1 < view_state.needs_input_options.len()
+                        {
+                            selected_option += 1;
+                        } else {
+                            scroll_focus_session_pane(&mut view_state, &layout, 1);
+                        }
                     }
-                    KeyCode::PageUp if !reply_open => {
+                    KeyCode::PageUp if view_state.active_pane != FocusSessionPane::Intervention => {
                         scroll_focus_session_page(&mut view_state, &layout, -1);
                     }
-                    KeyCode::PageDown if !reply_open => {
+                    KeyCode::PageDown if view_state.active_pane != FocusSessionPane::Intervention => {
                         scroll_focus_session_page(&mut view_state, &layout, 1);
                     }
-                    KeyCode::Home if !reply_open => {
+                    KeyCode::Home if view_state.active_pane != FocusSessionPane::Intervention => {
                         focus_session_home(&mut view_state);
                     }
-                    KeyCode::End if !reply_open => {
+                    KeyCode::End if view_state.active_pane != FocusSessionPane::Intervention => {
                         focus_session_end(&mut view_state, &layout);
                     }
-                    KeyCode::Char('v') if !reply_open => {
+                    KeyCode::Char('v') if view_state.active_pane != FocusSessionPane::Intervention => {
                         view_state.show_verbose = !view_state.show_verbose;
                         status = if view_state.show_verbose {
                             "verbose events shown".to_string()
@@ -1892,21 +1922,23 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
                             "verbose events hidden".to_string()
                         };
                     }
-                    KeyCode::Backspace if reply_open => {
+                    KeyCode::Backspace if view_state.active_pane == FocusSessionPane::Intervention => {
                         reply.pop();
                     }
-                    KeyCode::Enter if reply_open => {
-                        if reply.trim().is_empty() {
-                            status = "reply is empty".to_string();
-                        } else {
+                    KeyCode::Enter if view_state.active_pane == FocusSessionPane::Intervention => {
+                        if !reply.trim().is_empty() {
                             reply_session(paths, session_id, reply.trim()).await?;
-                            reply_open = false;
                             reply.clear();
                             view_state.active_pane = view_state.previous_pane;
                             status = format!("replied to {}", session_id);
+                        } else if let Some(option) = view_state.needs_input_options.get(selected_option) {
+                            reply = option.clone();
+                            status = "option copied to composer".to_string();
+                        } else {
+                            status = "reply is empty".to_string();
                         }
                     }
-                    KeyCode::Char('a') if !reply_open => {
+                    KeyCode::Char('a') if view_state.active_pane != FocusSessionPane::Intervention => {
                         if session.status == SessionStatus::Running {
                             drop(terminal);
                             drop(screen);
@@ -1915,7 +1947,7 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
                         }
                         status = "session is not running".to_string();
                     }
-                    KeyCode::Char('A') if !reply_open => {
+                    KeyCode::Char('A') if view_state.active_pane != FocusSessionPane::Intervention => {
                         if !session_has_pending_review(&session) {
                             status = format!("session {} has no pending changes", session_id);
                         } else {
@@ -1923,31 +1955,28 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
                             status = format!("applied changes for {}", session_id);
                         }
                     }
-                    KeyCode::Char('D') if !reply_open => {
+                    KeyCode::Char('D') if view_state.active_pane != FocusSessionPane::Intervention => {
                         if !session_has_pending_review(&session) {
                             status = format!("session {} has no pending changes", session_id);
                         } else {
                             discard_confirm_open = true;
                         }
                     }
-                    KeyCode::Char('k') if !reply_open => {
+                    KeyCode::Char('k') if view_state.active_pane != FocusSessionPane::Intervention => {
                         kill_session(paths, session_id).await?;
                         status = format!("terminated {}", session_id);
                     }
-                    KeyCode::Char('r') if !reply_open => {
+                    KeyCode::Char('r') if view_state.active_pane != FocusSessionPane::Intervention => {
                         let retried = retry_session(paths, &session).await?;
                         status = format!("created retry {}", retried.session_id);
                     }
-                    KeyCode::Char('y')
-                        if !reply_open && session.status == SessionStatus::NeedsInput =>
+                    KeyCode::Char('y') if session.status == SessionStatus::NeedsInput =>
                     {
-                        reply_open = true;
-                        reply.clear();
                         view_state.previous_pane = view_state.active_pane;
-                        view_state.active_pane = FocusSessionPane::ReplyComposer;
+                        view_state.active_pane = FocusSessionPane::Intervention;
                     }
                     KeyCode::Char(ch)
-                        if reply_open
+                        if view_state.active_pane == FocusSessionPane::Intervention
                             && (key.modifiers.is_empty()
                                 || key.modifiers == KeyModifiers::SHIFT) =>
                     {
@@ -1961,12 +1990,17 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
     }
 }
 
-fn focus_session_layout(area: Rect) -> FocusSessionLayout {
+fn focus_session_layout(area: Rect, intervention_active: bool) -> FocusSessionLayout {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5),
             Constraint::Min(10),
+            if intervention_active {
+                Constraint::Length(8)
+            } else {
+                Constraint::Length(0)
+            },
             Constraint::Length(2),
         ])
         .split(area);
@@ -1974,11 +2008,22 @@ fn focus_session_layout(area: Rect) -> FocusSessionLayout {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
         .split(outer[1]);
+    let intervention = if intervention_active {
+        Some(
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+                .split(outer[2])[0],
+        )
+    } else {
+        None
+    };
     FocusSessionLayout {
         transcript_rect: middle[0],
         activity_rect: middle[1],
         transcript_height: middle[0].height.saturating_sub(2) as usize,
         activity_height: middle[1].height.saturating_sub(2) as usize,
+        intervention_rect: intervention,
     }
 }
 
@@ -1993,6 +2038,11 @@ fn pane_at_position(layout: &FocusSessionLayout, column: u16, row: u16) -> Optio
         Some(FocusSessionPane::Transcript)
     } else if point_in_rect(layout.activity_rect) {
         Some(FocusSessionPane::Activity)
+    } else if layout
+        .intervention_rect
+        .is_some_and(point_in_rect)
+    {
+        Some(FocusSessionPane::Intervention)
     } else {
         None
     }
@@ -2027,6 +2077,17 @@ fn refresh_focus_session_view(
         state.last_event_id = Some(last.id);
     }
     state.events.extend(new_events);
+    if session.status == SessionStatus::NeedsInput {
+        state.needs_input_question = latest_needs_input_question(&state.events);
+        state.needs_input_options = state
+            .needs_input_question
+            .as_deref()
+            .map(parse_needs_input_options)
+            .unwrap_or_default();
+    } else {
+        state.needs_input_question = None;
+        state.needs_input_options.clear();
+    }
 
     rebuild_focus_session_lines(state);
 
@@ -2093,7 +2154,7 @@ fn scroll_focus_session_pane(
                 delta,
             );
         }
-        FocusSessionPane::ReplyComposer => {}
+        FocusSessionPane::Intervention => {}
     }
 }
 
@@ -2105,7 +2166,7 @@ fn scroll_focus_session_page(
     let delta = match state.active_pane {
         FocusSessionPane::Transcript => layout.transcript_height.saturating_sub(1) as isize,
         FocusSessionPane::Activity => layout.activity_height.saturating_sub(1) as isize,
-        FocusSessionPane::ReplyComposer => 0,
+        FocusSessionPane::Intervention => 0,
     };
     scroll_focus_session_pane(state, layout, delta.saturating_mul(direction));
 }
@@ -2114,7 +2175,7 @@ fn focus_session_home(state: &mut FocusSessionViewState) {
     match state.active_pane {
         FocusSessionPane::Transcript => state.transcript_scroll = 0,
         FocusSessionPane::Activity => state.activity_scroll = 0,
-        FocusSessionPane::ReplyComposer => {}
+        FocusSessionPane::Intervention => {}
     }
 }
 
@@ -2126,8 +2187,73 @@ fn focus_session_end(state: &mut FocusSessionViewState, layout: &FocusSessionLay
         FocusSessionPane::Activity => {
             state.activity_scroll = max_scroll(line_count(&state.activity_lines), layout.activity_height)
         }
-        FocusSessionPane::ReplyComposer => {}
+        FocusSessionPane::Intervention => {}
     }
+}
+
+fn latest_needs_input_question(events: &[agentd_shared::event::SessionEvent]) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        (event.event_type == "SESSION_NEEDS_INPUT")
+            .then(|| event.payload_json.get("question").and_then(Value::as_str))
+            .flatten()
+            .map(str::to_string)
+    })
+}
+
+fn parse_needs_input_options(question: &str) -> Vec<String> {
+    let mut options = Vec::new();
+    let mut current: Option<String> = None;
+    let mut seen_marker = false;
+
+    for line in question.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Some(option_text) = parse_option_marker(trimmed) {
+            if let Some(option) = current.take() {
+                options.push(option);
+            }
+            current = Some(option_text.to_string());
+            seen_marker = true;
+            continue;
+        }
+
+        if seen_marker && let Some(option) = current.as_mut() {
+            option.push(' ');
+            option.push_str(trimmed);
+        }
+    }
+
+    if let Some(option) = current {
+        options.push(option);
+    }
+
+    if options.len() >= 2 {
+        options
+    } else {
+        Vec::new()
+    }
+}
+
+fn parse_option_marker(line: &str) -> Option<&str> {
+    let bullet = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .map(str::trim);
+    if bullet.is_some() {
+        return bullet;
+    }
+
+    let digit_count = line.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digit_count == 0 {
+        return None;
+    }
+    let rest = &line[digit_count..];
+    rest.strip_prefix(". ")
+        .or_else(|| rest.strip_prefix(") "))
+        .map(str::trim)
 }
 
 fn apply_scroll_delta(current: usize, max: usize, delta: isize) -> usize {
@@ -2224,6 +2350,7 @@ fn append_timeline_lines(
                 .payload_json
                 .get("prompt")
                 .and_then(Value::as_str)
+                .or_else(|| event.payload_json.get("prompt_preview").and_then(Value::as_str))
                 .or_else(|| event.payload_json.get("data").and_then(Value::as_str))
                 .unwrap_or_default();
             if !prompt.trim().is_empty() {
@@ -2720,7 +2847,7 @@ fn item_type(item: &Value) -> Option<&str> {
 }
 
 fn event_preview(event: &agentd_shared::event::SessionEvent) -> String {
-    for key in ["question", "error", "prompt_preview", "prompt", "data", "rendered", "text"] {
+    for key in ["question_preview", "question", "error", "prompt_preview", "prompt", "data", "rendered", "text"] {
         if let Some(value) = event.payload_json.get(key).and_then(Value::as_str) {
             return preview_text(value, 120);
         }
@@ -3085,17 +3212,23 @@ fn render_focus_session(
     session: &SessionRecord,
     view_state: &FocusSessionViewState,
     status: &str,
-    reply_open: bool,
     discard_confirm_open: bool,
     reply: &str,
+    selected_option: usize,
 ) {
     let area = frame.area();
-    let layout = focus_session_layout(area);
+    let intervention_active = session.status == SessionStatus::NeedsInput || !reply.is_empty();
+    let layout = focus_session_layout(area, intervention_active);
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5),
             Constraint::Min(10),
+            if intervention_active {
+                Constraint::Length(8)
+            } else {
+                Constraint::Length(0)
+            },
             Constraint::Length(2),
         ])
         .split(area);
@@ -3145,9 +3278,7 @@ fn render_focus_session(
                         } else {
                             "narrative"
                         },
-                        pane_title_style(
-                            view_state.active_pane == FocusSessionPane::Transcript && !reply_open,
-                        ),
+                        pane_title_style(view_state.active_pane == FocusSessionPane::Transcript),
                     ))
                     .borders(Borders::RIGHT),
             )
@@ -3165,13 +3296,21 @@ fn render_focus_session(
                 .borders(Borders::LEFT)
                 .title(Span::styled(
                     "activity",
-                    pane_title_style(
-                        view_state.active_pane == FocusSessionPane::Activity && !reply_open,
-                    ),
+                    pane_title_style(view_state.active_pane == FocusSessionPane::Activity),
                 )),
         ),
         layout.activity_rect,
     );
+
+    if let Some(intervention_rect) = layout.intervention_rect {
+        render_intervention_pane(
+            frame,
+            intervention_rect,
+            view_state,
+            reply,
+            selected_option,
+        );
+    }
 
     let footer = Paragraph::new(focus_session_footer_text(
         session,
@@ -3194,30 +3333,97 @@ fn render_focus_session(
         );
     }
 
-    if reply_open {
-        let reply_area = centered_rect(60, 20, area);
-        frame.render_widget(WidgetClear, reply_area);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(3), Constraint::Length(1)])
-            .split(reply_area);
-        frame.render_widget(
-            Block::default()
-                .title(Span::styled("Reply", muted_style()))
-                .borders(Borders::ALL)
-                .style(composer_box_style()),
-            reply_area,
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("> ", accent_style()),
-                Span::raw(reply),
-                blinking_cursor_span(),
-            ]))
-            .style(composer_box_style()),
-            chunks[1],
-        );
+}
+
+fn render_intervention_pane(
+    frame: &mut Frame,
+    area: Rect,
+    view_state: &FocusSessionViewState,
+    reply: &str,
+    selected_option: usize,
+) {
+    frame.render_widget(
+        Block::default()
+            .title(Span::styled(
+                "Needs Input",
+                pane_title_style(view_state.active_pane == FocusSessionPane::Intervention),
+            ))
+            .borders(Borders::TOP | Borders::RIGHT),
+        area,
+    );
+
+    let option_rows = if view_state.needs_input_options.is_empty() {
+        0
+    } else {
+        view_state.needs_input_options.len().min(3) as u16
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Min(2),
+            Constraint::Length(option_rows),
+            Constraint::Length(2),
+        ])
+        .split(area);
+
+    let question = view_state
+        .needs_input_question
+        .as_deref()
+        .unwrap_or("Waiting for input.");
+    frame.render_widget(
+        Paragraph::new(question)
+            .wrap(Wrap { trim: false })
+            .style(Style::default()),
+        chunks[0],
+    );
+
+    if option_rows > 0 {
+        let items = view_state
+            .needs_input_options
+            .iter()
+            .take(option_rows as usize)
+            .enumerate()
+            .map(|(index, option)| {
+                let style = if index == selected_option {
+                    accent_style().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(if index == selected_option { "› " } else { "  " }, style),
+                    Span::styled(option.clone(), style),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(List::new(items), chunks[1]);
     }
+
+    let composer = if reply.is_empty() {
+        Line::from(vec![
+            Span::styled("> ", accent_style()),
+            Span::styled("type a reply or choose an option", muted_style()),
+            if view_state.active_pane == FocusSessionPane::Intervention {
+                blinking_cursor_span()
+            } else {
+                Span::raw("")
+            },
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("> ", accent_style()),
+            Span::raw(reply.to_string()),
+            if view_state.active_pane == FocusSessionPane::Intervention {
+                blinking_cursor_span()
+            } else {
+                Span::raw("")
+            },
+        ])
+    };
+    frame.render_widget(
+        Paragraph::new(composer).style(composer_box_style()),
+        chunks[2],
+    );
 }
 
 fn dashboard_footer_text(
@@ -3260,12 +3466,11 @@ fn focus_session_footer_text(
         return "Enter confirm discard  Esc cancel".to_string();
     }
 
-    let mut footer =
-        "Tab pane  Wheel scroll  ↑↓ PgUp PgDn Home End  v verbose".to_string();
+    let mut footer = "Tab pane  Wheel scroll".to_string();
     if session.status == SessionStatus::NeedsInput {
-        footer.push_str("  y reply");
+        footer.push_str("  y intervene  ↑↓ options  Enter prefill/send  Esc clear");
     } else {
-        footer.push_str("  a attach");
+        footer.push_str("  ↑↓ PgUp PgDn Home End  v verbose  a attach");
     }
     if session_has_pending_review(session) {
         footer.push_str("  A accept  D discard");
@@ -3739,7 +3944,7 @@ mod tests {
         FocusSessionPane, FocusSessionViewState, SessionEndSummary, apply_scroll_delta,
         clamp_focus_session_scroll, dashboard_footer_text, focus_session_footer_text,
         format_session_end_summary, looks_like_diff, pane_at_position,
-        parse_dashboard_composer_action, parse_rich_blocks, render_diff_text,
+        parse_dashboard_composer_action, parse_needs_input_options, parse_rich_blocks, render_diff_text,
         resolve_detach_session_id, resolve_new_session_options, should_colorize_diff_output,
     };
     use agentd_shared::session::{
@@ -4058,6 +4263,7 @@ mod tests {
             activity_rect: Rect::new(10, 0, 10, 10),
             transcript_height: 6,
             activity_height: 4,
+            intervention_rect: None,
         };
 
         clamp_focus_session_scroll(&mut state, &layout);
@@ -4073,6 +4279,7 @@ mod tests {
             activity_rect: Rect::new(20, 0, 10, 10),
             transcript_height: 8,
             activity_height: 8,
+            intervention_rect: None,
         };
 
         assert_eq!(
@@ -4177,6 +4384,22 @@ mod tests {
                 "usage: /plan <task>"
             ))
         );
+    }
+
+    #[test]
+    fn parse_needs_input_options_reads_numbered_choices() {
+        let options = parse_needs_input_options(
+            "Which mode?\n1. Fast path\n2. Safe path\n3. Hybrid path",
+        );
+        assert_eq!(options, vec!["Fast path", "Safe path", "Hybrid path"]);
+    }
+
+    #[test]
+    fn parse_needs_input_options_reads_bulleted_choices() {
+        let options = parse_needs_input_options(
+            "Choose one:\n- Keep current behavior\n- Redesign the flow",
+        );
+        assert_eq!(options, vec!["Keep current behavior", "Redesign the flow"]);
     }
 
     #[test]

@@ -691,6 +691,7 @@ impl AppState {
                             "SESSION_REPLY_REQUESTED",
                             serde_json::json!({
                                 "source": "daemon",
+                                "prompt": prompt,
                                 "prompt_preview": prompt_preview,
                             }),
                         )],
@@ -1336,7 +1337,8 @@ fn finalize_session_exit(
             }
         }
         SessionOutcome::NeedsInput { question } => {
-            db.mark_needs_input(session_id, exit_code, question.clone())?;
+            let question_preview = preview_text(&question, 240);
+            db.mark_needs_input(session_id, exit_code, question_preview.clone())?;
             db.append_events(
                 session_id,
                 &[daemon_event(
@@ -1345,6 +1347,7 @@ fn finalize_session_exit(
                         "source": "daemon",
                         "reason": "clarification_only_noop",
                         "question": question,
+                        "question_preview": question_preview,
                         "exit_code": exit_code,
                         "has_tool_use": false,
                         "has_worktree_changes": false,
@@ -1459,7 +1462,7 @@ fn classify_session_outcome(
     }
 
     Ok(SessionOutcome::NeedsInput {
-        question: preview_text(&question, 240),
+        question,
     })
 }
 
@@ -1927,7 +1930,10 @@ fn ensure_not_pending_review(session: &SessionRecord, action: &str) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::{AttachControl, SessionOutcome, SessionRuntime, classify_session_outcome, daemon_event};
+    use super::{
+        AttachControl, SessionOutcome, SessionRuntime, SessionStartMode, classify_session_outcome,
+        daemon_event, finalize_session_exit,
+    };
     use crate::db::{Database, NewSession, NewThread};
     use crate::terminal_state::TerminalStateEngine;
     use agentd_shared::{event::NewSessionEvent, paths::AppPaths, session::SessionMode};
@@ -2167,5 +2173,85 @@ mod tests {
             SessionOutcome::NeedsInput { ref question }
                 if question == "Should I optimize for speed or correctness?"
         ));
+    }
+
+    #[test]
+    fn finalize_session_exit_keeps_full_question_in_event_payload() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        let repo = paths.root.join("repo");
+        init_git_repo(repo.as_str());
+
+        db.insert_session(&NewSession {
+            session_id: "demo",
+            thread_id: Some("thread-demo"),
+            agent: "codex",
+            model: Some("gpt-5.3-codex"),
+            mode: SessionMode::Execute,
+            agent_command: "codex",
+            agent_args_json: "[]",
+            resume_session_id: Some("resume-1"),
+            workspace: repo.as_str(),
+            repo_path: repo.as_str(),
+            task: "clarify",
+            base_branch: "main",
+            branch: "agent/clarify",
+            worktree: repo.as_str(),
+        })
+        .unwrap();
+        db.insert_thread(&NewThread {
+            thread_id: "thread-demo",
+            session_id: "demo",
+            agent: "codex",
+            title: "clarify",
+            initial_prompt: "clarify",
+        })
+        .unwrap();
+
+        let long_question = format!("What {}?", "a".repeat(315));
+        db.append_events(
+            "demo",
+            &[NewSessionEvent {
+                event_type: "CODEX_ITEM_COMPLETED".to_string(),
+                payload_json: json!({
+                    "raw": {
+                        "item": {
+                            "type": "agent_message",
+                            "text": long_question
+                        }
+                    }
+                }),
+            }],
+        )
+        .unwrap();
+
+        finalize_session_exit(&db, "demo", Some(0), SessionStartMode::Create).unwrap();
+
+        let session = db.get_session("demo").unwrap().unwrap();
+        assert!(session.attention_summary.as_ref().is_some_and(|summary| summary.len() < 320));
+
+        let events = db.list_events_since("demo", None).unwrap();
+        let needs_input = events
+            .iter()
+            .find(|event| event.event_type == "SESSION_NEEDS_INPUT")
+            .unwrap();
+        assert_eq!(
+            needs_input
+                .payload_json
+                .get("question")
+                .and_then(|value| value.as_str())
+                .unwrap(),
+            format!("What {}?", "a".repeat(315))
+        );
+        assert!(
+            needs_input
+                .payload_json
+                .get("question_preview")
+                .and_then(|value| value.as_str())
+                .unwrap()
+                .len()
+                < 321
+        );
     }
 }
