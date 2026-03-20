@@ -16,6 +16,7 @@ use ratatui::{
 };
 
 use agentd_shared::{
+    config::Config,
     paths::AppPaths,
     protocol::{Request, Response},
     session::{IntegrationState, SessionRecord, SessionStatus},
@@ -75,6 +76,10 @@ const HOST_PICKER_STATUS_RED_FG: &str = "\x1b[38;2;239;68;68m";
 const HOST_PICKER_STATUS_BLUE_FG: &str = "\x1b[38;2;96;165;250m";
 const HOST_PICKER_STATUS_GREEN_FG: &str = "\x1b[38;2;34;197;94m";
 const HOST_PICKER_STATUS_GRAY_FG: &str = "\x1b[38;2;156;163;175m";
+const HOST_PICKER_DIFF_HEADER_STYLE: &str = "\x1b[38;2;153;214;255m\x1b[1m";
+const HOST_PICKER_DIFF_HUNK_STYLE: &str = "\x1b[38;2;242;201;76m\x1b[1m";
+const HOST_PICKER_DIFF_ADD_STYLE: &str = "\x1b[38;2;111;207;151m";
+const HOST_PICKER_DIFF_REMOVE_STYLE: &str = "\x1b[38;2;255;107;107m";
 const ANSI_DIM: &str = "\x1b[2m";
 const HOST_PICKER_CURSOR: &str = "█";
 const HOST_PICKER_CURSOR_BLINK_MS: u128 = 500;
@@ -93,6 +98,17 @@ impl Drop for InlineScreenGuard {
     fn drop(&mut self) {
         let _ = execute!(std::io::stdout(), Show);
     }
+}
+
+fn configured_agent_names(paths: &AppPaths) -> Vec<String> {
+    let mut names = Config::load(paths)
+        .map(|config| config.agents.into_keys().collect::<Vec<_>>())
+        .unwrap_or_else(|_| vec!["codex".to_string()]);
+    names.sort();
+    if names.is_empty() {
+        names.push("codex".to_string());
+    }
+    names
 }
 
 pub async fn pick_session(paths: &AppPaths) -> Result<Option<String>> {
@@ -170,15 +186,12 @@ fn clear_host_picker(previous_lines: usize) -> Result<()> {
 struct SessionPicker {
     paths: AppPaths,
     sessions: Vec<SessionRecord>,
+    create_agents: Vec<String>,
     composer: PickerComposer,
     mode: PickerMode,
+    detail_text: String,
+    detail_scroll: usize,
     toast: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PickerField {
-    Query,
-    Agent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -190,13 +203,16 @@ enum PickerRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PickerMode {
     Browse,
+    CreateAgentSelect { selected: usize },
     SessionActions { session_id: String, selected: usize },
+    DiffView { session_id: String },
     DeleteConfirm { session_id: String, selected: usize },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionAction {
     Attach,
+    Diff,
     Merge,
     Delete,
 }
@@ -210,29 +226,30 @@ enum ConfirmAction {
 #[derive(Clone, Debug)]
 struct PickerComposer {
     query: String,
-    agent_input: String,
     selected: usize,
-    field: PickerField,
 }
 
 impl SessionPicker {
     fn new(paths: AppPaths) -> Self {
+        let create_agents = configured_agent_names(&paths);
         Self {
             paths,
             sessions: Vec::new(),
+            create_agents,
             composer: PickerComposer {
                 query: String::new(),
-                agent_input: "codex".to_string(),
                 selected: 0,
-                field: PickerField::Query,
             },
             mode: PickerMode::Browse,
+            detail_text: String::new(),
+            detail_scroll: 0,
             toast: None,
         }
     }
 
     async fn refresh_sessions(&mut self) -> Result<()> {
         self.sessions = daemon_list_sessions(&self.paths).await?;
+        self.refresh_agent_names();
         self.clamp_selection();
         self.clamp_mode_selection();
         Ok(())
@@ -241,10 +258,14 @@ impl SessionPicker {
     async fn handle_key(&mut self, key: KeyEvent) -> Result<Option<Option<String>>> {
         match self.mode.clone() {
             PickerMode::Browse => self.handle_composer_key(key).await,
+            PickerMode::CreateAgentSelect { selected } => {
+                self.handle_create_agent_key(key, selected).await
+            }
             PickerMode::SessionActions {
                 session_id,
                 selected,
             } => self.handle_action_menu_key(key, session_id, selected).await,
+            PickerMode::DiffView { session_id } => self.handle_diff_view_key(key, session_id).await,
             PickerMode::DeleteConfirm {
                 session_id,
                 selected,
@@ -260,14 +281,10 @@ impl SessionPicker {
             return;
         }
         self.toast = None;
-        if self.composer.field == PickerField::Agent {
-            self.composer.agent_input.push_str(data);
-        } else {
-            self.composer.query.push_str(data);
-            self.clamp_selection();
-            if self.picker_rows().len() > 1 {
-                self.composer.selected = 1;
-            }
+        self.composer.query.push_str(data);
+        self.clamp_selection();
+        if self.picker_rows().len() > 1 {
+            self.composer.selected = 1;
         }
     }
 
@@ -275,12 +292,6 @@ impl SessionPicker {
         let row_count = self.picker_rows().len();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return Ok(Some(None)),
-            KeyCode::Tab => {
-                self.composer.field = match self.composer.field {
-                    PickerField::Query => PickerField::Agent,
-                    PickerField::Agent => PickerField::Query,
-                };
-            }
             KeyCode::Up => {
                 self.composer.selected = self.composer.selected.saturating_sub(1);
             }
@@ -291,12 +302,8 @@ impl SessionPicker {
             }
             KeyCode::Backspace => {
                 self.toast = None;
-                if self.composer.field == PickerField::Agent {
-                    self.composer.agent_input.pop();
-                } else {
-                    self.composer.query.pop();
-                    self.clamp_selection();
-                }
+                self.composer.query.pop();
+                self.clamp_selection();
             }
             KeyCode::Enter => match self.picker_rows().get(self.composer.selected).cloned() {
                 Some(PickerRow::Session(session_id)) => {
@@ -304,35 +311,7 @@ impl SessionPicker {
                     return Ok(None);
                 }
                 Some(PickerRow::Create) | None => {
-                    let title = self.composer.query.trim();
-                    let agent = self.composer.agent_input.trim();
-                    if agent.is_empty() {
-                        self.toast = Some("agent cannot be empty".to_string());
-                        return Ok(None);
-                    }
-                    let workspace =
-                        std::env::current_dir().context("failed to determine current directory")?;
-                    let response = send_request(
-                        &self.paths,
-                        &Request::CreateSession {
-                            workspace: workspace.to_string_lossy().to_string(),
-                            title: (!title.is_empty()).then(|| title.to_string()),
-                            agent: agent.to_string(),
-                            model: if agent == "codex" {
-                                Some(CODEX_MODELS[0].to_string())
-                            } else {
-                                None
-                            },
-                        },
-                    )
-                    .await?;
-                    match response {
-                        Response::CreateSession { session } => {
-                            return Ok(Some(Some(session.session_id)));
-                        }
-                        Response::Error { message } => self.toast = Some(message),
-                        other => bail!("unexpected response: {:?}", other),
-                    }
+                    self.open_create_agent_menu();
                 }
             },
             KeyCode::Char('r') if key.modifiers.is_empty() => {
@@ -342,13 +321,46 @@ impl SessionPicker {
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
                 self.toast = None;
-                if self.composer.field == PickerField::Agent {
-                    self.composer.agent_input.push(ch);
+                self.composer.query.push(ch);
+                self.clamp_selection();
+                if self.picker_rows().len() > 1 {
+                    self.composer.selected = 1;
+                }
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    async fn handle_create_agent_key(
+        &mut self,
+        key: KeyEvent,
+        selected: usize,
+    ) -> Result<Option<Option<String>>> {
+        let agent_count = self.create_agents.len();
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = PickerMode::Browse;
+            }
+            KeyCode::Up => self.set_create_agent_selection(selected.saturating_sub(1)),
+            KeyCode::Down => {
+                let next = if agent_count == 0 {
+                    0
                 } else {
-                    self.composer.query.push(ch);
-                    self.clamp_selection();
-                    if self.picker_rows().len() > 1 {
-                        self.composer.selected = 1;
+                    (selected + 1).min(agent_count - 1)
+                };
+                self.set_create_agent_selection(next);
+            }
+            KeyCode::Enter => {
+                if let Some(agent) = self.create_agents.get(selected).cloned() {
+                    return self.create_session_with_agent(&agent).await;
+                }
+            }
+            KeyCode::Char(ch) if key.modifiers.is_empty() => {
+                if let Some(index) = ch.to_digit(10).and_then(|value| value.checked_sub(1)) {
+                    let index = index as usize;
+                    if let Some(agent) = self.create_agents.get(index).cloned() {
+                        return self.create_session_with_agent(&agent).await;
                     }
                 }
             }
@@ -419,8 +431,8 @@ impl SessionPicker {
                 }
                 ConfirmAction::No => {
                     self.mode = PickerMode::SessionActions {
-                        session_id,
-                        selected: self.current_action_selection(),
+                        session_id: session_id.clone(),
+                        selected: self.action_index(&session_id, SessionAction::Delete),
                     };
                 }
             },
@@ -434,6 +446,35 @@ impl SessionPicker {
                     session_id: session_id.clone(),
                     selected: self.action_index(&session_id, SessionAction::Delete),
                 };
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    async fn handle_diff_view_key(
+        &mut self,
+        key: KeyEvent,
+        session_id: String,
+    ) -> Result<Option<Option<String>>> {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = PickerMode::SessionActions {
+                    session_id: session_id.clone(),
+                    selected: self.action_index(&session_id, SessionAction::Diff),
+                };
+            }
+            KeyCode::Up => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                self.detail_scroll = self.detail_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                self.detail_scroll = self.detail_scroll.saturating_add(10);
             }
             _ => {}
         }
@@ -470,6 +511,24 @@ impl SessionPicker {
                     }
                 }
             }
+            let visible_sessions = self
+                .picker_rows()
+                .into_iter()
+                .take(8)
+                .filter_map(|row| match row {
+                    PickerRow::Session(session_id) => self
+                        .sessions
+                        .iter()
+                        .find(|item| item.session_id == session_id)
+                        .cloned(),
+                    PickerRow::Create => None,
+                })
+                .collect::<Vec<_>>();
+            let legend = render_host_picker_legend_row(width, &visible_sessions);
+            if !legend.is_empty() {
+                lines.push(String::new());
+                lines.push(legend);
+            }
         }
 
         if let Some(toast) = &self.toast {
@@ -486,28 +545,16 @@ impl SessionPicker {
                 style_host_picker_background_row(width),
                 style_host_picker_query_line(&self.composer.query, width, cursor_visible),
                 style_host_picker_background_row(width),
-                fit_host_picker_line(
-                    format!(
-                        "{}agent  {}",
-                        if self.composer.field == PickerField::Agent {
-                            "> "
-                        } else {
-                            "  "
-                        },
-                        self.composer.agent_input
-                    ),
-                    width,
-                ),
-                fit_host_picker_line(
-                    "Type to filter sessions or name a new one. Enter opens the selected row. Tab switches field. Esc quits.".to_string(),
-                    width,
-                ),
                 String::new(),
             ],
+            PickerMode::CreateAgentSelect { selected } => {
+                self.render_create_agent_lines(width, *selected)
+            }
             PickerMode::SessionActions {
                 session_id,
                 selected,
             } => self.render_session_action_lines(width, session_id, *selected),
+            PickerMode::DiffView { session_id } => self.render_diff_lines(width, session_id),
             PickerMode::DeleteConfirm {
                 session_id,
                 selected,
@@ -537,6 +584,36 @@ impl SessionPicker {
                 if index == selected { "> " } else { "  " },
                 index + 1,
                 action.label()
+            );
+            lines.push(style_host_picker_menu_line(&label, width, false));
+        }
+        lines.push(style_host_picker_background_row(width));
+        lines.push(fit_host_picker_line(
+            "Enter selects. Esc goes back.".to_string(),
+            width,
+        ));
+        lines.push(String::new());
+        lines
+    }
+
+    fn render_create_agent_lines(&self, width: usize, selected: usize) -> Vec<String> {
+        let mut lines = vec![style_host_picker_background_row(width)];
+        let title = if self.composer.query.trim().is_empty() {
+            "Choose coding agent".to_string()
+        } else {
+            format!("Create: {}", self.composer.query.trim())
+        };
+        lines.push(style_host_picker_menu_line(
+            &fit_host_picker_line(title, width),
+            width,
+            false,
+        ));
+        for (index, agent) in self.create_agents.iter().enumerate() {
+            let label = format!(
+                "{}{}. {}",
+                if index == selected { "> " } else { "  " },
+                index + 1,
+                agent
             );
             lines.push(style_host_picker_menu_line(&label, width, false));
         }
@@ -585,6 +662,38 @@ impl SessionPicker {
         lines
     }
 
+    fn render_diff_lines(&self, width: usize, session_id: &str) -> Vec<String> {
+        let mut lines = vec![style_host_picker_background_row(width)];
+        let title = self
+            .session_by_id(session_id)
+            .map(|session| format!("Diff: {}  {}", session.session_id, session.branch))
+            .unwrap_or_else(|| format!("Diff: {session_id}"));
+        lines.push(style_host_picker_menu_line(
+            &fit_host_picker_line(title, width),
+            width,
+            false,
+        ));
+        let max_lines = 12usize;
+        let detail_lines = self.detail_text.lines().collect::<Vec<_>>();
+        let start = self.detail_scroll.min(detail_lines.len().saturating_sub(1));
+        for line in detail_lines.into_iter().skip(start).take(max_lines) {
+            lines.push(style_host_picker_diff_line(line, width));
+        }
+        if self.detail_text.is_empty() {
+            lines.push(fit_host_picker_line(
+                "No diff available.".to_string(),
+                width,
+            ));
+        }
+        lines.push(style_host_picker_background_row(width));
+        lines.push(fit_host_picker_line(
+            "Up/Down scroll. Esc goes back.".to_string(),
+            width,
+        ));
+        lines.push(String::new());
+        lines
+    }
+
     fn filtered_sessions(&self) -> Vec<&SessionRecord> {
         let mut sessions = self
             .sessions
@@ -621,6 +730,16 @@ impl SessionPicker {
     fn clamp_mode_selection(&mut self) {
         self.mode = match self.mode.clone() {
             PickerMode::Browse => PickerMode::Browse,
+            PickerMode::CreateAgentSelect { selected } => {
+                let len = self.create_agents.len();
+                if len == 0 {
+                    PickerMode::Browse
+                } else {
+                    PickerMode::CreateAgentSelect {
+                        selected: selected.min(len - 1),
+                    }
+                }
+            }
             PickerMode::SessionActions {
                 session_id,
                 selected,
@@ -633,6 +752,13 @@ impl SessionPicker {
                         session_id,
                         selected: selected.min(len - 1),
                     }
+                }
+            }
+            PickerMode::DiffView { session_id } => {
+                if self.session_by_id(&session_id).is_none() {
+                    PickerMode::Browse
+                } else {
+                    PickerMode::DiffView { session_id }
                 }
             }
             PickerMode::DeleteConfirm {
@@ -655,6 +781,22 @@ impl SessionPicker {
         self.sessions
             .iter()
             .find(|session| session.session_id == session_id)
+    }
+
+    fn refresh_agent_names(&mut self) {
+        self.create_agents = configured_agent_names(&self.paths);
+        if self.create_agents.is_empty() {
+            self.toast = Some("no configured agents found; falling back to codex".to_string());
+            self.create_agents = vec!["codex".to_string()];
+        }
+    }
+
+    fn open_create_agent_menu(&mut self) {
+        self.toast = None;
+        self.mode = PickerMode::CreateAgentSelect {
+            selected: self.default_create_agent_selection(),
+        };
+        self.clamp_mode_selection();
     }
 
     fn open_action_menu(&mut self, session_id: &str) {
@@ -686,6 +828,7 @@ impl SessionPicker {
         ) {
             actions.push(SessionAction::Attach);
         }
+        actions.push(SessionAction::Diff);
         if session.integration_state == IntegrationState::PendingReview {
             actions.push(SessionAction::Merge);
         }
@@ -701,6 +844,11 @@ impl SessionPicker {
         self.clamp_mode_selection();
     }
 
+    fn set_create_agent_selection(&mut self, selected: usize) {
+        self.mode = PickerMode::CreateAgentSelect { selected };
+        self.clamp_mode_selection();
+    }
+
     fn set_confirm_selection(&mut self, session_id: &str, selected: usize) {
         self.mode = PickerMode::DeleteConfirm {
             session_id: session_id.to_string(),
@@ -709,11 +857,11 @@ impl SessionPicker {
         self.clamp_mode_selection();
     }
 
-    fn current_action_selection(&self) -> usize {
-        match self.mode {
-            PickerMode::SessionActions { selected, .. } => selected,
-            _ => 0,
-        }
+    fn default_create_agent_selection(&self) -> usize {
+        self.create_agents
+            .iter()
+            .position(|agent| agent == "codex")
+            .unwrap_or(0)
     }
 
     fn action_index(&self, session_id: &str, action: SessionAction) -> usize {
@@ -730,6 +878,11 @@ impl SessionPicker {
     ) -> Result<Option<Option<String>>> {
         match action {
             SessionAction::Attach => Ok(Some(Some(session_id))),
+            SessionAction::Diff => {
+                self.load_diff(&session_id).await?;
+                self.mode = PickerMode::DiffView { session_id };
+                Ok(None)
+            }
             SessionAction::Merge => {
                 self.apply_session(&session_id).await?;
                 self.mode = PickerMode::Browse;
@@ -739,6 +892,33 @@ impl SessionPicker {
                 self.open_delete_confirmation(&session_id, 1);
                 Ok(None)
             }
+        }
+    }
+
+    async fn create_session_with_agent(&mut self, agent: &str) -> Result<Option<Option<String>>> {
+        let title = self.composer.query.trim();
+        let workspace = std::env::current_dir().context("failed to determine current directory")?;
+        let response = send_request(
+            &self.paths,
+            &Request::CreateSession {
+                workspace: workspace.to_string_lossy().to_string(),
+                title: (!title.is_empty()).then(|| title.to_string()),
+                agent: agent.to_string(),
+                model: if agent == "codex" {
+                    Some(CODEX_MODELS[0].to_string())
+                } else {
+                    None
+                },
+            },
+        )
+        .await?;
+        match response {
+            Response::CreateSession { session } => Ok(Some(Some(session.session_id))),
+            Response::Error { message } => {
+                self.toast = Some(message);
+                Ok(None)
+            }
+            other => bail!("unexpected response: {:?}", other),
         }
     }
 
@@ -782,6 +962,28 @@ impl SessionPicker {
             other => bail!("unexpected response: {:?}", other),
         }
     }
+
+    async fn load_diff(&mut self, session_id: &str) -> Result<()> {
+        let response = send_request(
+            &self.paths,
+            &Request::DiffSession {
+                session_id: session_id.to_string(),
+            },
+        )
+        .await?;
+        match response {
+            Response::Diff { diff } => {
+                self.detail_text = diff.diff;
+                self.detail_scroll = 0;
+                Ok(())
+            }
+            Response::Error { message } => {
+                self.toast = Some(message);
+                Ok(())
+            }
+            other => bail!("unexpected response: {:?}", other),
+        }
+    }
 }
 
 fn fit_host_picker_line(mut line: String, width: usize) -> String {
@@ -815,6 +1017,29 @@ fn style_host_picker_menu_line(content: &str, width: usize, selected: bool) -> S
         "{HOST_PICKER_QUERY_BG}{prefix}{visible}{}{ANSI_RESET}",
         " ".repeat(padding)
     )
+}
+
+fn style_host_picker_diff_line(content: &str, width: usize) -> String {
+    let visible = fit_host_picker_line(content.to_string(), width);
+    let style = if visible.starts_with("diff --git")
+        || visible.starts_with("--- ")
+        || visible.starts_with("+++ ")
+    {
+        HOST_PICKER_DIFF_HEADER_STYLE
+    } else if visible.starts_with("@@") {
+        HOST_PICKER_DIFF_HUNK_STYLE
+    } else if visible.starts_with('+') && !visible.starts_with("+++") {
+        HOST_PICKER_DIFF_ADD_STYLE
+    } else if visible.starts_with('-') && !visible.starts_with("---") {
+        HOST_PICKER_DIFF_REMOVE_STYLE
+    } else {
+        ""
+    };
+    if style.is_empty() {
+        visible
+    } else {
+        format!("{style}{visible}{ANSI_RESET}")
+    }
 }
 
 fn style_host_picker_query_line(query: &str, width: usize, cursor_visible: bool) -> String {
@@ -863,6 +1088,7 @@ impl SessionAction {
     fn label(self) -> &'static str {
         match self {
             Self::Attach => "attach",
+            Self::Diff => "diff",
             Self::Merge => "merge",
             Self::Delete => "delete",
         }
@@ -1523,8 +1749,8 @@ fn render_host_picker_session_row(session: &SessionRecord, prefix: &str, width: 
     let leader = format!("{prefix} ");
     let separator = "  ";
     let tail = format!(
-        "{}  {}  {}",
-        session.title, session.repo_name, session.branch
+        "{}  {}  {}  {}",
+        session.session_id, session.title, session.repo_name, session.branch
     );
     let used = leader.chars().count() + session_icon(session).chars().count() + separator.len();
     let remaining = max_chars.saturating_sub(used);
@@ -1534,6 +1760,109 @@ fn render_host_picker_session_row(session: &SessionRecord, prefix: &str, width: 
         host_picker_icon_ansi_prefix(session),
         icon = session_icon(session),
     )
+}
+
+fn render_host_picker_legend_row(width: usize, sessions: &[SessionRecord]) -> String {
+    let entries = [
+        (
+            demo_status_session(SessionStatus::NeedsInput, IntegrationState::Clean),
+            "needs input",
+        ),
+        (
+            demo_status_session(SessionStatus::Failed, IntegrationState::Clean),
+            "failed",
+        ),
+        (
+            demo_status_session(SessionStatus::UnknownRecovered, IntegrationState::Clean),
+            "recovered",
+        ),
+        (
+            demo_status_session(SessionStatus::Exited, IntegrationState::PendingReview),
+            "pending review",
+        ),
+        (
+            demo_status_session(SessionStatus::Running, IntegrationState::Clean),
+            "running",
+        ),
+        (
+            demo_status_session(SessionStatus::Paused, IntegrationState::Clean),
+            "paused",
+        ),
+        (
+            demo_status_session(SessionStatus::Exited, IntegrationState::Clean),
+            "exited",
+        ),
+    ];
+    let max_chars = width.saturating_sub(1).max(1);
+    let mut line = "  ".to_string();
+    let mut matching_entries = entries
+        .into_iter()
+        .filter(|(entry_session, _)| {
+            sessions
+                .iter()
+                .any(|session| session_icon(session) == session_icon(entry_session))
+        })
+        .peekable();
+    if matching_entries.peek().is_none() {
+        return String::new();
+    }
+    let mut visible = 0usize;
+    for (index, (session, label)) in matching_entries.enumerate() {
+        let separator = if index > 0 { " • " } else { "" };
+        let plain_entry = format!("{} {}", session_icon(&session), label);
+        let needed = separator.chars().count() + plain_entry.chars().count();
+        if visible > 0 && visible + needed > max_chars {
+            break;
+        }
+        if visible == 0 && plain_entry.chars().count() > max_chars {
+            return String::new();
+        }
+        if index > 0 {
+            line.push_str(separator);
+            visible += separator.chars().count();
+        }
+        line.push_str(&format!(
+            "{}{}{ANSI_RESET} {}",
+            host_picker_icon_ansi_prefix(&session),
+            session_icon(&session),
+            label
+        ));
+        visible += plain_entry.chars().count();
+    }
+    line
+}
+
+fn demo_status_session(
+    status: SessionStatus,
+    integration_state: IntegrationState,
+) -> SessionRecord {
+    SessionRecord {
+        session_id: String::new(),
+        thread_id: None,
+        agent: "codex".to_string(),
+        model: None,
+        mode: agentd_shared::session::SessionMode::Execute,
+        workspace: String::new(),
+        repo_path: String::new(),
+        repo_name: String::new(),
+        title: String::new(),
+        base_branch: String::new(),
+        branch: String::new(),
+        worktree: String::new(),
+        status,
+        integration_state,
+        git_sync: agentd_shared::session::GitSyncStatus::Unknown,
+        git_status_summary: None,
+        has_conflicts: false,
+        pid: None,
+        exit_code: None,
+        error: None,
+        attention: agentd_shared::session::AttentionLevel::Info,
+        attention_summary: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        exited_at: None,
+    }
 }
 
 fn host_picker_icon_ansi_prefix(session: &SessionRecord) -> String {
@@ -1588,12 +1917,15 @@ fn matches_query<T: AsRef<str>>(haystack: T, query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANSI_RESET, HOST_PICKER_CURSOR, HOST_PICKER_PLACEHOLDER_FG, HOST_PICKER_QUERY_BG,
-        HOST_PICKER_STATUS_BLUE_FG, HOST_PICKER_STATUS_GREEN_FG, HOST_PICKER_STATUS_RED_FG,
-        HOST_PICKER_STATUS_YELLOW_FG, HOST_PICKER_TEXT_FG, PickerComposer, PickerField, PickerMode,
-        PickerRow, SessionAction, SessionPicker, fit_host_picker_line,
+        ANSI_RESET, HOST_PICKER_CURSOR, HOST_PICKER_DIFF_ADD_STYLE, HOST_PICKER_DIFF_HEADER_STYLE,
+        HOST_PICKER_DIFF_HUNK_STYLE, HOST_PICKER_DIFF_REMOVE_STYLE, HOST_PICKER_PLACEHOLDER_FG,
+        HOST_PICKER_QUERY_BG, HOST_PICKER_STATUS_BLUE_FG, HOST_PICKER_STATUS_GRAY_FG,
+        HOST_PICKER_STATUS_GREEN_FG, HOST_PICKER_STATUS_RED_FG, HOST_PICKER_STATUS_YELLOW_FG,
+        HOST_PICKER_TEXT_FG, PickerComposer, PickerMode, PickerRow, SessionAction, SessionPicker,
+        configured_agent_names, fit_host_picker_line, render_host_picker_legend_row,
         render_host_picker_session_row, session_icon, session_icon_color,
-        style_host_picker_background_row, style_host_picker_query_line,
+        style_host_picker_background_row, style_host_picker_diff_line,
+        style_host_picker_query_line,
     };
     use agentd_shared::{
         paths::AppPaths,
@@ -1621,9 +1953,7 @@ mod tests {
         picker.sessions = vec![demo("alpha", "repo-a"), demo("beta", "repo-b")];
         picker.composer = PickerComposer {
             query: "beta".to_string(),
-            agent_input: "codex".to_string(),
             selected: 0,
-            field: PickerField::Query,
         };
 
         let rows = picker.picker_rows();
@@ -1649,14 +1979,21 @@ mod tests {
         let picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![demo("alpha", "repo-a")],
+            create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::Browse,
+            detail_text: String::new(),
+            detail_scroll: 0,
             toast: None,
         };
 
         assert_eq!(
             picker.action_items("alpha"),
-            vec![SessionAction::Attach, SessionAction::Delete]
+            vec![
+                SessionAction::Attach,
+                SessionAction::Diff,
+                SessionAction::Delete
+            ]
         );
     }
 
@@ -1667,12 +2004,18 @@ mod tests {
         let picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![session],
+            create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::Browse,
+            detail_text: String::new(),
+            detail_scroll: 0,
             toast: None,
         };
 
-        assert_eq!(picker.action_items("alpha"), vec![SessionAction::Delete]);
+        assert_eq!(
+            picker.action_items("alpha"),
+            vec![SessionAction::Diff, SessionAction::Delete]
+        );
     }
 
     #[test]
@@ -1683,14 +2026,21 @@ mod tests {
         let picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![session],
+            create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::Browse,
+            detail_text: String::new(),
+            detail_scroll: 0,
             toast: None,
         };
 
         assert_eq!(
             picker.action_items("alpha"),
-            vec![SessionAction::Merge, SessionAction::Delete]
+            vec![
+                SessionAction::Diff,
+                SessionAction::Merge,
+                SessionAction::Delete
+            ]
         );
     }
 
@@ -1701,8 +2051,11 @@ mod tests {
         let picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![session],
+            create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::Browse,
+            detail_text: String::new(),
+            detail_scroll: 0,
             toast: None,
         };
 
@@ -1710,6 +2063,7 @@ mod tests {
             picker.action_items("alpha"),
             vec![
                 SessionAction::Attach,
+                SessionAction::Diff,
                 SessionAction::Merge,
                 SessionAction::Delete
             ]
@@ -1721,11 +2075,14 @@ mod tests {
         let mut picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![demo("alpha", "repo-a")],
+            create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::SessionActions {
                 session_id: "alpha".to_string(),
                 selected: 9,
             },
+            detail_text: String::new(),
+            detail_scroll: 0,
             toast: None,
         };
 
@@ -1735,7 +2092,7 @@ mod tests {
             picker.mode,
             PickerMode::SessionActions {
                 session_id: "alpha".to_string(),
-                selected: 1,
+                selected: 2,
             }
         );
     }
@@ -1745,11 +2102,14 @@ mod tests {
         let mut picker = SessionPicker {
             paths: test_paths(),
             sessions: Vec::new(),
+            create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::DeleteConfirm {
                 session_id: "missing".to_string(),
                 selected: 1,
             },
+            detail_text: String::new(),
+            detail_scroll: 0,
             toast: None,
         };
 
@@ -1763,11 +2123,14 @@ mod tests {
         let picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![demo("alpha", "repo-a"), demo("beta", "repo-b")],
+            create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::SessionActions {
                 session_id: "alpha".to_string(),
                 selected: 0,
             },
+            detail_text: String::new(),
+            detail_scroll: 0,
             toast: None,
         };
 
@@ -1776,6 +2139,7 @@ mod tests {
 
         assert!(!rendered.contains("title-beta"));
         assert!(rendered.contains("> 1. attach"));
+        assert!(rendered.contains("  2. diff"));
     }
 
     #[test]
@@ -1783,11 +2147,14 @@ mod tests {
         let picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![demo("alpha", "repo-a")],
+            create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::DeleteConfirm {
                 session_id: "alpha".to_string(),
                 selected: 1,
             },
+            detail_text: String::new(),
+            detail_scroll: 0,
             toast: None,
         };
 
@@ -1796,6 +2163,75 @@ mod tests {
 
         assert!(rendered.contains("  1. yes"));
         assert!(rendered.contains("> 2. no"));
+    }
+
+    #[test]
+    fn render_lines_remove_helper_and_agent_row_in_browse_mode() {
+        let picker = SessionPicker {
+            paths: test_paths(),
+            sessions: vec![demo("alpha", "repo-a")],
+            create_agents: vec!["claude".to_string(), "codex".to_string()],
+            composer: default_composer(),
+            mode: PickerMode::Browse,
+            detail_text: String::new(),
+            detail_scroll: 0,
+            toast: None,
+        };
+
+        let rendered = picker.render_lines(120, true).join("\n");
+        assert!(!rendered.contains("Tab switches field"));
+        assert!(!rendered.contains("Enter opens the selected row"));
+        assert!(!rendered.contains("agent  "));
+        assert!(rendered.contains(HOST_PICKER_STATUS_GREEN_FG));
+        assert!(rendered.contains("running"));
+        assert!(!rendered.contains("needs input"));
+        assert!(!rendered.contains("pending review"));
+    }
+
+    #[test]
+    fn create_agent_menu_defaults_to_codex_when_present() {
+        let mut picker = SessionPicker {
+            paths: test_paths(),
+            sessions: vec![demo("alpha", "repo-a")],
+            create_agents: vec!["claude".to_string(), "codex".to_string()],
+            composer: default_composer(),
+            mode: PickerMode::Browse,
+            detail_text: String::new(),
+            detail_scroll: 0,
+            toast: None,
+        };
+
+        picker.open_create_agent_menu();
+
+        assert_eq!(picker.mode, PickerMode::CreateAgentSelect { selected: 1 });
+    }
+
+    #[test]
+    fn create_agent_menu_clamps_and_renders_agents() {
+        let mut picker = SessionPicker {
+            paths: test_paths(),
+            sessions: vec![demo("alpha", "repo-a")],
+            create_agents: vec!["claude".to_string(), "codex".to_string()],
+            composer: default_composer(),
+            mode: PickerMode::CreateAgentSelect { selected: 9 },
+            detail_text: String::new(),
+            detail_scroll: 0,
+            toast: None,
+        };
+
+        picker.clamp_mode_selection();
+        let rendered = picker.render_lines(120, true).join("\n");
+
+        assert_eq!(picker.mode, PickerMode::CreateAgentSelect { selected: 1 });
+        assert!(rendered.contains("1. claude"));
+        assert!(rendered.contains("> 2. codex"));
+        assert!(!rendered.contains("title-alpha"));
+    }
+
+    #[test]
+    fn configured_agent_names_use_sorted_defaults() {
+        let names = configured_agent_names(&test_paths());
+        assert_eq!(names, vec!["claude".to_string(), "codex".to_string()]);
     }
 
     #[test]
@@ -1960,6 +2396,7 @@ mod tests {
         assert!(review.contains(HOST_PICKER_STATUS_BLUE_FG));
         assert!(failed.contains(HOST_PICKER_STATUS_RED_FG));
         assert!(running.contains("●"));
+        assert!(running.contains("alpha  title-alpha"));
         assert!(review.contains("⧖"));
         assert!(failed.contains("✖"));
         let needs_input = render_host_picker_session_row(
@@ -1973,6 +2410,104 @@ mod tests {
             120,
         );
         assert!(needs_input.contains(HOST_PICKER_STATUS_YELLOW_FG));
+    }
+
+    #[test]
+    fn host_picker_legend_uses_colored_icons_and_separator() {
+        let rendered = render_host_picker_legend_row(
+            200,
+            &[
+                demo_with(
+                    "alpha",
+                    "repo-a",
+                    SessionStatus::NeedsInput,
+                    IntegrationState::Clean,
+                ),
+                demo_with(
+                    "beta",
+                    "repo-b",
+                    SessionStatus::Exited,
+                    IntegrationState::PendingReview,
+                ),
+                demo_with(
+                    "gamma",
+                    "repo-c",
+                    SessionStatus::Paused,
+                    IntegrationState::Clean,
+                ),
+            ],
+        );
+        assert!(rendered.contains(HOST_PICKER_STATUS_YELLOW_FG));
+        assert!(rendered.contains(HOST_PICKER_STATUS_BLUE_FG));
+        assert!(rendered.contains(HOST_PICKER_STATUS_GRAY_FG));
+        assert!(rendered.starts_with("  "));
+        assert!(rendered.contains("◦"));
+        assert!(rendered.contains("⧖"));
+        assert!(rendered.contains("⏸"));
+        assert!(rendered.contains("needs input"));
+        assert!(rendered.contains("pending review"));
+        assert!(rendered.contains("paused"));
+        assert!(rendered.contains(" • "));
+        assert!(!rendered.contains("failed"));
+        assert!(!rendered.contains("running"));
+    }
+
+    #[test]
+    fn host_picker_legend_is_hidden_in_submenus() {
+        let picker = SessionPicker {
+            paths: test_paths(),
+            sessions: vec![demo("alpha", "repo-a")],
+            create_agents: vec!["claude".to_string(), "codex".to_string()],
+            composer: default_composer(),
+            mode: PickerMode::CreateAgentSelect { selected: 0 },
+            detail_text: String::new(),
+            detail_scroll: 0,
+            toast: None,
+        };
+
+        let rendered = picker.render_lines(200, true).join("\n");
+        assert!(!rendered.contains("needs input"));
+        assert!(!rendered.contains("pending review"));
+    }
+
+    #[test]
+    fn diff_view_renders_and_hides_legend() {
+        let picker = SessionPicker {
+            paths: test_paths(),
+            sessions: vec![demo("alpha", "repo-a")],
+            create_agents: vec!["claude".to_string(), "codex".to_string()],
+            composer: default_composer(),
+            mode: PickerMode::DiffView {
+                session_id: "alpha".to_string(),
+            },
+            detail_text: "@@ -1 +1 @@\n-old\n+new\n".to_string(),
+            detail_scroll: 0,
+            toast: None,
+        };
+
+        let rendered = picker.render_lines(200, true).join("\n");
+        assert!(rendered.contains("Diff: alpha"));
+        assert!(rendered.contains(HOST_PICKER_DIFF_HUNK_STYLE));
+        assert!(rendered.contains(HOST_PICKER_DIFF_REMOVE_STYLE));
+        assert!(rendered.contains(HOST_PICKER_DIFF_ADD_STYLE));
+        assert!(rendered.contains("@@ -1 +1 @@"));
+        assert!(rendered.contains("-old"));
+        assert!(rendered.contains("+new"));
+        assert!(!rendered.contains("pending review"));
+        assert!(!rendered.contains("needs input"));
+    }
+
+    #[test]
+    fn style_host_picker_diff_line_colors_diff_sections() {
+        assert!(
+            style_host_picker_diff_line("diff --git a/a b/a", 80)
+                .contains(HOST_PICKER_DIFF_HEADER_STYLE)
+        );
+        assert!(
+            style_host_picker_diff_line("@@ -1 +1 @@", 80).contains(HOST_PICKER_DIFF_HUNK_STYLE)
+        );
+        assert!(style_host_picker_diff_line("+new", 80).contains(HOST_PICKER_DIFF_ADD_STYLE));
+        assert!(style_host_picker_diff_line("-old", 80).contains(HOST_PICKER_DIFF_REMOVE_STYLE));
     }
 
     #[test]
@@ -2078,9 +2613,7 @@ mod tests {
     fn default_composer() -> PickerComposer {
         PickerComposer {
             query: String::new(),
-            agent_input: "codex".to_string(),
             selected: 0,
-            field: PickerField::Query,
         }
     }
 }
