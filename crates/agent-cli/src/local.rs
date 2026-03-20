@@ -40,8 +40,8 @@ impl LocalStore {
     pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, task, base_branch, branch,
-                    repo_name, worktree, status, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
+            "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, repo_name, title, base_branch, branch,
+                    worktree, status, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
         )?;
@@ -53,8 +53,8 @@ impl LocalStore {
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, task, base_branch, branch,
-                    repo_name, worktree, status, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
+            "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, repo_name, title, base_branch, branch,
+                    worktree, status, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
             params![session_id],
@@ -148,6 +148,7 @@ impl LocalStore {
                 workspace TEXT NOT NULL,
                 repo_path TEXT,
                 repo_name TEXT,
+                title TEXT,
                 task TEXT NOT NULL,
                 base_branch TEXT,
                 branch TEXT NOT NULL,
@@ -211,6 +212,7 @@ impl LocalStore {
             "repo_name",
             "ALTER TABLE sessions ADD COLUMN repo_name TEXT",
         )?;
+        ensure_column(&conn, "title", "ALTER TABLE sessions ADD COLUMN title TEXT")?;
         ensure_column(
             &conn,
             "base_branch",
@@ -251,13 +253,14 @@ impl LocalStore {
              SET mode = COALESCE(mode, 'execute'),
                  repo_path = COALESCE(repo_path, workspace),
                  repo_name = COALESCE(repo_name, repo_path, workspace),
+                 title = COALESCE(title, task, repo_name, workspace),
                  base_branch = COALESCE(base_branch, 'HEAD'),
                  integration_state = COALESCE(integration_state, 'clean'),
                  git_sync = COALESCE(git_sync, 'unknown'),
                  has_conflicts = COALESCE(has_conflicts, 0),
                  attention = COALESCE(attention, 'info'),
-                 attention_summary = COALESCE(attention_summary, task)
-             WHERE mode IS NULL OR repo_path IS NULL OR repo_name IS NULL OR base_branch IS NULL OR integration_state IS NULL OR git_sync IS NULL OR has_conflicts IS NULL OR attention IS NULL OR attention_summary IS NULL",
+                 attention_summary = COALESCE(attention_summary, title, task)
+             WHERE mode IS NULL OR repo_path IS NULL OR repo_name IS NULL OR title IS NULL OR base_branch IS NULL OR integration_state IS NULL OR git_sync IS NULL OR has_conflicts IS NULL OR attention IS NULL OR attention_summary IS NULL",
             [],
         )?;
         let mut stmt = conn.prepare("SELECT session_id, repo_path, workspace, repo_name FROM sessions")?;
@@ -397,12 +400,12 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         })?,
         workspace: row.get(5)?,
         repo_path: row.get(6)?,
-        task: row.get(7)?,
-        base_branch: row.get(8)?,
-        branch: row.get(9)?,
-        repo_name: row
-            .get::<_, Option<String>>(10)?
-            .unwrap_or_else(|| repo_name_from_path(&row.get::<_, String>(6).unwrap_or_default())),
+        repo_name: row.get::<_, Option<String>>(7)?.unwrap_or_else(|| {
+            repo_name_from_path(&row.get::<_, String>(6).unwrap_or_default())
+        }),
+        title: row.get(8)?,
+        base_branch: row.get(9)?,
+        branch: row.get(10)?,
         worktree: row.get(11)?,
         status: str_to_status(&row.get::<_, String>(12)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(

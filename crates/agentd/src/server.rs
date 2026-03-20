@@ -107,11 +107,10 @@ async fn handle_connection(
         }
         IncomingRequest::Standard(Request::CreateSession {
             workspace,
-            task,
+            title,
             agent,
             model,
-            mode,
-        }) => match state.create_session(workspace, task, agent, model, mode).await {
+        }) => match state.create_session(workspace, title, agent, model).await {
             Ok(session) => send_response(&mut writer, &Response::CreateSession { session }).await?,
             Err(err) => {
                 send_response(
@@ -230,46 +229,38 @@ async fn handle_connection(
             }
         },
         IncomingRequest::Standard(Request::ReplyToSession { session_id, prompt }) => {
-            match state.reply_to_session(&session_id, prompt).await {
-                Ok(session) => send_response(&mut writer, &Response::Session { session }).await?,
-                Err(err) => {
-                    send_response(
-                        &mut writer,
-                        &Response::Error {
-                            message: err.to_string(),
-                        },
-                    )
-                    .await?
-                }
-            }
+            let _ = (session_id, prompt);
+            send_response(
+                &mut writer,
+                &Response::Error {
+                    message:
+                        "structured reply is disabled; focus the worker and type directly into the PTY"
+                            .to_string(),
+                },
+            )
+            .await?
         }
         IncomingRequest::Standard(Request::ApplySession { session_id }) => {
-            match state.apply_session(&session_id).await {
-                Ok(session) => send_response(&mut writer, &Response::Session { session }).await?,
-                Err(err) => {
-                    send_response(
-                        &mut writer,
-                        &Response::Error {
-                            message: err.to_string(),
-                        },
-                    )
-                    .await?
-                }
-            }
+            let _ = session_id;
+            send_response(
+                &mut writer,
+                &Response::Error {
+                    message: "structured apply/discard review is disabled in interactive mode"
+                        .to_string(),
+                },
+            )
+            .await?
         }
         IncomingRequest::Standard(Request::DiscardSession { session_id, force }) => {
-            match state.discard_session(&session_id, force).await {
-                Ok(session) => send_response(&mut writer, &Response::Session { session }).await?,
-                Err(err) => {
-                    send_response(
-                        &mut writer,
-                        &Response::Error {
-                            message: err.to_string(),
-                        },
-                    )
-                    .await?
-                }
-            }
+            let _ = (session_id, force);
+            send_response(
+                &mut writer,
+                &Response::Error {
+                    message: "structured apply/discard review is disabled in interactive mode"
+                        .to_string(),
+                },
+            )
+            .await?
         }
         IncomingRequest::Standard(Request::SwitchAttachedSession {
             source_session_id,
@@ -322,18 +313,15 @@ async fn handle_connection(
             send_response(&mut writer, &Response::Sessions { sessions }).await?;
         }
         IncomingRequest::Standard(Request::AppendSessionEvents { session_id, events }) => {
-            match state.append_session_events(&session_id, events).await {
-                Ok(_) => send_response(&mut writer, &Response::Ok).await?,
-                Err(err) => {
-                    send_response(
-                        &mut writer,
-                        &Response::Error {
-                            message: err.to_string(),
-                        },
-                    )
-                    .await?
-                }
-            }
+            let _ = (session_id, events);
+            send_response(
+                &mut writer,
+                &Response::Error {
+                    message: "structured event ingestion is disabled in interactive mode"
+                        .to_string(),
+                },
+            )
+            .await?
         }
         IncomingRequest::Standard(Request::StreamLogs { session_id, follow }) => {
             if let Err(err) = stream_logs(&state, &session_id, follow, &mut writer).await {
@@ -349,17 +337,14 @@ async fn handle_connection(
             }
         }
         IncomingRequest::Standard(Request::StreamEvents { session_id, follow }) => {
-            if let Err(err) = stream_events(&state, &session_id, follow, &mut writer).await {
-                send_response(
-                    &mut writer,
-                    &Response::Error {
-                        message: err.to_string(),
-                    },
-                )
-                .await?;
-            } else {
-                send_response(&mut writer, &Response::EndOfStream).await?;
-            }
+            let _ = (session_id, follow);
+            send_response(
+                &mut writer,
+                &Response::Error {
+                    message: "event streaming is disabled in interactive mode".to_string(),
+                },
+            )
+            .await?;
         }
     }
 
@@ -664,7 +649,7 @@ mod tests {
             workspace: "/tmp/workspace".to_string(),
             repo_path: "/tmp/workspace".to_string(),
             repo_name: "workspace".to_string(),
-            task: "task".to_string(),
+            title: "task".to_string(),
             base_branch: "main".to_string(),
             branch: "agent/task".to_string(),
             worktree: "/tmp/worktree".to_string(),

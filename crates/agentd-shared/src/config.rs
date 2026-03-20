@@ -16,6 +16,12 @@ pub struct AgentConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default = "default_model_flag")]
+    pub model_flag: Option<String>,
+}
+
+fn default_model_flag() -> Option<String> {
+    Some("--model".to_string())
 }
 
 impl Config {
@@ -53,6 +59,7 @@ impl Default for Config {
             AgentConfig {
                 command: "claude".to_string(),
                 args: Vec::new(),
+                model_flag: default_model_flag(),
             },
         );
         agents.insert(
@@ -60,6 +67,7 @@ impl Default for Config {
             AgentConfig {
                 command: "codex".to_string(),
                 args: Vec::new(),
+                model_flag: default_model_flag(),
             },
         );
         Self { agents }

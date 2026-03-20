@@ -1,7 +1,4 @@
-use std::{
-    collections::VecDeque,
-    time::Duration,
-};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -22,7 +19,7 @@ use tokio::{
 use agentd_shared::{
     paths::AppPaths,
     protocol::{Request, Response, read_response, write_request},
-    session::{IntegrationState, SessionMode, SessionRecord, SessionStatus},
+    session::{IntegrationState, SessionRecord, SessionStatus},
 };
 
 use crate::{
@@ -33,9 +30,6 @@ use crate::{
 const LEADER_KEY: (KeyCode, KeyModifiers) = (KeyCode::Char('b'), KeyModifiers::CONTROL);
 const SIDEBAR_WIDTH: u16 = 34;
 const CARD_HEIGHT: u16 = 6;
-const MAX_PTY_LINES: usize = 1200;
-const MAX_PTY_CHARS: usize = 200_000;
-
 pub async fn run_runtime_ui(paths: &AppPaths, initial_session_id: Option<&str>) -> Result<()> {
     let _raw_mode = RawModeGuard::new()?;
     let _screen = TerminalScreenGuard::enter()?;
@@ -82,7 +76,7 @@ enum Modal {
     None,
     Palette,
     SessionSwitcher,
-    NewTask { edit_agent: bool },
+    NewSession { edit_agent: bool },
     WorktreeActions,
     GitStatus,
     Diff,
@@ -103,7 +97,7 @@ enum Command {
     NextAttention,
     FocusCoordinator,
     SessionSwitcher,
-    NewTask,
+    NewSession,
     NewAgent,
     WorktreeActions,
     GitStatus,
@@ -121,7 +115,7 @@ struct RuntimeApp {
     palette_selected: usize,
     switcher_query: String,
     switcher_selected: usize,
-    task_input: String,
+    title_input: String,
     agent_input: String,
     diff_text: String,
     diff_scroll: u16,
@@ -147,7 +141,7 @@ impl RuntimeApp {
             palette_selected: 0,
             switcher_query: String::new(),
             switcher_selected: 0,
-            task_input: String::new(),
+            title_input: String::new(),
             agent_input: "codex".to_string(),
             diff_text: String::new(),
             diff_scroll: 0,
@@ -277,8 +271,8 @@ impl RuntimeApp {
         loop {
             match pty.messages.try_recv() {
                 Ok(message) => match message {
-                    PtyEvent::Snapshot(text) => pty.replace(text),
-                    PtyEvent::Output(text) => pty.push(text),
+                    PtyEvent::Snapshot(bytes) => pty.replace(bytes),
+                    PtyEvent::Output(bytes) => pty.push(bytes),
                     PtyEvent::Ended(summary) => {
                         pty.connected = false;
                         pty.last_error = Some(summary);
@@ -340,7 +334,7 @@ impl RuntimeApp {
             KeyCode::Char('a') => self.run_command(Command::NextAttention).await?,
             KeyCode::Char('c') => self.run_command(Command::FocusCoordinator).await?,
             KeyCode::Char('s') => self.run_command(Command::SessionSwitcher).await?,
-            KeyCode::Char('t') => self.run_command(Command::NewTask).await?,
+            KeyCode::Char('t') => self.run_command(Command::NewSession).await?,
             KeyCode::Char('w') => self.run_command(Command::WorktreeActions).await?,
             KeyCode::Char('g') => self.run_command(Command::GitStatus).await?,
             KeyCode::Char('d') => self.run_command(Command::Diff).await?,
@@ -371,7 +365,7 @@ impl RuntimeApp {
                 self.handle_switcher_key(key);
                 Ok(true)
             }
-            Modal::NewTask { edit_agent } => {
+            Modal::NewSession { edit_agent } => {
                 self.handle_task_modal_key(key, edit_agent).await?;
                 Ok(true)
             }
@@ -401,14 +395,14 @@ impl RuntimeApp {
                 self.switcher_query.clear();
                 self.switcher_selected = 0;
             }
-            Command::NewTask => {
-                self.modal = Modal::NewTask { edit_agent: false };
-                self.task_input.clear();
+            Command::NewSession => {
+                self.modal = Modal::NewSession { edit_agent: false };
+                self.title_input.clear();
                 self.agent_input = "codex".to_string();
             }
             Command::NewAgent => {
-                self.modal = Modal::NewTask { edit_agent: true };
-                self.task_input.clear();
+                self.modal = Modal::NewSession { edit_agent: true };
+                self.title_input.clear();
                 self.agent_input = "codex".to_string();
             }
             Command::WorktreeActions => {
@@ -547,22 +541,18 @@ impl RuntimeApp {
             KeyCode::Esc => self.close_modal(),
             KeyCode::Tab => {
                 edit_agent = !edit_agent;
-                self.modal = Modal::NewTask { edit_agent };
+                self.modal = Modal::NewSession { edit_agent };
             }
             KeyCode::Backspace => {
                 if edit_agent {
                     self.agent_input.pop();
                 } else {
-                    self.task_input.pop();
+                    self.title_input.pop();
                 }
             }
             KeyCode::Enter => {
-                let task = self.task_input.trim();
+                let title = self.title_input.trim();
                 let agent = self.agent_input.trim();
-                if task.is_empty() {
-                    self.toast = Some("task cannot be empty".to_string());
-                    return Ok(());
-                }
                 if agent.is_empty() {
                     self.toast = Some("agent cannot be empty".to_string());
                     return Ok(());
@@ -572,14 +562,13 @@ impl RuntimeApp {
                     &self.paths,
                     &Request::CreateSession {
                         workspace: workspace.to_string_lossy().to_string(),
-                        task: task.to_string(),
+                        title: (!title.is_empty()).then(|| title.to_string()),
                         agent: agent.to_string(),
                         model: if agent == "codex" {
                             Some(CODEX_MODELS[0].to_string())
                         } else {
                             None
                         },
-                        mode: SessionMode::Execute,
                     },
                 )
                 .await?;
@@ -587,7 +576,7 @@ impl RuntimeApp {
                     Response::CreateSession { session } => {
                         let created = daemon_get_session(&self.paths, &session.session_id).await?;
                         self.focus = FocusTarget::Worker(created.session_id);
-                        self.toast = Some(format!("created {}", created.task));
+                        self.toast = Some(format!("created {}", created.title));
                         self.close_modal();
                     }
                     Response::Error { message } => self.toast = Some(message),
@@ -600,7 +589,7 @@ impl RuntimeApp {
                 if edit_agent {
                     self.agent_input.push(ch);
                 } else {
-                    self.task_input.push(ch);
+                    self.title_input.push(ch);
                 }
             }
             _ => {}
@@ -779,7 +768,7 @@ impl RuntimeApp {
                 lines.push(Line::from(vec![
                     Span::styled(session_icon(session), Style::default().fg(session_icon_color(session))),
                     Span::raw("  "),
-                    Span::styled(session.task.as_str(), Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(session.title.as_str(), Style::default().add_modifier(Modifier::BOLD)),
                     Span::raw("  "),
                     Span::styled(session.repo_name.as_str(), subtle_style()),
                     Span::raw("  "),
@@ -817,7 +806,7 @@ impl RuntimeApp {
             Line::from(vec![
                 Span::styled(session_icon(session), Style::default().fg(session_icon_color(session)).add_modifier(Modifier::BOLD)),
                 Span::raw("  "),
-                Span::styled(session.task.as_str(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(session.title.as_str(), Style::default().add_modifier(Modifier::BOLD)),
             ]),
             Line::from(vec![
                 Span::styled("repo      ", subtle_style()),
@@ -842,27 +831,13 @@ impl RuntimeApp {
         let pty_inner = pane.inner(pty_area);
         frame.render_widget(pane, pty_area);
 
-        let mut body = if let Some(pty) = &self.pty {
-            if pty.session_id == session.session_id {
-                pty.rendered_text()
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        };
-
-        if body.trim().is_empty() {
-            let path = super::resolve_focus_log_path(&self.paths, session);
-            body = super::read_focus_log_contents(&path).unwrap_or_default();
-        }
-
         if let Some(pty) = &mut self.pty
             && pty.session_id == session.session_id
         {
             let size = (pty_inner.width.max(1), pty_inner.height.max(1));
             if self.last_pane_size != Some(size) {
                 self.last_pane_size = Some(size);
+                pty.resize(size.0, size.1);
                 let _ = pty.commands.send(PtyCommand::Resize {
                     cols: size.0,
                     rows: size.1,
@@ -870,13 +845,25 @@ impl RuntimeApp {
             }
         }
 
-        // TODO: replace this sanitized text surface with a real inline VT cell renderer.
-        frame.render_widget(
-            Paragraph::new(body)
-                .wrap(Wrap { trim: false })
-                .block(Block::default()),
-            pty_inner,
-        );
+        if let Some(pty) = &self.pty
+            && pty.session_id == session.session_id
+        {
+            frame.render_widget(
+                Paragraph::new(pty.rendered_lines())
+                    .wrap(Wrap { trim: false })
+                    .block(Block::default()),
+                pty_inner,
+            );
+        } else {
+            let path = super::resolve_focus_log_path(&self.paths, session);
+            let body = super::read_focus_log_contents(&path).unwrap_or_default();
+            frame.render_widget(
+                Paragraph::new(body)
+                    .wrap(Wrap { trim: false })
+                    .block(Block::default()),
+                pty_inner,
+            );
+        }
     }
 
     fn render_overlay(&self, frame: &mut Frame, area: Rect) {
@@ -884,7 +871,7 @@ impl RuntimeApp {
             Modal::None => {}
             Modal::Palette => self.render_palette(frame, area),
             Modal::SessionSwitcher => self.render_switcher(frame, area),
-            Modal::NewTask { edit_agent } => self.render_task_modal(frame, area, edit_agent),
+            Modal::NewSession { edit_agent } => self.render_task_modal(frame, area, edit_agent),
             Modal::WorktreeActions => self.render_detail_modal(frame, area, "Worktree Actions", &self.detail_text, self.detail_scroll),
             Modal::GitStatus => self.render_detail_modal(frame, area, "Git Status", &self.detail_text, self.detail_scroll),
             Modal::Diff => self.render_detail_modal(frame, area, "Diff", &self.diff_text, self.diff_scroll),
@@ -956,7 +943,7 @@ impl RuntimeApp {
             lines.push(Line::from(vec![
                 Span::styled(session_icon(session), Style::default().fg(session_icon_color(session))),
                 Span::raw("  "),
-                Span::styled(session.task.as_str(), style),
+                Span::styled(session.title.as_str(), style),
             ]));
             lines.push(Line::from(vec![
                 Span::raw("   "),
@@ -982,8 +969,8 @@ impl RuntimeApp {
                     if edit_agent { "  " } else { "> " },
                     Style::default().fg(Color::Cyan),
                 ),
-                Span::styled("task   ", subtle_style()),
-                Span::raw(self.task_input.as_str()),
+                Span::styled("label  ", subtle_style()),
+                Span::raw(self.title_input.as_str()),
             ]),
             Line::from(vec![
                 Span::styled(
@@ -1002,7 +989,7 @@ impl RuntimeApp {
         frame.render_widget(WidgetClear, overlay);
         frame.render_widget(
             Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title("New Worker")),
+                .block(Block::default().borders(Borders::ALL).title("New Session")),
             overlay,
         );
     }
@@ -1045,7 +1032,7 @@ struct FocusedPty {
     session_id: String,
     commands: UnboundedSender<PtyCommand>,
     messages: UnboundedReceiver<PtyEvent>,
-    lines: VecDeque<String>,
+    terminal: TerminalSurface,
     connected: bool,
     last_error: Option<String>,
 }
@@ -1059,39 +1046,37 @@ impl FocusedPty {
             session_id,
             commands: command_tx,
             messages: message_rx,
-            lines: VecDeque::new(),
+            terminal: TerminalSurface::new(80, 24),
             connected: true,
             last_error: None,
         }
     }
 
-    fn replace(&mut self, text: String) {
-        self.lines.clear();
-        self.push(text);
+    fn replace(&mut self, bytes: Vec<u8>) {
+        self.terminal.reset();
+        self.terminal.process(&bytes);
     }
 
-    fn push(&mut self, text: String) {
-        for line in text.lines() {
-            self.lines.push_back(line.to_string());
-        }
-        while self.lines.len() > MAX_PTY_LINES {
-            self.lines.pop_front();
-        }
+    fn push(&mut self, bytes: Vec<u8>) {
+        self.terminal.process(&bytes);
     }
 
-    fn rendered_text(&self) -> String {
-        let mut text = self.lines.iter().cloned().collect::<Vec<_>>().join("\n");
+    fn resize(&mut self, cols: u16, rows: u16) {
+        self.terminal.resize(cols.max(1), rows.max(1));
+    }
+
+    fn rendered_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = self.terminal.render_lines(self.connected);
         if let Some(error) = &self.last_error {
-            if !text.is_empty() {
-                text.push_str("\n\n");
+            if !lines.is_empty() {
+                lines.push(Line::from(""));
             }
-            text.push_str(error);
+            lines.push(Line::from(Span::styled(
+                error.clone(),
+                Style::default().fg(Color::Red),
+            )));
         }
-        if text.len() > MAX_PTY_CHARS {
-            let start = text.len() - MAX_PTY_CHARS;
-            text = text[start..].to_string();
-        }
-        text
+        lines
     }
 }
 
@@ -1102,8 +1087,8 @@ enum PtyCommand {
 }
 
 enum PtyEvent {
-    Snapshot(String),
-    Output(String),
+    Snapshot(Vec<u8>),
+    Output(Vec<u8>),
     Ended(String),
     Error(String),
     Closed,
@@ -1135,7 +1120,7 @@ async fn run_pty_session(
 
         match initial {
             Response::Attached { snapshot } => {
-                let _ = messages.send(PtyEvent::Snapshot(sanitize_terminal_bytes(&snapshot)));
+                let _ = messages.send(PtyEvent::Snapshot(snapshot));
             }
             Response::SessionEnded { status, .. } => {
                 let _ = messages.send(PtyEvent::Ended(format!("session ended: {}", status_label(status))));
@@ -1169,10 +1154,7 @@ async fn run_pty_session(
                     };
                     match response {
                         Response::PtyOutput { data } => {
-                            let text = sanitize_terminal_bytes(&data);
-                            if !text.is_empty() {
-                                let _ = messages.send(PtyEvent::Output(text));
-                            }
+                            let _ = messages.send(PtyEvent::Output(data));
                         }
                         Response::SessionEnded { status, error, .. } => {
                             let summary = error.unwrap_or_else(|| format!("session ended: {}", status_label(status)));
@@ -1203,6 +1185,629 @@ async fn run_pty_session(
     let _ = messages.send(PtyEvent::Closed);
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TerminalCellStyle {
+    fg: Option<Color>,
+    bg: Option<Color>,
+    bold: bool,
+    underlined: bool,
+    reversed: bool,
+}
+
+#[derive(Clone, Debug)]
+struct TerminalCell {
+    ch: char,
+    style: TerminalCellStyle,
+}
+
+impl Default for TerminalCell {
+    fn default() -> Self {
+        Self {
+            ch: ' ',
+            style: TerminalCellStyle::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalParserState {
+    Ground,
+    Escape,
+    Csi,
+    Osc,
+    OscEscape,
+}
+
+struct TerminalSurface {
+    cols: u16,
+    rows: u16,
+    cursor_col: usize,
+    cursor_row: usize,
+    saved_cursor: (usize, usize),
+    style: TerminalCellStyle,
+    cells: Vec<TerminalCell>,
+    parser_state: TerminalParserState,
+    csi_buffer: String,
+}
+
+impl TerminalSurface {
+    fn new(cols: u16, rows: u16) -> Self {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        Self {
+            cols,
+            rows,
+            cursor_col: 0,
+            cursor_row: 0,
+            saved_cursor: (0, 0),
+            style: TerminalCellStyle::default(),
+            cells: vec![TerminalCell::default(); cols as usize * rows as usize],
+            parser_state: TerminalParserState::Ground,
+            csi_buffer: String::new(),
+        }
+    }
+
+    fn reset(&mut self) {
+        let cols = self.cols;
+        let rows = self.rows;
+        *self = Self::new(cols, rows);
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        if self.cols == cols && self.rows == rows {
+            return;
+        }
+
+        let old_cols = self.cols as usize;
+        let old_rows = self.rows as usize;
+        let mut cells = vec![TerminalCell::default(); cols as usize * rows as usize];
+        let copy_rows = old_rows.min(rows as usize);
+        let copy_cols = old_cols.min(cols as usize);
+        for row in 0..copy_rows {
+            let old_start = row * old_cols;
+            let new_start = row * cols as usize;
+            cells[new_start..new_start + copy_cols]
+                .clone_from_slice(&self.cells[old_start..old_start + copy_cols]);
+        }
+
+        self.cols = cols;
+        self.rows = rows;
+        self.cells = cells;
+        self.cursor_col = self.cursor_col.min(cols.saturating_sub(1) as usize);
+        self.cursor_row = self.cursor_row.min(rows.saturating_sub(1) as usize);
+    }
+
+    fn process(&mut self, bytes: &[u8]) {
+        for ch in String::from_utf8_lossy(bytes).chars() {
+            match self.parser_state {
+                TerminalParserState::Ground => self.process_ground(ch),
+                TerminalParserState::Escape => self.process_escape(ch),
+                TerminalParserState::Csi => self.process_csi(ch),
+                TerminalParserState::Osc => self.process_osc(ch),
+                TerminalParserState::OscEscape => self.process_osc_escape(ch),
+            }
+        }
+    }
+
+    fn render_lines(&self, show_cursor: bool) -> Vec<Line<'static>> {
+        let mut lines = Vec::with_capacity(self.rows as usize);
+        for row in 0..self.rows as usize {
+            let mut spans = Vec::new();
+            let mut current_style = None::<Style>;
+            let mut current_text = String::new();
+            for col in 0..self.cols as usize {
+                let mut cell = self.cells[self.index(row, col)].clone();
+                if show_cursor && row == self.cursor_row && col == self.cursor_col {
+                    cell.style.reversed = !cell.style.reversed;
+                }
+                let style = terminal_style(cell.style);
+                if current_style == Some(style) {
+                    current_text.push(cell.ch);
+                } else {
+                    if !current_text.is_empty() {
+                        spans.push(Span::styled(
+                            std::mem::take(&mut current_text),
+                            current_style.unwrap_or_default(),
+                        ));
+                    }
+                    current_style = Some(style);
+                    current_text.push(cell.ch);
+                }
+            }
+            if !current_text.is_empty() {
+                spans.push(Span::styled(
+                    current_text,
+                    current_style.unwrap_or_default(),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+        lines
+    }
+
+    fn process_ground(&mut self, ch: char) {
+        match ch {
+            '\u{1b}' => self.parser_state = TerminalParserState::Escape,
+            '\n' => self.newline(),
+            '\r' => self.cursor_col = 0,
+            '\u{8}' => self.cursor_col = self.cursor_col.saturating_sub(1),
+            '\t' => {
+                let next_tab = ((self.cursor_col / 8) + 1) * 8;
+                while self.cursor_col < next_tab {
+                    self.put_char(' ');
+                }
+            }
+            ch if ch.is_control() => {}
+            ch => self.put_char(ch),
+        }
+    }
+
+    fn process_escape(&mut self, ch: char) {
+        match ch {
+            '[' => {
+                self.csi_buffer.clear();
+                self.parser_state = TerminalParserState::Csi;
+            }
+            ']' => self.parser_state = TerminalParserState::Osc,
+            '7' => {
+                self.saved_cursor = (self.cursor_col, self.cursor_row);
+                self.parser_state = TerminalParserState::Ground;
+            }
+            '8' => {
+                (self.cursor_col, self.cursor_row) = self.saved_cursor;
+                self.clamp_cursor();
+                self.parser_state = TerminalParserState::Ground;
+            }
+            'c' => {
+                self.reset();
+                self.parser_state = TerminalParserState::Ground;
+            }
+            'D' => {
+                self.index_line();
+                self.parser_state = TerminalParserState::Ground;
+            }
+            'E' => {
+                self.index_line();
+                self.cursor_col = 0;
+                self.parser_state = TerminalParserState::Ground;
+            }
+            'M' => {
+                self.reverse_index();
+                self.parser_state = TerminalParserState::Ground;
+            }
+            _ => self.parser_state = TerminalParserState::Ground,
+        }
+    }
+
+    fn process_csi(&mut self, ch: char) {
+        if ('@'..='~').contains(&ch) {
+            let buffer = std::mem::take(&mut self.csi_buffer);
+            self.dispatch_csi(&buffer, ch);
+            self.parser_state = TerminalParserState::Ground;
+        } else {
+            self.csi_buffer.push(ch);
+        }
+    }
+
+    fn process_osc(&mut self, ch: char) {
+        match ch {
+            '\u{7}' => self.parser_state = TerminalParserState::Ground,
+            '\u{1b}' => self.parser_state = TerminalParserState::OscEscape,
+            _ => {}
+        }
+    }
+
+    fn process_osc_escape(&mut self, ch: char) {
+        self.parser_state = if ch == '\\' {
+            TerminalParserState::Ground
+        } else {
+            TerminalParserState::Osc
+        };
+    }
+
+    fn dispatch_csi(&mut self, params: &str, action: char) {
+        let private = params.starts_with('?');
+        let params = if private { &params[1..] } else { params };
+        let parsed = parse_csi_params(params);
+        match action {
+            'A' => self.cursor_row = self.cursor_row.saturating_sub(first_param(&parsed, 1) as usize),
+            'B' => self.cursor_row = (self.cursor_row + first_param(&parsed, 1) as usize).min(self.rows.saturating_sub(1) as usize),
+            'C' => self.cursor_col = (self.cursor_col + first_param(&parsed, 1) as usize).min(self.cols.saturating_sub(1) as usize),
+            'D' => self.cursor_col = self.cursor_col.saturating_sub(first_param(&parsed, 1) as usize),
+            'G' => self.cursor_col = first_param(&parsed, 1).saturating_sub(1) as usize,
+            'H' | 'f' => {
+                self.cursor_row = first_param(&parsed, 1).saturating_sub(1) as usize;
+                self.cursor_col = nth_param(&parsed, 1, 1).saturating_sub(1) as usize;
+                self.clamp_cursor();
+            }
+            'J' => self.clear_screen(first_param(&parsed, 0)),
+            'K' => self.clear_line(first_param(&parsed, 0)),
+            'L' => self.insert_lines(first_param(&parsed, 1) as usize),
+            'M' => self.delete_lines(first_param(&parsed, 1) as usize),
+            'P' => self.delete_chars(first_param(&parsed, 1) as usize),
+            'X' => self.erase_chars(first_param(&parsed, 1) as usize),
+            '@' => self.insert_blank_chars(first_param(&parsed, 1) as usize),
+            'd' => {
+                self.cursor_row = first_param(&parsed, 1).saturating_sub(1) as usize;
+                self.clamp_cursor();
+            }
+            'm' => self.apply_sgr(&parsed),
+            's' => self.saved_cursor = (self.cursor_col, self.cursor_row),
+            'u' => {
+                (self.cursor_col, self.cursor_row) = self.saved_cursor;
+                self.clamp_cursor();
+            }
+            'h' | 'l' if private => {
+                if parsed.first().copied().flatten() == Some(1049) {
+                    self.clear_all();
+                    self.cursor_col = 0;
+                    self.cursor_row = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_sgr(&mut self, params: &[Option<u16>]) {
+        if params.is_empty() {
+            self.style = TerminalCellStyle::default();
+            return;
+        }
+
+        let mut index = 0;
+        while index < params.len() {
+            let value = params[index].unwrap_or(0);
+            match value {
+                0 => self.style = TerminalCellStyle::default(),
+                1 => self.style.bold = true,
+                4 => self.style.underlined = true,
+                7 => self.style.reversed = true,
+                22 => self.style.bold = false,
+                24 => self.style.underlined = false,
+                27 => self.style.reversed = false,
+                30..=37 => self.style.fg = Some(ansi_color(value - 30, false)),
+                39 => self.style.fg = None,
+                40..=47 => self.style.bg = Some(ansi_color(value - 40, false)),
+                49 => self.style.bg = None,
+                90..=97 => self.style.fg = Some(ansi_color(value - 90, true)),
+                100..=107 => self.style.bg = Some(ansi_color(value - 100, true)),
+                38 | 48 => {
+                    let is_fg = value == 38;
+                    if let Some((color, consumed)) = parse_extended_color(params, index + 1) {
+                        if is_fg {
+                            self.style.fg = Some(color);
+                        } else {
+                            self.style.bg = Some(color);
+                        }
+                        index += consumed;
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+    }
+
+    fn put_char(&mut self, ch: char) {
+        if self.cursor_row >= self.rows as usize || self.cursor_col >= self.cols as usize {
+            self.clamp_cursor();
+        }
+        let index = self.index(self.cursor_row, self.cursor_col);
+        self.cells[index] = TerminalCell {
+            ch,
+            style: self.style,
+        };
+        if self.cursor_col + 1 >= self.cols as usize {
+            self.cursor_col = 0;
+            self.index_line();
+        } else {
+            self.cursor_col += 1;
+        }
+    }
+
+    fn index_line(&mut self) {
+        if self.cursor_row + 1 >= self.rows as usize {
+            self.scroll_up(1);
+        } else {
+            self.cursor_row += 1;
+        }
+    }
+
+    fn newline(&mut self) {
+        self.index_line();
+    }
+
+    fn reverse_index(&mut self) {
+        if self.cursor_row == 0 {
+            self.scroll_down(1);
+        } else {
+            self.cursor_row -= 1;
+        }
+    }
+
+    fn clear_screen(&mut self, mode: u16) {
+        match mode {
+            0 => {
+                self.clear_line(0);
+                for row in self.cursor_row + 1..self.rows as usize {
+                    self.clear_row(row);
+                }
+            }
+            1 => {
+                for row in 0..self.cursor_row {
+                    self.clear_row(row);
+                }
+                self.clear_line(1);
+            }
+            _ => self.clear_all(),
+        }
+    }
+
+    fn clear_line(&mut self, mode: u16) {
+        let row = self.cursor_row;
+        match mode {
+            0 => {
+                for col in self.cursor_col..self.cols as usize {
+                    let index = self.index(row, col);
+                    self.cells[index] = TerminalCell::default();
+                }
+            }
+            1 => {
+                for col in 0..=self.cursor_col.min(self.cols.saturating_sub(1) as usize) {
+                    let index = self.index(row, col);
+                    self.cells[index] = TerminalCell::default();
+                }
+            }
+            _ => self.clear_row(row),
+        }
+    }
+
+    fn insert_blank_chars(&mut self, count: usize) {
+        let row = self.cursor_row;
+        let width = self.cols as usize;
+        let count = count.min(width.saturating_sub(self.cursor_col));
+        if count == 0 {
+            return;
+        }
+        for col in (self.cursor_col..width).rev() {
+            let target = col + count;
+            if target < width {
+                let src = self.index(row, col);
+                let dst = self.index(row, target);
+                self.cells[dst] = self.cells[src].clone();
+            }
+        }
+        for col in self.cursor_col..(self.cursor_col + count).min(width) {
+            let index = self.index(row, col);
+            self.cells[index] = TerminalCell::default();
+        }
+    }
+
+    fn delete_chars(&mut self, count: usize) {
+        let row = self.cursor_row;
+        let width = self.cols as usize;
+        let count = count.min(width.saturating_sub(self.cursor_col));
+        for col in self.cursor_col..width {
+            let src = col + count;
+            let dst = self.index(row, col);
+            self.cells[dst] = if src < width {
+                self.cells[self.index(row, src)].clone()
+            } else {
+                TerminalCell::default()
+            };
+        }
+    }
+
+    fn erase_chars(&mut self, count: usize) {
+        for col in self.cursor_col..(self.cursor_col + count).min(self.cols as usize) {
+            let index = self.index(self.cursor_row, col);
+            self.cells[index] = TerminalCell::default();
+        }
+    }
+
+    fn insert_lines(&mut self, count: usize) {
+        let row = self.cursor_row;
+        let width = self.cols as usize;
+        let count = count.min(self.rows as usize - row);
+        for target_row in (row..self.rows as usize).rev() {
+            let src_row = target_row.saturating_sub(count);
+            for col in 0..width {
+                let dst = self.index(target_row, col);
+                self.cells[dst] = if src_row >= row {
+                    self.cells[self.index(src_row, col)].clone()
+                } else {
+                    TerminalCell::default()
+                };
+            }
+        }
+    }
+
+    fn delete_lines(&mut self, count: usize) {
+        let row = self.cursor_row;
+        let width = self.cols as usize;
+        let count = count.min(self.rows as usize - row);
+        for target_row in row..self.rows as usize {
+            let src_row = target_row + count;
+            for col in 0..width {
+                let dst = self.index(target_row, col);
+                self.cells[dst] = if src_row < self.rows as usize {
+                    self.cells[self.index(src_row, col)].clone()
+                } else {
+                    TerminalCell::default()
+                };
+            }
+        }
+    }
+
+    fn clear_row(&mut self, row: usize) {
+        for col in 0..self.cols as usize {
+            let index = self.index(row, col);
+            self.cells[index] = TerminalCell::default();
+        }
+    }
+
+    fn clear_all(&mut self) {
+        for cell in &mut self.cells {
+            *cell = TerminalCell::default();
+        }
+    }
+
+    fn scroll_up(&mut self, count: usize) {
+        let width = self.cols as usize;
+        let count = count.min(self.rows as usize);
+        if count == 0 {
+            return;
+        }
+        for row in 0..self.rows as usize {
+            for col in 0..width {
+                let dst = self.index(row, col);
+                self.cells[dst] = if row + count < self.rows as usize {
+                    self.cells[self.index(row + count, col)].clone()
+                } else {
+                    TerminalCell::default()
+                };
+            }
+        }
+    }
+
+    fn scroll_down(&mut self, count: usize) {
+        let width = self.cols as usize;
+        let count = count.min(self.rows as usize);
+        if count == 0 {
+            return;
+        }
+        for row in (0..self.rows as usize).rev() {
+            for col in 0..width {
+                let dst = self.index(row, col);
+                self.cells[dst] = if row >= count {
+                    self.cells[self.index(row - count, col)].clone()
+                } else {
+                    TerminalCell::default()
+                };
+            }
+        }
+    }
+
+    fn clamp_cursor(&mut self) {
+        self.cursor_col = self.cursor_col.min(self.cols.saturating_sub(1) as usize);
+        self.cursor_row = self.cursor_row.min(self.rows.saturating_sub(1) as usize);
+    }
+
+    fn index(&self, row: usize, col: usize) -> usize {
+        row * self.cols as usize + col
+    }
+}
+
+fn parse_csi_params(params: &str) -> Vec<Option<u16>> {
+    if params.is_empty() {
+        return Vec::new();
+    }
+    params
+        .split(';')
+        .map(|part| {
+            if part.is_empty() {
+                None
+            } else {
+                part.parse::<u16>().ok()
+            }
+        })
+        .collect()
+}
+
+fn first_param(params: &[Option<u16>], default: u16) -> u16 {
+    params.first().copied().flatten().unwrap_or(default)
+}
+
+fn nth_param(params: &[Option<u16>], index: usize, default: u16) -> u16 {
+    params.get(index).copied().flatten().unwrap_or(default)
+}
+
+fn parse_extended_color(params: &[Option<u16>], start: usize) -> Option<(Color, usize)> {
+    match params.get(start).copied().flatten()? {
+        5 => {
+            let value = params.get(start + 1).copied().flatten()?;
+            Some((ansi_256_color(value), 2))
+        }
+        2 => {
+            let r = params.get(start + 1).copied().flatten()?;
+            let g = params.get(start + 2).copied().flatten()?;
+            let b = params.get(start + 3).copied().flatten()?;
+            Some((Color::Rgb(r as u8, g as u8, b as u8), 4))
+        }
+        _ => None,
+    }
+}
+
+fn ansi_color(index: u16, bright: bool) -> Color {
+    match (index, bright) {
+        (0, false) => Color::Black,
+        (1, false) => Color::Red,
+        (2, false) => Color::Green,
+        (3, false) => Color::Yellow,
+        (4, false) => Color::Blue,
+        (5, false) => Color::Magenta,
+        (6, false) => Color::Cyan,
+        (7, false) => Color::Gray,
+        (0, true) => Color::DarkGray,
+        (1, true) => Color::LightRed,
+        (2, true) => Color::LightGreen,
+        (3, true) => Color::LightYellow,
+        (4, true) => Color::LightBlue,
+        (5, true) => Color::LightMagenta,
+        (6, true) => Color::LightCyan,
+        _ => Color::White,
+    }
+}
+
+fn ansi_256_color(index: u16) -> Color {
+    match index {
+        0..=15 => ansi_color(index % 8, index >= 8),
+        16..=231 => {
+            let value = index - 16;
+            let r = value / 36;
+            let g = (value / 6) % 6;
+            let b = value % 6;
+            let convert = |component: u16| -> u8 {
+                if component == 0 {
+                    0
+                } else {
+                    (component * 40 + 55) as u8
+                }
+            };
+            Color::Rgb(convert(r), convert(g), convert(b))
+        }
+        232..=255 => {
+            let shade = ((index - 232) * 10 + 8) as u8;
+            Color::Rgb(shade, shade, shade)
+        }
+        _ => Color::White,
+    }
+}
+
+fn terminal_style(cell: TerminalCellStyle) -> Style {
+    let mut style = Style::default();
+    let (fg, bg) = if cell.reversed {
+        (cell.bg, cell.fg)
+    } else {
+        (cell.fg, cell.bg)
+    };
+    if let Some(fg) = fg {
+        style = style.fg(fg);
+    }
+    if let Some(bg) = bg {
+        style = style.bg(bg);
+    }
+    if cell.bold {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if cell.underlined {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    style
+}
+
 struct SidebarCard {
     icon: &'static str,
     icon_color: Color,
@@ -1230,7 +1835,7 @@ impl SidebarCard {
         Self {
             icon: session_icon(session),
             icon_color: session_icon_color(session),
-            title: session.task.clone(),
+            title: session.title.clone(),
             repo_name: session.repo_name.clone(),
             branch: session.branch.clone(),
             status_text: session_status_text(session),
@@ -1253,7 +1858,7 @@ fn palette_items() -> Vec<PaletteItem> {
         PaletteItem { key_hint: "a", title: "Next Attention", command: Command::NextAttention },
         PaletteItem { key_hint: "c", title: "Focus Coordinator", command: Command::FocusCoordinator },
         PaletteItem { key_hint: "s", title: "Session Switcher", command: Command::SessionSwitcher },
-        PaletteItem { key_hint: "t", title: "New Task", command: Command::NewTask },
+        PaletteItem { key_hint: "t", title: "New Session", command: Command::NewSession },
         PaletteItem { key_hint: "N", title: "New Agent", command: Command::NewAgent },
         PaletteItem { key_hint: "w", title: "Worktree Actions", command: Command::WorktreeActions },
         PaletteItem { key_hint: "g", title: "Git Status", command: Command::GitStatus },
@@ -1348,58 +1953,8 @@ fn matches_query<T: AsRef<str>>(haystack: T, query: &str) -> bool {
 fn session_switcher_text(session: &SessionRecord) -> String {
     format!(
         "{} {} {} {} {}",
-        session.session_id, session.task, session.repo_name, session.branch, session.status_string()
+        session.session_id, session.title, session.repo_name, session.branch, session.status_string()
     )
-}
-
-fn sanitize_terminal_bytes(bytes: &[u8]) -> String {
-    sanitize_terminal_text(&String::from_utf8_lossy(bytes))
-}
-
-fn sanitize_terminal_text(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\u{1b}' => {
-                match chars.peek().copied() {
-                    Some('[') => {
-                        chars.next();
-                        for next in chars.by_ref() {
-                            if ('@'..='~').contains(&next) {
-                                break;
-                            }
-                        }
-                    }
-                    Some(']') => {
-                        chars.next();
-                        let mut prev = '\0';
-                        for next in chars.by_ref() {
-                            if next == '\u{7}' || (prev == '\u{1b}' && next == '\\') {
-                                break;
-                            }
-                            prev = next;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            '\r' => {
-                if chars.peek() != Some(&'\n') {
-                    output.push('\n');
-                }
-            }
-            ch if ch == '\n' || ch == '\t' => output.push(ch),
-            ch if ch.is_control() => {}
-            ch => output.push(ch),
-        }
-    }
-
-    if output.len() > MAX_PTY_CHARS {
-        output = output[output.len() - MAX_PTY_CHARS..].to_string();
-    }
-    output
 }
 
 fn status_label(status: SessionStatus) -> &'static str {
@@ -1416,7 +1971,7 @@ fn status_label(status: SessionStatus) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{matches_query, sanitize_terminal_text, session_icon, session_rank, session_status_text};
+    use super::{TerminalSurface, matches_query, session_icon, session_rank, session_status_text};
     use agentd_shared::session::{AttentionLevel, GitSyncStatus, IntegrationState, SessionMode, SessionRecord, SessionStatus};
     use chrono::Utc;
 
@@ -1431,7 +1986,7 @@ mod tests {
             workspace: "/tmp/repo".to_string(),
             repo_path: "/tmp/repo".to_string(),
             repo_name: "repo".to_string(),
-            task: "demo".to_string(),
+            title: "demo".to_string(),
             base_branch: "main".to_string(),
             branch: "agent/demo".to_string(),
             worktree: "/tmp/worktree".to_string(),
@@ -1469,8 +2024,11 @@ mod tests {
     }
 
     #[test]
-    fn ansi_sequences_are_stripped_from_terminal_text() {
-        assert_eq!(sanitize_terminal_text("\u{1b}[31mhello\u{1b}[0m"), "hello");
+    fn terminal_surface_applies_basic_ansi_sequences() {
+        let mut surface = TerminalSurface::new(10, 2);
+        surface.process(b"\x1b[31mhello\x1b[0m");
+        let rendered = surface.render_lines(false);
+        assert_eq!(rendered[0].spans[0].content, "hello");
     }
 
     #[test]

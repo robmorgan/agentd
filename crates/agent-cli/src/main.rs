@@ -82,7 +82,7 @@ enum Command {
         session_id: Option<String>,
     },
     New {
-        task: Option<String>,
+        title: Option<String>,
         #[arg(long)]
         workspace: Option<PathBuf>,
         #[arg(long)]
@@ -92,7 +92,7 @@ enum Command {
         #[arg(long)]
         workspace: PathBuf,
         #[arg(long)]
-        task: String,
+        title: Option<String>,
         #[arg(long)]
         agent: String,
     },
@@ -199,21 +199,20 @@ async fn main() -> Result<()> {
         }
         (
             Command::New {
-                task,
+                title,
                 workspace,
                 agent,
             },
             ExecutionMode::Daemon,
         ) => {
-            let options = resolve_new_session_options(workspace, task, agent)?;
+            let options = resolve_new_session_options(workspace, title, agent)?;
             let response = send_request(
                 &paths,
                 &Request::CreateSession {
                     workspace: options.workspace.to_string_lossy().to_string(),
-                    task: options.task,
+                    title: options.title,
                     agent: options.agent,
                     model: None,
-                    mode: SessionMode::Execute,
                 },
             )
             .await?;
@@ -232,7 +231,7 @@ async fn main() -> Result<()> {
         (
             Command::Create {
                 workspace,
-                task,
+                title,
                 agent,
             },
             ExecutionMode::Daemon,
@@ -241,10 +240,9 @@ async fn main() -> Result<()> {
                 &paths,
                 &Request::CreateSession {
                     workspace: workspace.to_string_lossy().to_string(),
-                    task,
+                    title,
                     agent,
                     model: None,
-                    mode: SessionMode::Execute,
                 },
             )
             .await?;
@@ -485,7 +483,7 @@ enum ExecutionMode {
 
 struct NewSessionOptions {
     workspace: PathBuf,
-    task: String,
+    title: Option<String>,
     agent: String,
 }
 
@@ -561,7 +559,7 @@ fn bail_live_command(reason: &str) -> Result<()> {
 
 fn resolve_new_session_options(
     workspace: Option<PathBuf>,
-    task: Option<String>,
+    title: Option<String>,
     agent: Option<String>,
 ) -> Result<NewSessionOptions> {
     Ok(NewSessionOptions {
@@ -569,7 +567,7 @@ fn resolve_new_session_options(
             Some(workspace) => workspace,
             None => std::env::current_dir().context("failed to resolve current directory")?,
         },
-        task: task.unwrap_or_default(),
+        title: title.filter(|value| !value.trim().is_empty()),
         agent: agent.unwrap_or_else(|| "codex".to_string()),
     })
 }
@@ -1077,7 +1075,7 @@ fn print_session(session: &SessionRecord) {
     println!("repo_name: {}", session.repo_name);
     println!("repo_path: {}", session.repo_path);
     println!("workspace: {}", session.workspace);
-    println!("task: {}", session.task);
+    println!("title: {}", session.title);
     println!("base_branch: {}", session.base_branch);
     println!("branch: {}", session.branch);
     println!("worktree: {}", session.worktree);
@@ -3187,7 +3185,7 @@ fn render_focus_dashboard(
                 let summary = session
                     .attention_summary
                     .as_deref()
-                    .unwrap_or(session.task.as_str());
+                    .unwrap_or(session.title.as_str());
                 ListItem::new(vec![
                     Line::from(vec![
                         Span::styled(
@@ -3368,7 +3366,7 @@ fn render_focus_session(
         Span::styled(session.status_string(), muted_style()),
     ])];
     header_lines.push(Line::from(vec![
-        Span::styled(&session.task, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(&session.title, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(&session.branch, muted_style()),
         Span::raw("  "),
@@ -3808,10 +3806,9 @@ async fn retry_session(paths: &AppPaths, session: &SessionRecord) -> Result<Sess
         paths,
         &Request::CreateSession {
             workspace: session.workspace.clone(),
-            task: session.task.clone(),
+            title: Some(session.title.clone()),
             agent: session.agent.clone(),
             model: session.model.clone(),
-            mode: session.mode,
         },
     )
     .await?;
@@ -3825,19 +3822,19 @@ async fn retry_session(paths: &AppPaths, session: &SessionRecord) -> Result<Sess
 
 async fn create_dashboard_session(
     paths: &AppPaths,
-    task: &str,
+    title: &str,
     model: Option<&str>,
     mode: SessionMode,
 ) -> Result<SessionRecord> {
+    let _ = mode;
     let workspace = std::env::current_dir().context("failed to determine current directory")?;
     let response = send_request(
         paths,
         &Request::CreateSession {
             workspace: workspace.to_string_lossy().to_string(),
-            task: task.to_string(),
+            title: Some(title.to_string()),
             agent: "codex".to_string(),
             model: model.map(str::to_string),
-            mode,
         },
     )
     .await?;
@@ -3991,7 +3988,7 @@ fn render_session_picker(
                 session.status_string(),
                 session.branch
             )?;
-            writeln!(stdout, "  {}", session.task)?;
+            writeln!(stdout, "  {}", session.title)?;
         }
     }
 
@@ -4021,7 +4018,7 @@ fn filtered_sessions<'a>(
 fn session_search_text(session: &SessionRecord) -> String {
     format!(
         "{} {} {} {} {}",
-        session.session_id, session.agent, session.branch, session.task, session.workspace
+        session.session_id, session.agent, session.branch, session.title, session.workspace
     )
 }
 
@@ -4084,11 +4081,11 @@ mod tests {
         let cli = Cli::try_parse_from(["agent", "new", "fix failing tests"]).unwrap();
         match cli.command {
             Some(Command::New {
-                task,
+                title,
                 workspace,
                 agent,
             }) => {
-                assert_eq!(task.as_deref(), Some("fix failing tests"));
+                assert_eq!(title.as_deref(), Some("fix failing tests"));
                 assert!(workspace.is_none());
                 assert!(agent.is_none());
             }
@@ -4110,11 +4107,11 @@ mod tests {
         .unwrap();
         match cli.command {
             Some(Command::New {
-                task,
+                title,
                 workspace,
                 agent,
             }) => {
-                assert_eq!(task.as_deref(), Some("fix"));
+                assert_eq!(title.as_deref(), Some("fix"));
                 assert_eq!(workspace, Some(PathBuf::from("/tmp/repo")));
                 assert_eq!(agent.as_deref(), Some("claude"));
             }
@@ -4126,7 +4123,7 @@ mod tests {
     fn resolve_new_session_options_uses_defaults() {
         let options = resolve_new_session_options(None, None, None).unwrap();
         assert_eq!(options.workspace, std::env::current_dir().unwrap());
-        assert_eq!(options.task, "");
+        assert!(options.title.is_none());
         assert_eq!(options.agent, "codex");
     }
 
@@ -4139,7 +4136,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(options.workspace, PathBuf::from("/tmp/repo"));
-        assert_eq!(options.task, "fix tests");
+        assert_eq!(options.title.as_deref(), Some("fix tests"));
         assert_eq!(options.agent, "claude");
     }
 
@@ -4614,7 +4611,7 @@ mod tests {
             workspace: "/tmp/workspace".to_string(),
             repo_path: "/tmp/workspace".to_string(),
             repo_name: "workspace".to_string(),
-            task: "task".to_string(),
+            title: "task".to_string(),
             base_branch: "main".to_string(),
             branch: "agent/task".to_string(),
             worktree: "/tmp/worktree".to_string(),

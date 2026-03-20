@@ -58,7 +58,7 @@ pub struct SessionRecord {
     pub workspace: String,
     pub repo_path: String,
     pub repo_name: String,
-    pub task: String,
+    pub title: String,
     pub base_branch: String,
     pub branch: String,
     pub worktree: String,
@@ -115,11 +115,11 @@ pub struct PlanRecord {
     pub created_at: DateTime<Utc>,
 }
 
-pub fn branch_name_from_task(task: &str) -> String {
-    let slug = slugify(task);
+pub fn branch_name_from_title(title: &str) -> String {
+    let slug = slugify(title);
     let trimmed = slug.trim_matches('-');
     let branch = if trimmed.is_empty() {
-        "task".to_string()
+        "session".to_string()
     } else {
         trimmed.to_string()
     };
@@ -178,19 +178,19 @@ impl SessionMode {
 
 #[cfg(test)]
 mod tests {
-    use super::{branch_name_from_task, repo_name_from_path};
+    use super::{branch_name_from_title, repo_name_from_path};
 
     #[test]
     fn branch_names_are_slugified() {
         assert_eq!(
-            branch_name_from_task("fix failing tests"),
+            branch_name_from_title("fix failing tests"),
             "agent/fix-failing-tests"
         );
     }
 
     #[test]
-    fn empty_tasks_fall_back_to_task() {
-        assert_eq!(branch_name_from_task("!!!"), "agent/task");
+    fn empty_titles_fall_back_to_session() {
+        assert_eq!(branch_name_from_title("!!!"), "agent/session");
     }
 
     #[test]

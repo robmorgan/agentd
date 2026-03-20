@@ -28,7 +28,7 @@ use agentd_shared::{
     request_input::PendingUserInputRequest,
     session::{
         AttentionLevel, CreateSessionResult, IntegrationState, SessionDiff, SessionMode,
-        SessionRecord, SessionStatus, WorktreeRecord, branch_name_from_task, repo_name_from_path,
+        SessionRecord, SessionStatus, WorktreeRecord, branch_name_from_title, repo_name_from_path,
     },
 };
 
@@ -62,10 +62,9 @@ impl AppState {
     pub async fn create_session(
         &self,
         workspace: String,
-        task_text: String,
+        title: Option<String>,
         agent_name: String,
         model: Option<String>,
-        mode: SessionMode,
     ) -> Result<CreateSessionResult> {
         let paths = self.paths.clone();
         let db = self.db.clone();
@@ -79,19 +78,17 @@ impl AppState {
             let agent = config.require_agent(&paths, &agent_name)?.clone();
             let agent_args_json =
                 serde_json::to_string(&agent.args).context("failed to serialize agent args")?;
-            let prompt_text = build_initial_prompt(&task_text, mode);
             let repo_name = repo_name_from_path(repo_root.as_str());
+            let mode = SessionMode::Execute;
 
             let session_id = unique_session_id(&db)?;
-            let thread_id = (agent_name == "codex")
-                .then(|| unique_thread_id(&db))
-                .transpose()?;
             let worktree = paths.worktree_path(&session_id);
-            let branch = unique_branch_name(&repo_root, &task_text, &session_id)?;
+            let title = normalize_session_title(title, &agent_name, &repo_name, &session_id);
+            let branch = unique_branch_name(&repo_root, &title, &session_id)?;
 
             db.insert_session(&NewSession {
                 session_id: &session_id,
-                thread_id: thread_id.as_deref(),
+                thread_id: None,
                 agent: &agent_name,
                 model: model.as_deref(),
                 mode,
@@ -101,34 +98,11 @@ impl AppState {
                 workspace: repo_root.as_str(),
                 repo_path: repo_root.as_str(),
                 repo_name: &repo_name,
-                task: &task_text,
+                title: &title,
                 base_branch: &base_branch,
                 branch: &branch,
                 worktree: worktree.as_str(),
             })?;
-            if let Some(thread_id) = &thread_id {
-                db.insert_thread(&NewThread {
-                    thread_id,
-                    session_id: &session_id,
-                    agent: &agent_name,
-                    title: &task_text,
-                    initial_prompt: &prompt_text,
-                })?;
-                let _ = db.append_events(
-                    &session_id,
-                    &[daemon_event(
-                        "THREAD_CREATED",
-                        serde_json::json!({
-                            "source": "daemon",
-                            "thread_id": thread_id,
-                            "session_id": &session_id,
-                            "agent": &agent_name,
-                            "title": &task_text,
-                            "session_mode": mode.as_str(),
-                        }),
-                    )],
-                );
-            }
 
             if let Err(err) = git::create_worktree(&repo_root, &base_branch, &branch, &worktree) {
                 let _ = record_session_failure(&db, &session_id, err.to_string());
@@ -162,21 +136,19 @@ impl AppState {
             if let Err(err) = start_session_runtime(
                 &paths,
                 &db,
+                &config,
                 &runtimes,
                 SessionStartRequest {
                     session_id: &session_id,
                     repo_root: repo_root.as_str(),
                     worktree: worktree.as_str(),
                     branch: &branch,
-                    task_text: &task_text,
-                    prompt_text: &prompt_text,
+                    title: &title,
                     log_path: &log_path,
                     launch: &launch,
                     model: model.as_deref(),
                     session_mode: mode,
-                    thread_id: thread_id.as_deref(),
                     resume_session_id: None,
-                    resume_prompt: None,
                     mode: SessionStartMode::Create,
                 },
             ) {
@@ -251,6 +223,7 @@ impl AppState {
 
     pub async fn resume_paused_sessions(&self) -> Result<()> {
         let sessions = self.list_sessions().await?;
+        let config = self.config.clone();
         for session in sessions {
             if session.status != SessionStatus::Paused {
                 continue;
@@ -274,51 +247,27 @@ impl AppState {
             let repo_path = session.repo_path.clone();
             let worktree = session.worktree.clone();
             let branch = session.branch.clone();
-            let task_text = session.task.clone();
-            let thread_id = session.thread_id.clone();
+            let title = session.title.clone();
             let log_path = self.paths.log_path(&session.session_id);
-            let resume_session_id = match self.resolve_resume_session_id(&session, &launch).await {
-                Ok(Some(resume_session_id)) => resume_session_id,
-                Ok(None) => {
-                    let error = format!(
-                        "session `{}` does not have an exact Codex resume id",
-                        session.session_id
-                    );
-                    let db = self.db.clone();
-                    let session_id = session.session_id.clone();
-                    task::spawn_blocking(move || record_session_failure(&db, &session_id, error))
-                        .await??;
-                    continue;
-                }
-                Err(err) => {
-                    let error = err.to_string();
-                    let db = self.db.clone();
-                    let session_id = session.session_id.clone();
-                    task::spawn_blocking(move || record_session_failure(&db, &session_id, error))
-                        .await??;
-                    continue;
-                }
-            };
+            let config = config.clone();
 
             let result = task::spawn_blocking(move || {
                 start_session_runtime(
                     &paths,
                     &db,
+                    &config,
                     &runtimes,
                     SessionStartRequest {
                         session_id: &session_id,
                         repo_root: &repo_path,
                         worktree: &worktree,
                         branch: &branch,
-                        task_text: &task_text,
-                        prompt_text: &task_text,
+                        title: &title,
                         log_path: &log_path,
                         launch: &launch,
                         model: session.model.as_deref(),
                         session_mode: session.mode,
-                        thread_id: thread_id.as_deref(),
-                        resume_session_id: Some(&resume_session_id),
-                        resume_prompt: None,
+                        resume_session_id: None,
                         mode: SessionStartMode::Resume,
                     },
                 )
@@ -517,7 +466,7 @@ impl AppState {
             git::apply_patch(&repo_root, &worktree_patch)?;
             git::commit_all(
                 &repo_root,
-                &format!("{} ({})", session.task, session.session_id),
+                &format!("{} ({})", session.title, session.session_id),
             )?;
 
             db.set_integration_state(
@@ -651,120 +600,15 @@ impl AppState {
         .await?
     }
 
-    pub async fn reply_to_session(&self, session_id: &str, prompt: String) -> Result<SessionRecord> {
-        let session = self
-            .get_session(session_id)
-            .await?
-            .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
-
-        match session.status {
-            SessionStatus::Running => {
-                let mut data = prompt.into_bytes();
-                data.push(b'\n');
-                self.send_input(session_id, data, None).await?;
-            }
-            SessionStatus::NeedsInput if self.runtimes.get(&session.session_id).is_some() => {
-                let runtime = self
-                    .runtimes
-                    .get(&session.session_id)
-                    .ok_or_else(|| anyhow!("session `{session_id}` does not have a live PTY"))?;
-                let mut data = prompt.clone().into_bytes();
-                data.push(b'\n');
-                runtime.write_input(&data)?;
-
-                let db = self.db.clone();
-                let session_id = session.session_id.clone();
-                let prompt_preview = preview_text(&prompt, 160);
-                let pid = session.pid.unwrap_or(0);
-                task::spawn_blocking(move || {
-                    db.append_events(
-                        &session_id,
-                        &[daemon_event(
-                            "SESSION_REPLY_REQUESTED",
-                            serde_json::json!({
-                                "source": "daemon",
-                                "prompt": prompt,
-                                "prompt_preview": prompt_preview,
-                            }),
-                        )],
-                    )?;
-                    db.mark_running(&session_id, pid)?;
-                    Ok::<(), anyhow::Error>(())
-                })
-                .await??;
-            }
-            SessionStatus::NeedsInput => {
-                let launch = self.resolve_launch_command(&session).await?;
-                let resume_session_id = self
-                    .resolve_resume_session_id(&session, &launch)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "session `{}` does not have an exact Codex resume id",
-                            session.session_id
-                        )
-                    })?;
-                let paths = self.paths.clone();
-                let db = self.db.clone();
-                let runtimes = self.runtimes.clone();
-                let session_id = session.session_id.clone();
-                let repo_path = session.repo_path.clone();
-                let worktree = session.worktree.clone();
-                let branch = session.branch.clone();
-                let task_text = session.task.clone();
-                let thread_id = session.thread_id.clone();
-                let model = session.model.clone();
-                let prompt_preview = preview_text(&prompt, 160);
-                let resume_prompt = prompt.clone();
-                let log_path = self.paths.log_path(&session.session_id);
-                task::spawn_blocking(move || {
-                    db.append_events(
-                        &session_id,
-                        &[daemon_event(
-                            "SESSION_REPLY_REQUESTED",
-                            serde_json::json!({
-                                "source": "daemon",
-                                "prompt": prompt,
-                                "prompt_preview": prompt_preview,
-                            }),
-                        )],
-                    )?;
-                    start_session_runtime(
-                        &paths,
-                        &db,
-                        &runtimes,
-                        SessionStartRequest {
-                            session_id: &session_id,
-                            repo_root: &repo_path,
-                            worktree: &worktree,
-                            branch: &branch,
-                            task_text: &task_text,
-                            prompt_text: &task_text,
-                            log_path: &log_path,
-                            launch: &launch,
-                            model: model.as_deref(),
-                            session_mode: session.mode,
-                            thread_id: thread_id.as_deref(),
-                            resume_session_id: Some(&resume_session_id),
-                            resume_prompt: Some(&resume_prompt),
-                            mode: SessionStartMode::Resume,
-                        },
-                    )
-                })
-                .await??;
-            }
-            SessionStatus::Creating
-            | SessionStatus::Paused
-            | SessionStatus::Exited
-            | SessionStatus::Failed
-            | SessionStatus::UnknownRecovered => {
-                bail!("session `{}` is not accepting replies", session.session_id);
-            }
-        }
-
-        self.get_session(session_id)
-            .await?
-            .ok_or_else(|| anyhow!("session `{session_id}` not found after reply"))
+    pub async fn reply_to_session(
+        &self,
+        session_id: &str,
+        _prompt: String,
+    ) -> Result<SessionRecord> {
+        bail!(
+            "session `{}` does not support structured replies; send input directly to the interactive PTY",
+            session_id
+        )
     }
 
     pub async fn send_input(
@@ -929,15 +773,12 @@ struct SessionStartRequest<'a> {
     repo_root: &'a str,
     worktree: &'a str,
     branch: &'a str,
-    task_text: &'a str,
-    prompt_text: &'a str,
+    title: &'a str,
     log_path: &'a Utf8PathBuf,
     launch: &'a LaunchCommand,
     model: Option<&'a str>,
     session_mode: SessionMode,
-    thread_id: Option<&'a str>,
     resume_session_id: Option<&'a str>,
-    resume_prompt: Option<&'a str>,
     mode: SessionStartMode,
 }
 
@@ -993,15 +834,11 @@ fn prepare_log_file(log_path: &Utf8PathBuf, mode: SessionStartMode) -> Result<()
 fn start_session_runtime(
     paths: &AppPaths,
     db: &Database,
+    config: &Config,
     runtimes: &SessionRuntimeRegistry,
     request: SessionStartRequest<'_>,
 ) -> Result<()> {
     prepare_log_file(request.log_path, request.mode)?;
-    let use_codex_json = request.launch.agent_name == "codex" && request.thread_id.is_some();
-    let rendered_log_path = paths.rendered_log_path(request.session_id);
-    if use_codex_json {
-        prepare_log_file(&rendered_log_path, request.mode)?;
-    }
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -1014,7 +851,7 @@ fn start_session_runtime(
         .context("failed to allocate PTY")?;
 
     let mut command = CommandBuilder::new(&request.launch.command);
-    configure_spawn_command(&mut command, &request)?;
+    configure_spawn_command(&mut command, &request, config)?;
     command.cwd(request.worktree);
     for (key, value) in std::env::vars() {
         command.env(&key, &value);
@@ -1024,7 +861,7 @@ fn start_session_runtime(
     command.env("AGENTD_WORKSPACE", request.repo_root);
     command.env("AGENTD_WORKTREE", request.worktree);
     command.env("AGENTD_BRANCH", request.branch);
-    command.env("AGENTD_TASK", request.task_text);
+    command.env("AGENTD_TITLE", request.title);
 
     let mut child = pair
         .slave
@@ -1046,7 +883,6 @@ fn start_session_runtime(
                 "pid": pid,
                 "agent": request.launch.agent_name,
                 "session_mode": request.session_mode.as_str(),
-                "thread_id": request.thread_id,
                 "branch": request.branch,
                 "worktree": request.worktree,
                 "resume_session_id": request.resume_session_id
@@ -1077,29 +913,10 @@ fn start_session_runtime(
     let writer_db = db.clone();
     let writer_session_id = request.session_id.to_string();
     let writer_log_path = request.log_path.clone();
-    let writer_rendered_log_path = rendered_log_path.clone();
-    let writer_thread_id = if use_codex_json {
-        request.thread_id.map(|value| value.to_string())
-    } else {
-        None
-    };
     let writer_runtime = runtime.clone();
     let (writer_done_tx, writer_done_rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = if let Some(thread_id) = writer_thread_id {
-            pump_codex_json_to_logs(
-                reader,
-                &writer_log_path,
-                &writer_rendered_log_path,
-                &writer_runtime,
-                &writer_db,
-                &writer_session_id,
-                &thread_id,
-                request.session_mode == SessionMode::Plan,
-            )
-        } else {
-            pump_pty_to_log(reader, &writer_log_path, &writer_runtime)
-        };
+        let result = pump_pty_to_log(reader, &writer_log_path, &writer_runtime);
         if let Err(err) = result {
             let _ = record_session_failure(&writer_db, &writer_session_id, err.to_string());
         }
@@ -1360,80 +1177,41 @@ fn finalize_session_exit(
         return Ok(());
     }
 
-    let outcome = classify_session_outcome(db, &session, exit_code)?;
     let has_changes = session_has_pending_changes(&session)?;
-    let latest_plan = if session.mode == SessionMode::Plan {
-        db.latest_plan(session_id)?
-    } else {
-        None
-    };
-    match &outcome {
-        SessionOutcome::Finished => {
-            db.mark_exited(session_id, exit_code)?;
-            if has_changes {
-                db.set_integration_state(
-                    session_id,
-                    IntegrationState::PendingReview,
-                    AttentionLevel::Notice,
-                    "changes ready to apply",
-                )?;
-                db.append_events(
-                    session_id,
-                    &[daemon_event(
-                        "SESSION_PENDING_REVIEW",
-                        serde_json::json!({
-                            "source": "daemon",
-                            "repo_path": session.repo_path,
-                            "base_branch": session.base_branch,
-                            "branch": session.branch,
-                            "worktree": session.worktree,
-                        }),
-                    )],
-                )?;
-            } else if session.mode == SessionMode::Plan && latest_plan.is_none() {
-                db.set_integration_state(
-                    session_id,
-                    IntegrationState::Clean,
-                    AttentionLevel::Action,
-                    "planning finished without a final plan",
-                )?;
-                db.append_events(
-                    session_id,
-                    &[daemon_event(
-                        "SESSION_PLAN_MISSING",
-                        serde_json::json!({
-                            "source": "daemon",
-                            "reason": "missing_proposed_plan_block",
-                            "exit_code": exit_code,
-                        }),
-                    )],
-                )?;
-            }
-        }
-        SessionOutcome::NeedsInputText { question } => {
-            let question_preview = preview_text(&question, 240);
-            db.mark_needs_input(session_id, exit_code, question_preview.clone())?;
+    let outcome = if exit_code == Some(0) {
+        db.mark_exited(session_id, exit_code)?;
+        if has_changes {
+            db.set_integration_state(
+                session_id,
+                IntegrationState::PendingReview,
+                AttentionLevel::Notice,
+                "changes ready to review",
+            )?;
             db.append_events(
                 session_id,
                 &[daemon_event(
-                    "SESSION_NEEDS_INPUT",
+                    "SESSION_PENDING_REVIEW",
                     serde_json::json!({
                         "source": "daemon",
-                        "reason": "clarification_only_noop",
-                        "question": question,
-                        "question_preview": question_preview,
-                        "exit_code": exit_code,
-                        "has_tool_use": false,
-                        "has_worktree_changes": false,
+                        "repo_path": session.repo_path,
+                        "base_branch": session.base_branch,
+                        "branch": session.branch,
+                        "worktree": session.worktree,
                     }),
                 )],
             )?;
+            "pending_review"
+        } else {
+            "complete"
         }
-        SessionOutcome::NeedsInputRequest { request } => {
-            let summary = preview_text(&request.summary(), 240);
-            db.mark_needs_input(session_id, exit_code, summary)?;
-        }
-    }
+    } else {
+        let error = match exit_code {
+            Some(code) => format!("agent exited with code {code}"),
+            None => "agent exited unexpectedly".to_string(),
+        };
+        db.mark_failed(session_id, error)?;
+        "failed"
+    };
 
     db.append_events(
         session_id,
@@ -1451,7 +1229,7 @@ fn finalize_session_exit(
                     SessionStartMode::Create => "create",
                     SessionStartMode::Resume => "resume",
                 },
-                "outcome": outcome.as_str(),
+                "outcome": outcome,
             }),
         )],
     )?;
@@ -1707,12 +1485,30 @@ fn summarize_plan(body_markdown: &str) -> String {
     "plan ready".to_string()
 }
 
+fn normalize_session_title(
+    title: Option<String>,
+    agent_name: &str,
+    repo_name: &str,
+    session_id: &str,
+) -> String {
+    let trimmed = title.as_deref().map(str::trim).unwrap_or_default();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+
+    let short_id = session_id
+        .split('-')
+        .next_back()
+        .unwrap_or(session_id);
+    format!("{agent_name} @ {repo_name} ({short_id})")
+}
+
 fn unique_branch_name(
     repo_root: &camino::Utf8Path,
-    task_text: &str,
+    title: &str,
     session_id: &str,
 ) -> Result<String> {
-    let base = branch_name_from_task(task_text);
+    let base = branch_name_from_title(title);
     if !git::branch_exists(repo_root, &base)? {
         return Ok(base);
     }
@@ -1728,54 +1524,25 @@ fn unique_branch_name(
 fn configure_spawn_command(
     command: &mut CommandBuilder,
     request: &SessionStartRequest<'_>,
+    config: &Config,
 ) -> Result<()> {
     command.args(request.launch.args.clone());
     if let Some(model) = request.model {
-        command.arg("--model");
-        command.arg(model);
-    }
-    if request.launch.agent_name == "codex" && request.thread_id.is_some() {
-        command.arg("exec");
-        match request.mode {
-            SessionStartMode::Create => {
-                command.arg("--json");
-                if !request.prompt_text.is_empty() {
-                    command.arg(request.prompt_text);
-                }
-            }
-            SessionStartMode::Resume => {
-                let resume_session_id = request.resume_session_id.ok_or_else(|| {
-                    anyhow!(
-                        "session `{}` does not have an exact Codex resume id",
-                        request.session_id
-                    )
-                })?;
-                command.arg("resume");
-                command.arg("--json");
-                command.arg(resume_session_id);
-                if let Some(prompt) = request.resume_prompt.filter(|value| !value.is_empty()) {
-                    command.arg(prompt);
-                }
-            }
+        if let Some(flag) = config
+            .agents
+            .get(&request.launch.agent_name)
+            .and_then(|agent| agent.model_flag.as_deref())
+        {
+            command.arg(flag);
+            command.arg(model);
         }
-        return Ok(());
     }
 
-    if request.mode == SessionStartMode::Resume {
-        if !is_resumable_command(&request.launch.command) {
-            bail!(
-                "agent `{}` does not support resume-based upgrades",
-                request.launch.agent_name
-            );
-        }
-        let resume_session_id = request.resume_session_id.ok_or_else(|| {
-            anyhow!(
-                "session `{}` does not have an exact Codex resume id",
-                request.session_id
-            )
-        })?;
-        command.arg("resume");
-        command.arg(resume_session_id);
+    if request.mode == SessionStartMode::Resume && request.resume_session_id.is_some() {
+        bail!(
+            "resume-based interactive sessions are no longer supported for `{}`",
+            request.launch.agent_name
+        );
     }
     Ok(())
 }
@@ -2266,7 +2033,7 @@ mod tests {
             workspace: repo.as_str(),
             repo_path: repo.as_str(),
             repo_name: "repo",
-            task: "clarify",
+            title: "clarify",
             base_branch: "main",
             branch: "agent/clarify",
             worktree: repo.as_str(),
@@ -2325,7 +2092,7 @@ mod tests {
             workspace: repo.as_str(),
             repo_path: repo.as_str(),
             repo_name: "repo",
-            task: "plan",
+            title: "plan",
             base_branch: "main",
             branch: "agent/plan",
             worktree: repo.as_str(),
@@ -2400,7 +2167,7 @@ mod tests {
             workspace: repo.as_str(),
             repo_path: repo.as_str(),
             repo_name: "repo",
-            task: "plan",
+            title: "plan",
             base_branch: "main",
             branch: "agent/plan",
             worktree: repo.as_str(),
@@ -2446,7 +2213,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_session_exit_keeps_full_question_in_event_payload() {
+    fn finalize_session_exit_ignores_structured_questions_in_interactive_mode() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
         let db = Database::open(&paths).unwrap();
@@ -2465,7 +2232,7 @@ mod tests {
             workspace: repo.as_str(),
             repo_path: repo.as_str(),
             repo_name: "repo",
-            task: "clarify",
+            title: "clarify",
             base_branch: "main",
             branch: "agent/clarify",
             worktree: repo.as_str(),
@@ -2500,29 +2267,15 @@ mod tests {
         finalize_session_exit(&db, "demo", Some(0), SessionStartMode::Create).unwrap();
 
         let session = db.get_session("demo").unwrap().unwrap();
-        assert!(session.attention_summary.as_ref().is_some_and(|summary| summary.len() < 320));
+        assert_eq!(session.status, agentd_shared::session::SessionStatus::Exited);
+        assert_eq!(
+            session.integration_state,
+            agentd_shared::session::IntegrationState::Clean
+        );
 
         let events = db.list_events_since("demo", None).unwrap();
-        let needs_input = events
+        assert!(events
             .iter()
-            .find(|event| event.event_type == "SESSION_NEEDS_INPUT")
-            .unwrap();
-        assert_eq!(
-            needs_input
-                .payload_json
-                .get("question")
-                .and_then(|value| value.as_str())
-                .unwrap(),
-            format!("What {}?", "a".repeat(315))
-        );
-        assert!(
-            needs_input
-                .payload_json
-                .get("question_preview")
-                .and_then(|value| value.as_str())
-                .unwrap()
-                .len()
-                < 321
-        );
+            .all(|event| event.event_type != "SESSION_NEEDS_INPUT"));
     }
 }

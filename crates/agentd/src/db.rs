@@ -29,7 +29,7 @@ pub struct NewSession<'a> {
     pub workspace: &'a str,
     pub repo_path: &'a str,
     pub repo_name: &'a str,
-    pub task: &'a str,
+    pub title: &'a str,
     pub base_branch: &'a str,
     pub branch: &'a str,
     pub worktree: &'a str,
@@ -89,6 +89,7 @@ impl Database {
                 workspace TEXT NOT NULL,
                 repo_path TEXT,
                 repo_name TEXT,
+                title TEXT,
                 task TEXT NOT NULL,
                 base_branch TEXT,
                 branch TEXT NOT NULL,
@@ -162,6 +163,7 @@ impl Database {
             "repo_name",
             "ALTER TABLE sessions ADD COLUMN repo_name TEXT",
         )?;
+        self.ensure_column(&conn, "title", "ALTER TABLE sessions ADD COLUMN title TEXT")?;
         self.ensure_column(
             &conn,
             "agent_command",
@@ -217,13 +219,14 @@ impl Database {
              SET mode = COALESCE(mode, 'execute'),
                  repo_path = COALESCE(repo_path, workspace),
                  repo_name = COALESCE(repo_name, repo_path, workspace),
+                 title = COALESCE(title, task, repo_name, workspace),
                  base_branch = COALESCE(base_branch, 'HEAD'),
                  integration_state = COALESCE(integration_state, 'clean'),
                  git_sync = COALESCE(git_sync, 'unknown'),
                  has_conflicts = COALESCE(has_conflicts, 0),
                  attention = COALESCE(attention, 'info'),
-                 attention_summary = COALESCE(attention_summary, task)
-             WHERE mode IS NULL OR repo_path IS NULL OR repo_name IS NULL OR base_branch IS NULL OR integration_state IS NULL OR git_sync IS NULL OR has_conflicts IS NULL OR attention IS NULL OR attention_summary IS NULL",
+                 attention_summary = COALESCE(attention_summary, title, task)
+             WHERE mode IS NULL OR repo_path IS NULL OR repo_name IS NULL OR title IS NULL OR base_branch IS NULL OR integration_state IS NULL OR git_sync IS NULL OR has_conflicts IS NULL OR attention IS NULL OR attention_summary IS NULL",
             [],
         )?;
         self.backfill_repo_names(&conn)?;
@@ -278,9 +281,9 @@ impl Database {
         conn.execute(
             "INSERT INTO sessions (
                 session_id, thread_id, agent, model, mode, agent_command, agent_args_json, resume_session_id, workspace,
-                repo_path, repo_name, task, base_branch, branch, worktree, status, attention, attention_summary,
+                repo_path, repo_name, title, task, base_branch, branch, worktree, status, attention, attention_summary,
                 integration_state, git_sync, git_status_summary, has_conflicts, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?23)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?23)",
             params![
                 new_session.session_id,
                 new_session.thread_id,
@@ -293,13 +296,13 @@ impl Database {
                 new_session.workspace,
                 new_session.repo_path,
                 new_session.repo_name,
-                new_session.task,
+                new_session.title,
                 new_session.base_branch,
                 new_session.branch,
                 new_session.worktree,
                 status_to_str(SessionStatus::Creating),
                 attention_to_str(AttentionLevel::Info),
-                new_session.task,
+                new_session.title,
                 integration_state_to_str(IntegrationState::Clean),
                 git_sync_status_to_str(GitSyncStatus::Unknown),
                 Option::<String>::None,
@@ -542,8 +545,8 @@ impl Database {
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, task, base_branch, branch,
-                    repo_name, worktree, status, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
+            "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, repo_name, title, base_branch, branch,
+                    worktree, status, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
             params![session_id],
@@ -556,8 +559,8 @@ impl Database {
     pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, task, base_branch, branch,
-                    repo_name, worktree, status, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
+            "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, repo_name, title, base_branch, branch,
+                    worktree, status, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
         )?;
@@ -791,10 +794,10 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         })?,
         workspace: row.get(5)?,
         repo_path: row.get(6)?,
-        task: row.get(7)?,
-        base_branch: row.get(8)?,
-        branch: row.get(9)?,
-        repo_name: row.get(10)?,
+        repo_name: row.get(7)?,
+        title: row.get(8)?,
+        base_branch: row.get(9)?,
+        branch: row.get(10)?,
         worktree: row.get(11)?,
         status: str_to_status(&row.get::<_, String>(12)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
@@ -1046,7 +1049,7 @@ mod tests {
             workspace: "/tmp/repo",
             repo_path: "/tmp/repo",
             repo_name: "repo",
-            task: "test",
+            title: "test",
             base_branch: "main",
             branch: "agent/test",
             worktree: "/tmp/worktree",
@@ -1095,7 +1098,7 @@ mod tests {
             workspace: "/tmp/repo",
             repo_path: "/tmp/repo",
             repo_name: "repo",
-            task: "test",
+            title: "test",
             base_branch: "main",
             branch: "agent/test",
             worktree: "/tmp/worktree",
@@ -1132,7 +1135,7 @@ mod tests {
             workspace: "/tmp/repo",
             repo_path: "/tmp/repo",
             repo_name: "repo",
-            task: "test",
+            title: "test",
             base_branch: "main",
             branch: "agent/test",
             worktree: "/tmp/worktree",
@@ -1164,7 +1167,7 @@ mod tests {
             workspace: "/tmp/repo",
             repo_path: "/tmp/repo",
             repo_name: "repo",
-            task: "test",
+            title: "test",
             base_branch: "main",
             branch: "agent/test",
             worktree: "/tmp/worktree",
@@ -1201,7 +1204,7 @@ mod tests {
             workspace: "/tmp/repo",
             repo_path: "/tmp/repo",
             repo_name: "repo",
-            task: "test",
+            title: "test",
             base_branch: "main",
             branch: "agent/test",
             worktree: "/tmp/worktree",
@@ -1245,7 +1248,7 @@ mod tests {
             workspace: "/tmp/repo",
             repo_path: "/tmp/repo",
             repo_name: "repo",
-            task: "plan",
+            title: "plan",
             base_branch: "main",
             branch: "agent/plan",
             worktree: "/tmp/worktree",
