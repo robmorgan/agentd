@@ -578,6 +578,13 @@ impl SessionPicker {
             width,
             false,
         ));
+        if let Some(session) = self.session_by_id(session_id) {
+            lines.push(style_host_picker_menu_line(
+                &fit_host_picker_line(session.worktree.clone(), width),
+                width,
+                false,
+            ));
+        }
         for (index, action) in self.action_items(session_id).into_iter().enumerate() {
             let label = format!(
                 "{}{}. {}",
@@ -633,6 +640,13 @@ impl SessionPicker {
         selected: usize,
     ) -> Vec<String> {
         let mut lines = vec![style_host_picker_background_row(width)];
+        if let Some(session) = self.session_by_id(session_id) {
+            lines.push(style_host_picker_menu_line(
+                &fit_host_picker_line(session.worktree.clone(), width),
+                width,
+                false,
+            ));
+        }
         lines.push(style_host_picker_menu_line(
             &format!("Delete {session_id} and remove its worktree?"),
             width,
@@ -673,6 +687,13 @@ impl SessionPicker {
             width,
             false,
         ));
+        if let Some(session) = self.session_by_id(session_id) {
+            lines.push(style_host_picker_menu_line(
+                &fit_host_picker_line(session.worktree.clone(), width),
+                width,
+                false,
+            ));
+        }
         let max_lines = 12usize;
         let detail_lines = self.detail_text.lines().collect::<Vec<_>>();
         let start = self.detail_scroll.min(detail_lines.len().saturating_sub(1));
@@ -2140,6 +2161,7 @@ mod tests {
         assert!(!rendered.contains("title-beta"));
         assert!(rendered.contains("> 1. attach"));
         assert!(rendered.contains("  2. diff"));
+        assert!(rendered.contains("/tmp/alpha"));
     }
 
     #[test]
