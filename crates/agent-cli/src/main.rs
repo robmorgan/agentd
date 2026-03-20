@@ -2,7 +2,7 @@ use std::{
     fs,
     io::{IsTerminal, Write},
     mem::MaybeUninit,
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::PathBuf,
     process::Stdio,
     time::{Duration, Instant},
@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, Subcommand};
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{Event, EventStream, KeyCode, KeyModifiers},
     execute,
     style::{Attribute as CrosAttribute, Color as CrosColor, Stylize},
     terminal::{
@@ -20,16 +20,22 @@ use crossterm::{
     },
     event::{DisableMouseCapture, EnableMouseCapture},
 };
+use futures::StreamExt;
 use libc::{
-    _POSIX_VDISABLE, TCSAFLUSH, TCSANOW, VLNEXT, VMIN, VQUIT, VTIME, cfmakeraw, tcgetattr,
-    tcsetattr, termios,
+    _POSIX_VDISABLE, O_NONBLOCK, TCSAFLUSH, TCSANOW, VLNEXT, VMIN, VQUIT, VTIME, cfmakeraw,
+    fcntl, tcgetattr, tcsetattr, termios,
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
 };
-use tokio::{io::BufReader, net::UnixStream, sync::mpsc};
+use tokio::{
+    io::{BufReader, unix::AsyncFd},
+    net::UnixStream,
+    signal::unix::{SignalKind, signal},
+};
 
 mod local;
+mod runtime;
 mod tui;
 
 use agentd_shared::{
@@ -49,7 +55,7 @@ use agentd_shared::{
 use crate::local::{LocalStore, normalize_session, print_log_file, remove_session_artifacts};
 
 const AGENTD_ATTACH_RESTORE_SEQUENCE: &[u8] =
-    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[<u\x1b[?25h";
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[?25h";
 const AGENTD_ATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
 const CODEX_MODELS: &[&str] = &[
     "gpt-5.4",
@@ -70,6 +76,10 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Focus {
+        session_id: Option<String>,
+    },
+    #[command(hide = true)]
+    Runtime {
         session_id: Option<String>,
     },
     New {
@@ -190,10 +200,20 @@ async fn main() -> Result<()> {
 
     match (command, execution) {
         (Command::Focus { session_id }, ExecutionMode::Daemon) => {
-            tui::run_runtime_ui(&paths, session_id.as_deref()).await?;
+            if let Some(session_id) = session_id {
+                attach_session(&paths, &session_id).await?;
+            } else if let Some(session_id) = runtime::pick_session(&paths).await? {
+                attach_session(&paths, &session_id).await?;
+            }
         }
         (Command::Focus { .. }, ExecutionMode::Local(reason)) => {
             bail!("{reason}. `agent focus` requires a compatible daemon");
+        }
+        (Command::Runtime { session_id }, ExecutionMode::Daemon) => {
+            tui::run_runtime_ui(&paths, session_id.as_deref()).await?;
+        }
+        (Command::Runtime { .. }, ExecutionMode::Local(reason)) => {
+            bail!("{reason}. `agent runtime` requires a compatible daemon");
         }
         (
             Command::New {
@@ -969,7 +989,7 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
         bail!("agentd closed the connection");
     };
 
-    let (attach_id, snapshot) = match response {
+    let (attach_id, initial_snapshot) = match response {
         Response::Attached {
             attach_id,
             snapshot,
@@ -998,30 +1018,119 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
     };
 
     eprintln!("attached to {session_id} ({attach_id}); detach with Ctrl-]");
+    let _screen = AttachScreenGuard::enter()?;
     let _terminal = AttachTerminalGuard::enter()?;
-    write_attach_bytes(AGENTD_ATTACH_CLEAR_SEQUENCE)?;
-    write_attach_bytes(&snapshot)?;
-    let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel();
-
-    let stdin_task = tokio::task::spawn_blocking(move || read_attach_stdin(stdin_tx));
+    let raw_input = AttachRawInput::new()?;
+    let mut resize_signal =
+        signal(SignalKind::window_change()).context("failed to watch terminal resize")?;
+    if let Ok((cols, rows)) = crossterm::terminal::size() {
+        write_request(&mut write_half, &Request::AttachResize { cols, rows }).await?;
+    }
+    if let Ok(snapshot) = fetch_session_snapshot(paths, session_id).await {
+        write_session_snapshot(&snapshot)?;
+    } else {
+        write_session_snapshot(&initial_snapshot)?;
+    }
+    let mut input_parser = AttachInputParser::default();
+    let mut overlay = None::<runtime::AttachOverlay>;
+    let mut overlay_events = None::<EventStream>;
 
     loop {
         tokio::select! {
-            event = stdin_rx.recv() => match event {
-                Some(AttachInput::Data(data)) => {
-                    write_request(&mut write_half, &Request::AttachInput { data }).await?;
+            chunk = raw_input.read_chunk(), if overlay.is_none() => {
+                let Some(chunk) = chunk? else {
+                    break;
+                };
+                for action in input_parser.push_bytes(&chunk) {
+                    match action {
+                        AttachInputAction::Data(data) => {
+                            write_request(&mut write_half, &Request::AttachInput { data }).await?;
+                        }
+                        AttachInputAction::Detach => {
+                            drop(write_half);
+                            return Ok(AttachOutcome::Detached);
+                        }
+                        AttachInputAction::Leader(action) => {
+                            let mut active_overlay =
+                                runtime::AttachOverlay::new(paths.clone(), session_id.to_string());
+                            if let Some(outcome) = active_overlay.open_leader_action(action).await? {
+                                match outcome {
+                                    runtime::OverlayOutcome::Close => {
+                                        write_attach_bytes(AGENTD_ATTACH_CLEAR_SEQUENCE)?;
+                                        if let Ok(snapshot) = fetch_session_snapshot(paths, session_id).await {
+                                            write_attach_bytes(&snapshot)?;
+                                        }
+                                    }
+                                    runtime::OverlayOutcome::SwitchSession(next_session_id) => {
+                                        drop(write_half);
+                                        return Ok(AttachOutcome::SwitchSession(next_session_id));
+                                    }
+                                }
+                            } else {
+                                active_overlay.draw()?;
+                                overlay_events = Some(EventStream::new());
+                                overlay = Some(active_overlay);
+                            }
+                        }
+                    }
                 }
-                Some(AttachInput::Detach) | None => break,
-            },
+            }
+            resize = resize_signal.recv() => {
+                if resize.is_none() {
+                    break;
+                }
+                if let Ok((cols, rows)) = crossterm::terminal::size() {
+                    write_request(&mut write_half, &Request::AttachResize { cols, rows }).await?;
+                    if let Some(overlay) = overlay.as_ref() {
+                        overlay.draw()?;
+                    }
+                }
+            }
+            event = next_overlay_event(overlay_events.as_mut()), if overlay.is_some() => {
+                let Some(event) = event? else {
+                    overlay_events = None;
+                    overlay = None;
+                    write_attach_bytes(AGENTD_ATTACH_CLEAR_SEQUENCE)?;
+                    if let Ok(snapshot) = fetch_session_snapshot(paths, session_id).await {
+                        write_attach_bytes(&snapshot)?;
+                    }
+                    continue;
+                };
+                if let Some(active_overlay) = overlay.as_mut()
+                    && let Some(outcome) = active_overlay.handle_event(event).await?
+                {
+                    match outcome {
+                        runtime::OverlayOutcome::Close => {
+                            overlay_events = None;
+                            overlay = None;
+                            write_attach_bytes(AGENTD_ATTACH_CLEAR_SEQUENCE)?;
+                            if let Ok(snapshot) = fetch_session_snapshot(paths, session_id).await {
+                                write_attach_bytes(&snapshot)?;
+                            }
+                            continue;
+                        }
+                        runtime::OverlayOutcome::SwitchSession(next_session_id) => {
+                            drop(write_half);
+                            return Ok(AttachOutcome::SwitchSession(next_session_id));
+                        }
+                    }
+                }
+                if let Some(active_overlay) = overlay.as_ref() {
+                    active_overlay.draw()?;
+                }
+            }
             response = read_response(&mut reader) => {
                 let Some(response) = response? else {
                     break;
                 };
                 match response {
-                    Response::PtyOutput { data } => write_attach_bytes(&data)?,
+                    Response::PtyOutput { data } => {
+                        if overlay.is_none() {
+                            write_attach_bytes(&data)?;
+                        }
+                    }
                     Response::SwitchSession { session_id } => {
                         drop(write_half);
-                        stdin_task.abort();
                         return Ok(AttachOutcome::SwitchSession(session_id));
                     }
                     Response::SessionEnded {
@@ -1034,7 +1143,6 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
                         error,
                     } => {
                         drop(write_half);
-                        stdin_task.abort();
                         return Ok(AttachOutcome::SessionEnded(SessionEndSummary {
                             session_id,
                             status,
@@ -1054,8 +1162,50 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
     }
 
     drop(write_half);
-    stdin_task.abort();
     Ok(AttachOutcome::Detached)
+}
+
+async fn next_overlay_event(stream: Option<&mut EventStream>) -> Result<Option<Event>> {
+    let Some(stream) = stream else {
+        return Ok(None);
+    };
+    loop {
+        match stream.next().await {
+            Some(Ok(event @ Event::Key(_))) | Some(Ok(event @ Event::Paste(_))) => {
+                return Ok(Some(event));
+            }
+            Some(Ok(_)) => continue,
+            Some(Err(err)) => return Err(err).context("failed to read attach overlay input"),
+            None => return Ok(None),
+        }
+    }
+}
+
+async fn fetch_session_snapshot(paths: &AppPaths, session_id: &str) -> Result<Vec<u8>> {
+    let mut stream = try_connect(paths).await?;
+    write_request(
+        &mut stream,
+        &Request::AttachSession {
+            session_id: session_id.to_string(),
+            kind: AttachmentKind::Tui,
+        },
+    )
+    .await?;
+    let (read_half, _write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    let Some(response) = read_response(&mut reader).await? else {
+        bail!("agentd closed the snapshot connection");
+    };
+    match response {
+        Response::Attached { snapshot, .. } => Ok(snapshot),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected snapshot response: {:?}", other),
+    }
+}
+
+fn write_session_snapshot(snapshot: &[u8]) -> Result<()> {
+    write_attach_bytes(AGENTD_ATTACH_CLEAR_SEQUENCE)?;
+    write_attach_bytes(snapshot)
 }
 
 async fn try_connect(paths: &AppPaths) -> Result<UnixStream> {
@@ -1236,57 +1386,6 @@ fn print_kill_result(session_id: &str, was_running: bool, removed: bool) {
     }
 }
 
-fn read_attach_stdin(tx: mpsc::UnboundedSender<AttachInput>) -> Result<()> {
-    let mut parser = AttachKeyBindingParser;
-    loop {
-        let event = event::read().context("failed to read attach input")?;
-        let Some(input) = parser.parse_event(event) else {
-            continue;
-        };
-
-        match input {
-            AttachInput::Data(data) => {
-                if tx.send(AttachInput::Data(data)).is_err() {
-                    break;
-                }
-            }
-            AttachInput::Detach => {
-                let _ = tx.send(AttachInput::Detach);
-                break;
-            }
-        };
-    }
-    Ok(())
-}
-
-struct AttachKeyBindingParser;
-
-impl AttachKeyBindingParser {
-    fn parse_event(&mut self, event: Event) -> Option<AttachInput> {
-        match event {
-            Event::Key(key) => self.parse_key_event(key),
-            Event::Paste(data) => Some(AttachInput::Data(data.into_bytes())),
-            Event::FocusGained | Event::FocusLost | Event::Mouse(_) | Event::Resize(_, _) => None,
-        }
-    }
-
-    fn parse_key_event(&mut self, key: crossterm::event::KeyEvent) -> Option<AttachInput> {
-        if key.kind != KeyEventKind::Press {
-            return None;
-        }
-
-        if is_attach_detach_key(&key) {
-            return Some(AttachInput::Detach);
-        }
-
-        encode_attach_key(key).map(AttachInput::Data)
-    }
-}
-
-fn is_attach_detach_key(key: &crossterm::event::KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char(']'))
-}
-
 fn encode_attach_key(key: crossterm::event::KeyEvent) -> Option<Vec<u8>> {
     let mut bytes = match key.code {
         KeyCode::Backspace => vec![0x7f],
@@ -1345,9 +1444,130 @@ fn control_char_byte(ch: char) -> Option<u8> {
     }
 }
 
-enum AttachInput {
+const ATTACH_DETACH_BYTE: u8 = 0x1d;
+const ATTACH_LEADER_BYTE: u8 = 0x02;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttachInputAction {
     Data(Vec<u8>),
     Detach,
+    Leader(runtime::AttachLeaderAction),
+}
+
+#[derive(Default)]
+struct AttachInputParser {
+    leader_pending: bool,
+}
+
+impl AttachInputParser {
+    fn push_bytes(&mut self, bytes: &[u8]) -> Vec<AttachInputAction> {
+        let mut actions = Vec::new();
+        let mut forwarded = Vec::new();
+
+        for &byte in bytes {
+            if self.leader_pending {
+                self.leader_pending = false;
+                if let Some(action) = attach_leader_action(byte) {
+                    flush_attach_bytes(&mut actions, &mut forwarded);
+                    actions.push(action);
+                }
+                continue;
+            }
+
+            match byte {
+                ATTACH_LEADER_BYTE => {
+                    flush_attach_bytes(&mut actions, &mut forwarded);
+                    self.leader_pending = true;
+                }
+                ATTACH_DETACH_BYTE => {
+                    flush_attach_bytes(&mut actions, &mut forwarded);
+                    actions.push(AttachInputAction::Detach);
+                }
+                _ => forwarded.push(byte),
+            }
+        }
+
+        flush_attach_bytes(&mut actions, &mut forwarded);
+        actions
+    }
+}
+
+fn attach_leader_action(byte: u8) -> Option<AttachInputAction> {
+    Some(match byte {
+        ATTACH_LEADER_BYTE => AttachInputAction::Data(vec![ATTACH_LEADER_BYTE]),
+        b' ' => AttachInputAction::Leader(runtime::AttachLeaderAction::OpenPalette),
+        b's' => AttachInputAction::Leader(runtime::AttachLeaderAction::SessionSwitcher),
+        b't' => AttachInputAction::Leader(runtime::AttachLeaderAction::NewSession),
+        b'g' => AttachInputAction::Leader(runtime::AttachLeaderAction::SessionDetails),
+        b'd' => AttachInputAction::Leader(runtime::AttachLeaderAction::Diff),
+        b'x' => AttachInputAction::Leader(runtime::AttachLeaderAction::StopSession),
+        0x1b => return None,
+        _ => return None,
+    })
+}
+
+fn flush_attach_bytes(actions: &mut Vec<AttachInputAction>, forwarded: &mut Vec<u8>) {
+    if !forwarded.is_empty() {
+        actions.push(AttachInputAction::Data(std::mem::take(forwarded)));
+    }
+}
+
+struct AttachRawInput {
+    fd: AsyncFd<OwnedFd>,
+}
+
+impl AttachRawInput {
+    fn new() -> Result<Self> {
+        let duplicated = unsafe { libc::dup(std::io::stdin().as_raw_fd()) };
+        if duplicated < 0 {
+            return Err(std::io::Error::last_os_error()).context("failed to duplicate stdin");
+        }
+
+        let flags = unsafe { fcntl(duplicated, libc::F_GETFL) };
+        if flags < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(duplicated);
+            }
+            return Err(err).context("failed to read stdin flags");
+        }
+
+        if unsafe { fcntl(duplicated, libc::F_SETFL, flags | O_NONBLOCK) } < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(duplicated);
+            }
+            return Err(err).context("failed to set stdin nonblocking");
+        }
+
+        let fd = unsafe { OwnedFd::from_raw_fd(duplicated) };
+        Ok(Self {
+            fd: AsyncFd::new(fd).context("failed to register stdin for async reads")?,
+        })
+    }
+
+    async fn read_chunk(&self) -> Result<Option<Vec<u8>>> {
+        let mut buf = [0_u8; 4096];
+        loop {
+            let mut guard = self.fd.readable().await?;
+            match guard.try_io(|inner| {
+                match nix::unistd::read(inner.get_ref(), &mut buf) {
+                    Ok(0) => Ok(None),
+                    Ok(count) => Ok(Some(buf[..count].to_vec())),
+                    Err(err) => {
+                        if err == nix::errno::Errno::EAGAIN || err == nix::errno::Errno::EINTR {
+                            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                        } else {
+                            Err(std::io::Error::from_raw_os_error(err as i32))
+                        }
+                    }
+                }
+            }) {
+                Ok(result) => return result.context("failed to read attach input"),
+                Err(_) => continue,
+            }
+        }
+    }
 }
 
 enum AttachOutcome {
@@ -1484,6 +1704,22 @@ impl Drop for TerminalScreenGuard {
             DisableMouseCapture,
             LeaveAlternateScreen
         );
+    }
+}
+
+struct AttachScreenGuard;
+
+impl AttachScreenGuard {
+    fn enter() -> Result<Self> {
+        execute!(std::io::stdout(), EnterAlternateScreen, Hide)
+            .context("failed to enter attach screen")?;
+        Ok(Self)
+    }
+}
+
+impl Drop for AttachScreenGuard {
+    fn drop(&mut self) {
+        let _ = execute!(std::io::stdout(), Show, LeaveAlternateScreen);
     }
 }
 
@@ -1627,13 +1863,14 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENTD_ATTACH_RESTORE_SEQUENCE, AttachInput, AttachKeyBindingParser, Cli, Command,
-        DaemonCommand, SessionEndSummary, format_session_end_summary, render_diff_text,
-        resolve_detach_session_id, resolve_new_session_options, should_colorize_diff_output,
+        AGENTD_ATTACH_RESTORE_SEQUENCE, ATTACH_DETACH_BYTE, ATTACH_LEADER_BYTE,
+        AttachInputAction, AttachInputParser, Cli, Command, DaemonCommand, SessionEndSummary,
+        format_session_end_summary, render_diff_text, resolve_detach_session_id,
+        resolve_new_session_options, should_colorize_diff_output,
     };
+    use crate::runtime::AttachLeaderAction;
     use agentd_shared::session::{IntegrationState, SessionStatus};
     use clap::Parser;
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::{ffi::OsString, path::PathBuf};
 
     #[test]
@@ -1796,101 +2033,113 @@ mod tests {
     }
 
     #[test]
-    fn attach_parser_detaches_on_ctrl_right_bracket() {
-        let mut parser = AttachKeyBindingParser;
-        assert!(matches!(
-            parser.parse_event(Event::Key(key_event(
-                KeyCode::Char(']'),
-                KeyModifiers::CONTROL
-            ))),
-            Some(AttachInput::Detach)
-        ));
-    }
-
-    #[test]
-    fn attach_parser_emits_printable_bytes() {
-        let mut parser = AttachKeyBindingParser;
-        assert!(matches!(
-            parser.parse_event(Event::Key(key_event(KeyCode::Char('x'), KeyModifiers::NONE))),
-            Some(AttachInput::Data(data)) if data == b"x"
-        ));
-    }
-
-    #[test]
-    fn attach_parser_encodes_special_keys() {
-        let mut parser = AttachKeyBindingParser;
-        assert!(matches!(
-            parser.parse_event(Event::Key(key_event(KeyCode::Enter, KeyModifiers::NONE))),
-            Some(AttachInput::Data(data)) if data == b"\r"
-        ));
-        assert!(matches!(
-            parser.parse_event(Event::Key(key_event(KeyCode::Backspace, KeyModifiers::NONE))),
-            Some(AttachInput::Data(data)) if data == [0x7f]
-        ));
-        assert!(matches!(
-            parser.parse_event(Event::Key(key_event(KeyCode::Tab, KeyModifiers::NONE))),
-            Some(AttachInput::Data(data)) if data == b"\t"
-        ));
-        assert!(matches!(
-            parser.parse_event(Event::Key(key_event(KeyCode::Esc, KeyModifiers::NONE))),
-            Some(AttachInput::Data(data)) if data == [0x1b]
-        ));
-    }
-
-    #[test]
-    fn attach_parser_encodes_navigation_keys_as_ansi() {
-        let mut parser = AttachKeyBindingParser;
-        assert!(matches!(
-            parser.parse_event(Event::Key(key_event(KeyCode::Up, KeyModifiers::NONE))),
-            Some(AttachInput::Data(data)) if data == b"\x1b[A"
-        ));
-        assert!(matches!(
-            parser.parse_event(Event::Key(key_event(KeyCode::Left, KeyModifiers::NONE))),
-            Some(AttachInput::Data(data)) if data == b"\x1b[D"
-        ));
-    }
-
-    #[test]
-    fn attach_parser_forwards_paste_bytes() {
-        let mut parser = AttachKeyBindingParser;
-        assert!(matches!(
-            parser.parse_event(Event::Paste("hello".to_string())),
-            Some(AttachInput::Data(data)) if data == b"hello"
-        ));
-    }
-
-    #[test]
-    fn attach_parser_ignores_non_press_events() {
-        let mut parser = AttachKeyBindingParser;
-        assert!(
-            parser
-                .parse_event(Event::Key(KeyEvent {
-                    code: KeyCode::Char('x'),
-                    modifiers: KeyModifiers::NONE,
-                    kind: KeyEventKind::Release,
-                    state: KeyEventState::empty(),
-                }))
-                .is_none()
+    fn attach_parser_detaches_on_ctrl_right_bracket_byte() {
+        let mut parser = AttachInputParser::default();
+        assert_eq!(
+            parser.push_bytes(&[ATTACH_DETACH_BYTE]),
+            vec![AttachInputAction::Detach]
         );
     }
 
     #[test]
-    fn attach_parser_encodes_alt_modified_input() {
-        let mut parser = AttachKeyBindingParser;
-        assert!(matches!(
-            parser.parse_event(Event::Key(key_event(
-                KeyCode::Char('x'),
-                KeyModifiers::ALT
-            ))),
-            Some(AttachInput::Data(data)) if data == b"\x1bx"
-        ));
+    fn attach_parser_forwards_regular_bytes() {
+        let mut parser = AttachInputParser::default();
+        assert_eq!(
+            parser.push_bytes(b"hello"),
+            vec![AttachInputAction::Data(b"hello".to_vec())]
+        );
+    }
+
+    #[test]
+    fn attach_parser_preserves_mouse_and_scroll_sequences() {
+        let mut parser = AttachInputParser::default();
+        let mouse = b"\x1b[<64;10;5M";
+        assert_eq!(
+            parser.push_bytes(mouse),
+            vec![AttachInputAction::Data(mouse.to_vec())]
+        );
+    }
+
+    #[test]
+    fn attach_parser_treats_ctrl_b_as_leader_prefix() {
+        let mut parser = AttachInputParser::default();
+        assert!(parser.push_bytes(&[ATTACH_LEADER_BYTE]).is_empty());
+        assert_eq!(
+            parser.push_bytes(b" "),
+            vec![AttachInputAction::Leader(AttachLeaderAction::OpenPalette)]
+        );
+    }
+
+    #[test]
+    fn attach_parser_sends_literal_ctrl_b_on_double_prefix() {
+        let mut parser = AttachInputParser::default();
+        assert!(parser.push_bytes(&[ATTACH_LEADER_BYTE]).is_empty());
+        assert_eq!(
+            parser.push_bytes(&[ATTACH_LEADER_BYTE]),
+            vec![AttachInputAction::Data(vec![ATTACH_LEADER_BYTE])]
+        );
+    }
+
+    #[test]
+    fn attach_parser_maps_leader_commands() {
+        let mut parser = AttachInputParser::default();
+        parser.push_bytes(&[ATTACH_LEADER_BYTE]);
+        assert_eq!(
+            parser.push_bytes(b"s"),
+            vec![AttachInputAction::Leader(AttachLeaderAction::SessionSwitcher)]
+        );
+
+        parser.push_bytes(&[ATTACH_LEADER_BYTE]);
+        assert_eq!(
+            parser.push_bytes(b"t"),
+            vec![AttachInputAction::Leader(AttachLeaderAction::NewSession)]
+        );
+
+        parser.push_bytes(&[ATTACH_LEADER_BYTE]);
+        assert_eq!(
+            parser.push_bytes(b"g"),
+            vec![AttachInputAction::Leader(AttachLeaderAction::SessionDetails)]
+        );
+
+        parser.push_bytes(&[ATTACH_LEADER_BYTE]);
+        assert_eq!(
+            parser.push_bytes(b"d"),
+            vec![AttachInputAction::Leader(AttachLeaderAction::Diff)]
+        );
+
+        parser.push_bytes(&[ATTACH_LEADER_BYTE]);
+        assert_eq!(
+            parser.push_bytes(b"x"),
+            vec![AttachInputAction::Leader(AttachLeaderAction::StopSession)]
+        );
+    }
+
+    #[test]
+    fn attach_parser_drops_unknown_leader_keys() {
+        let mut parser = AttachInputParser::default();
+        parser.push_bytes(&[ATTACH_LEADER_BYTE]);
+        assert!(parser.push_bytes(b"q").is_empty());
+    }
+
+    #[test]
+    fn attach_parser_flushes_bytes_around_control_sequences() {
+        let mut parser = AttachInputParser::default();
+        assert_eq!(
+            parser.push_bytes(b"ab\x02\x02cd\x1d"),
+            vec![
+                AttachInputAction::Data(b"ab".to_vec()),
+                AttachInputAction::Data(vec![ATTACH_LEADER_BYTE]),
+                AttachInputAction::Data(b"cd".to_vec()),
+                AttachInputAction::Detach,
+            ]
+        );
     }
 
     #[test]
     fn attach_restore_sequence_matches_agentd_cleanup() {
         assert_eq!(
             AGENTD_ATTACH_RESTORE_SEQUENCE,
-            b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[<u\x1b[?25h"
+            b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[?25h"
         );
     }
 
@@ -1962,14 +2211,5 @@ mod tests {
     fn render_diff_text_adds_ansi_when_enabled() {
         let rendered = render_diff_text("@@ -1 +1 @@\n-old\n+new\n", true);
         assert!(rendered.contains("\u{1b}["));
-    }
-
-    fn key_event(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
-        KeyEvent {
-            code,
-            modifiers,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::empty(),
-        }
     }
 }

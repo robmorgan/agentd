@@ -14,7 +14,8 @@ anyhow.workspace = true
 camino.workspace = true
 chrono.workspace = true
 clap.workspace = true
-crossterm.workspace = true
+crossterm = { workspace = true, features = ["event-stream"] }
+futures.workspace = true
 libc.workspace = true
 nix.workspace = true
 ratatui.workspace = true
