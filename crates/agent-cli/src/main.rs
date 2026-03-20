@@ -1604,7 +1604,10 @@ impl AttachRawInput {
                 Ok(0) => Ok(None),
                 Ok(count) => Ok(Some(buf[..count].to_vec())),
                 Err(err) => {
-                    if err == nix::errno::Errno::EAGAIN || err == nix::errno::Errno::EINTR {
+                    if err == nix::errno::Errno::EAGAIN
+                        || err == nix::errno::Errno::EWOULDBLOCK
+                        || err == nix::errno::Errno::EINTR
+                    {
                         Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
                     } else {
                         Err(std::io::Error::from_raw_os_error(err as i32))
