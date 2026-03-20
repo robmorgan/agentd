@@ -12,22 +12,18 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, Subcommand};
 use crossterm::{
     cursor::{Hide, Show},
+    event::{DisableMouseCapture, EnableMouseCapture},
     event::{Event, EventStream, KeyCode, KeyModifiers},
     execute,
     style::{Attribute as CrosAttribute, Color as CrosColor, Stylize},
-    terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    },
-    event::{DisableMouseCapture, EnableMouseCapture},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures::StreamExt;
 use libc::{
-    _POSIX_VDISABLE, O_NONBLOCK, TCSAFLUSH, TCSANOW, VLNEXT, VMIN, VQUIT, VTIME, cfmakeraw,
-    fcntl, tcgetattr, tcsetattr, termios,
+    _POSIX_VDISABLE, O_NONBLOCK, TCSAFLUSH, TCSANOW, VLNEXT, VMIN, VQUIT, VTIME, cfmakeraw, fcntl,
+    tcgetattr, tcsetattr, termios,
 };
-use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
-};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use tokio::{
     io::{BufReader, unix::AsyncFd},
     net::UnixStream,
@@ -388,7 +384,7 @@ async fn main() -> Result<()> {
             }
         }
         (Command::Accept { .. }, ExecutionMode::Local(reason)) => {
-            bail_live_command(&reason)?;
+            bail_daemon_command(&reason, "agent accept")?;
         }
         (Command::Discard { session_id, force }, ExecutionMode::Daemon) => {
             let response =
@@ -598,6 +594,10 @@ fn bail_live_command(reason: &str) -> Result<()> {
     )
 }
 
+fn bail_daemon_command(reason: &str, command: &str) -> Result<()> {
+    bail!("{reason}. `{command}` requires a compatible daemon")
+}
+
 fn resolve_new_session_options(
     workspace: Option<PathBuf>,
     title: Option<String>,
@@ -639,6 +639,8 @@ async fn ensure_daemon(paths: &AppPaths) -> Result<()> {
 }
 
 async fn spawn_daemon(paths: &AppPaths) -> Result<()> {
+    clear_stale_daemon_state(paths)?;
+
     let daemon_exe = daemon_executable()?;
 
     std::process::Command::new(daemon_exe)
@@ -659,6 +661,51 @@ async fn spawn_daemon(paths: &AppPaths) -> Result<()> {
             bail!("timed out waiting for agentd to start");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn clear_stale_daemon_state(paths: &AppPaths) -> Result<()> {
+    let pid = read_daemon_pid(paths)?;
+    if let Some(pid) = pid
+        && local::process_exists(Some(pid))
+    {
+        if paths.socket.exists() {
+            bail!("agentd is running (pid {pid}) but not responding; restart the daemon");
+        }
+        bail!(
+            "agentd is running (pid {pid}) but socket {} is missing; restart the daemon",
+            paths.socket
+        );
+    }
+
+    remove_file_if_exists(&paths.socket)
+        .with_context(|| format!("failed to remove stale socket {}", paths.socket))?;
+    remove_file_if_exists(&paths.pid_file)
+        .with_context(|| format!("failed to remove stale pid file {}", paths.pid_file))?;
+    Ok(())
+}
+
+fn read_daemon_pid(paths: &AppPaths) -> Result<Option<u32>> {
+    let contents = match fs::read_to_string(paths.pid_file.as_std_path()) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", paths.pid_file)),
+    };
+    let raw = contents.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let pid = raw
+        .parse::<u32>()
+        .with_context(|| format!("failed to parse pid from {}", paths.pid_file))?;
+    Ok(Some(pid))
+}
+
+fn remove_file_if_exists(path: &camino::Utf8Path) -> Result<()> {
+    match fs::remove_file(path.as_std_path()) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -1314,7 +1361,10 @@ fn read_focus_log_contents(path: &camino::Utf8Path) -> Result<String> {
 }
 
 fn diff_color_enabled() -> bool {
-    should_colorize_diff_output(std::io::stdout().is_terminal(), std::env::var_os("NO_COLOR"))
+    should_colorize_diff_output(
+        std::io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR"),
+    )
 }
 
 fn should_colorize_diff_output(is_terminal: bool, no_color: Option<std::ffi::OsString>) -> bool {
@@ -1550,16 +1600,14 @@ impl AttachRawInput {
         let mut buf = [0_u8; 4096];
         loop {
             let mut guard = self.fd.readable().await?;
-            match guard.try_io(|inner| {
-                match nix::unistd::read(inner.get_ref(), &mut buf) {
-                    Ok(0) => Ok(None),
-                    Ok(count) => Ok(Some(buf[..count].to_vec())),
-                    Err(err) => {
-                        if err == nix::errno::Errno::EAGAIN || err == nix::errno::Errno::EINTR {
-                            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
-                        } else {
-                            Err(std::io::Error::from_raw_os_error(err as i32))
-                        }
+            match guard.try_io(|inner| match nix::unistd::read(inner.get_ref(), &mut buf) {
+                Ok(0) => Ok(None),
+                Ok(count) => Ok(Some(buf[..count].to_vec())),
+                Err(err) => {
+                    if err == nix::errno::Errno::EAGAIN || err == nix::errno::Errno::EINTR {
+                        Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                    } else {
+                        Err(std::io::Error::from_raw_os_error(err as i32))
                     }
                 }
             }) {
@@ -1691,7 +1739,7 @@ impl TerminalScreenGuard {
             EnableMouseCapture,
             Hide
         )
-            .context("failed to enter alternate screen")?;
+        .context("failed to enter alternate screen")?;
         Ok(Self)
     }
 }
@@ -1863,15 +1911,24 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENTD_ATTACH_RESTORE_SEQUENCE, ATTACH_DETACH_BYTE, ATTACH_LEADER_BYTE,
-        AttachInputAction, AttachInputParser, Cli, Command, DaemonCommand, SessionEndSummary,
-        format_session_end_summary, render_diff_text, resolve_detach_session_id,
-        resolve_new_session_options, should_colorize_diff_output,
+        AGENTD_ATTACH_RESTORE_SEQUENCE, ATTACH_DETACH_BYTE, ATTACH_LEADER_BYTE, AttachInputAction,
+        AttachInputParser, Cli, Command, DaemonCommand, SessionEndSummary, bail_daemon_command,
+        clear_stale_daemon_state, format_session_end_summary, render_diff_text,
+        resolve_detach_session_id, resolve_new_session_options, should_colorize_diff_output,
     };
     use crate::runtime::AttachLeaderAction;
+    use agentd_shared::paths::AppPaths;
     use agentd_shared::session::{IntegrationState, SessionStatus};
     use clap::Parser;
-    use std::{ffi::OsString, path::PathBuf};
+    use std::{
+        ffi::OsString,
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn new_command_parses_optional_title() {
@@ -2033,6 +2090,28 @@ mod tests {
     }
 
     #[test]
+    fn daemon_command_error_for_accept_does_not_mention_pty() {
+        let err = bail_daemon_command("agentd is unavailable", "agent accept").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "agentd is unavailable. `agent accept` requires a compatible daemon"
+        );
+    }
+
+    #[test]
+    fn clear_stale_daemon_state_removes_dead_pid_and_socket() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        fs::write(paths.pid_file.as_str(), "999999\n").unwrap();
+        fs::write(paths.socket.as_str(), "").unwrap();
+
+        clear_stale_daemon_state(&paths).unwrap();
+
+        assert!(!paths.pid_file.exists());
+        assert!(!paths.socket.exists());
+    }
+
+    #[test]
     fn attach_parser_detaches_on_ctrl_right_bracket_byte() {
         let mut parser = AttachInputParser::default();
         assert_eq!(
@@ -2086,7 +2165,9 @@ mod tests {
         parser.push_bytes(&[ATTACH_LEADER_BYTE]);
         assert_eq!(
             parser.push_bytes(b"s"),
-            vec![AttachInputAction::Leader(AttachLeaderAction::SessionSwitcher)]
+            vec![AttachInputAction::Leader(
+                AttachLeaderAction::SessionSwitcher
+            )]
         );
 
         parser.push_bytes(&[ATTACH_LEADER_BYTE]);
@@ -2098,7 +2179,9 @@ mod tests {
         parser.push_bytes(&[ATTACH_LEADER_BYTE]);
         assert_eq!(
             parser.push_bytes(b"g"),
-            vec![AttachInputAction::Leader(AttachLeaderAction::SessionDetails)]
+            vec![AttachInputAction::Leader(
+                AttachLeaderAction::SessionDetails
+            )]
         );
 
         parser.push_bytes(&[ATTACH_LEADER_BYTE]);
@@ -2198,7 +2281,10 @@ mod tests {
 
     #[test]
     fn diff_colorization_respects_no_color() {
-        assert!(!should_colorize_diff_output(true, Some(OsString::from("1"))));
+        assert!(!should_colorize_diff_output(
+            true,
+            Some(OsString::from("1"))
+        ));
     }
 
     #[test]
@@ -2211,5 +2297,23 @@ mod tests {
     fn render_diff_text_adds_ansi_when_enabled() {
         let rendered = render_diff_text("@@ -1 +1 @@\n-old\n+new\n", true);
         assert!(rendered.contains("\u{1b}["));
+    }
+
+    fn test_paths() -> AppPaths {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            + u128::from(TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed));
+        let root = camino::Utf8PathBuf::from(format!("/tmp/agent-cli-test-{suffix}"));
+        AppPaths {
+            socket: root.join("agentd.sock"),
+            pid_file: root.join("agentd.pid"),
+            database: root.join("state.db"),
+            config: root.join("config.toml"),
+            logs_dir: root.join("logs"),
+            worktrees_dir: root.join("worktrees"),
+            root,
+        }
     }
 }

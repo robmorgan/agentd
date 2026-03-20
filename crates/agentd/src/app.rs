@@ -1548,18 +1548,26 @@ fn inspect_review_state(session: &SessionRecord) -> Result<ReviewState> {
     }
 
     let repo_root = Utf8PathBuf::from(session.repo_path.clone());
+    let current_branch = git::current_branch(&repo_root)?;
     if git::has_worktree_changes(&repo_root)? {
+        let summary = if current_branch == session.base_branch {
+            format!(
+                "upstream checkout {} on {} has uncommitted changes; clean it before accept",
+                session.repo_path, session.base_branch
+            )
+        } else {
+            format!(
+                "repo {} has local changes on {}; clean it before accept",
+                session.repo_path, current_branch
+            )
+        };
         return Ok(ReviewState {
             git_sync: GitSyncStatus::NeedsSync,
-            summary: format!(
-                "repo {} has local changes; clean it before accept",
-                session.repo_path
-            ),
+            summary,
             has_conflicts: false,
         });
     }
 
-    let current_branch = git::current_branch(&repo_root)?;
     if current_branch != session.base_branch {
         return Ok(ReviewState {
             git_sync: GitSyncStatus::NeedsSync,
@@ -1842,6 +1850,25 @@ mod tests {
     }
 
     #[test]
+    fn inspect_review_state_blocks_dirty_upstream_checkout() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        let repo = paths.root.join("repo");
+        let worktree = paths.root.join("worktree");
+        init_git_repo(repo.as_str());
+
+        insert_session_with_worktree(&db, repo.as_str(), worktree.as_str(), "demo", "changed");
+        fs::write(repo.join("README.md"), "repo dirty\n").unwrap();
+
+        let session = db.get_session("demo").unwrap().unwrap();
+        let review = inspect_review_state(&session).unwrap();
+        assert_eq!(review.git_sync, GitSyncStatus::NeedsSync);
+        assert!(review.summary.contains("upstream checkout"));
+        assert!(review.summary.contains("main"));
+    }
+
+    #[test]
     fn apply_commit_message_uses_session_title() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
@@ -1940,14 +1967,45 @@ mod tests {
     }
 
     fn insert_session(db: &Database, repo: &str, session_id: &str, title: &str) {
-        assert!(
-            Command::new("git")
-                .args(["-C", repo, "branch", "-f", "agent/demo"])
-                .output()
-                .unwrap()
-                .status
-                .success()
-        );
+        insert_session_with_worktree(db, repo, repo, session_id, title);
+    }
+
+    fn insert_session_with_worktree(
+        db: &Database,
+        repo: &str,
+        worktree: &str,
+        session_id: &str,
+        title: &str,
+    ) {
+        if worktree != repo {
+            assert!(
+                Command::new("git")
+                    .args([
+                        "-C",
+                        repo,
+                        "worktree",
+                        "add",
+                        "-b",
+                        "agent/demo",
+                        worktree,
+                        "main"
+                    ])
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        } else {
+            assert!(
+                Command::new("git")
+                    .args(["-C", repo, "branch", "-f", "agent/demo"])
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+
         db.insert_session(&NewSession {
             session_id,
             thread_id: None,
@@ -1963,7 +2021,7 @@ mod tests {
             title,
             base_branch: "main",
             branch: "agent/demo",
-            worktree: repo,
+            worktree,
         })
         .unwrap();
     }
