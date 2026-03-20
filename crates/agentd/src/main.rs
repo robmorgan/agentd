@@ -1,6 +1,5 @@
 mod app;
 mod codex;
-mod codex_json;
 mod db;
 mod git;
 mod ids;

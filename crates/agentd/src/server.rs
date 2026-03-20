@@ -584,40 +584,6 @@ async fn stream_logs(
     Ok(())
 }
 
-async fn stream_events(
-    state: &AppState,
-    session_id: &str,
-    follow: bool,
-    writer: &mut OwnedWriteHalf,
-) -> Result<()> {
-    let mut last_event_id = None;
-
-    loop {
-        let events = state.list_events_since(session_id, last_event_id).await?;
-        for event in events {
-            last_event_id = Some(event.id);
-            send_response(writer, &Response::Event { event }).await?;
-        }
-
-        let session = state.get_session(session_id).await?;
-        let is_running = matches!(
-            session.as_ref().map(|item| item.status),
-            Some(SessionStatus::Running)
-        );
-        if !follow || !is_running {
-            let trailing = state.list_events_since(session_id, last_event_id).await?;
-            for event in trailing {
-                send_response(writer, &Response::Event { event }).await?;
-            }
-            break;
-        }
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-
-    Ok(())
-}
-
 fn read_from_offset(log_path: &camino::Utf8PathBuf, position: u64) -> Result<(String, u64)> {
     let bytes = std::fs::read(log_path.as_std_path())
         .with_context(|| format!("failed to read {}", log_path))?;
@@ -644,7 +610,7 @@ mod tests {
             session_id: "demo".to_string(),
             thread_id: Some("thread-demo".to_string()),
             agent: "codex".to_string(),
-            model: Some("gpt-5.3-codex".to_string()),
+            model: Some("gpt-5.4".to_string()),
             mode: SessionMode::Execute,
             workspace: "/tmp/workspace".to_string(),
             repo_path: "/tmp/workspace".to_string(),

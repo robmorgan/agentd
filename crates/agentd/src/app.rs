@@ -23,9 +23,8 @@ use tokio::{sync::broadcast, task};
 
 use agentd_shared::{
     config::Config,
-    event::{NewSessionEvent, SessionEvent},
+    event::NewSessionEvent,
     paths::AppPaths,
-    request_input::PendingUserInputRequest,
     session::{
         AttentionLevel, CreateSessionResult, IntegrationState, SessionDiff, SessionMode,
         SessionRecord, SessionStatus, WorktreeRecord, branch_name_from_title, repo_name_from_path,
@@ -33,11 +32,9 @@ use agentd_shared::{
 };
 
 use crate::{
-    codex,
-    codex_json::{CodexJsonStream, preview_line},
-    db::{Database, NewSession, NewThread, SessionLaunchInfo},
+    db::{Database, NewSession, SessionLaunchInfo},
     git,
-    ids::{generate_session_id, generate_thread_id},
+    ids::generate_session_id,
     terminal_state::{GhosttyTerminalState, TerminalStateEngine},
 };
 
@@ -179,36 +176,6 @@ impl AppState {
         task::spawn_blocking(move || db.list_sessions()).await?
     }
 
-    pub async fn append_session_events(
-        &self,
-        session_id: &str,
-        events: Vec<NewSessionEvent>,
-    ) -> Result<Vec<SessionEvent>> {
-        let db = self.db.clone();
-        let session_id = session_id.to_string();
-        task::spawn_blocking(move || {
-            db.get_session(&session_id)?
-                .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
-            db.append_events(&session_id, &events)
-        })
-        .await?
-    }
-
-    pub async fn list_events_since(
-        &self,
-        session_id: &str,
-        after_id: Option<i64>,
-    ) -> Result<Vec<SessionEvent>> {
-        let db = self.db.clone();
-        let session_id = session_id.to_string();
-        task::spawn_blocking(move || {
-            db.get_session(&session_id)?
-                .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
-            db.list_events_since(&session_id, after_id)
-        })
-        .await?
-    }
-
     pub async fn reconcile_sessions(&self) -> Result<()> {
         let sessions = self.list_sessions().await?;
         for session in sessions {
@@ -308,41 +275,6 @@ impl AppState {
         .await?
     }
 
-    async fn resolve_resume_session_id(
-        &self,
-        session: &SessionRecord,
-        launch: &LaunchCommand,
-    ) -> Result<Option<String>> {
-        if !is_resumable_command(&launch.command) {
-            return Ok(None);
-        }
-
-        let db = self.db.clone();
-        let session_id = session.session_id.clone();
-        let worktree = session.worktree.clone();
-        let thread_id = session.thread_id.clone();
-        task::spawn_blocking(move || {
-            if let Some(thread_id) = thread_id {
-                if let Some(thread) = db.get_thread(&thread_id)? {
-                    if let Some(upstream_thread_id) = thread.upstream_thread_id {
-                        db.set_resume_session_id(&session_id, &upstream_thread_id)?;
-                        return Ok(Some(upstream_thread_id));
-                    }
-                }
-            }
-            if let Some(resume_session_id) = db.get_resume_session_id(&session_id)? {
-                return Ok(Some(resume_session_id));
-            }
-
-            let discovered = codex::discover_resume_session_id(&worktree)?;
-            if let Some(ref resume_session_id) = discovered {
-                db.set_resume_session_id(&session_id, resume_session_id)?;
-            }
-            Ok(discovered)
-        })
-        .await?
-    }
-
     pub async fn create_worktree(&self, session_id: &str) -> Result<WorktreeRecord> {
         let db = self.db.clone();
         let session_id = session_id.to_string();
@@ -425,114 +357,6 @@ impl AppState {
         .await?
     }
 
-    pub async fn apply_session(&self, session_id: &str) -> Result<SessionRecord> {
-        let db = self.db.clone();
-        let session_id = session_id.to_string();
-        task::spawn_blocking(move || {
-            let session = db
-                .get_session(&session_id)?
-                .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
-            ensure_session_not_running(&session)?;
-            ensure_pending_review(&session, "apply")?;
-
-            let repo_root = Utf8PathBuf::from(session.repo_path.clone());
-            let worktree = Utf8PathBuf::from(session.worktree.clone());
-            if !worktree.exists() {
-                bail!("worktree `{worktree}` does not exist");
-            }
-
-            let current_branch = git::current_branch(&repo_root)?;
-            if current_branch != session.base_branch {
-                bail!(
-                    "repo `{}` is on branch `{}`, expected `{}`",
-                    repo_root,
-                    current_branch,
-                    session.base_branch
-                );
-            }
-
-            let status = git::working_tree_status(&repo_root)?;
-            if !status.trim().is_empty() {
-                bail!("repo `{repo_root}` has uncommitted changes");
-            }
-
-            let committed_patch = git::committed_patch_against_base(&worktree, &session.base_branch)?;
-            let worktree_patch = git::worktree_patch_against_head(&worktree)?;
-            if committed_patch.trim().is_empty() && worktree_patch.trim().is_empty() {
-                bail!("session `{session_id}` has no changes to apply");
-            }
-
-            git::apply_patch(&repo_root, &committed_patch)?;
-            git::apply_patch(&repo_root, &worktree_patch)?;
-            git::commit_all(
-                &repo_root,
-                &format!("{} ({})", session.title, session.session_id),
-            )?;
-
-            db.set_integration_state(
-                &session_id,
-                IntegrationState::Applied,
-                AttentionLevel::Notice,
-                "changes applied to repo",
-            )?;
-            db.append_events(
-                &session_id,
-                &[daemon_event(
-                    "SESSION_APPLIED",
-                    serde_json::json!({
-                        "source": "daemon",
-                        "repo_path": session.repo_path,
-                        "base_branch": session.base_branch,
-                        "branch": session.branch,
-                    }),
-                )],
-            )?;
-
-            db.get_session(&session_id)?
-                .ok_or_else(|| anyhow!("session `{session_id}` not found after apply"))
-        })
-        .await?
-    }
-
-    pub async fn discard_session(&self, session_id: &str, force: bool) -> Result<SessionRecord> {
-        let db = self.db.clone();
-        let paths = self.paths.clone();
-        let session_id = session_id.to_string();
-        task::spawn_blocking(move || {
-            let session = db
-                .get_session(&session_id)?
-                .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
-            ensure_session_not_running(&session)?;
-            if !force {
-                ensure_pending_review(&session, "discard")?;
-            }
-
-            remove_session_artifacts(&paths, &session)?;
-            db.set_integration_state(
-                &session_id,
-                IntegrationState::Discarded,
-                AttentionLevel::Notice,
-                "changes discarded",
-            )?;
-            db.append_events(
-                &session_id,
-                &[daemon_event(
-                    "SESSION_DISCARDED",
-                    serde_json::json!({
-                        "source": "daemon",
-                        "repo_path": session.repo_path,
-                        "branch": session.branch,
-                        "force": force,
-                    }),
-                )],
-            )?;
-
-            db.get_session(&session_id)?
-                .ok_or_else(|| anyhow!("session `{session_id}` not found after discard"))
-        })
-        .await?
-    }
-
     pub async fn kill_session(&self, session_id: &str, remove: bool) -> Result<(bool, bool)> {
         let db = self.db.clone();
         let paths = self.paths.clone();
@@ -598,17 +422,6 @@ impl AppState {
             })
         })
         .await?
-    }
-
-    pub async fn reply_to_session(
-        &self,
-        session_id: &str,
-        _prompt: String,
-    ) -> Result<SessionRecord> {
-        bail!(
-            "session `{}` does not support structured replies; send input directly to the interactive PTY",
-            session_id
-        )
     }
 
     pub async fn send_input(
@@ -1114,38 +927,10 @@ fn unique_session_id(db: &Database) -> Result<String> {
     bail!("failed to allocate a unique session id")
 }
 
-fn unique_thread_id(db: &Database) -> Result<String> {
-    for _ in 0..16 {
-        let candidate = generate_thread_id();
-        if db.get_thread(&candidate)?.is_none() {
-            return Ok(candidate);
-        }
-    }
-    bail!("failed to allocate a unique thread id")
-}
-
 fn daemon_event(event_type: &str, payload_json: serde_json::Value) -> NewSessionEvent {
     NewSessionEvent {
         event_type: event_type.to_string(),
         payload_json,
-    }
-}
-
-fn build_initial_prompt(task_text: &str, mode: SessionMode) -> String {
-    match mode {
-        SessionMode::Execute => task_text.to_string(),
-        SessionMode::Plan => format!(
-            "You are in planning mode for this repository.\n\
-             \n\
-             Task:\n\
-             {task_text}\n\
-             \n\
-             Requirements:\n\
-             - If you need clarification before finalizing the plan, use the structured request_user_input flow when it is available. If it is unavailable, ask one blocking follow-up question in plain text.\n\
-             - Do not edit files, run implementation commands, or apply changes.\n\
-             - When you have enough information, reply with exactly one <proposed_plan>...</proposed_plan> block in Markdown.\n\
-             - Stop after producing the plan.\n"
-        ),
     }
 }
 
@@ -1247,244 +1032,6 @@ fn session_has_pending_changes(session: &SessionRecord) -> Result<bool> {
     )
 }
 
-enum SessionOutcome {
-    Finished,
-    NeedsInputText { question: String },
-    NeedsInputRequest { request: PendingUserInputRequest },
-}
-
-impl SessionOutcome {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Finished => "finished",
-            Self::NeedsInputText { .. } | Self::NeedsInputRequest { .. } => "needs_input",
-        }
-    }
-}
-
-fn classify_session_outcome(
-    db: &Database,
-    session: &SessionRecord,
-    exit_code: Option<i32>,
-) -> Result<SessionOutcome> {
-    if exit_code != Some(0) || session.agent != "codex" || session.thread_id.is_none() {
-        return Ok(SessionOutcome::Finished);
-    }
-
-    if session_has_pending_changes(session)? {
-        return Ok(SessionOutcome::Finished);
-    }
-
-    let events = db.list_events_since(&session.session_id, None)?;
-    let boundary_id = latest_reply_boundary_id(&events);
-
-    if session.mode == SessionMode::Plan {
-        if let Some(request) = latest_pending_user_input_request(&events, boundary_id) {
-            return Ok(SessionOutcome::NeedsInputRequest { request });
-        }
-    }
-
-    let mut agent_messages = Vec::new();
-    for event in &events {
-        if event.id <= boundary_id {
-            continue;
-        }
-        if event.event_type != "CODEX_ITEM_COMPLETED" {
-            continue;
-        }
-        let Some(item) = event.payload_json.get("raw").and_then(|raw| raw.get("item")) else {
-            continue;
-        };
-        let Some(item_type) = item.get("type").and_then(|value| value.as_str()) else {
-            return Ok(SessionOutcome::Finished);
-        };
-        if item_type != "agent_message" {
-            return Ok(SessionOutcome::Finished);
-        }
-        if let Some(text) = item.get("text").and_then(|value| value.as_str()) {
-            agent_messages.push(text.to_string());
-        }
-    }
-
-    if agent_messages.len() != 1 {
-        return Ok(SessionOutcome::Finished);
-    }
-    let question = agent_messages.pop().unwrap_or_default();
-    if !looks_like_blocking_question(&question) {
-        return Ok(SessionOutcome::Finished);
-    }
-
-    Ok(SessionOutcome::NeedsInputText {
-        question,
-    })
-}
-
-fn latest_reply_boundary_id(events: &[SessionEvent]) -> i64 {
-    events
-        .iter()
-        .rev()
-        .find(|event| {
-            matches!(
-                event.event_type.as_str(),
-                "SESSION_STARTED" | "SESSION_RESUMED" | "SESSION_REPLY_REQUESTED"
-            )
-        })
-        .map(|event| event.id)
-        .unwrap_or(0)
-}
-
-fn latest_pending_user_input_request(
-    events: &[SessionEvent],
-    boundary_id: i64,
-) -> Option<PendingUserInputRequest> {
-    let mut request = None;
-    for event in events {
-        if event.id <= boundary_id {
-            continue;
-        }
-        match event.event_type.as_str() {
-            "SESSION_REQUEST_USER_INPUT" => {
-                request = event
-                    .payload_json
-                    .get("request")
-                    .cloned()
-                    .and_then(|value| serde_json::from_value::<PendingUserInputRequest>(value).ok());
-            }
-            "SESSION_REPLY_REQUESTED" => request = None,
-            _ => {}
-        }
-    }
-    request
-}
-
-fn looks_like_blocking_question(text: &str) -> bool {
-    let trimmed = text.trim();
-    if !trimmed.ends_with('?') {
-        return false;
-    }
-
-    let normalized = trimmed.to_ascii_lowercase();
-    [
-        "do you want",
-        "can you",
-        "could you",
-        "which",
-        "what",
-        "if yes",
-        "if so",
-        "should i",
-    ]
-    .iter()
-    .any(|prefix| normalized.contains(prefix))
-}
-
-fn persist_extracted_plans(
-    db: &Database,
-    session_id: &str,
-    events: &[SessionEvent],
-) -> Result<()> {
-    for event in events {
-        let Some(body_markdown) = extract_plan_markdown(event) else {
-            continue;
-        };
-        if db
-            .latest_plan(session_id)?
-            .as_ref()
-            .is_some_and(|plan| plan.body_markdown == body_markdown)
-        {
-            continue;
-        }
-        let summary = summarize_plan(&body_markdown);
-        let plan = db.insert_plan(session_id, &summary, &body_markdown, event.id)?;
-        db.set_integration_state(
-            session_id,
-            IntegrationState::Clean,
-            AttentionLevel::Notice,
-            &format!("plan ready v{}: {}", plan.version, plan.summary),
-        )?;
-        db.append_events(
-            session_id,
-            &[daemon_event(
-                "SESSION_PLAN_READY",
-                serde_json::json!({
-                    "source": "daemon",
-                    "version": plan.version,
-                    "summary": plan.summary,
-                    "body_markdown": plan.body_markdown,
-                    "source_event_id": plan.source_event_id,
-                }),
-            )],
-        )?;
-    }
-    Ok(())
-}
-
-fn persist_request_user_input(
-    db: &Database,
-    session_id: &str,
-    events: &[SessionEvent],
-) -> Result<()> {
-    for event in events {
-        let Some(request) = extract_request_user_input(event) else {
-            continue;
-        };
-        let question_preview = preview_text(&request.summary(), 240);
-        db.mark_waiting_for_input(session_id, question_preview.clone())?;
-        db.append_events(
-            session_id,
-            &[daemon_event(
-                "SESSION_REQUEST_USER_INPUT",
-                serde_json::json!({
-                    "source": "daemon",
-                    "source_event_id": event.id,
-                    "question_preview": question_preview,
-                    "request": request,
-                }),
-            )],
-        )?;
-    }
-    Ok(())
-}
-
-fn extract_request_user_input(event: &SessionEvent) -> Option<PendingUserInputRequest> {
-    if event.event_type != "CODEX_REQUEST_USER_INPUT" {
-        return None;
-    }
-    PendingUserInputRequest::from_codex_raw(event.payload_json.get("raw")?)
-}
-
-fn extract_plan_markdown(event: &SessionEvent) -> Option<String> {
-    let item = event.payload_json.get("raw")?.get("item")?;
-    if item.get("type").and_then(|value| value.as_str()) != Some("agent_message") {
-        return None;
-    }
-    let text = item.get("text").and_then(|value| value.as_str())?;
-    let start_tag = "<proposed_plan>";
-    let end_tag = "</proposed_plan>";
-    let start = text.find(start_tag)? + start_tag.len();
-    let end = text[start..].find(end_tag)? + start;
-    let body = text[start..end].trim();
-    if body.is_empty() {
-        return None;
-    }
-    Some(body.to_string())
-}
-
-fn summarize_plan(body_markdown: &str) -> String {
-    for line in body_markdown.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let trimmed = trimmed.trim_start_matches('#').trim();
-        let trimmed = trimmed.trim_start_matches(['-', '*', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', ' ']).trim();
-        if !trimmed.is_empty() {
-            return preview_text(trimmed, 80);
-        }
-    }
-    "plan ready".to_string()
-}
-
 fn normalize_session_title(
     title: Option<String>,
     agent_name: &str,
@@ -1574,132 +1121,6 @@ fn pump_pty_to_log(
         runtime.publish_output(&buffer[..bytes_read])?;
     }
 
-    Ok(())
-}
-
-fn pump_codex_json_to_logs(
-    mut reader: Box<dyn Read + Send>,
-    raw_log_path: &Utf8PathBuf,
-    rendered_log_path: &Utf8PathBuf,
-    runtime: &SessionRuntime,
-    db: &Database,
-    session_id: &str,
-    thread_id: &str,
-    is_plan_session: bool,
-) -> Result<()> {
-    let mut raw_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(raw_log_path.as_std_path())
-        .with_context(|| format!("failed to open {}", raw_log_path))?;
-    let mut rendered_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(rendered_log_path.as_std_path())
-        .with_context(|| format!("failed to open {}", rendered_log_path))?;
-    let mut stream = CodexJsonStream::default();
-    let mut bound_upstream_thread_id = db
-        .get_thread(thread_id)?
-        .and_then(|thread| thread.upstream_thread_id);
-    let mut buffer = [0_u8; 8192];
-
-    loop {
-        let bytes_read = reader.read(&mut buffer)?;
-        if bytes_read == 0 {
-            break;
-        }
-
-        raw_file.write_all(&buffer[..bytes_read])?;
-        raw_file.flush()?;
-        runtime.publish_output(&buffer[..bytes_read])?;
-
-        let (messages, issues) = stream.push_bytes(&buffer[..bytes_read]);
-        persist_codex_output(
-            db,
-            session_id,
-            thread_id,
-            &mut bound_upstream_thread_id,
-            &mut rendered_file,
-            messages,
-            issues,
-            is_plan_session,
-        )?;
-    }
-
-    let (messages, issues) = stream.finish();
-    persist_codex_output(
-        db,
-        session_id,
-        thread_id,
-        &mut bound_upstream_thread_id,
-        &mut rendered_file,
-        messages,
-        issues,
-        is_plan_session,
-    )?;
-    Ok(())
-}
-
-fn persist_codex_output(
-    db: &Database,
-    session_id: &str,
-    thread_id: &str,
-    bound_upstream_thread_id: &mut Option<String>,
-    rendered_file: &mut File,
-    messages: Vec<crate::codex_json::ParsedCodexMessage>,
-    issues: Vec<crate::codex_json::ParseIssue>,
-    is_plan_session: bool,
-) -> Result<()> {
-    let mut events = Vec::with_capacity(messages.len() + issues.len() + 1);
-
-    for message in messages {
-        if let Some(upstream_thread_id) = message.upstream_thread_id.as_deref() {
-            if bound_upstream_thread_id.as_deref() != Some(upstream_thread_id) {
-                db.set_thread_upstream_id(thread_id, upstream_thread_id)?;
-                db.set_resume_session_id(session_id, upstream_thread_id)?;
-                *bound_upstream_thread_id = Some(upstream_thread_id.to_string());
-                events.push(daemon_event(
-                    "THREAD_UPSTREAM_BOUND",
-                    serde_json::json!({
-                        "source": "daemon",
-                        "thread_id": thread_id,
-                        "session_id": session_id,
-                        "upstream_thread_id": upstream_thread_id,
-                    }),
-                ));
-            }
-        }
-        rendered_file.write_all(message.rendered.as_bytes())?;
-        events.push(NewSessionEvent {
-            event_type: message.event_type,
-            payload_json: message.payload_json,
-        });
-    }
-
-    for issue in issues {
-        let rendered = format!("[invalid codex json] {}\n", preview_line(&issue.line));
-        rendered_file.write_all(rendered.as_bytes())?;
-        events.push(daemon_event(
-            "CODEX_JSON_PARSE_ERROR",
-            serde_json::json!({
-                "source": "daemon",
-                "thread_id": thread_id,
-                "line_preview": preview_line(&issue.line),
-                "error": issue.error,
-            }),
-        ));
-    }
-
-    if !events.is_empty() {
-        let inserted = db.append_events(session_id, &events)?;
-        if is_plan_session {
-            persist_request_user_input(db, session_id, &inserted)?;
-        }
-        if is_plan_session {
-            persist_extracted_plans(db, session_id, &inserted)?;
-        }
-        rendered_file.flush()?;
-    }
     Ok(())
 }
 
@@ -1799,15 +1220,6 @@ fn preview_input(data: &[u8]) -> String {
     preview
 }
 
-fn preview_text(text: &str, limit: usize) -> String {
-    let mut preview = text.replace('\n', "\\n").replace('\r', "\\r");
-    if preview.len() > limit {
-        preview.truncate(limit);
-        preview.push_str("...");
-    }
-    preview
-}
-
 fn ensure_session_running(session: &SessionRecord) -> Result<()> {
     let accepts_live_io =
         matches!(session.status, SessionStatus::Running | SessionStatus::NeedsInput)
@@ -1821,16 +1233,6 @@ fn ensure_session_running(session: &SessionRecord) -> Result<()> {
 fn ensure_session_not_running(session: &SessionRecord) -> Result<()> {
     if session.status == SessionStatus::Running && process_exists(session.pid) {
         bail!("session `{}` is still running", session.session_id);
-    }
-    Ok(())
-}
-
-fn ensure_pending_review(session: &SessionRecord, action: &str) -> Result<()> {
-    if session.integration_state != IntegrationState::PendingReview {
-        bail!(
-            "session `{}` is not pending review; cannot {action}",
-            session.session_id
-        );
     }
     Ok(())
 }
@@ -1850,17 +1252,13 @@ fn ensure_not_pending_review(session: &SessionRecord, action: &str) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AttachControl, SessionOutcome, SessionRuntime, SessionStartMode, classify_session_outcome,
-        daemon_event, finalize_session_exit,
-    };
-    use crate::db::{Database, NewSession, NewThread};
+    use super::{AttachControl, SessionRuntime, SessionStartMode, finalize_session_exit};
+    use crate::db::{Database, NewSession};
     use crate::terminal_state::TerminalStateEngine;
-    use agentd_shared::{event::NewSessionEvent, paths::AppPaths, session::SessionMode};
+    use agentd_shared::{paths::AppPaths, session::SessionMode};
     use anyhow::{Error, Result};
     use nix::libc;
     use portable_pty::{MasterPty, PtySize};
-    use serde_json::json;
     use std::{
         fs,
         io::{Read, Write},
@@ -1951,6 +1349,45 @@ mod tests {
         assert_eq!(control, AttachControl::Detach);
     }
 
+    #[test]
+    fn finalize_session_exit_marks_clean_sessions_complete() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        let repo = paths.root.join("repo");
+        init_git_repo(repo.as_str());
+
+        insert_session(&db, repo.as_str(), "demo", "clean");
+        finalize_session_exit(&db, "demo", Some(0), SessionStartMode::Create).unwrap();
+
+        let session = db.get_session("demo").unwrap().unwrap();
+        assert_eq!(session.status, agentd_shared::session::SessionStatus::Exited);
+        assert_eq!(
+            session.integration_state,
+            agentd_shared::session::IntegrationState::Clean
+        );
+    }
+
+    #[test]
+    fn finalize_session_exit_marks_changed_sessions_pending_review() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        let repo = paths.root.join("repo");
+        init_git_repo(repo.as_str());
+
+        insert_session(&db, repo.as_str(), "demo", "changed");
+        fs::write(repo.join("README.md"), "updated\n").unwrap();
+        finalize_session_exit(&db, "demo", Some(0), SessionStartMode::Create).unwrap();
+
+        let session = db.get_session("demo").unwrap().unwrap();
+        assert_eq!(session.status, agentd_shared::session::SessionStatus::Exited);
+        assert_eq!(
+            session.integration_state,
+            agentd_shared::session::IntegrationState::PendingReview
+        );
+    }
+
     fn test_paths() -> AppPaths {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2013,269 +1450,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn classify_session_outcome_marks_clarification_only_run_as_needs_input() {
-        let paths = test_paths();
-        paths.ensure_layout().unwrap();
-        let db = Database::open(&paths).unwrap();
-        let repo = paths.root.join("repo");
-        init_git_repo(repo.as_str());
-
+    fn insert_session(db: &Database, repo: &str, session_id: &str, title: &str) {
         db.insert_session(&NewSession {
-            session_id: "demo",
-            thread_id: Some("thread-demo"),
+            session_id,
+            thread_id: None,
             agent: "codex",
             model: Some("gpt-5.3-codex"),
             mode: SessionMode::Execute,
             agent_command: "codex",
             agent_args_json: "[]",
-            resume_session_id: Some("resume-1"),
-            workspace: repo.as_str(),
-            repo_path: repo.as_str(),
+            resume_session_id: None,
+            workspace: repo,
+            repo_path: repo,
             repo_name: "repo",
-            title: "clarify",
+            title,
             base_branch: "main",
-            branch: "agent/clarify",
-            worktree: repo.as_str(),
+            branch: "agent/demo",
+            worktree: repo,
         })
         .unwrap();
-        db.insert_thread(&NewThread {
-            thread_id: "thread-demo",
-            session_id: "demo",
-            agent: "codex",
-            title: "clarify",
-            initial_prompt: "clarify",
-        })
-        .unwrap();
-        db.append_events(
-            "demo",
-            &[NewSessionEvent {
-                event_type: "CODEX_ITEM_COMPLETED".to_string(),
-                payload_json: json!({
-                    "raw": {
-                        "item": {
-                            "type": "agent_message",
-                            "text": "Do you want me to make the change?"
-                        }
-                    }
-                }),
-            }],
-        )
-        .unwrap();
-
-        let session = db.get_session("demo").unwrap().unwrap();
-        let outcome = classify_session_outcome(&db, &session, Some(0)).unwrap();
-        assert!(matches!(
-            outcome,
-            SessionOutcome::NeedsInputText { ref question }
-                if question == "Do you want me to make the change?"
-        ));
-    }
-
-    #[test]
-    fn classify_session_outcome_uses_latest_resume_boundary() {
-        let paths = test_paths();
-        paths.ensure_layout().unwrap();
-        let db = Database::open(&paths).unwrap();
-        let repo = paths.root.join("repo");
-        init_git_repo(repo.as_str());
-
-        db.insert_session(&NewSession {
-            session_id: "demo",
-            thread_id: Some("thread-demo"),
-            agent: "codex",
-            model: Some("gpt-5.3-codex"),
-            mode: SessionMode::Plan,
-            agent_command: "codex",
-            agent_args_json: "[]",
-            resume_session_id: Some("resume-1"),
-            workspace: repo.as_str(),
-            repo_path: repo.as_str(),
-            repo_name: "repo",
-            title: "plan",
-            base_branch: "main",
-            branch: "agent/plan",
-            worktree: repo.as_str(),
-        })
-        .unwrap();
-        db.insert_thread(&NewThread {
-            thread_id: "thread-demo",
-            session_id: "demo",
-            agent: "codex",
-            title: "plan",
-            initial_prompt: "plan",
-        })
-        .unwrap();
-        db.append_events(
-            "demo",
-            &[
-                daemon_event("SESSION_STARTED", json!({"source":"daemon"})),
-                NewSessionEvent {
-                    event_type: "CODEX_ITEM_COMPLETED".to_string(),
-                    payload_json: json!({
-                        "raw": {
-                            "item": {
-                                "type": "agent_message",
-                                "text": "What area should I focus on?"
-                            }
-                        }
-                    }),
-                },
-                daemon_event("SESSION_REPLY_REQUESTED", json!({"source":"daemon"})),
-                daemon_event("SESSION_RESUMED", json!({"source":"daemon"})),
-                NewSessionEvent {
-                    event_type: "CODEX_ITEM_COMPLETED".to_string(),
-                    payload_json: json!({
-                        "raw": {
-                            "item": {
-                                "type": "agent_message",
-                                "text": "Should I optimize for speed or correctness?"
-                            }
-                        }
-                    }),
-                },
-            ],
-        )
-        .unwrap();
-
-        let session = db.get_session("demo").unwrap().unwrap();
-        let outcome = classify_session_outcome(&db, &session, Some(0)).unwrap();
-        assert!(matches!(
-            outcome,
-            SessionOutcome::NeedsInputText { ref question }
-                if question == "Should I optimize for speed or correctness?"
-        ));
-    }
-
-    #[test]
-    fn classify_session_outcome_prefers_structured_plan_request() {
-        let paths = test_paths();
-        paths.ensure_layout().unwrap();
-        let db = Database::open(&paths).unwrap();
-        let repo = paths.root.join("repo");
-        init_git_repo(repo.as_str());
-
-        db.insert_session(&NewSession {
-            session_id: "demo",
-            thread_id: Some("thread-demo"),
-            agent: "codex",
-            model: Some("gpt-5.3-codex"),
-            mode: SessionMode::Plan,
-            agent_command: "codex",
-            agent_args_json: "[]",
-            resume_session_id: Some("resume-1"),
-            workspace: repo.as_str(),
-            repo_path: repo.as_str(),
-            repo_name: "repo",
-            title: "plan",
-            base_branch: "main",
-            branch: "agent/plan",
-            worktree: repo.as_str(),
-        })
-        .unwrap();
-        db.insert_thread(&NewThread {
-            thread_id: "thread-demo",
-            session_id: "demo",
-            agent: "codex",
-            title: "plan",
-            initial_prompt: "plan",
-        })
-        .unwrap();
-        db.append_events(
-            "demo",
-            &[daemon_event(
-                "SESSION_REQUEST_USER_INPUT",
-                json!({
-                    "source": "daemon",
-                    "request": {
-                        "turn_id": "turn-1",
-                        "questions": [
-                            {
-                                "id": "scope",
-                                "header": "Scope",
-                                "question": "Which scope should I use?",
-                                "options": [{"label": "Plan only"}]
-                            }
-                        ]
-                    }
-                }),
-            )],
-        )
-        .unwrap();
-
-        let session = db.get_session("demo").unwrap().unwrap();
-        let outcome = classify_session_outcome(&db, &session, Some(0)).unwrap();
-        assert!(matches!(
-            outcome,
-            SessionOutcome::NeedsInputRequest { ref request }
-                if request.questions[0].question == "Which scope should I use?"
-        ));
-    }
-
-    #[test]
-    fn finalize_session_exit_ignores_structured_questions_in_interactive_mode() {
-        let paths = test_paths();
-        paths.ensure_layout().unwrap();
-        let db = Database::open(&paths).unwrap();
-        let repo = paths.root.join("repo");
-        init_git_repo(repo.as_str());
-
-        db.insert_session(&NewSession {
-            session_id: "demo",
-            thread_id: Some("thread-demo"),
-            agent: "codex",
-            model: Some("gpt-5.3-codex"),
-            mode: SessionMode::Execute,
-            agent_command: "codex",
-            agent_args_json: "[]",
-            resume_session_id: Some("resume-1"),
-            workspace: repo.as_str(),
-            repo_path: repo.as_str(),
-            repo_name: "repo",
-            title: "clarify",
-            base_branch: "main",
-            branch: "agent/clarify",
-            worktree: repo.as_str(),
-        })
-        .unwrap();
-        db.insert_thread(&NewThread {
-            thread_id: "thread-demo",
-            session_id: "demo",
-            agent: "codex",
-            title: "clarify",
-            initial_prompt: "clarify",
-        })
-        .unwrap();
-
-        let long_question = format!("What {}?", "a".repeat(315));
-        db.append_events(
-            "demo",
-            &[NewSessionEvent {
-                event_type: "CODEX_ITEM_COMPLETED".to_string(),
-                payload_json: json!({
-                    "raw": {
-                        "item": {
-                            "type": "agent_message",
-                            "text": long_question
-                        }
-                    }
-                }),
-            }],
-        )
-        .unwrap();
-
-        finalize_session_exit(&db, "demo", Some(0), SessionStartMode::Create).unwrap();
-
-        let session = db.get_session("demo").unwrap().unwrap();
-        assert_eq!(session.status, agentd_shared::session::SessionStatus::Exited);
-        assert_eq!(
-            session.integration_state,
-            agentd_shared::session::IntegrationState::Clean
-        );
-
-        let events = db.list_events_since("demo", None).unwrap();
-        assert!(events
-            .iter()
-            .all(|event| event.event_type != "SESSION_NEEDS_INPUT"));
     }
 }

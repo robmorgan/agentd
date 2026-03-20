@@ -1,13 +1,12 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
-use serde_json::Value;
 
 use agentd_shared::{
     event::{NewSessionEvent, SessionEvent},
     paths::AppPaths,
     session::{
-        AttentionLevel, GitSyncStatus, IntegrationState, PlanRecord, SessionMode, SessionRecord,
+        AttentionLevel, GitSyncStatus, IntegrationState, SessionMode, SessionRecord,
         SessionStatus, repo_name_from_path,
     },
 };
@@ -33,14 +32,6 @@ pub struct NewSession<'a> {
     pub base_branch: &'a str,
     pub branch: &'a str,
     pub worktree: &'a str,
-}
-
-pub struct NewThread<'a> {
-    pub thread_id: &'a str,
-    pub session_id: &'a str,
-    pub agent: &'a str,
-    pub title: &'a str,
-    pub initial_prompt: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,25 +304,6 @@ impl Database {
         Ok(())
     }
 
-    pub fn insert_thread(&self, new_thread: &NewThread<'_>) -> Result<()> {
-        let conn = self.connect()?;
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO threads (
-                thread_id, session_id, agent, title, initial_prompt, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-            params![
-                new_thread.thread_id,
-                new_thread.session_id,
-                new_thread.agent,
-                new_thread.title,
-                new_thread.initial_prompt,
-                now,
-            ],
-        )?;
-        Ok(())
-    }
-
     pub fn mark_running(&self, session_id: &str, pid: u32) -> Result<()> {
         let conn = self.connect()?;
         let now = Utc::now().to_rfc3339();
@@ -402,61 +374,6 @@ impl Database {
                 status_to_str(SessionStatus::Paused),
                 attention_to_str(AttentionLevel::Notice),
                 "paused",
-                now,
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn mark_needs_input(
-        &self,
-        session_id: &str,
-        exit_code: Option<i32>,
-        summary: String,
-    ) -> Result<()> {
-        let conn = self.connect()?;
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE sessions
-             SET status = ?2,
-                 pid = NULL,
-                 exit_code = ?3,
-                 error = NULL,
-                 attention = ?4,
-                 attention_summary = ?5,
-                 updated_at = ?6,
-                 exited_at = ?6
-             WHERE session_id = ?1",
-            params![
-                session_id,
-                status_to_str(SessionStatus::NeedsInput),
-                exit_code,
-                attention_to_str(AttentionLevel::Action),
-                summary,
-                now,
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn mark_waiting_for_input(&self, session_id: &str, summary: String) -> Result<()> {
-        let conn = self.connect()?;
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE sessions
-             SET status = ?2,
-                 exit_code = NULL,
-                 error = NULL,
-                 attention = ?3,
-                 attention_summary = ?4,
-                 updated_at = ?5,
-                 exited_at = NULL
-             WHERE session_id = ?1",
-            params![
-                session_id,
-                status_to_str(SessionStatus::NeedsInput),
-                attention_to_str(AttentionLevel::Action),
-                summary,
                 now,
             ],
         )?;
@@ -636,69 +553,6 @@ impl Database {
             .map_err(Into::into)
     }
 
-    pub fn insert_plan(
-        &self,
-        session_id: &str,
-        summary: &str,
-        body_markdown: &str,
-        source_event_id: i64,
-    ) -> Result<PlanRecord> {
-        let conn = self.connect()?;
-        let version = conn.query_row(
-            "SELECT COALESCE(MAX(version), 0) + 1 FROM plans WHERE session_id = ?1",
-            params![session_id],
-            |row| row.get::<_, u32>(0),
-        )?;
-        let created_at = Utc::now();
-        conn.execute(
-            "INSERT INTO plans (session_id, version, summary, body_markdown, source_event_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                session_id,
-                version,
-                summary,
-                body_markdown,
-                source_event_id,
-                created_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(PlanRecord {
-            session_id: session_id.to_string(),
-            version,
-            summary: summary.to_string(),
-            body_markdown: body_markdown.to_string(),
-            source_event_id,
-            created_at,
-        })
-    }
-
-    pub fn latest_plan(&self, session_id: &str) -> Result<Option<PlanRecord>> {
-        let conn = self.connect()?;
-        conn.query_row(
-            "SELECT session_id, version, summary, body_markdown, source_event_id, created_at
-             FROM plans
-             WHERE session_id = ?1
-             ORDER BY version DESC
-             LIMIT 1",
-            params![session_id],
-            row_to_plan,
-        )
-        .optional()
-        .map_err(Into::into)
-    }
-
-    pub fn set_thread_upstream_id(&self, thread_id: &str, upstream_thread_id: &str) -> Result<()> {
-        let conn = self.connect()?;
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE threads
-             SET upstream_thread_id = ?2, updated_at = ?3
-             WHERE thread_id = ?1",
-            params![thread_id, upstream_thread_id, now],
-        )?;
-        Ok(())
-    }
-
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
@@ -758,24 +612,6 @@ impl Database {
 
         tx.commit()?;
         Ok(inserted)
-    }
-
-    pub fn list_events_since(
-        &self,
-        session_id: &str,
-        after_id: Option<i64>,
-    ) -> Result<Vec<SessionEvent>> {
-        let conn = self.connect()?;
-        let after_id = after_id.unwrap_or(0);
-        let mut stmt = conn.prepare(
-            "SELECT id, session_id, timestamp, type, payload_json
-             FROM events
-             WHERE session_id = ?1 AND id > ?2
-             ORDER BY id ASC",
-        )?;
-        let rows = stmt.query_map(params![session_id, after_id], row_to_event)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
     }
 }
 
@@ -844,17 +680,6 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     })
 }
 
-fn row_to_plan(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanRecord> {
-    Ok(PlanRecord {
-        session_id: row.get(0)?,
-        version: row.get(1)?,
-        summary: row.get(2)?,
-        body_markdown: row.get(3)?,
-        source_event_id: row.get(4)?,
-        created_at: parse_time(row.get::<_, String>(5)?)?,
-    })
-}
-
 fn row_to_thread(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRecord> {
     Ok(ThreadRecord {
         thread_id: row.get(0)?,
@@ -876,28 +701,12 @@ fn parse_time(value: String) -> rusqlite::Result<DateTime<Utc>> {
         })
 }
 
-fn parse_payload(value: String) -> rusqlite::Result<Value> {
-    serde_json::from_str(&value).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
-    })
-}
-
 fn parse_agent_args_json(value: Option<String>) -> rusqlite::Result<Option<Vec<String>>> {
     let Some(value) = value else {
         return Ok(None);
     };
     serde_json::from_str(&value).map(Some).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
-    })
-}
-
-fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
-    Ok(SessionEvent {
-        id: row.get(0)?,
-        session_id: row.get(1)?,
-        timestamp: parse_time(row.get::<_, String>(2)?)?,
-        event_type: row.get(3)?,
-        payload_json: parse_payload(row.get::<_, String>(4)?)?,
     })
 }
 
@@ -1033,7 +842,37 @@ mod tests {
     }
 
     #[test]
-    fn event_rows_round_trip_in_order() {
+    fn insert_session_round_trips_active_fields() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        db.insert_session(&super::NewSession {
+            session_id: "demo",
+            thread_id: None,
+            agent: "codex",
+            model: Some("gpt-5.3-codex"),
+            mode: SessionMode::Execute,
+            agent_command: "codex",
+            agent_args_json: "[]",
+            resume_session_id: None,
+            workspace: "/tmp/repo",
+            repo_path: "/tmp/repo",
+            repo_name: "repo",
+            title: "test",
+            base_branch: "main",
+            branch: "agent/test",
+            worktree: "/tmp/worktree",
+        })
+        .unwrap();
+
+        let session = db.get_session("demo").unwrap().unwrap();
+        assert_eq!(session.title, "test");
+        assert_eq!(session.repo_name, "repo");
+        assert_eq!(session.branch, "agent/test");
+    }
+
+    #[test]
+    fn append_events_returns_inserted_rows_in_order() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
         let db = Database::open(&paths).unwrap();
@@ -1074,48 +913,8 @@ mod tests {
 
         assert_eq!(inserted.len(), 2);
         assert!(inserted[0].id < inserted[1].id);
-
-        let listed = db.list_events_since("demo", None).unwrap();
-        assert_eq!(listed.len(), 2);
-        assert_eq!(listed[0].event_type, "SESSION_STARTED");
-        assert_eq!(listed[1].event_type, "COMMAND_EXECUTED");
-    }
-
-    #[test]
-    fn deleting_session_removes_events() {
-        let paths = test_paths();
-        paths.ensure_layout().unwrap();
-        let db = Database::open(&paths).unwrap();
-        db.insert_session(&super::NewSession {
-            session_id: "demo",
-            thread_id: None,
-            agent: "codex",
-            model: None,
-            mode: SessionMode::Execute,
-            agent_command: "codex",
-            agent_args_json: "[]",
-            resume_session_id: None,
-            workspace: "/tmp/repo",
-            repo_path: "/tmp/repo",
-            repo_name: "repo",
-            title: "test",
-            base_branch: "main",
-            branch: "agent/test",
-            worktree: "/tmp/worktree",
-        })
-        .unwrap();
-        db.append_events(
-            "demo",
-            &[NewSessionEvent {
-                event_type: "SESSION_STARTED".to_string(),
-                payload_json: json!({"source":"daemon"}),
-            }],
-        )
-        .unwrap();
-
-        db.delete_session("demo").unwrap();
-
-        assert!(db.list_events_since("demo", None).unwrap().is_empty());
+        assert_eq!(inserted[0].event_type, "SESSION_STARTED");
+        assert_eq!(inserted[1].event_type, "COMMAND_EXECUTED");
     }
 
     #[test]
@@ -1147,126 +946,6 @@ mod tests {
         assert_eq!(
             db.get_resume_session_id("demo").unwrap().as_deref(),
             Some("thread-123")
-        );
-    }
-
-    #[test]
-    fn mark_needs_input_persists_status_and_summary() {
-        let paths = test_paths();
-        paths.ensure_layout().unwrap();
-        let db = Database::open(&paths).unwrap();
-        db.insert_session(&super::NewSession {
-            session_id: "demo",
-            thread_id: None,
-            agent: "codex",
-            model: None,
-            mode: SessionMode::Execute,
-            agent_command: "codex",
-            agent_args_json: "[]",
-            resume_session_id: None,
-            workspace: "/tmp/repo",
-            repo_path: "/tmp/repo",
-            repo_name: "repo",
-            title: "test",
-            base_branch: "main",
-            branch: "agent/test",
-            worktree: "/tmp/worktree",
-        })
-        .unwrap();
-
-        db.mark_needs_input("demo", Some(0), "Can you clarify?".to_string())
-            .unwrap();
-
-        let session = db.get_session("demo").unwrap().unwrap();
-        assert_eq!(session.status, agentd_shared::session::SessionStatus::NeedsInput);
-        assert_eq!(
-            session.attention,
-            agentd_shared::session::AttentionLevel::Action
-        );
-        assert_eq!(session.attention_summary.as_deref(), Some("Can you clarify?"));
-        assert_eq!(session.exit_code, Some(0));
-    }
-
-    #[test]
-    fn thread_rows_round_trip_and_link_to_sessions() {
-        let paths = test_paths();
-        paths.ensure_layout().unwrap();
-        let db = Database::open(&paths).unwrap();
-        db.insert_session(&super::NewSession {
-            session_id: "demo",
-            thread_id: Some("thread-demo"),
-            agent: "codex",
-            model: Some("gpt-5.3-codex"),
-            mode: SessionMode::Execute,
-            agent_command: "codex",
-            agent_args_json: "[]",
-            resume_session_id: None,
-            workspace: "/tmp/repo",
-            repo_path: "/tmp/repo",
-            repo_name: "repo",
-            title: "test",
-            base_branch: "main",
-            branch: "agent/test",
-            worktree: "/tmp/worktree",
-        })
-        .unwrap();
-        db.insert_thread(&super::NewThread {
-            thread_id: "thread-demo",
-            session_id: "demo",
-            agent: "codex",
-            title: "test",
-            initial_prompt: "test",
-        })
-        .unwrap();
-
-        db.set_thread_upstream_id("thread-demo", "codex-upstream")
-            .unwrap();
-
-        let session = db.get_session("demo").unwrap().unwrap();
-        assert_eq!(session.thread_id.as_deref(), Some("thread-demo"));
-        assert_eq!(session.model.as_deref(), Some("gpt-5.3-codex"));
-
-        let thread = db.get_thread("thread-demo").unwrap().unwrap();
-        assert_eq!(thread.thread_id, "thread-demo");
-        assert_eq!(thread.upstream_thread_id.as_deref(), Some("codex-upstream"));
-    }
-
-    #[test]
-    fn plan_rows_version_and_round_trip() {
-        let paths = test_paths();
-        paths.ensure_layout().unwrap();
-        let db = Database::open(&paths).unwrap();
-        db.insert_session(&super::NewSession {
-            session_id: "demo",
-            thread_id: None,
-            agent: "codex",
-            model: None,
-            mode: SessionMode::Plan,
-            agent_command: "codex",
-            agent_args_json: "[]",
-            resume_session_id: None,
-            workspace: "/tmp/repo",
-            repo_path: "/tmp/repo",
-            repo_name: "repo",
-            title: "plan",
-            base_branch: "main",
-            branch: "agent/plan",
-            worktree: "/tmp/worktree",
-        })
-        .unwrap();
-
-        let first = db
-            .insert_plan("demo", "First plan", "first body", 10)
-            .unwrap();
-        let second = db
-            .insert_plan("demo", "Second plan", "second body", 11)
-            .unwrap();
-
-        assert_eq!(first.version, 1);
-        assert_eq!(second.version, 2);
-        assert_eq!(
-            db.latest_plan("demo").unwrap().map(|plan| plan.summary),
-            Some("Second plan".to_string())
         );
     }
 }

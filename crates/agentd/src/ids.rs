@@ -14,7 +14,3 @@ pub fn generate_session_id() -> String {
     let animal = ANIMALS.choose(&mut rng).copied().unwrap_or("otters");
     format!("{adjective}-{animal}")
 }
-
-pub fn generate_thread_id() -> String {
-    format!("thread-{}", generate_session_id())
-}

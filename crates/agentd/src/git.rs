@@ -50,10 +50,6 @@ pub fn current_branch(repo_root: &Utf8Path) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
-pub fn working_tree_status(repo_root: &Utf8Path) -> Result<String> {
-    run_git(repo_root, &["status", "--porcelain"])
-}
-
 pub fn create_worktree(
     repo_root: &Utf8Path,
     base_branch: &str,
@@ -144,42 +140,6 @@ pub fn remove_worktree(repo_root: &Utf8Path, worktree: &Utf8Path) -> Result<()> 
     Ok(())
 }
 
-pub fn committed_patch_against_base(worktree: &Utf8Path, base_branch: &str) -> Result<String> {
-    run_git(worktree, &["diff", "--binary", &format!("{base_branch}...HEAD")])
-}
-
-pub fn worktree_patch_against_head(worktree: &Utf8Path) -> Result<String> {
-    run_git(worktree, &["diff", "--binary", "HEAD"])
-}
-
-pub fn apply_patch(repo_root: &Utf8Path, patch: &str) -> Result<()> {
-    if patch.trim().is_empty() {
-        return Ok(());
-    }
-
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(repo_root.as_str())
-        .args(["apply", "--index", "--allow-binary-replacement", "-"]);
-    run_git_with_stdin(command, patch.as_bytes())
-        .with_context(|| format!("failed to apply patch in {}", repo_root))?;
-    Ok(())
-}
-
-pub fn commit_all(repo_root: &Utf8Path, message: &str) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root.as_str())
-        .args(["commit", "-m", message])
-        .output()
-        .with_context(|| format!("failed to create commit in {}", repo_root))?;
-    if !output.status.success() {
-        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
-    }
-    Ok(())
-}
-
 pub fn diff_against_base(worktree: &Utf8Path, base_branch: &str) -> Result<String> {
     let status = run_git(worktree, &["status", "--short"])?;
     let committed = run_git(
@@ -251,22 +211,6 @@ fn run_git(worktree: &Utf8Path, args: &[&str]) -> Result<String> {
         .args(args)
         .output()
         .with_context(|| format!("failed to run git in {}", worktree))?;
-    if !output.status.success() {
-        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
-    }
-    Ok(String::from_utf8(output.stdout)?)
-}
-
-fn run_git_with_stdin(mut command: Command, stdin: &[u8]) -> Result<String> {
-    use std::process::Stdio;
-
-    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn().context("failed to spawn git command")?;
-    if let Some(mut child_stdin) = child.stdin.take() {
-        use std::io::Write;
-        child_stdin.write_all(stdin)?;
-    }
-    let output = child.wait_with_output().context("failed to wait for git command")?;
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
