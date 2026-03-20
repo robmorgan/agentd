@@ -6,12 +6,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::{
     event::{NewSessionEvent, SessionEvent},
     session::{
-        AttentionLevel, CreateSessionResult, GitSyncStatus, IntegrationState, SessionDiff,
-        SessionMode, SessionRecord, SessionStatus, WorktreeRecord,
+        AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult, GitSyncStatus,
+        IntegrationState, SessionDiff, SessionMode, SessionRecord, SessionStatus, WorktreeRecord,
     },
 };
 
-pub const PROTOCOL_VERSION: u16 = 18;
+pub const PROTOCOL_VERSION: u16 = 19;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
@@ -87,6 +87,7 @@ pub enum Request {
     },
     AttachSession {
         session_id: String,
+        kind: AttachmentKind,
     },
     AttachResize {
         cols: u16,
@@ -94,6 +95,11 @@ pub enum Request {
     },
     DetachSession {
         session_id: String,
+        all: bool,
+    },
+    DetachAttachment {
+        session_id: String,
+        attach_id: String,
     },
     AttachInput {
         data: Vec<u8>,
@@ -125,6 +131,9 @@ pub enum Request {
         session_id: String,
     },
     ListSessions,
+    ListAttachments {
+        session_id: String,
+    },
     AppendSessionEvents {
         session_id: String,
         events: Vec<NewSessionEvent>,
@@ -152,6 +161,7 @@ pub enum Response {
         was_running: bool,
     },
     Attached {
+        attach_id: String,
         snapshot: Vec<u8>,
     },
     SessionEnded {
@@ -175,6 +185,9 @@ pub enum Response {
     },
     Sessions {
         sessions: Vec<SessionRecord>,
+    },
+    Attachments {
+        attachments: Vec<AttachmentRecord>,
     },
     Event {
         event: SessionEvent,
@@ -207,6 +220,8 @@ enum MessageKind {
     AttachSessionRequest = 7,
     AttachInputRequest = 8,
     SendInputRequest = 9,
+    ListAttachmentsRequest = 22,
+    DetachAttachmentRequest = 23,
     AttachResizeRequest = 21,
     ReplyToSessionRequest = 18,
     ApplySessionRequest = 19,
@@ -224,6 +239,7 @@ enum MessageKind {
     KillSessionResponse = 103,
     AttachedResponse = 104,
     SessionEndedResponse = 117,
+    AttachmentsResponse = 118,
     InputAcceptedResponse = 105,
     WorktreeResponse = 106,
     DiffResponse = 107,
@@ -250,6 +266,8 @@ impl MessageKind {
             7 => Self::AttachSessionRequest,
             8 => Self::AttachInputRequest,
             9 => Self::SendInputRequest,
+            22 => Self::ListAttachmentsRequest,
+            23 => Self::DetachAttachmentRequest,
             21 => Self::AttachResizeRequest,
             18 => Self::ReplyToSessionRequest,
             19 => Self::ApplySessionRequest,
@@ -267,6 +285,7 @@ impl MessageKind {
             103 => Self::KillSessionResponse,
             104 => Self::AttachedResponse,
             117 => Self::SessionEndedResponse,
+            118 => Self::AttachmentsResponse,
             105 => Self::InputAcceptedResponse,
             106 => Self::WorktreeResponse,
             107 => Self::DiffResponse,
@@ -490,8 +509,9 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             put_bool(&mut payload, *remove);
             MessageKind::KillSessionRequest
         }
-        Request::AttachSession { session_id } => {
+        Request::AttachSession { session_id, kind } => {
             put_string(&mut payload, session_id)?;
+            put_attachment_kind(&mut payload, *kind);
             MessageKind::AttachSessionRequest
         }
         Request::AttachResize { cols, rows } => {
@@ -499,9 +519,18 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             payload.extend_from_slice(&rows.to_le_bytes());
             MessageKind::AttachResizeRequest
         }
-        Request::DetachSession { session_id } => {
+        Request::DetachSession { session_id, all } => {
             put_string(&mut payload, session_id)?;
+            put_bool(&mut payload, *all);
             MessageKind::DetachSessionRequest
+        }
+        Request::DetachAttachment {
+            session_id,
+            attach_id,
+        } => {
+            put_string(&mut payload, session_id)?;
+            put_string(&mut payload, attach_id)?;
+            MessageKind::DetachAttachmentRequest
         }
         Request::AttachInput { data } => {
             put_bytes(&mut payload, data)?;
@@ -548,6 +577,10 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             MessageKind::GetSessionRequest
         }
         Request::ListSessions => MessageKind::ListSessionsRequest,
+        Request::ListAttachments { session_id } => {
+            put_string(&mut payload, session_id)?;
+            MessageKind::ListAttachmentsRequest
+        }
         Request::AppendSessionEvents { session_id, events } => {
             put_string(&mut payload, session_id)?;
             put_len(&mut payload, events.len())?;
@@ -593,6 +626,7 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
         },
         MessageKind::AttachSessionRequest => Request::AttachSession {
             session_id: cursor.take_string()?,
+            kind: cursor.take_attachment_kind()?,
         },
         MessageKind::AttachResizeRequest => Request::AttachResize {
             cols: cursor.take_u16()?,
@@ -600,6 +634,11 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
         },
         MessageKind::DetachSessionRequest => Request::DetachSession {
             session_id: cursor.take_string()?,
+            all: cursor.take_bool()?,
+        },
+        MessageKind::DetachAttachmentRequest => Request::DetachAttachment {
+            session_id: cursor.take_string()?,
+            attach_id: cursor.take_string()?,
         },
         MessageKind::AttachInputRequest => Request::AttachInput {
             data: cursor.take_bytes()?,
@@ -631,6 +670,9 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
             session_id: cursor.take_string()?,
         },
         MessageKind::ListSessionsRequest => Request::ListSessions,
+        MessageKind::ListAttachmentsRequest => Request::ListAttachments {
+            session_id: cursor.take_string()?,
+        },
         MessageKind::AppendSessionEventsRequest => {
             let session_id = cursor.take_string()?;
             let len = cursor.take_len()?;
@@ -673,7 +715,8 @@ fn encode_response(response: &Response) -> Result<(MessageKind, Vec<u8>)> {
             put_bool(&mut payload, *was_running);
             MessageKind::KillSessionResponse
         }
-        Response::Attached { snapshot } => {
+        Response::Attached { attach_id, snapshot } => {
+            put_string(&mut payload, attach_id)?;
             put_bytes(&mut payload, snapshot)?;
             MessageKind::AttachedResponse
         }
@@ -715,6 +758,13 @@ fn encode_response(response: &Response) -> Result<(MessageKind, Vec<u8>)> {
             }
             MessageKind::SessionsResponse
         }
+        Response::Attachments { attachments } => {
+            put_len(&mut payload, attachments.len())?;
+            for attachment in attachments {
+                put_attachment_record(&mut payload, attachment)?;
+            }
+            MessageKind::AttachmentsResponse
+        }
         Response::Event { event } => {
             put_session_event(&mut payload, event)?;
             MessageKind::EventResponse
@@ -755,6 +805,7 @@ fn decode_response(kind: MessageKind, payload: &[u8]) -> Result<Response> {
             was_running: cursor.take_bool()?,
         },
         MessageKind::AttachedResponse => Response::Attached {
+            attach_id: cursor.take_string()?,
             snapshot: cursor.take_bytes()?,
         },
         MessageKind::SessionEndedResponse => Response::SessionEnded {
@@ -783,6 +834,14 @@ fn decode_response(kind: MessageKind, payload: &[u8]) -> Result<Response> {
                 sessions.push(cursor.take_session_record()?);
             }
             Response::Sessions { sessions }
+        }
+        MessageKind::AttachmentsResponse => {
+            let len = cursor.take_len()?;
+            let mut attachments = Vec::with_capacity(len);
+            for _ in 0..len {
+                attachments.push(cursor.take_attachment_record()?);
+            }
+            Response::Attachments { attachments }
         }
         MessageKind::EventResponse => Response::Event {
             event: cursor.take_session_event()?,
@@ -922,6 +981,13 @@ fn put_session_status(buf: &mut Vec<u8>, status: SessionStatus) {
     });
 }
 
+fn put_attachment_kind(buf: &mut Vec<u8>, kind: AttachmentKind) {
+    buf.push(match kind {
+        AttachmentKind::Attach => 1,
+        AttachmentKind::Tui => 2,
+    });
+}
+
 fn put_attention_level(buf: &mut Vec<u8>, attention: AttentionLevel) {
     buf.push(match attention {
         AttentionLevel::Info => 1,
@@ -1009,6 +1075,14 @@ fn put_session_record(buf: &mut Vec<u8>, session: &SessionRecord) -> Result<()> 
     put_datetime(buf, &session.created_at);
     put_datetime(buf, &session.updated_at);
     put_optional_datetime(buf, session.exited_at.as_ref());
+    Ok(())
+}
+
+fn put_attachment_record(buf: &mut Vec<u8>, attachment: &AttachmentRecord) -> Result<()> {
+    put_string(buf, &attachment.attach_id)?;
+    put_string(buf, &attachment.session_id)?;
+    put_attachment_kind(buf, attachment.kind);
+    put_datetime(buf, &attachment.connected_at);
     Ok(())
 }
 
@@ -1177,6 +1251,14 @@ impl<'a> Cursor<'a> {
         })
     }
 
+    fn take_attachment_kind(&mut self) -> Result<AttachmentKind> {
+        Ok(match self.take_u8()? {
+            1 => AttachmentKind::Attach,
+            2 => AttachmentKind::Tui,
+            other => bail!("invalid attachment kind `{other}`"),
+        })
+    }
+
     fn take_attention_level(&mut self) -> Result<AttentionLevel> {
         Ok(match self.take_u8()? {
             1 => AttentionLevel::Info,
@@ -1302,6 +1384,15 @@ impl<'a> Cursor<'a> {
         })
     }
 
+    fn take_attachment_record(&mut self) -> Result<AttachmentRecord> {
+        Ok(AttachmentRecord {
+            attach_id: self.take_string()?,
+            session_id: self.take_string()?,
+            kind: self.take_attachment_kind()?,
+            connected_at: self.take_datetime()?,
+        })
+    }
+
     fn take_session_event(&mut self) -> Result<SessionEvent> {
         Ok(SessionEvent {
             id: self.take_i64()?,
@@ -1362,8 +1453,8 @@ mod tests {
     use crate::{
         event::{NewSessionEvent, SessionEvent},
         session::{
-            AttentionLevel, CreateSessionResult, GitSyncStatus, IntegrationState, SessionMode,
-            SessionRecord, SessionStatus,
+            AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult,
+            GitSyncStatus, IntegrationState, SessionMode, SessionRecord, SessionStatus,
         },
     };
     use chrono::Utc;
@@ -1416,6 +1507,39 @@ mod tests {
     fn detach_session_round_trips() {
         let request = Request::DetachSession {
             session_id: "demo".to_string(),
+            all: true,
+        };
+        let (kind, payload) = encode_request(&request).unwrap();
+        let decoded = decode_request(kind, &payload).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn attach_session_round_trips_kind() {
+        let request = Request::AttachSession {
+            session_id: "demo".to_string(),
+            kind: AttachmentKind::Tui,
+        };
+        let (kind, payload) = encode_request(&request).unwrap();
+        let decoded = decode_request(kind, &payload).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn detach_attachment_round_trips() {
+        let request = Request::DetachAttachment {
+            session_id: "demo".to_string(),
+            attach_id: "attach-1".to_string(),
+        };
+        let (kind, payload) = encode_request(&request).unwrap();
+        let decoded = decode_request(kind, &payload).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn list_attachments_round_trips() {
+        let request = Request::ListAttachments {
+            session_id: "demo".to_string(),
         };
         let (kind, payload) = encode_request(&request).unwrap();
         let decoded = decode_request(kind, &payload).unwrap();
@@ -1446,6 +1570,7 @@ mod tests {
     #[test]
     fn response_round_trips_snapshot_bytes() {
         let response = Response::Attached {
+            attach_id: "attach-1".to_string(),
             snapshot: vec![0, 1, 2, 3, 4],
         };
         let (kind, payload) = encode_response(&response).unwrap();
@@ -1509,6 +1634,22 @@ mod tests {
                 created_at: now,
                 updated_at: now,
                 exited_at: None,
+            }],
+        };
+        let (kind, payload) = encode_response(&response).unwrap();
+        let decoded = decode_response(kind, &payload).unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn attachments_response_round_trips() {
+        let now = Utc::now();
+        let response = Response::Attachments {
+            attachments: vec![AttachmentRecord {
+                attach_id: "attach-1".to_string(),
+                session_id: "demo".to_string(),
+                kind: AttachmentKind::Attach,
+                connected_at: now,
             }],
         };
         let (kind, payload) = encode_response(&response).unwrap();

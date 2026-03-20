@@ -11,13 +11,12 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, Subcommand};
 use crossterm::{
-    cursor::{Hide, MoveTo, Show},
+    cursor::{Hide, Show},
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     style::{Attribute as CrosAttribute, Color as CrosColor, Stylize},
     terminal::{
-        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-        enable_raw_mode,
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     },
     event::{DisableMouseCapture, EnableMouseCapture},
 };
@@ -42,8 +41,8 @@ use agentd_shared::{
         write_daemon_management_request, write_request,
     },
     session::{
-        AttentionLevel, IntegrationState, SessionDiff, SessionRecord, SessionStatus,
-        WorktreeRecord,
+        AttachmentKind, AttachmentRecord, AttentionLevel, IntegrationState, SessionDiff,
+        SessionRecord, SessionStatus, WorktreeRecord,
     },
 };
 
@@ -98,6 +97,10 @@ enum Command {
     },
     Detach {
         session_id: Option<String>,
+        #[arg(long)]
+        attach: Option<String>,
+        #[arg(long)]
+        all: bool,
     },
     SendInput {
         session_id: String,
@@ -141,6 +144,9 @@ enum Command {
     },
     #[command(visible_alias = "ls", alias = "sessions")]
     List,
+    Attachments {
+        session_id: String,
+    },
     Status {
         session_id: String,
     },
@@ -282,18 +288,36 @@ async fn main() -> Result<()> {
         (Command::Attach { .. }, ExecutionMode::Local(reason)) => {
             bail_live_command(&reason)?;
         }
-        (Command::Detach { session_id }, ExecutionMode::Daemon) => {
+        (
+            Command::Detach {
+                session_id,
+                attach,
+                all,
+            },
+            ExecutionMode::Daemon,
+        ) => {
             let session_id = resolve_detach_session_id(session_id)?;
-            let response = send_request(
-                &paths,
-                &Request::DetachSession {
+            if all && attach.is_some() {
+                bail!("use either `--all` or `--attach <attach_id>`, not both");
+            }
+            let request = match (all, attach) {
+                (true, None) => Request::DetachSession {
                     session_id: session_id.clone(),
+                    all: true,
                 },
-            )
-            .await?;
+                (false, Some(attach_id)) => Request::DetachAttachment {
+                    session_id: session_id.clone(),
+                    attach_id,
+                },
+                (false, None) => bail!(
+                    "shared attach requires either `--all` or `--attach <attach_id>`; use Ctrl-] to detach the local client"
+                ),
+                (true, Some(_)) => unreachable!(),
+            };
+            let response = send_request(&paths, &request).await?;
 
             match response {
-                Response::Ok => println!("detached session {session_id}"),
+                Response::Ok => println!("detached from {session_id}"),
                 Response::Error { message } => bail!(message),
                 other => bail!("unexpected response: {:?}", other),
             }
@@ -374,9 +398,7 @@ async fn main() -> Result<()> {
         }
         (Command::List, ExecutionMode::Daemon) => {
             let sessions = daemon_list_sessions(&paths).await?;
-            if !maybe_switch_attached_session(&paths, &sessions).await? {
-                print_sessions(&sessions);
-            }
+            print_sessions(&sessions);
         }
         (Command::List, ExecutionMode::Local(reason)) => {
             print_degraded_notice(&reason);
@@ -387,6 +409,13 @@ async fn main() -> Result<()> {
                 .map(normalize_session)
                 .collect::<Vec<_>>();
             print_sessions(&sessions);
+        }
+        (Command::Attachments { session_id }, ExecutionMode::Daemon) => {
+            let attachments = daemon_list_attachments(&paths, &session_id).await?;
+            print_attachments(&attachments);
+        }
+        (Command::Attachments { .. }, ExecutionMode::Local(reason)) => {
+            bail!("{reason}. `agent attachments` requires a compatible daemon");
         }
         (Command::Diff { session_id }, ExecutionMode::Daemon) => {
             let response = send_request(&paths, &Request::DiffSession { session_id }).await?;
@@ -929,6 +958,7 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
         &mut stream,
         &Request::AttachSession {
             session_id: session_id.to_string(),
+            kind: AttachmentKind::Attach,
         },
     )
     .await?;
@@ -939,8 +969,11 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
         bail!("agentd closed the connection");
     };
 
-    let snapshot = match response {
-        Response::Attached { snapshot } => snapshot,
+    let (attach_id, snapshot) = match response {
+        Response::Attached {
+            attach_id,
+            snapshot,
+        } => (attach_id, snapshot),
         Response::SessionEnded {
             session_id,
             status,
@@ -964,7 +997,7 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
         other => bail!("unexpected response: {:?}", other),
     };
 
-    eprintln!("attached to {session_id}; detach with Ctrl-]");
+    eprintln!("attached to {session_id} ({attach_id}); detach with Ctrl-]");
     let _terminal = AttachTerminalGuard::enter()?;
     write_attach_bytes(AGENTD_ATTACH_CLEAR_SEQUENCE)?;
     write_attach_bytes(&snapshot)?;
@@ -1046,6 +1079,18 @@ fn print_sessions(sessions: &[SessionRecord]) {
         if let Some(summary) = &session.attention_summary {
             println!("\t{summary}");
         }
+    }
+}
+
+fn print_attachments(attachments: &[AttachmentRecord]) {
+    for attachment in attachments {
+        println!(
+            "{}\t{}\t{}\t{}",
+            attachment.attach_id,
+            attachment.session_id,
+            attachment.kind.as_str(),
+            attachment.connected_at.to_rfc3339(),
+        );
     }
 }
 
@@ -1495,6 +1540,24 @@ async fn daemon_list_sessions(paths: &AppPaths) -> Result<Vec<SessionRecord>> {
     }
 }
 
+async fn daemon_list_attachments(
+    paths: &AppPaths,
+    session_id: &str,
+) -> Result<Vec<AttachmentRecord>> {
+    let response = send_request(
+        paths,
+        &Request::ListAttachments {
+            session_id: session_id.to_string(),
+        },
+    )
+    .await?;
+    match response {
+        Response::Attachments { attachments } => Ok(attachments),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {:?}", other),
+    }
+}
+
 async fn daemon_get_session(paths: &AppPaths, session_id: &str) -> Result<SessionRecord> {
     let response = send_request(
         paths,
@@ -1559,194 +1622,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup[1])[1]
-}
-
-async fn maybe_switch_attached_session(
-    paths: &AppPaths,
-    sessions: &[SessionRecord],
-) -> Result<bool> {
-    let Some(current_session_id) = in_session_switch_context() else {
-        return Ok(false);
-    };
-
-    let choices = sessions
-        .iter()
-        .filter(|session| {
-            session.status == SessionStatus::Running && session.session_id != current_session_id
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if choices.is_empty() {
-        return Ok(true);
-    }
-
-    let Some(selected) = pick_session(&choices)? else {
-        return Ok(true);
-    };
-
-    let response = send_request(
-        paths,
-        &Request::SwitchAttachedSession {
-            source_session_id: current_session_id,
-            target_session_id: selected.session_id,
-        },
-    )
-    .await?;
-    match response {
-        Response::Ok => Ok(true),
-        Response::Error { message } => bail!(message),
-        other => bail!("unexpected response: {:?}", other),
-    }
-}
-
-fn in_session_switch_context() -> Option<String> {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return None;
-    }
-    std::env::var("AGENTD_SESSION_ID").ok()
-}
-
-fn pick_session(sessions: &[SessionRecord]) -> Result<Option<SessionRecord>> {
-    let _raw_mode = RawModeGuard::new()?;
-    let _screen = TerminalScreenGuard::enter()?;
-    let mut stdout = std::io::stdout();
-    let mut query = String::new();
-    let mut selected = 0_usize;
-
-    loop {
-        let matches = filtered_sessions(sessions, &query);
-        if selected >= matches.len() && !matches.is_empty() {
-            selected = matches.len() - 1;
-        }
-        render_session_picker(&mut stdout, &query, &matches, selected)?;
-
-        let Event::Key(key) = event::read().context("failed to read terminal input")? else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-
-        match key.code {
-            KeyCode::Esc => return Ok(None),
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(None),
-            KeyCode::Enter => {
-                if let Some((_, session)) = matches.get(selected) {
-                    return Ok(Some((*session).clone()));
-                }
-            }
-            KeyCode::Up => {
-                selected = selected.saturating_sub(1);
-            }
-            KeyCode::Down => {
-                if selected + 1 < matches.len() {
-                    selected += 1;
-                }
-            }
-            KeyCode::Backspace => {
-                query.pop();
-                selected = 0;
-            }
-            KeyCode::Char(ch)
-                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
-            {
-                query.push(ch);
-                selected = 0;
-            }
-            _ => {}
-        }
-    }
-}
-
-fn render_session_picker(
-    stdout: &mut std::io::Stdout,
-    query: &str,
-    matches: &[(i64, &SessionRecord)],
-    selected: usize,
-) -> Result<()> {
-    execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
-    writeln!(stdout, "Switch session")?;
-    writeln!(stdout, "Query: {query}")?;
-    writeln!(stdout, "Enter switches, Esc cancels")?;
-    writeln!(stdout)?;
-
-    if matches.is_empty() {
-        writeln!(stdout, "No matching running sessions.")?;
-    } else {
-        for (index, (_, session)) in matches.iter().take(10).enumerate() {
-            let marker = if index == selected { ">" } else { " " };
-            writeln!(
-                stdout,
-                "{marker} {}  {}  {}  {}",
-                session.session_id,
-                session.agent,
-                session.status_string(),
-                session.branch
-            )?;
-            writeln!(stdout, "  {}", session.title)?;
-        }
-    }
-
-    stdout.flush()?;
-    Ok(())
-}
-
-fn filtered_sessions<'a>(
-    sessions: &'a [SessionRecord],
-    query: &str,
-) -> Vec<(i64, &'a SessionRecord)> {
-    let mut matches = sessions
-        .iter()
-        .filter_map(|session| {
-            fuzzy_score(&session_search_text(session), query).map(|score| (score, session))
-        })
-        .collect::<Vec<_>>();
-    matches.sort_by(|left, right| {
-        right
-            .0
-            .cmp(&left.0)
-            .then_with(|| left.1.created_at.cmp(&right.1.created_at))
-    });
-    matches
-}
-
-fn session_search_text(session: &SessionRecord) -> String {
-    format!(
-        "{} {} {} {} {}",
-        session.session_id, session.agent, session.branch, session.title, session.workspace
-    )
-}
-
-fn fuzzy_score(haystack: &str, needle: &str) -> Option<i64> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-
-    let haystack = haystack.to_lowercase();
-    let needle = needle.to_lowercase();
-    let mut score = 0_i64;
-    let mut last_match = None;
-    let mut position = 0_usize;
-
-    for needle_char in needle.chars() {
-        let remainder = &haystack[position..];
-        let offset = remainder.find(needle_char)?;
-        let absolute = position + offset;
-        score += 10;
-        if let Some(previous) = last_match {
-            if absolute == previous + needle_char.len_utf8() {
-                score += 15;
-            }
-            score -= (absolute.saturating_sub(previous + 1)) as i64;
-        } else {
-            score -= absolute as i64;
-        }
-        last_match = Some(absolute);
-        position = absolute + needle_char.len_utf8();
-    }
-
-    Some(score)
 }
 
 #[cfg(test)]
@@ -1829,9 +1704,41 @@ mod tests {
     fn detach_command_parses_optional_session_id() {
         let cli = Cli::try_parse_from(["agent", "detach", "demo"]).unwrap();
         match cli.command {
-            Some(Command::Detach { session_id }) => {
+            Some(Command::Detach {
+                session_id,
+                attach,
+                all,
+            }) => {
                 assert_eq!(session_id.as_deref(), Some("demo"));
+                assert!(attach.is_none());
+                assert!(!all);
             }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detach_command_parses_attachment_flag() {
+        let cli = Cli::try_parse_from(["agent", "detach", "demo", "--attach", "attach-1"]).unwrap();
+        match cli.command {
+            Some(Command::Detach {
+                session_id,
+                attach,
+                all,
+            }) => {
+                assert_eq!(session_id.as_deref(), Some("demo"));
+                assert_eq!(attach.as_deref(), Some("attach-1"));
+                assert!(!all);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attachments_command_parses() {
+        let cli = Cli::try_parse_from(["agent", "attachments", "demo"]).unwrap();
+        match cli.command {
+            Some(Command::Attachments { session_id }) => assert_eq!(session_id, "demo"),
             other => panic!("unexpected command: {other:?}"),
         }
     }

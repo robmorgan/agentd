@@ -59,7 +59,17 @@ You can attach to a running agent to open the underlying PTY session:
 agent attach fix-tests
 ```
 
-Then detach using `ctrl + ]` or `agent detach`.
+Multiple clients can attach to the same running session at once, including the TUI and one or
+more `agent attach` processes.
+
+Detach the local `agent attach` client using `ctrl + ]`. To inspect or manage other attached
+clients:
+
+```sh
+agent attachments fix-tests
+agent detach fix-tests --attach attach-1
+agent detach fix-tests --all
+```
 
 Stop a task:
 
@@ -177,9 +187,11 @@ macOS typically does not set `XDG_RUNTIME_DIR`, so the default root on macOS bec
 unless `AGENTD_DIR` is set explicitly.
 
 Interactive PTY attach is available with `agent attach <session_id>`. Detach with `Ctrl-]` or
-`agent detach <session_id>`. When run inside a managed session, `agent detach` uses
-`AGENTD_SESSION_ID` automatically.
-Only one interactive attacher is allowed per session. Background PTY writes are available with
+`agent detach <session_id> --attach <attach_id>` for a specific client, or
+`agent detach <session_id> --all` to disconnect every attached client on the session.
+Use `agent attachments <session_id>` to inspect the current attachment ids.
+Multiple interactive attachers are allowed per session, and the TUI uses the same shared attach
+path when a worker is focused. Background PTY writes are still available with
 `agent send-input <session_id> -- <text>`.
 
 ## Troubleshooting

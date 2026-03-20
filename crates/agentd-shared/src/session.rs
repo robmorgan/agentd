@@ -48,6 +48,13 @@ pub enum SessionMode {
     Plan,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKind {
+    Attach,
+    Tui,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionRecord {
     pub session_id: String,
@@ -103,6 +110,14 @@ pub struct SessionDiff {
     pub branch: String,
     pub worktree: String,
     pub diff: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentRecord {
+    pub attach_id: String,
+    pub session_id: String,
+    pub kind: AttachmentKind,
+    pub connected_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -172,6 +187,15 @@ impl SessionMode {
         match self {
             Self::Execute => "execute",
             Self::Plan => "plan",
+        }
+    }
+}
+
+impl AttachmentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Attach => "attach",
+            Self::Tui => "tui",
         }
     }
 }

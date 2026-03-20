@@ -4,15 +4,15 @@ use std::{
     io::{Read, Write},
     path::Path,
     sync::{
-        mpsc,
+        mpsc as std_mpsc,
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use camino::Utf8PathBuf;
+use chrono::Utc;
 use nix::{
     errno::Errno,
     sys::signal::{Signal, kill},
@@ -20,14 +20,16 @@ use nix::{
 };
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::{sync::broadcast, task};
+use tokio::sync::mpsc;
 
 use agentd_shared::{
     config::Config,
     event::NewSessionEvent,
     paths::AppPaths,
     session::{
-        AttentionLevel, CreateSessionResult, IntegrationState, SessionDiff, SessionMode,
-        SessionRecord, SessionStatus, WorktreeRecord, branch_name_from_title, repo_name_from_path,
+        AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult, IntegrationState,
+        SessionDiff, SessionMode, SessionRecord, SessionStatus, WorktreeRecord,
+        branch_name_from_title, repo_name_from_path,
     },
 };
 
@@ -499,11 +501,13 @@ impl AppState {
     pub async fn attach_session(
         &self,
         session_id: &str,
+        kind: AttachmentKind,
     ) -> Result<(
-        AttachLease,
+        AttachmentHandle,
+        AttachmentRecord,
         Vec<u8>,
         broadcast::Receiver<Vec<u8>>,
-        broadcast::Receiver<AttachControl>,
+        mpsc::UnboundedReceiver<AttachControl>,
     )> {
         let session = self
             .get_session(session_id)
@@ -515,44 +519,26 @@ impl AppState {
             .runtimes
             .get(session_id)
             .ok_or_else(|| anyhow!("session `{session_id}` does not have a live PTY"))?;
-        let (lease, snapshot, receiver, control_rx) = runtime
-            .try_attach()
-            .ok_or_else(|| anyhow!("session `{session_id}` already has an attached client"))?;
-        Ok((lease, snapshot, receiver, control_rx))
+        let (handle, attachment, snapshot, receiver, control_rx) =
+            runtime.attach(session_id, kind)?;
+        Ok((handle, attachment, snapshot, receiver, control_rx))
     }
 
-    pub async fn switch_attached_session(
-        &self,
-        source_session_id: &str,
-        target_session_id: &str,
-    ) -> Result<()> {
-        if source_session_id == target_session_id {
-            bail!("source and target sessions must differ");
-        }
-
-        let source = self
-            .get_session(source_session_id)
+    pub async fn list_attachments(&self, session_id: &str) -> Result<Vec<AttachmentRecord>> {
+        let session = self
+            .get_session(session_id)
             .await?
-            .ok_or_else(|| anyhow!("session `{source_session_id}` not found"))?;
-        ensure_session_running(&source)?;
-        let source_runtime = self
+            .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+        ensure_session_running(&session)?;
+
+        let runtime = self
             .runtimes
-            .get(source_session_id)
-            .ok_or_else(|| anyhow!("session `{source_session_id}` does not have a live PTY"))?;
-
-        let target = self
-            .get_session(target_session_id)
-            .await?
-            .ok_or_else(|| anyhow!("session `{target_session_id}` not found"))?;
-        ensure_session_running(&target)?;
-        self.runtimes
-            .get(target_session_id)
-            .ok_or_else(|| anyhow!("session `{target_session_id}` does not have a live PTY"))?;
-
-        source_runtime.request_switch(target_session_id)
+            .get(session_id)
+            .ok_or_else(|| anyhow!("session `{session_id}` does not have a live PTY"))?;
+        runtime.list_attachments(session_id)
     }
 
-    pub async fn detach_session(&self, session_id: &str) -> Result<()> {
+    pub async fn detach_session(&self, session_id: &str, all: bool) -> Result<()> {
         let session = self
             .get_session(session_id)
             .await?
@@ -564,7 +550,28 @@ impl AppState {
             .get(session_id)
             .ok_or_else(|| anyhow!("session `{session_id}` does not have a live PTY"))?;
 
-        runtime.request_detach()
+        if !all {
+            bail!(
+                "shared attach no longer supports per-client detach by session id; use Ctrl-], close the local UI, or `agent detach {session_id} --attach <attach_id>`"
+            );
+        }
+
+        runtime.request_detach_all()
+    }
+
+    pub async fn detach_attachment(&self, session_id: &str, attach_id: &str) -> Result<()> {
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+        ensure_session_running(&session)?;
+
+        let runtime = self
+            .runtimes
+            .get(session_id)
+            .ok_or_else(|| anyhow!("session `{session_id}` does not have a live PTY"))?;
+
+        runtime.request_detach(attach_id)
     }
 }
 
@@ -727,7 +734,7 @@ fn start_session_runtime(
     let writer_session_id = request.session_id.to_string();
     let writer_log_path = request.log_path.clone();
     let writer_runtime = runtime.clone();
-    let (writer_done_tx, writer_done_rx) = mpsc::channel();
+    let (writer_done_tx, writer_done_rx) = std_mpsc::channel();
     std::thread::spawn(move || {
         let result = pump_pty_to_log(reader, &writer_log_path, &writer_runtime);
         if let Err(err) = result {
@@ -794,8 +801,6 @@ struct SessionRuntime {
     writer: Mutex<Box<dyn Write + Send>>,
     state: Mutex<SessionRuntimeState>,
     output_tx: broadcast::Sender<Vec<u8>>,
-    control_tx: broadcast::Sender<AttachControl>,
-    attached: AtomicBool,
 }
 
 impl SessionRuntime {
@@ -806,14 +811,15 @@ impl SessionRuntime {
         output_buffer_capacity: usize,
     ) -> Self {
         let (output_tx, _) = broadcast::channel(output_buffer_capacity);
-        let (control_tx, _) = broadcast::channel(4);
         Self {
             master: Mutex::new(master),
             writer: Mutex::new(writer),
-            state: Mutex::new(SessionRuntimeState { terminal_state }),
+            state: Mutex::new(SessionRuntimeState {
+                terminal_state,
+                next_attach_ordinal: 1,
+                attachments: HashMap::new(),
+            }),
             output_tx,
-            control_tx,
-            attached: AtomicBool::new(false),
         }
     }
 
@@ -851,24 +857,45 @@ impl SessionRuntime {
         Ok(())
     }
 
-    fn try_attach(
+    fn attach(
         self: &Arc<Self>,
-    ) -> Option<(
-        AttachLease,
+        session_id: &str,
+        kind: AttachmentKind,
+    ) -> Result<(
+        AttachmentHandle,
+        AttachmentRecord,
         Vec<u8>,
         broadcast::Receiver<Vec<u8>>,
-        broadcast::Receiver<AttachControl>,
+        mpsc::UnboundedReceiver<AttachControl>,
     )> {
-        self.attached
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()?;
-        let mut state = self.state.lock().ok()?;
-        let snapshot = state.terminal_state.snapshot().ok()?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("session runtime state poisoned"))?;
+        let attach_id = format!("{}-{}", kind.as_str(), state.next_attach_ordinal);
+        state.next_attach_ordinal += 1;
+        let connected_at = Utc::now();
+        let snapshot = state.terminal_state.snapshot()?;
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        state.attachments.insert(
+            attach_id.clone(),
+            RuntimeAttachment {
+                kind,
+                connected_at,
+                control_tx,
+            },
+        );
         let receiver = self.output_tx.subscribe();
-        let control_rx = self.control_tx.subscribe();
-        Some((
-            AttachLease {
+        Ok((
+            AttachmentHandle {
                 runtime: self.clone(),
+                attach_id: attach_id.clone(),
+            },
+            AttachmentRecord {
+                attach_id,
+                session_id: session_id.to_string(),
+                kind,
+                connected_at,
             },
             snapshot,
             receiver,
@@ -876,44 +903,87 @@ impl SessionRuntime {
         ))
     }
 
-    fn request_switch(&self, target_session_id: &str) -> Result<()> {
-        if !self.attached.load(Ordering::Acquire) {
-            bail!("session does not have an attached client");
-        }
-        self.control_tx
-            .send(AttachControl::SwitchSession(target_session_id.to_string()))
-            .map_err(|_| anyhow!("session does not have an attached client"))?;
+    fn list_attachments(&self, session_id: &str) -> Result<Vec<AttachmentRecord>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("session runtime state poisoned"))?;
+        let mut attachments = state
+            .attachments
+            .iter()
+            .map(|(attach_id, attachment)| AttachmentRecord {
+                attach_id: attach_id.clone(),
+                session_id: session_id.to_string(),
+                kind: attachment.kind,
+                connected_at: attachment.connected_at,
+            })
+            .collect::<Vec<_>>();
+        attachments.sort_by(|left, right| left.connected_at.cmp(&right.connected_at));
+        Ok(attachments)
+    }
+
+    fn request_detach(&self, attach_id: &str) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("session runtime state poisoned"))?;
+        let attachment = state
+            .attachments
+            .get(attach_id)
+            .ok_or_else(|| anyhow!("attachment `{attach_id}` not found"))?;
+        attachment
+            .control_tx
+            .send(AttachControl::Detach)
+            .map_err(|_| anyhow!("attachment `{attach_id}` is no longer connected"))?;
         Ok(())
     }
 
-    fn request_detach(&self) -> Result<()> {
-        if !self.attached.load(Ordering::Acquire) {
-            bail!("session does not have an attached client");
+    fn request_detach_all(&self) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("session runtime state poisoned"))?;
+        for (attach_id, attachment) in &state.attachments {
+            attachment
+                .control_tx
+                .send(AttachControl::Detach)
+                .map_err(|_| anyhow!("attachment `{attach_id}` is no longer connected"))?;
         }
-        self.control_tx
-            .send(AttachControl::Detach)
-            .map_err(|_| anyhow!("session does not have an attached client"))?;
         Ok(())
+    }
+
+    fn remove_attachment(&self, attach_id: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state.attachments.remove(attach_id);
+        }
     }
 }
 
 struct SessionRuntimeState {
     terminal_state: Box<dyn TerminalStateEngine>,
+    next_attach_ordinal: u64,
+    attachments: HashMap<String, RuntimeAttachment>,
 }
 
-pub struct AttachLease {
+struct RuntimeAttachment {
+    kind: AttachmentKind,
+    connected_at: chrono::DateTime<Utc>,
+    control_tx: mpsc::UnboundedSender<AttachControl>,
+}
+
+pub struct AttachmentHandle {
     runtime: Arc<SessionRuntime>,
+    attach_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttachControl {
-    SwitchSession(String),
     Detach,
 }
 
-impl Drop for AttachLease {
+impl Drop for AttachmentHandle {
     fn drop(&mut self) {
-        self.runtime.attached.store(false, Ordering::Release);
+        self.runtime.remove_attachment(&self.attach_id);
     }
 }
 
@@ -1255,7 +1325,10 @@ mod tests {
     use super::{AttachControl, SessionRuntime, SessionStartMode, finalize_session_exit};
     use crate::db::{Database, NewSession};
     use crate::terminal_state::TerminalStateEngine;
-    use agentd_shared::{paths::AppPaths, session::SessionMode};
+    use agentd_shared::{
+        paths::AppPaths,
+        session::{AttachmentKind, SessionMode},
+    };
     use anyhow::{Error, Result};
     use nix::libc;
     use portable_pty::{MasterPty, PtySize};
@@ -1328,8 +1401,8 @@ mod tests {
             Box::new(StubTerminalState),
             8,
         );
-        let err = runtime.request_detach().unwrap_err();
-        assert_eq!(err.to_string(), "session does not have an attached client");
+        let err = runtime.request_detach("attach-1").unwrap_err();
+        assert_eq!(err.to_string(), "attachment `attach-1` not found");
     }
 
     #[test]
@@ -1340,13 +1413,34 @@ mod tests {
             Box::new(StubTerminalState),
             8,
         ));
-        let (_lease, snapshot, _output_rx, mut control_rx) = runtime.try_attach().unwrap();
+        let (_handle, attachment, snapshot, _output_rx, mut control_rx) = runtime
+            .attach("demo", AttachmentKind::Attach)
+            .unwrap();
         assert_eq!(snapshot, b"snapshot".to_vec());
 
-        runtime.request_detach().unwrap();
+        runtime.request_detach(&attachment.attach_id).unwrap();
 
         let control = control_rx.try_recv().unwrap();
         assert_eq!(control, AttachControl::Detach);
+    }
+
+    #[test]
+    fn multiple_attachments_are_allowed() {
+        let runtime = Arc::new(SessionRuntime::new(
+            Box::new(StubMasterPty),
+            Box::new(std::io::sink()),
+            Box::new(StubTerminalState),
+            8,
+        ));
+        let (_first_handle, first, _snapshot, _first_output, _first_control) = runtime
+            .attach("demo", AttachmentKind::Attach)
+            .unwrap();
+        let (_second_handle, second, _snapshot, _second_output, _second_control) = runtime
+            .attach("demo", AttachmentKind::Tui)
+            .unwrap();
+
+        assert_ne!(first.attach_id, second.attach_id);
+        assert_eq!(runtime.list_attachments("demo").unwrap().len(), 2);
     }
 
     #[test]

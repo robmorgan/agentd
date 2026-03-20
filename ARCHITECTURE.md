@@ -62,9 +62,9 @@ For each running session, the daemon keeps three kinds of state:
 - an in-memory PTY runtime with the live writer handle and output fan-out used by `attach` and `send`
 
 PTY output is copied into the log file and also broadcast to attached clients. PTY input can come
-from either an interactive `attach` session or a background `send-input` request. Interactive
-attach is exclusive per session; background writes do not steal focus from the current attached
-client.
+from either an interactive `attach` session or a background `send-input` request. Multiple
+interactive attach clients may connect to the same session concurrently. PTY input is shared
+across attached clients, and PTY resize follows last-writer-wins semantics.
 
 Structured events are separate from raw PTY logs. The daemon records lifecycle events such as
 session start, finish, worktree creation or removal, and injected background input. Instrumented
@@ -96,7 +96,7 @@ We use `libghostty-vt` to restore the previous state of the terminal when a clie
 
 How it works:
 
-* user creates or re-attaches to a session with `agent attach <session_id>`
+* user creates or re-attaches to a session with `agent attach <session_id>` or by focusing it in the TUI
 * user interacts with terminal stdin
 * stdin gets sent to pty via daemon
 * daemon sends pty output to client and `ghostty-vt`

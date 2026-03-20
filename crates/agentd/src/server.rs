@@ -15,6 +15,7 @@ use agentd_shared::{
         IncomingRequest, PROTOCOL_VERSION, Request, Response, read_incoming_request, read_request,
         write_daemon_management_response, write_response,
     },
+    session::AttachmentKind,
     session::{SessionRecord, SessionStatus},
 };
 
@@ -177,11 +178,28 @@ async fn handle_connection(
                 }
             }
         }
-        IncomingRequest::Standard(Request::AttachSession { session_id }) => {
-            attach_session(&state, &session_id, &mut reader, &mut writer).await?;
+        IncomingRequest::Standard(Request::AttachSession { session_id, kind }) => {
+            attach_session(&state, &session_id, kind, &mut reader, &mut writer).await?;
         }
-        IncomingRequest::Standard(Request::DetachSession { session_id }) => {
-            match state.detach_session(&session_id).await {
+        IncomingRequest::Standard(Request::DetachSession { session_id, all }) => {
+            match state.detach_session(&session_id, all).await {
+                Ok(()) => send_response(&mut writer, &Response::Ok).await?,
+                Err(err) => {
+                    send_response(
+                        &mut writer,
+                        &Response::Error {
+                            message: err.to_string(),
+                        },
+                    )
+                    .await?
+                }
+            }
+        }
+        IncomingRequest::Standard(Request::DetachAttachment {
+            session_id,
+            attach_id,
+        }) => {
+            match state.detach_attachment(&session_id, &attach_id).await {
                 Ok(()) => send_response(&mut writer, &Response::Ok).await?,
                 Err(err) => {
                     send_response(
@@ -265,21 +283,16 @@ async fn handle_connection(
         IncomingRequest::Standard(Request::SwitchAttachedSession {
             source_session_id,
             target_session_id,
-        }) => match state
-            .switch_attached_session(&source_session_id, &target_session_id)
-            .await
-        {
-            Ok(()) => send_response(&mut writer, &Response::Ok).await?,
-            Err(err) => {
-                send_response(
-                    &mut writer,
-                    &Response::Error {
-                        message: err.to_string(),
-                    },
-                )
-                .await?
-            }
-        },
+        }) => {
+            let _ = (source_session_id, target_session_id);
+            send_response(
+                &mut writer,
+                &Response::Error {
+                    message: "shared attach uses client-local switching; reconnect the local client instead".to_string(),
+                },
+            )
+            .await?
+        }
         IncomingRequest::Standard(Request::DiffSession { session_id }) => {
             match state.diff_session(&session_id).await {
                 Ok(diff) => send_response(&mut writer, &Response::Diff { diff }).await?,
@@ -311,6 +324,22 @@ async fn handle_connection(
         IncomingRequest::Standard(Request::ListSessions) => {
             let sessions = state.list_sessions().await?;
             send_response(&mut writer, &Response::Sessions { sessions }).await?;
+        }
+        IncomingRequest::Standard(Request::ListAttachments { session_id }) => {
+            match state.list_attachments(&session_id).await {
+                Ok(attachments) => {
+                    send_response(&mut writer, &Response::Attachments { attachments }).await?
+                }
+                Err(err) => {
+                    send_response(
+                        &mut writer,
+                        &Response::Error {
+                            message: err.to_string(),
+                        },
+                    )
+                    .await?
+                }
+            }
         }
         IncomingRequest::Standard(Request::AppendSessionEvents { session_id, events }) => {
             let _ = (session_id, events);
@@ -403,11 +432,12 @@ async fn handle_daemon_management_request(
 async fn attach_session(
     state: &AppState,
     session_id: &str,
+    kind: AttachmentKind,
     reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: &mut OwnedWriteHalf,
 ) -> Result<()> {
-    let (_lease, snapshot, mut output_rx, mut control_rx) =
-        match state.attach_session(session_id).await {
+    let (_handle, attachment, snapshot, mut output_rx, mut control_rx) =
+        match state.attach_session(session_id, kind).await {
             Ok(attached) => attached,
             Err(err) => {
                 let response = match ended_session_response(state, session_id).await? {
@@ -421,7 +451,14 @@ async fn attach_session(
             }
         };
 
-    send_response(writer, &Response::Attached { snapshot }).await?;
+    send_response(
+        writer,
+        &Response::Attached {
+            attach_id: attachment.attach_id,
+            snapshot,
+        },
+    )
+    .await?;
     let mut final_response = Some(Response::EndOfStream);
 
     loop {
@@ -441,18 +478,8 @@ async fn attach_session(
                 }
             },
             control = control_rx.recv() => match control {
-                Ok(crate::app::AttachControl::SwitchSession(target_session_id)) => {
-                    send_response(
-                        writer,
-                        &Response::SwitchSession { session_id: target_session_id },
-                    )
-                    .await?;
-                    final_response = None;
-                    break;
-                }
-                Ok(crate::app::AttachControl::Detach) => break,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => {
+                Some(crate::app::AttachControl::Detach) => break,
+                None => {
                     final_response = end_of_attach_response(state, session_id).await?;
                     break;
                 }

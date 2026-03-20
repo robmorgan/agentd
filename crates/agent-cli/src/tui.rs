@@ -19,7 +19,7 @@ use tokio::{
 use agentd_shared::{
     paths::AppPaths,
     protocol::{Request, Response, read_response, write_request},
-    session::{IntegrationState, SessionRecord, SessionStatus},
+    session::{AttachmentKind, IntegrationState, SessionRecord, SessionStatus},
 };
 
 use crate::{
@@ -1108,6 +1108,7 @@ async fn run_pty_session(
             &mut stream,
             &Request::AttachSession {
                 session_id: session_id.clone(),
+                kind: AttachmentKind::Tui,
             },
         )
         .await?;
@@ -1119,7 +1120,7 @@ async fn run_pty_session(
         };
 
         match initial {
-            Response::Attached { snapshot } => {
+            Response::Attached { snapshot, .. } => {
                 let _ = messages.send(PtyEvent::Snapshot(snapshot));
             }
             Response::SessionEnded { status, .. } => {
