@@ -1609,10 +1609,7 @@ fn review_state_for_accept(session: &SessionRecord) -> Result<ReviewState> {
 
     Ok(ReviewState {
         git_sync: GitSyncStatus::Conflicted,
-        summary: format!(
-            "squash apply would conflict with {}; resolve it manually",
-            session.base_branch
-        ),
+        summary: manual_accept_conflict_summary(session),
         has_conflicts: true,
     })
 }
@@ -1621,17 +1618,35 @@ fn apply_commit_message(session: &SessionRecord) -> String {
     format!("Apply session {}: {}", session.session_id, session.title)
 }
 
+fn manual_accept_conflict_summary(session: &SessionRecord) -> String {
+    format!(
+        "squash apply would conflict with {}\nrun:\n  git -C {} checkout {}\n  git -C {} merge --squash --no-commit {}\nthen resolve conflicts and commit:\n  git -C {} commit -m {}",
+        session.base_branch,
+        shell_quote(&session.repo_path),
+        shell_quote(&session.base_branch),
+        shell_quote(&session.repo_path),
+        shell_quote(&session.branch),
+        shell_quote(&session.repo_path),
+        shell_quote(&apply_commit_message(session)),
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AttachControl, SessionRuntime, SessionStartMode, apply_commit_message,
-        finalize_session_exit, inspect_review_state, review_state_for_accept,
+        finalize_session_exit, inspect_review_state, manual_accept_conflict_summary,
+        review_state_for_accept, shell_quote,
     };
     use crate::db::{Database, NewSession};
     use crate::terminal_state::TerminalStateEngine;
     use agentd_shared::{
         paths::AppPaths,
-        session::{AttachmentKind, GitSyncStatus, SessionMode},
+        session::{AttachmentKind, GitSyncStatus, SessionMode, SessionRecord, SessionStatus},
     };
     use anyhow::{Error, Result};
     use nix::libc;
@@ -1847,6 +1862,18 @@ mod tests {
         let review = review_state_for_accept(&session).unwrap();
         assert_eq!(review.git_sync, GitSyncStatus::Conflicted);
         assert!(review.has_conflicts);
+        assert!(review.summary.contains("git -C"));
+        assert!(review.summary.contains("checkout 'main'"));
+        assert!(
+            review
+                .summary
+                .contains("merge --squash --no-commit 'agent/demo'")
+        );
+        assert!(
+            review
+                .summary
+                .contains("commit -m 'Apply session demo: changed'")
+        );
     }
 
     #[test]
@@ -1882,6 +1909,46 @@ mod tests {
             apply_commit_message(&session),
             "Apply session demo: changed"
         );
+    }
+
+    #[test]
+    fn manual_accept_conflict_summary_shell_quotes_values() {
+        let session = SessionRecord {
+            session_id: "demo".to_string(),
+            thread_id: None,
+            agent: "codex".to_string(),
+            model: Some("gpt-5.3-codex".to_string()),
+            mode: SessionMode::Execute,
+            workspace: "/tmp/work".to_string(),
+            repo_path: "/tmp/repo path/it's".to_string(),
+            repo_name: "repo".to_string(),
+            title: "ship it's".to_string(),
+            base_branch: "main".to_string(),
+            branch: "agent/demo".to_string(),
+            worktree: "/tmp/worktree".to_string(),
+            status: SessionStatus::Exited,
+            integration_state: agentd_shared::session::IntegrationState::PendingReview,
+            git_sync: GitSyncStatus::InSync,
+            git_status_summary: None,
+            has_conflicts: true,
+            pid: None,
+            exit_code: Some(0),
+            error: None,
+            attention: agentd_shared::session::AttentionLevel::Notice,
+            attention_summary: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            exited_at: None,
+        };
+
+        let summary = manual_accept_conflict_summary(&session);
+        assert!(summary.contains("git -C '/tmp/repo path/it'\"'\"'s' checkout 'main'"));
+        assert!(summary.contains("commit -m 'Apply session demo: ship it'\"'\"'s'"));
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("it's"), "'it'\"'\"'s'");
     }
 
     fn test_paths() -> AppPaths {
