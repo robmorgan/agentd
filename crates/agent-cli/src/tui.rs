@@ -910,10 +910,7 @@ impl RuntimeApp {
         } else {
             for session in ordered.iter().take(inner.height.saturating_sub(4) as usize) {
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        session_icon(session),
-                        Style::default().fg(session_icon_color(session)),
-                    ),
+                    Span::styled(session_icon(session), session_icon_style(session)),
                     Span::raw("  "),
                     Span::styled(
                         session.title.as_str(),
@@ -962,9 +959,7 @@ impl RuntimeApp {
             Line::from(vec![
                 Span::styled(
                     session_icon(session),
-                    Style::default()
-                        .fg(session_icon_color(session))
-                        .add_modifier(Modifier::BOLD),
+                    session_icon_style(session).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
                 Span::styled(
@@ -1176,10 +1171,7 @@ impl RuntimeApp {
                         .find(|item| item.session_id == session_id)
                     {
                         lines.push(Line::from(vec![
-                            Span::styled(
-                                session_icon(session),
-                                Style::default().fg(session_icon_color(session)),
-                            ),
+                            Span::styled(session_icon(session), session_icon_style(session)),
                             Span::raw("  "),
                             Span::styled(session.title.as_str(), style),
                             Span::raw("  "),
@@ -2164,30 +2156,43 @@ fn session_rank(session: &SessionRecord) -> u8 {
 
 fn session_icon(session: &SessionRecord) -> &'static str {
     if session.integration_state == IntegrationState::PendingReview {
-        "R"
+        "⧖"
     } else {
         match session.status {
-            SessionStatus::NeedsInput => "?",
-            SessionStatus::Failed | SessionStatus::UnknownRecovered => "!",
-            SessionStatus::Running | SessionStatus::Creating | SessionStatus::Paused => "...",
-            SessionStatus::Exited => "\u{2713}",
+            SessionStatus::NeedsInput => "◦",
+            SessionStatus::Failed => "✖",
+            SessionStatus::UnknownRecovered => "⚠",
+            SessionStatus::Running | SessionStatus::Creating => "●",
+            SessionStatus::Paused => "⏸",
+            SessionStatus::Exited => "✔",
         }
     }
 }
 
 fn session_icon_color(session: &SessionRecord) -> Color {
-    if session.has_conflicts {
-        Color::Red
-    } else if session.integration_state == IntegrationState::PendingReview {
-        Color::Yellow
+    if session.integration_state == IntegrationState::PendingReview {
+        Color::Blue
     } else {
         match session.status {
             SessionStatus::NeedsInput => Color::Yellow,
-            SessionStatus::Failed | SessionStatus::UnknownRecovered => Color::Red,
-            SessionStatus::Running | SessionStatus::Creating | SessionStatus::Paused => Color::Blue,
+            SessionStatus::Failed => Color::Red,
+            SessionStatus::UnknownRecovered => Color::Yellow,
+            SessionStatus::Running | SessionStatus::Creating => Color::Green,
+            SessionStatus::Paused => Color::DarkGray,
             SessionStatus::Exited => Color::Green,
         }
     }
+}
+
+fn session_icon_style(session: &SessionRecord) -> Style {
+    let mut style = Style::default().fg(session_icon_color(session));
+    if matches!(
+        session.status,
+        SessionStatus::NeedsInput | SessionStatus::Paused
+    ) {
+        style = style.add_modifier(Modifier::DIM);
+    }
+    style
 }
 
 fn session_status_text(session: &SessionRecord) -> String {
@@ -2259,7 +2264,7 @@ fn status_label(status: SessionStatus) -> &'static str {
 mod tests {
     use super::{
         ComposerField, ComposerRow, RuntimeApp, TerminalSurface, matches_query, session_icon,
-        session_rank, session_status_text,
+        session_icon_color, session_rank, session_status_text,
     };
     use agentd_shared::paths::AppPaths;
     use agentd_shared::session::{
@@ -2267,6 +2272,7 @@ mod tests {
     };
     use camino::Utf8PathBuf;
     use chrono::Utc;
+    use ratatui::style::Color;
 
     fn demo(status: SessionStatus, integration_state: IntegrationState) -> SessionRecord {
         let now = Utc::now();
@@ -2326,7 +2332,72 @@ mod tests {
                 SessionStatus::Exited,
                 IntegrationState::PendingReview
             )),
-            "R"
+            "⧖"
+        );
+    }
+
+    #[test]
+    fn session_icons_match_requested_symbols() {
+        assert_eq!(
+            session_icon(&demo(SessionStatus::NeedsInput, IntegrationState::Clean)),
+            "◦"
+        );
+        assert_eq!(
+            session_icon(&demo(SessionStatus::Failed, IntegrationState::Clean)),
+            "✖"
+        );
+        assert_eq!(
+            session_icon(&demo(
+                SessionStatus::UnknownRecovered,
+                IntegrationState::Clean
+            )),
+            "⚠"
+        );
+        assert_eq!(
+            session_icon(&demo(SessionStatus::Running, IntegrationState::Clean)),
+            "●"
+        );
+        assert_eq!(
+            session_icon(&demo(SessionStatus::Paused, IntegrationState::Clean)),
+            "⏸"
+        );
+        assert_eq!(
+            session_icon(&demo(SessionStatus::Exited, IntegrationState::Clean)),
+            "✔"
+        );
+    }
+
+    #[test]
+    fn session_icon_colors_match_requested_palette() {
+        assert_eq!(
+            session_icon_color(&demo(SessionStatus::NeedsInput, IntegrationState::Clean)),
+            Color::Yellow
+        );
+        assert_eq!(
+            session_icon_color(&demo(SessionStatus::Failed, IntegrationState::Clean)),
+            Color::Red
+        );
+        assert_eq!(
+            session_icon_color(&demo(
+                SessionStatus::UnknownRecovered,
+                IntegrationState::Clean
+            )),
+            Color::Yellow
+        );
+        assert_eq!(
+            session_icon_color(&demo(
+                SessionStatus::Exited,
+                IntegrationState::PendingReview
+            )),
+            Color::Blue
+        );
+        assert_eq!(
+            session_icon_color(&demo(SessionStatus::Running, IntegrationState::Clean)),
+            Color::Green
+        );
+        assert_eq!(
+            session_icon_color(&demo(SessionStatus::Paused, IntegrationState::Clean)),
+            Color::DarkGray
         );
     }
 
