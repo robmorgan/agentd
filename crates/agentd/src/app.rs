@@ -25,6 +25,7 @@ use agentd_shared::{
     config::Config,
     event::{NewSessionEvent, SessionEvent},
     paths::AppPaths,
+    request_input::PendingUserInputRequest,
     session::{
         AttentionLevel, CreateSessionResult, IntegrationState, SessionDiff, SessionMode,
         SessionRecord, SessionStatus, WorktreeRecord, branch_name_from_task,
@@ -660,6 +661,36 @@ impl AppState {
                 data.push(b'\n');
                 self.send_input(session_id, data, None).await?;
             }
+            SessionStatus::NeedsInput if self.runtimes.get(&session.session_id).is_some() => {
+                let runtime = self
+                    .runtimes
+                    .get(&session.session_id)
+                    .ok_or_else(|| anyhow!("session `{session_id}` does not have a live PTY"))?;
+                let mut data = prompt.clone().into_bytes();
+                data.push(b'\n');
+                runtime.write_input(&data)?;
+
+                let db = self.db.clone();
+                let session_id = session.session_id.clone();
+                let prompt_preview = preview_text(&prompt, 160);
+                let pid = session.pid.unwrap_or(0);
+                task::spawn_blocking(move || {
+                    db.append_events(
+                        &session_id,
+                        &[daemon_event(
+                            "SESSION_REPLY_REQUESTED",
+                            serde_json::json!({
+                                "source": "daemon",
+                                "prompt": prompt,
+                                "prompt_preview": prompt_preview,
+                            }),
+                        )],
+                    )?;
+                    db.mark_running(&session_id, pid)?;
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await??;
+            }
             SessionStatus::NeedsInput => {
                 let launch = self.resolve_launch_command(&session).await?;
                 let resume_session_id = self
@@ -1250,7 +1281,7 @@ fn build_initial_prompt(task_text: &str, mode: SessionMode) -> String {
              {task_text}\n\
              \n\
              Requirements:\n\
-             - Ask follow-up questions if you need clarification before finalizing the plan.\n\
+             - If you need clarification before finalizing the plan, use the structured request_user_input flow when it is available. If it is unavailable, ask one blocking follow-up question in plain text.\n\
              - Do not edit files, run implementation commands, or apply changes.\n\
              - When you have enough information, reply with exactly one <proposed_plan>...</proposed_plan> block in Markdown.\n\
              - Stop after producing the plan.\n"
@@ -1336,7 +1367,7 @@ fn finalize_session_exit(
                 )?;
             }
         }
-        SessionOutcome::NeedsInput { question } => {
+        SessionOutcome::NeedsInputText { question } => {
             let question_preview = preview_text(&question, 240);
             db.mark_needs_input(session_id, exit_code, question_preview.clone())?;
             db.append_events(
@@ -1354,6 +1385,10 @@ fn finalize_session_exit(
                     }),
                 )],
             )?;
+        }
+        SessionOutcome::NeedsInputRequest { request } => {
+            let summary = preview_text(&request.summary(), 240);
+            db.mark_needs_input(session_id, exit_code, summary)?;
         }
     }
 
@@ -1393,14 +1428,15 @@ fn session_has_pending_changes(session: &SessionRecord) -> Result<bool> {
 
 enum SessionOutcome {
     Finished,
-    NeedsInput { question: String },
+    NeedsInputText { question: String },
+    NeedsInputRequest { request: PendingUserInputRequest },
 }
 
 impl SessionOutcome {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Finished => "finished",
-            Self::NeedsInput { .. } => "needs_input",
+            Self::NeedsInputText { .. } | Self::NeedsInputRequest { .. } => "needs_input",
         }
     }
 }
@@ -1419,17 +1455,13 @@ fn classify_session_outcome(
     }
 
     let events = db.list_events_since(&session.session_id, None)?;
-    let boundary_id = events
-        .iter()
-        .rev()
-        .find(|event| {
-            matches!(
-                event.event_type.as_str(),
-                "SESSION_STARTED" | "SESSION_RESUMED" | "SESSION_REPLY_REQUESTED"
-            )
-        })
-        .map(|event| event.id)
-        .unwrap_or(0);
+    let boundary_id = latest_reply_boundary_id(&events);
+
+    if session.mode == SessionMode::Plan {
+        if let Some(request) = latest_pending_user_input_request(&events, boundary_id) {
+            return Ok(SessionOutcome::NeedsInputRequest { request });
+        }
+    }
 
     let mut agent_messages = Vec::new();
     for event in &events {
@@ -1461,9 +1493,47 @@ fn classify_session_outcome(
         return Ok(SessionOutcome::Finished);
     }
 
-    Ok(SessionOutcome::NeedsInput {
+    Ok(SessionOutcome::NeedsInputText {
         question,
     })
+}
+
+fn latest_reply_boundary_id(events: &[SessionEvent]) -> i64 {
+    events
+        .iter()
+        .rev()
+        .find(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "SESSION_STARTED" | "SESSION_RESUMED" | "SESSION_REPLY_REQUESTED"
+            )
+        })
+        .map(|event| event.id)
+        .unwrap_or(0)
+}
+
+fn latest_pending_user_input_request(
+    events: &[SessionEvent],
+    boundary_id: i64,
+) -> Option<PendingUserInputRequest> {
+    let mut request = None;
+    for event in events {
+        if event.id <= boundary_id {
+            continue;
+        }
+        match event.event_type.as_str() {
+            "SESSION_REQUEST_USER_INPUT" => {
+                request = event
+                    .payload_json
+                    .get("request")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<PendingUserInputRequest>(value).ok());
+            }
+            "SESSION_REPLY_REQUESTED" => request = None,
+            _ => {}
+        }
+    }
+    request
 }
 
 fn looks_like_blocking_question(text: &str) -> bool {
@@ -1526,6 +1596,40 @@ fn persist_extracted_plans(
         )?;
     }
     Ok(())
+}
+
+fn persist_request_user_input(
+    db: &Database,
+    session_id: &str,
+    events: &[SessionEvent],
+) -> Result<()> {
+    for event in events {
+        let Some(request) = extract_request_user_input(event) else {
+            continue;
+        };
+        let question_preview = preview_text(&request.summary(), 240);
+        db.mark_waiting_for_input(session_id, question_preview.clone())?;
+        db.append_events(
+            session_id,
+            &[daemon_event(
+                "SESSION_REQUEST_USER_INPUT",
+                serde_json::json!({
+                    "source": "daemon",
+                    "source_event_id": event.id,
+                    "question_preview": question_preview,
+                    "request": request,
+                }),
+            )],
+        )?;
+    }
+    Ok(())
+}
+
+fn extract_request_user_input(event: &SessionEvent) -> Option<PendingUserInputRequest> {
+    if event.event_type != "CODEX_REQUEST_USER_INPUT" {
+        return None;
+    }
+    PendingUserInputRequest::from_codex_raw(event.payload_json.get("raw")?)
 }
 
 fn extract_plan_markdown(event: &SessionEvent) -> Option<String> {
@@ -1779,6 +1883,9 @@ fn persist_codex_output(
     if !events.is_empty() {
         let inserted = db.append_events(session_id, &events)?;
         if is_plan_session {
+            persist_request_user_input(db, session_id, &inserted)?;
+        }
+        if is_plan_session {
             persist_extracted_plans(db, session_id, &inserted)?;
         }
         rendered_file.flush()?;
@@ -1892,7 +1999,10 @@ fn preview_text(text: &str, limit: usize) -> String {
 }
 
 fn ensure_session_running(session: &SessionRecord) -> Result<()> {
-    if session.status != SessionStatus::Running || !process_exists(session.pid) {
+    let accepts_live_io =
+        matches!(session.status, SessionStatus::Running | SessionStatus::NeedsInput)
+            && process_exists(session.pid);
+    if !accepts_live_io {
         bail!("session `{}` is not running", session.session_id);
     }
     Ok(())
@@ -2096,7 +2206,7 @@ mod tests {
         let outcome = classify_session_outcome(&db, &session, Some(0)).unwrap();
         assert!(matches!(
             outcome,
-            SessionOutcome::NeedsInput { ref question }
+            SessionOutcome::NeedsInputText { ref question }
                 if question == "Do you want me to make the change?"
         ));
     }
@@ -2170,8 +2280,72 @@ mod tests {
         let outcome = classify_session_outcome(&db, &session, Some(0)).unwrap();
         assert!(matches!(
             outcome,
-            SessionOutcome::NeedsInput { ref question }
+            SessionOutcome::NeedsInputText { ref question }
                 if question == "Should I optimize for speed or correctness?"
+        ));
+    }
+
+    #[test]
+    fn classify_session_outcome_prefers_structured_plan_request() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        let repo = paths.root.join("repo");
+        init_git_repo(repo.as_str());
+
+        db.insert_session(&NewSession {
+            session_id: "demo",
+            thread_id: Some("thread-demo"),
+            agent: "codex",
+            model: Some("gpt-5.3-codex"),
+            mode: SessionMode::Plan,
+            agent_command: "codex",
+            agent_args_json: "[]",
+            resume_session_id: Some("resume-1"),
+            workspace: repo.as_str(),
+            repo_path: repo.as_str(),
+            task: "plan",
+            base_branch: "main",
+            branch: "agent/plan",
+            worktree: repo.as_str(),
+        })
+        .unwrap();
+        db.insert_thread(&NewThread {
+            thread_id: "thread-demo",
+            session_id: "demo",
+            agent: "codex",
+            title: "plan",
+            initial_prompt: "plan",
+        })
+        .unwrap();
+        db.append_events(
+            "demo",
+            &[daemon_event(
+                "SESSION_REQUEST_USER_INPUT",
+                json!({
+                    "source": "daemon",
+                    "request": {
+                        "turn_id": "turn-1",
+                        "questions": [
+                            {
+                                "id": "scope",
+                                "header": "Scope",
+                                "question": "Which scope should I use?",
+                                "options": [{"label": "Plan only"}]
+                            }
+                        ]
+                    }
+                }),
+            )],
+        )
+        .unwrap();
+
+        let session = db.get_session("demo").unwrap().unwrap();
+        let outcome = classify_session_outcome(&db, &session, Some(0)).unwrap();
+        assert!(matches!(
+            outcome,
+            SessionOutcome::NeedsInputRequest { ref request }
+                if request.questions[0].question == "Which scope should I use?"
         ));
     }
 

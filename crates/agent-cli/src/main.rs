@@ -46,6 +46,7 @@ use agentd_shared::{
         PROTOCOL_VERSION, Request, Response, read_daemon_management_response, read_response,
         write_daemon_management_request, write_request,
     },
+    request_input::PendingUserInputRequest,
     session::{
         AttentionLevel, IntegrationState, SessionDiff, SessionMode, SessionRecord,
         SessionStatus, WorktreeRecord,
@@ -1474,6 +1475,7 @@ struct FocusSessionViewState {
     activity_scroll: usize,
     last_event_id: Option<i64>,
     show_verbose: bool,
+    pending_input_request: Option<PendingUserInputRequest>,
     needs_input_question: Option<String>,
     needs_input_options: Vec<String>,
 }
@@ -1779,21 +1781,23 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
     let mut reply = String::new();
     let mut selected_option = 0_usize;
     let mut view_state = FocusSessionViewState::default();
-    let mut last_needs_input_question: Option<String> = None;
+    let mut last_intervention_key: Option<String> = None;
 
     loop {
         let session = daemon_get_session(paths, session_id).await?;
         let size = terminal.size()?;
-        let intervention_active = session.status == SessionStatus::NeedsInput || !reply.is_empty();
+        let intervention_active = focus_session_has_intervention(&session, &view_state) || !reply.is_empty();
         let layout = focus_session_layout(Rect::new(0, 0, size.width, size.height), intervention_active);
         refresh_focus_session_view(paths, &store, &session, &mut view_state, &layout)?;
-        if view_state.needs_input_question != last_needs_input_question {
-            last_needs_input_question = view_state.needs_input_question.clone();
+        let intervention_key = focus_session_intervention_key(&view_state);
+        if intervention_key != last_intervention_key {
+            last_intervention_key = intervention_key;
             reply.clear();
             selected_option = 0;
         }
-        if selected_option >= view_state.needs_input_options.len() && !view_state.needs_input_options.is_empty() {
-            selected_option = view_state.needs_input_options.len() - 1;
+        let option_count = focus_session_option_labels(&view_state).len();
+        if selected_option >= option_count && option_count > 0 {
+            selected_option = option_count - 1;
         }
         clamp_focus_session_scroll(&mut view_state, &layout);
         terminal.draw(|frame| {
@@ -1885,17 +1889,17 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
                         };
                     }
                     KeyCode::Up => {
-                        if view_state.active_pane == FocusSessionPane::Intervention
-                            && !view_state.needs_input_options.is_empty()
-                        {
+                        let option_count = focus_session_option_labels(&view_state).len();
+                        if view_state.active_pane == FocusSessionPane::Intervention && option_count > 0 {
                             selected_option = selected_option.saturating_sub(1);
                         } else {
                             scroll_focus_session_pane(&mut view_state, &layout, -1);
                         }
                     }
                     KeyCode::Down => {
+                        let option_count = focus_session_option_labels(&view_state).len();
                         if view_state.active_pane == FocusSessionPane::Intervention
-                            && selected_option + 1 < view_state.needs_input_options.len()
+                            && selected_option + 1 < option_count
                         {
                             selected_option += 1;
                         } else {
@@ -1931,7 +1935,7 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
                             reply.clear();
                             view_state.active_pane = view_state.previous_pane;
                             status = format!("replied to {}", session_id);
-                        } else if let Some(option) = view_state.needs_input_options.get(selected_option) {
+                        } else if let Some(option) = focus_session_option_labels(&view_state).get(selected_option) {
                             reply = option.clone();
                             status = "option copied to composer".to_string();
                         } else {
@@ -1970,7 +1974,7 @@ async fn focus_session(paths: &AppPaths, session_id: &str) -> Result<()> {
                         let retried = retry_session(paths, &session).await?;
                         status = format!("created retry {}", retried.session_id);
                     }
-                    KeyCode::Char('y') if session.status == SessionStatus::NeedsInput =>
+                    KeyCode::Char('y') if focus_session_has_intervention(&session, &view_state) =>
                     {
                         view_state.previous_pane = view_state.active_pane;
                         view_state.active_pane = FocusSessionPane::Intervention;
@@ -2078,13 +2082,20 @@ fn refresh_focus_session_view(
     }
     state.events.extend(new_events);
     if session.status == SessionStatus::NeedsInput {
-        state.needs_input_question = latest_needs_input_question(&state.events);
-        state.needs_input_options = state
-            .needs_input_question
-            .as_deref()
-            .map(parse_needs_input_options)
-            .unwrap_or_default();
+        state.pending_input_request = latest_pending_user_input_request(&state.events);
+        if state.pending_input_request.is_some() {
+            state.needs_input_question = None;
+            state.needs_input_options.clear();
+        } else {
+            state.needs_input_question = latest_needs_input_question(&state.events);
+            state.needs_input_options = state
+                .needs_input_question
+                .as_deref()
+                .map(parse_needs_input_options)
+                .unwrap_or_default();
+        }
     } else {
+        state.pending_input_request = latest_pending_user_input_request(&state.events);
         state.needs_input_question = None;
         state.needs_input_options.clear();
     }
@@ -2198,6 +2209,84 @@ fn latest_needs_input_question(events: &[agentd_shared::event::SessionEvent]) ->
             .flatten()
             .map(str::to_string)
     })
+}
+
+fn latest_pending_user_input_request(
+    events: &[agentd_shared::event::SessionEvent],
+) -> Option<PendingUserInputRequest> {
+    let boundary_id = events
+        .iter()
+        .rev()
+        .find(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "SESSION_STARTED" | "SESSION_RESUMED" | "SESSION_REPLY_REQUESTED"
+            )
+        })
+        .map(|event| event.id)
+        .unwrap_or(0);
+
+    let mut request = None;
+    for event in events {
+        if event.id <= boundary_id {
+            continue;
+        }
+        match event.event_type.as_str() {
+            "SESSION_REQUEST_USER_INPUT" => {
+                request = event
+                    .payload_json
+                    .get("request")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<PendingUserInputRequest>(value).ok());
+            }
+            "SESSION_REPLY_REQUESTED" => request = None,
+            _ => {}
+        }
+    }
+    request
+}
+
+fn focus_session_has_intervention(session: &SessionRecord, state: &FocusSessionViewState) -> bool {
+    session.status == SessionStatus::NeedsInput
+        || state.pending_input_request.is_some()
+        || state.needs_input_question.is_some()
+}
+
+fn focus_session_intervention_key(state: &FocusSessionViewState) -> Option<String> {
+    if let Some(request) = &state.pending_input_request {
+        serde_json::to_string(request).ok()
+    } else {
+        state.needs_input_question.clone()
+    }
+}
+
+fn focus_session_question_text(state: &FocusSessionViewState) -> String {
+    if let Some(request) = &state.pending_input_request {
+        return request
+            .questions
+            .iter()
+            .map(|question| format!("{}:\n{}", question.header, question.question))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+    }
+    state
+        .needs_input_question
+        .clone()
+        .unwrap_or_else(|| "Waiting for input.".to_string())
+}
+
+fn focus_session_option_labels(state: &FocusSessionViewState) -> Vec<String> {
+    if let Some(request) = &state.pending_input_request {
+        if request.questions.len() == 1 {
+            return request.questions[0]
+                .options
+                .iter()
+                .map(|option| option.label.clone())
+                .collect();
+        }
+        return Vec::new();
+    }
+    state.needs_input_options.clone()
 }
 
 fn parse_needs_input_options(question: &str) -> Vec<String> {
@@ -2364,6 +2453,23 @@ fn append_timeline_lines(
                 .and_then(Value::as_str)
                 .unwrap_or("Agent is waiting for input.");
             append_system_card(lines, event, "needs input", question, attention_style(AttentionLevel::Action));
+        }
+        "SESSION_REQUEST_USER_INPUT" => {
+            let question = event
+                .payload_json
+                .get("request")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<PendingUserInputRequest>(value).ok())
+                .map(|request| {
+                    request
+                        .questions
+                        .into_iter()
+                        .map(|question| format!("{}:\n{}", question.header, question.question))
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                })
+                .unwrap_or_else(|| "Agent is waiting for input.".to_string());
+            append_system_card(lines, event, "needs input", &question, attention_style(AttentionLevel::Action));
         }
         "SESSION_PLAN_READY" => {
             append_plan_card(lines, event);
@@ -2770,6 +2876,11 @@ fn summarize_activity_event(
             event_preview(event),
             attention_style(AttentionLevel::Action),
         )),
+        "SESSION_REQUEST_USER_INPUT" => Some((
+            "input".to_string(),
+            event_preview(event),
+            attention_style(AttentionLevel::Action),
+        )),
         "SESSION_FAILED" => Some((
             "failed".to_string(),
             event_preview(event),
@@ -2851,6 +2962,14 @@ fn event_preview(event: &agentd_shared::event::SessionEvent) -> String {
         if let Some(value) = event.payload_json.get(key).and_then(Value::as_str) {
             return preview_text(value, 120);
         }
+    }
+    if let Some(value) = event
+        .payload_json
+        .get("request")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<PendingUserInputRequest>(value).ok())
+    {
+        return preview_text(&value.summary(), 120);
     }
     if let Some(item) = codex_item(&event.payload_json) {
         for key in ["text", "command", "status"] {
@@ -3217,7 +3336,7 @@ fn render_focus_session(
     selected_option: usize,
 ) {
     let area = frame.area();
-    let intervention_active = session.status == SessionStatus::NeedsInput || !reply.is_empty();
+    let intervention_active = focus_session_has_intervention(session, view_state) || !reply.is_empty();
     let layout = focus_session_layout(area, intervention_active);
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -3319,7 +3438,7 @@ fn render_focus_session(
     ))
     .style(muted_style())
     .block(Block::default().borders(Borders::TOP));
-    frame.render_widget(footer, outer[2]);
+    frame.render_widget(footer, outer[3]);
 
     if discard_confirm_open {
         render_confirmation_modal(
@@ -3352,10 +3471,11 @@ fn render_intervention_pane(
         area,
     );
 
-    let option_rows = if view_state.needs_input_options.is_empty() {
+    let option_labels = focus_session_option_labels(view_state);
+    let option_rows = if option_labels.is_empty() {
         0
     } else {
-        view_state.needs_input_options.len().min(3) as u16
+        option_labels.len().min(3) as u16
     };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -3367,10 +3487,7 @@ fn render_intervention_pane(
         ])
         .split(area);
 
-    let question = view_state
-        .needs_input_question
-        .as_deref()
-        .unwrap_or("Waiting for input.");
+    let question = focus_session_question_text(view_state);
     frame.render_widget(
         Paragraph::new(question)
             .wrap(Wrap { trim: false })
@@ -3379,8 +3496,7 @@ fn render_intervention_pane(
     );
 
     if option_rows > 0 {
-        let items = view_state
-            .needs_input_options
+        let items = option_labels
             .iter()
             .take(option_rows as usize)
             .enumerate()
@@ -3943,9 +4059,11 @@ mod tests {
         DaemonCommand, DashboardComposerAction, DashboardFocus, FocusSessionLayout,
         FocusSessionPane, FocusSessionViewState, SessionEndSummary, apply_scroll_delta,
         clamp_focus_session_scroll, dashboard_footer_text, focus_session_footer_text,
-        format_session_end_summary, looks_like_diff, pane_at_position,
-        parse_dashboard_composer_action, parse_needs_input_options, parse_rich_blocks, render_diff_text,
-        resolve_detach_session_id, resolve_new_session_options, should_colorize_diff_output,
+        focus_session_layout, format_session_end_summary, looks_like_diff, pane_at_position,
+        focus_session_option_labels, focus_session_question_text, latest_pending_user_input_request,
+        parse_dashboard_composer_action, parse_needs_input_options, parse_rich_blocks,
+        render_diff_text, resolve_detach_session_id, resolve_new_session_options,
+        should_colorize_diff_output,
     };
     use agentd_shared::session::{
         AttentionLevel, IntegrationState, SessionMode, SessionRecord, SessionStatus,
@@ -4294,6 +4412,13 @@ mod tests {
     }
 
     #[test]
+    fn focus_session_layout_places_footer_below_intervention() {
+        let area = Rect::new(0, 0, 100, 30);
+        let layout = focus_session_layout(area, true);
+        assert_eq!(layout.intervention_rect, Some(Rect::new(0, 20, 68, 8)));
+    }
+
+    #[test]
     fn rich_text_parser_detects_fenced_diff_blocks() {
         let blocks = parse_rich_blocks("before\n```diff\n+added\n-removed\n```\nafter");
         assert_eq!(blocks.len(), 3);
@@ -4400,6 +4525,52 @@ mod tests {
             "Choose one:\n- Keep current behavior\n- Redesign the flow",
         );
         assert_eq!(options, vec!["Keep current behavior", "Redesign the flow"]);
+    }
+
+    #[test]
+    fn latest_pending_user_input_request_prefers_structured_event_after_boundary() {
+        let events = vec![
+            agentd_shared::event::SessionEvent {
+                id: 1,
+                session_id: "demo".to_string(),
+                timestamp: Utc::now(),
+                event_type: "SESSION_STARTED".to_string(),
+                payload_json: serde_json::json!({}),
+            },
+            agentd_shared::event::SessionEvent {
+                id: 2,
+                session_id: "demo".to_string(),
+                timestamp: Utc::now(),
+                event_type: "SESSION_REQUEST_USER_INPUT".to_string(),
+                payload_json: serde_json::json!({
+                    "request": {
+                        "turn_id": "turn-1",
+                        "questions": [
+                            {
+                                "id": "scope",
+                                "header": "Scope",
+                                "question": "Which scope should I use?",
+                                "options": [{"label": "Plan only"}]
+                            }
+                        ]
+                    }
+                }),
+            },
+        ];
+
+        let request = latest_pending_user_input_request(&events).unwrap();
+        assert_eq!(request.questions[0].question, "Which scope should I use?");
+        assert_eq!(focus_session_option_labels(&FocusSessionViewState {
+            pending_input_request: Some(request.clone()),
+            ..Default::default()
+        }), vec!["Plan only".to_string()]);
+        assert_eq!(
+            focus_session_question_text(&FocusSessionViewState {
+                pending_input_request: Some(request),
+                ..Default::default()
+            }),
+            "Scope:\nWhich scope should I use?"
+        );
     }
 
     #[test]

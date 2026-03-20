@@ -371,6 +371,30 @@ impl Database {
         Ok(())
     }
 
+    pub fn mark_waiting_for_input(&self, session_id: &str, summary: String) -> Result<()> {
+        let conn = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE sessions
+             SET status = ?2,
+                 exit_code = NULL,
+                 error = NULL,
+                 attention = ?3,
+                 attention_summary = ?4,
+                 updated_at = ?5,
+                 exited_at = NULL
+             WHERE session_id = ?1",
+            params![
+                session_id,
+                status_to_str(SessionStatus::NeedsInput),
+                attention_to_str(AttentionLevel::Action),
+                summary,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn mark_exited(&self, session_id: &str, exit_code: Option<i32>) -> Result<()> {
         let conn = self.connect()?;
         let now = Utc::now().to_rfc3339();
