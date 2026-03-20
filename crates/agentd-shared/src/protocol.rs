@@ -6,12 +6,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::{
     event::{NewSessionEvent, SessionEvent},
     session::{
-        AttentionLevel, CreateSessionResult, IntegrationState, SessionDiff, SessionMode,
-        SessionRecord, SessionStatus, WorktreeRecord,
+        AttentionLevel, CreateSessionResult, GitSyncStatus, IntegrationState, SessionDiff,
+        SessionMode, SessionRecord, SessionStatus, WorktreeRecord,
     },
 };
 
-pub const PROTOCOL_VERSION: u16 = 16;
+pub const PROTOCOL_VERSION: u16 = 17;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
@@ -88,6 +88,10 @@ pub enum Request {
     },
     AttachSession {
         session_id: String,
+    },
+    AttachResize {
+        cols: u16,
+        rows: u16,
     },
     DetachSession {
         session_id: String,
@@ -204,6 +208,7 @@ enum MessageKind {
     AttachSessionRequest = 7,
     AttachInputRequest = 8,
     SendInputRequest = 9,
+    AttachResizeRequest = 21,
     ReplyToSessionRequest = 18,
     ApplySessionRequest = 19,
     DiscardSessionRequest = 20,
@@ -246,6 +251,7 @@ impl MessageKind {
             7 => Self::AttachSessionRequest,
             8 => Self::AttachInputRequest,
             9 => Self::SendInputRequest,
+            21 => Self::AttachResizeRequest,
             18 => Self::ReplyToSessionRequest,
             19 => Self::ApplySessionRequest,
             20 => Self::DiscardSessionRequest,
@@ -491,6 +497,11 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             put_string(&mut payload, session_id)?;
             MessageKind::AttachSessionRequest
         }
+        Request::AttachResize { cols, rows } => {
+            payload.extend_from_slice(&cols.to_le_bytes());
+            payload.extend_from_slice(&rows.to_le_bytes());
+            MessageKind::AttachResizeRequest
+        }
         Request::DetachSession { session_id } => {
             put_string(&mut payload, session_id)?;
             MessageKind::DetachSessionRequest
@@ -586,6 +597,10 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
         },
         MessageKind::AttachSessionRequest => Request::AttachSession {
             session_id: cursor.take_string()?,
+        },
+        MessageKind::AttachResizeRequest => Request::AttachResize {
+            cols: cursor.take_u16()?,
+            rows: cursor.take_u16()?,
         },
         MessageKind::DetachSessionRequest => Request::DetachSession {
             session_id: cursor.take_string()?,
@@ -928,6 +943,15 @@ fn put_integration_state(buf: &mut Vec<u8>, state: IntegrationState) {
     });
 }
 
+fn put_git_sync_status(buf: &mut Vec<u8>, status: GitSyncStatus) {
+    buf.push(match status {
+        GitSyncStatus::Unknown => 1,
+        GitSyncStatus::InSync => 2,
+        GitSyncStatus::NeedsSync => 3,
+        GitSyncStatus::Conflicted => 4,
+    });
+}
+
 fn put_session_mode(buf: &mut Vec<u8>, mode: SessionMode) {
     buf.push(match mode {
         SessionMode::Execute => 1,
@@ -971,12 +995,16 @@ fn put_session_record(buf: &mut Vec<u8>, session: &SessionRecord) -> Result<()> 
     put_session_mode(buf, session.mode);
     put_string(buf, &session.workspace)?;
     put_string(buf, &session.repo_path)?;
+    put_string(buf, &session.repo_name)?;
     put_string(buf, &session.task)?;
     put_string(buf, &session.base_branch)?;
     put_string(buf, &session.branch)?;
     put_string(buf, &session.worktree)?;
     put_session_status(buf, session.status);
     put_integration_state(buf, session.integration_state);
+    put_git_sync_status(buf, session.git_sync);
+    put_optional_string(buf, session.git_status_summary.as_deref())?;
+    put_bool(buf, session.has_conflicts);
     put_optional_u32(buf, session.pid);
     put_optional_i32(buf, session.exit_code);
     put_optional_string(buf, session.error.as_deref())?;
@@ -1172,6 +1200,16 @@ impl<'a> Cursor<'a> {
         })
     }
 
+    fn take_git_sync_status(&mut self) -> Result<GitSyncStatus> {
+        Ok(match self.take_u8()? {
+            1 => GitSyncStatus::Unknown,
+            2 => GitSyncStatus::InSync,
+            3 => GitSyncStatus::NeedsSync,
+            4 => GitSyncStatus::Conflicted,
+            other => bail!("invalid git sync status `{other}`"),
+        })
+    }
+
     fn take_session_mode(&mut self) -> Result<SessionMode> {
         Ok(match self.take_u8()? {
             1 => SessionMode::Execute,
@@ -1247,12 +1285,16 @@ impl<'a> Cursor<'a> {
             mode: self.take_session_mode()?,
             workspace: self.take_string()?,
             repo_path: self.take_string()?,
+            repo_name: self.take_string()?,
             task: self.take_string()?,
             base_branch: self.take_string()?,
             branch: self.take_string()?,
             worktree: self.take_string()?,
             status: self.take_session_status()?,
             integration_state: self.take_integration_state()?,
+            git_sync: self.take_git_sync_status()?,
+            git_status_summary: self.take_optional_string()?,
+            has_conflicts: self.take_bool()?,
             pid: self.take_optional_u32()?,
             exit_code: self.take_optional_i32()?,
             error: self.take_optional_string()?,
@@ -1324,8 +1366,8 @@ mod tests {
     use crate::{
         event::{NewSessionEvent, SessionEvent},
         session::{
-            AttentionLevel, CreateSessionResult, IntegrationState, SessionMode, SessionRecord,
-            SessionStatus,
+            AttentionLevel, CreateSessionResult, GitSyncStatus, IntegrationState, SessionMode,
+            SessionRecord, SessionStatus,
         },
     };
     use chrono::Utc;
@@ -1339,6 +1381,14 @@ mod tests {
             data: vec![0, 1, 2, 255],
             source_session_id: Some("origin".to_string()),
         };
+        let (kind, payload) = encode_request(&request).unwrap();
+        let decoded = decode_request(kind, &payload).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn attach_resize_round_trips() {
+        let request = Request::AttachResize { cols: 120, rows: 48 };
         let (kind, payload) = encode_request(&request).unwrap();
         let decoded = decode_request(kind, &payload).unwrap();
         assert_eq!(decoded, request);
@@ -1445,12 +1495,16 @@ mod tests {
                 mode: SessionMode::Execute,
                 workspace: "/tmp/demo".to_string(),
                 repo_path: "/tmp/demo".to_string(),
+                repo_name: "demo".to_string(),
                 task: "fix".to_string(),
                 base_branch: "main".to_string(),
                 branch: "agent/fix".to_string(),
                 worktree: "/tmp/worktree".to_string(),
                 status: SessionStatus::Running,
                 integration_state: IntegrationState::Clean,
+                git_sync: GitSyncStatus::Unknown,
+                git_status_summary: None,
+                has_conflicts: false,
                 pid: Some(123),
                 exit_code: None,
                 error: None,

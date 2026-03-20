@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use slug::slugify;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -33,6 +34,15 @@ pub enum IntegrationState {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum GitSyncStatus {
+    Unknown,
+    InSync,
+    NeedsSync,
+    Conflicted,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionMode {
     Execute,
     Plan,
@@ -47,12 +57,16 @@ pub struct SessionRecord {
     pub mode: SessionMode,
     pub workspace: String,
     pub repo_path: String,
+    pub repo_name: String,
     pub task: String,
     pub base_branch: String,
     pub branch: String,
     pub worktree: String,
     pub status: SessionStatus,
     pub integration_state: IntegrationState,
+    pub git_sync: GitSyncStatus,
+    pub git_status_summary: Option<String>,
+    pub has_conflicts: bool,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
     pub error: Option<String>,
@@ -112,6 +126,15 @@ pub fn branch_name_from_task(task: &str) -> String {
     format!("agent/{branch}")
 }
 
+pub fn repo_name_from_path(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
 impl AttentionLevel {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -133,6 +156,17 @@ impl IntegrationState {
     }
 }
 
+impl GitSyncStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::InSync => "in_sync",
+            Self::NeedsSync => "needs_sync",
+            Self::Conflicted => "conflicted",
+        }
+    }
+}
+
 impl SessionMode {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -144,7 +178,7 @@ impl SessionMode {
 
 #[cfg(test)]
 mod tests {
-    use super::branch_name_from_task;
+    use super::{branch_name_from_task, repo_name_from_path};
 
     #[test]
     fn branch_names_are_slugified() {
@@ -157,5 +191,10 @@ mod tests {
     #[test]
     fn empty_tasks_fall_back_to_task() {
         assert_eq!(branch_name_from_task("!!!"), "agent/task");
+    }
+
+    #[test]
+    fn repo_names_are_derived_from_path() {
+        assert_eq!(repo_name_from_path("/tmp/demo"), "demo");
     }
 }

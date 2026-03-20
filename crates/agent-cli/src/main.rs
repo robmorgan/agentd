@@ -37,6 +37,7 @@ use serde_json::Value;
 use tokio::{io::BufReader, net::UnixStream, sync::mpsc};
 
 mod local;
+mod tui;
 
 use agentd_shared::{
     config::Config,
@@ -191,11 +192,7 @@ async fn main() -> Result<()> {
 
     match (command, execution) {
         (Command::Focus { session_id }, ExecutionMode::Daemon) => {
-            if let Some(session_id) = session_id {
-                focus_session(&paths, &session_id).await?;
-            } else {
-                focus_dashboard(&paths).await?;
-            }
+            tui::run_runtime_ui(&paths, session_id.as_deref()).await?;
         }
         (Command::Focus { .. }, ExecutionMode::Local(reason)) => {
             bail!("{reason}. `agent focus` requires a compatible daemon");
@@ -1047,12 +1044,13 @@ async fn try_connect(paths: &AppPaths) -> Result<UnixStream> {
 fn print_sessions(sessions: &[SessionRecord]) {
     for session in sessions {
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             session.session_id,
             session.agent,
             session.status_string(),
             session.integration_string(),
             session.attention_string(),
+            session.repo_name,
             session.branch
         );
         if let Some(summary) = &session.attention_summary {
@@ -1076,12 +1074,18 @@ fn print_session(session: &SessionRecord) {
     if let Some(summary) = &session.attention_summary {
         println!("attention_summary: {summary}");
     }
+    println!("repo_name: {}", session.repo_name);
     println!("repo_path: {}", session.repo_path);
     println!("workspace: {}", session.workspace);
     println!("task: {}", session.task);
     println!("base_branch: {}", session.base_branch);
     println!("branch: {}", session.branch);
     println!("worktree: {}", session.worktree);
+    println!("git_sync: {}", session.git_sync.as_str());
+    println!("has_conflicts: {}", session.has_conflicts);
+    if let Some(summary) = &session.git_status_summary {
+        println!("git_status_summary: {summary}");
+    }
     if let Some(pid) = session.pid {
         println!("pid: {pid}");
     }
@@ -4066,7 +4070,8 @@ mod tests {
         should_colorize_diff_output,
     };
     use agentd_shared::session::{
-        AttentionLevel, IntegrationState, SessionMode, SessionRecord, SessionStatus,
+        AttentionLevel, GitSyncStatus, IntegrationState, SessionMode, SessionRecord,
+        SessionStatus,
     };
     use chrono::Utc;
     use clap::Parser;
@@ -4608,12 +4613,16 @@ mod tests {
             mode: SessionMode::Execute,
             workspace: "/tmp/workspace".to_string(),
             repo_path: "/tmp/workspace".to_string(),
+            repo_name: "workspace".to_string(),
             task: "task".to_string(),
             base_branch: "main".to_string(),
             branch: "agent/task".to_string(),
             worktree: "/tmp/worktree".to_string(),
             status,
             integration_state,
+            git_sync: GitSyncStatus::Unknown,
+            git_status_summary: None,
+            has_conflicts: false,
             pid: Some(123),
             exit_code: Some(0),
             error: None,

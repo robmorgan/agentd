@@ -18,7 +18,7 @@ use nix::{
     sys::signal::{Signal, kill},
     unistd::Pid,
 };
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::{sync::broadcast, task};
 
 use agentd_shared::{
@@ -28,7 +28,7 @@ use agentd_shared::{
     request_input::PendingUserInputRequest,
     session::{
         AttentionLevel, CreateSessionResult, IntegrationState, SessionDiff, SessionMode,
-        SessionRecord, SessionStatus, WorktreeRecord, branch_name_from_task,
+        SessionRecord, SessionStatus, WorktreeRecord, branch_name_from_task, repo_name_from_path,
     },
 };
 
@@ -80,6 +80,7 @@ impl AppState {
             let agent_args_json =
                 serde_json::to_string(&agent.args).context("failed to serialize agent args")?;
             let prompt_text = build_initial_prompt(&task_text, mode);
+            let repo_name = repo_name_from_path(repo_root.as_str());
 
             let session_id = unique_session_id(&db)?;
             let thread_id = (agent_name == "codex")
@@ -99,6 +100,7 @@ impl AppState {
                 resume_session_id: None,
                 workspace: repo_root.as_str(),
                 repo_path: repo_root.as_str(),
+                repo_name: &repo_name,
                 task: &task_text,
                 base_branch: &base_branch,
                 branch: &branch,
@@ -818,6 +820,25 @@ impl AppState {
         runtime.write_input(&data)
     }
 
+    pub async fn resize_attached_session(
+        &self,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<()> {
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+        ensure_session_running(&session)?;
+
+        let runtime = self
+            .runtimes
+            .get(session_id)
+            .ok_or_else(|| anyhow!("session `{session_id}` does not have a live PTY"))?;
+        runtime.resize(cols, rows)
+    }
+
     pub async fn attach_session(
         &self,
         session_id: &str,
@@ -1046,7 +1067,12 @@ fn start_session_runtime(
             .context("failed to initialize libghostty-vt state")?;
     let runtime = runtimes.insert(
         request.session_id.to_string(),
-        SessionRuntime::new(writer, Box::new(terminal_state), OUTPUT_BUFFER_CAPACITY),
+        SessionRuntime::new(
+            pair.master,
+            writer,
+            Box::new(terminal_state),
+            OUTPUT_BUFFER_CAPACITY,
+        ),
     );
     let writer_db = db.clone();
     let writer_session_id = request.session_id.to_string();
@@ -1134,6 +1160,7 @@ impl SessionRuntimeRegistry {
 }
 
 struct SessionRuntime {
+    master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     state: Mutex<SessionRuntimeState>,
     output_tx: broadcast::Sender<Vec<u8>>,
@@ -1143,6 +1170,7 @@ struct SessionRuntime {
 
 impl SessionRuntime {
     fn new(
+        master: Box<dyn MasterPty + Send>,
         writer: Box<dyn Write + Send>,
         terminal_state: Box<dyn TerminalStateEngine>,
         output_buffer_capacity: usize,
@@ -1150,6 +1178,7 @@ impl SessionRuntime {
         let (output_tx, _) = broadcast::channel(output_buffer_capacity);
         let (control_tx, _) = broadcast::channel(4);
         Self {
+            master: Mutex::new(master),
             writer: Mutex::new(writer),
             state: Mutex::new(SessionRuntimeState { terminal_state }),
             output_tx,
@@ -1165,6 +1194,20 @@ impl SessionRuntime {
             .map_err(|_| anyhow!("PTY writer poisoned"))?;
         writer.write_all(data)?;
         writer.flush()?;
+        Ok(())
+    }
+
+    fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        let master = self
+            .master
+            .lock()
+            .map_err(|_| anyhow!("PTY master poisoned"))?;
+        master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
         Ok(())
     }
 
@@ -2047,10 +2090,13 @@ mod tests {
     use crate::db::{Database, NewSession, NewThread};
     use crate::terminal_state::TerminalStateEngine;
     use agentd_shared::{event::NewSessionEvent, paths::AppPaths, session::SessionMode};
-    use anyhow::Result;
+    use anyhow::{Error, Result};
+    use nix::libc;
+    use portable_pty::{MasterPty, PtySize};
     use serde_json::json;
     use std::{
         fs,
+        io::{Read, Write},
         process::Command,
         sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
@@ -2068,9 +2114,55 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct StubMasterPty;
+
+    impl MasterPty for StubMasterPty {
+        fn resize(&self, _size: PtySize) -> std::result::Result<(), Error> {
+            Ok(())
+        }
+
+        fn get_size(&self) -> std::result::Result<PtySize, Error> {
+            Ok(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+        }
+
+        fn try_clone_reader(&self) -> std::result::Result<Box<dyn Read + Send>, Error> {
+            Ok(Box::new(std::io::empty()))
+        }
+
+        fn take_writer(&self) -> std::result::Result<Box<dyn Write + Send>, Error> {
+            Ok(Box::new(std::io::sink()))
+        }
+
+        #[cfg(unix)]
+        fn process_group_leader(&self) -> Option<libc::pid_t> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn tty_name(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+
     #[test]
     fn request_detach_requires_active_attacher() {
-        let runtime = SessionRuntime::new(Box::new(Vec::new()), Box::new(StubTerminalState), 8);
+        let runtime = SessionRuntime::new(
+            Box::new(StubMasterPty),
+            Box::new(std::io::sink()),
+            Box::new(StubTerminalState),
+            8,
+        );
         let err = runtime.request_detach().unwrap_err();
         assert_eq!(err.to_string(), "session does not have an attached client");
     }
@@ -2078,7 +2170,8 @@ mod tests {
     #[test]
     fn request_detach_notifies_attached_client() {
         let runtime = Arc::new(SessionRuntime::new(
-            Box::new(Vec::new()),
+            Box::new(StubMasterPty),
+            Box::new(std::io::sink()),
             Box::new(StubTerminalState),
             8,
         ));
@@ -2172,6 +2265,7 @@ mod tests {
             resume_session_id: Some("resume-1"),
             workspace: repo.as_str(),
             repo_path: repo.as_str(),
+            repo_name: "repo",
             task: "clarify",
             base_branch: "main",
             branch: "agent/clarify",
@@ -2230,6 +2324,7 @@ mod tests {
             resume_session_id: Some("resume-1"),
             workspace: repo.as_str(),
             repo_path: repo.as_str(),
+            repo_name: "repo",
             task: "plan",
             base_branch: "main",
             branch: "agent/plan",
@@ -2304,6 +2399,7 @@ mod tests {
             resume_session_id: Some("resume-1"),
             workspace: repo.as_str(),
             repo_path: repo.as_str(),
+            repo_name: "repo",
             task: "plan",
             base_branch: "main",
             branch: "agent/plan",
@@ -2368,6 +2464,7 @@ mod tests {
             resume_session_id: Some("resume-1"),
             workspace: repo.as_str(),
             repo_path: repo.as_str(),
+            repo_name: "repo",
             task: "clarify",
             base_branch: "main",
             branch: "agent/clarify",

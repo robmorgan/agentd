@@ -204,6 +204,15 @@ async fn handle_connection(
             )
             .await?;
         }
+        IncomingRequest::Standard(Request::AttachResize { .. }) => {
+            send_response(
+                &mut writer,
+                &Response::Error {
+                    message: "attach_resize is only valid during an attached session".to_string(),
+                },
+            )
+            .await?;
+        }
         IncomingRequest::Standard(Request::SendInput {
             session_id,
             data,
@@ -468,6 +477,17 @@ async fn attach_session(
                     break;
                 };
                 match request {
+                    Request::AttachResize { cols, rows } => {
+                        if let Err(err) = state.resize_attached_session(session_id, cols, rows).await {
+                            final_response = Some(match ended_session_response(state, session_id).await? {
+                                Some(response) => response,
+                                None => Response::Error {
+                                    message: err.to_string(),
+                                },
+                            });
+                            break;
+                        }
+                    }
                     Request::AttachInput { data } => {
                         if let Err(err) = state.write_attached_input(session_id, data).await {
                             final_response = Some(match ended_session_response(state, session_id).await? {
@@ -626,7 +646,10 @@ mod tests {
     use super::session_ended_response;
     use agentd_shared::{
         protocol::Response,
-        session::{AttentionLevel, IntegrationState, SessionMode, SessionRecord, SessionStatus},
+        session::{
+            AttentionLevel, GitSyncStatus, IntegrationState, SessionMode, SessionRecord,
+            SessionStatus,
+        },
     };
     use chrono::Utc;
 
@@ -640,12 +663,16 @@ mod tests {
             mode: SessionMode::Execute,
             workspace: "/tmp/workspace".to_string(),
             repo_path: "/tmp/workspace".to_string(),
+            repo_name: "workspace".to_string(),
             task: "task".to_string(),
             base_branch: "main".to_string(),
             branch: "agent/task".to_string(),
             worktree: "/tmp/worktree".to_string(),
             status,
             integration_state: IntegrationState::Clean,
+            git_sync: GitSyncStatus::Unknown,
+            git_status_summary: None,
+            has_conflicts: false,
             pid: Some(123),
             exit_code: Some(0),
             error: None,

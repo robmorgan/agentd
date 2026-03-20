@@ -18,7 +18,10 @@ use serde_json::Value;
 use agentd_shared::{
     event::SessionEvent,
     paths::AppPaths,
-    session::{AttentionLevel, IntegrationState, SessionMode, SessionRecord, SessionStatus},
+    session::{
+        AttentionLevel, GitSyncStatus, IntegrationState, SessionMode, SessionRecord, SessionStatus,
+        repo_name_from_path,
+    },
 };
 
 pub struct LocalStore {
@@ -38,7 +41,7 @@ impl LocalStore {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, task, base_branch, branch,
-                    worktree, status, integration_state, pid, exit_code, error, attention, attention_summary,
+                    repo_name, worktree, status, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
         )?;
@@ -51,7 +54,7 @@ impl LocalStore {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, task, base_branch, branch,
-                    worktree, status, integration_state, pid, exit_code, error, attention, attention_summary,
+                    repo_name, worktree, status, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
             params![session_id],
@@ -144,6 +147,7 @@ impl LocalStore {
                 mode TEXT NOT NULL DEFAULT 'execute',
                 workspace TEXT NOT NULL,
                 repo_path TEXT,
+                repo_name TEXT,
                 task TEXT NOT NULL,
                 base_branch TEXT,
                 branch TEXT NOT NULL,
@@ -153,6 +157,9 @@ impl LocalStore {
                 exit_code INTEGER,
                 error TEXT,
                 integration_state TEXT NOT NULL DEFAULT 'clean',
+                git_sync TEXT NOT NULL DEFAULT 'unknown',
+                git_status_summary TEXT,
+                has_conflicts INTEGER NOT NULL DEFAULT 0,
                 attention TEXT NOT NULL DEFAULT 'info',
                 attention_summary TEXT,
                 created_at TEXT NOT NULL,
@@ -201,6 +208,11 @@ impl LocalStore {
         )?;
         ensure_column(
             &conn,
+            "repo_name",
+            "ALTER TABLE sessions ADD COLUMN repo_name TEXT",
+        )?;
+        ensure_column(
+            &conn,
             "base_branch",
             "ALTER TABLE sessions ADD COLUMN base_branch TEXT",
         )?;
@@ -208,6 +220,21 @@ impl LocalStore {
             &conn,
             "integration_state",
             "ALTER TABLE sessions ADD COLUMN integration_state TEXT NOT NULL DEFAULT 'clean'",
+        )?;
+        ensure_column(
+            &conn,
+            "git_sync",
+            "ALTER TABLE sessions ADD COLUMN git_sync TEXT NOT NULL DEFAULT 'unknown'",
+        )?;
+        ensure_column(
+            &conn,
+            "git_status_summary",
+            "ALTER TABLE sessions ADD COLUMN git_status_summary TEXT",
+        )?;
+        ensure_column(
+            &conn,
+            "has_conflicts",
+            "ALTER TABLE sessions ADD COLUMN has_conflicts INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(
             &conn,
@@ -223,13 +250,35 @@ impl LocalStore {
             "UPDATE sessions
              SET mode = COALESCE(mode, 'execute'),
                  repo_path = COALESCE(repo_path, workspace),
+                 repo_name = COALESCE(repo_name, repo_path, workspace),
                  base_branch = COALESCE(base_branch, 'HEAD'),
                  integration_state = COALESCE(integration_state, 'clean'),
+                 git_sync = COALESCE(git_sync, 'unknown'),
+                 has_conflicts = COALESCE(has_conflicts, 0),
                  attention = COALESCE(attention, 'info'),
                  attention_summary = COALESCE(attention_summary, task)
-             WHERE mode IS NULL OR repo_path IS NULL OR base_branch IS NULL OR integration_state IS NULL OR attention IS NULL OR attention_summary IS NULL",
+             WHERE mode IS NULL OR repo_path IS NULL OR repo_name IS NULL OR base_branch IS NULL OR integration_state IS NULL OR git_sync IS NULL OR has_conflicts IS NULL OR attention IS NULL OR attention_summary IS NULL",
             [],
         )?;
+        let mut stmt = conn.prepare("SELECT session_id, repo_path, workspace, repo_name FROM sessions")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (session_id, repo_path, workspace, repo_name) = row?;
+            let desired = repo_name_from_path(repo_path.as_deref().unwrap_or(&workspace));
+            if repo_name.unwrap_or_default() != desired {
+                conn.execute(
+                    "UPDATE sessions SET repo_name = ?2 WHERE session_id = ?1",
+                    params![session_id, desired],
+                )?;
+            }
+        }
         Ok(())
     }
 }
@@ -351,38 +400,50 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         task: row.get(7)?,
         base_branch: row.get(8)?,
         branch: row.get(9)?,
-        worktree: row.get(10)?,
-        status: str_to_status(&row.get::<_, String>(11)?).map_err(|err| {
+        repo_name: row
+            .get::<_, Option<String>>(10)?
+            .unwrap_or_else(|| repo_name_from_path(&row.get::<_, String>(6).unwrap_or_default())),
+        worktree: row.get(11)?,
+        status: str_to_status(&row.get::<_, String>(12)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                11,
+                12,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        integration_state: str_to_integration_state(&row.get::<_, String>(12)?).map_err(
+        integration_state: str_to_integration_state(&row.get::<_, String>(13)?).map_err(
             |err| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    12,
+                    13,
                     rusqlite::types::Type::Text,
                     Box::new(err),
                 )
             },
         )?,
-        pid: row.get::<_, Option<u32>>(13)?,
-        exit_code: row.get(14)?,
-        error: row.get(15)?,
-        attention: str_to_attention(&row.get::<_, String>(16)?).map_err(|err| {
+        git_sync: str_to_git_sync_status(&row.get::<_, String>(14)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                16,
+                14,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        attention_summary: row.get(17)?,
-        created_at: parse_time(row.get::<_, String>(18)?)?,
-        updated_at: parse_time(row.get::<_, String>(19)?)?,
+        git_status_summary: row.get(15)?,
+        has_conflicts: row.get::<_, bool>(16)?,
+        pid: row.get::<_, Option<u32>>(17)?,
+        exit_code: row.get(18)?,
+        error: row.get(19)?,
+        attention: str_to_attention(&row.get::<_, String>(20)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                20,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?,
+        attention_summary: row.get(21)?,
+        created_at: parse_time(row.get::<_, String>(22)?)?,
+        updated_at: parse_time(row.get::<_, String>(23)?)?,
         exited_at: row
-            .get::<_, Option<String>>(20)?
+            .get::<_, Option<String>>(24)?
             .map(parse_time)
             .transpose()?,
     })
@@ -449,6 +510,19 @@ fn str_to_integration_state(value: &str) -> std::result::Result<IntegrationState
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown integration state `{value}`"),
+        )),
+    }
+}
+
+fn str_to_git_sync_status(value: &str) -> std::result::Result<GitSyncStatus, std::io::Error> {
+    match value {
+        "unknown" => Ok(GitSyncStatus::Unknown),
+        "in_sync" => Ok(GitSyncStatus::InSync),
+        "needs_sync" => Ok(GitSyncStatus::NeedsSync),
+        "conflicted" => Ok(GitSyncStatus::Conflicted),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown git sync status `{value}`"),
         )),
     }
 }
