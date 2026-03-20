@@ -12,9 +12,7 @@ use ratatui::{
     backend::CrosstermBackend,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, Borders, Clear as WidgetClear, List, ListItem, ListState, Paragraph, Wrap,
-    },
+    widgets::{Block, Borders, Clear as WidgetClear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use agentd_shared::{
@@ -24,8 +22,8 @@ use agentd_shared::{
 };
 
 use crate::{
-    CODEX_MODELS, RawModeGuard, centered_rect, daemon_get_session, daemon_list_sessions,
-    kill_session, send_request, StatusString,
+    CODEX_MODELS, RawModeGuard, StatusString, centered_rect, daemon_get_session,
+    daemon_list_sessions, kill_session, send_request,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,7 +162,9 @@ impl SessionPicker {
     async fn handle_key(&mut self, key: KeyEvent) -> Result<Option<Option<String>>> {
         match self.mode {
             PickerMode::Browse => self.handle_browse_key(key).await,
-            PickerMode::NewSession { edit_agent } => self.handle_new_session_key(key, edit_agent).await,
+            PickerMode::NewSession { edit_agent } => {
+                self.handle_new_session_key(key, edit_agent).await
+            }
         }
     }
 
@@ -265,7 +265,9 @@ impl SessionPicker {
                 )
                 .await?;
                 match response {
-                    Response::CreateSession { session } => return Ok(Some(Some(session.session_id))),
+                    Response::CreateSession { session } => {
+                        return Ok(Some(Some(session.session_id)));
+                    }
                     Response::Error { message } => self.toast = Some(message),
                     other => bail!("unexpected response: {:?}", other),
                 }
@@ -294,7 +296,9 @@ impl SessionPicker {
 
         match self.mode {
             PickerMode::Browse => self.render_browser(frame, inner),
-            PickerMode::NewSession { edit_agent } => self.render_new_session(frame, inner, edit_agent),
+            PickerMode::NewSession { edit_agent } => {
+                self.render_new_session(frame, inner, edit_agent)
+            }
         }
     }
 
@@ -306,9 +310,15 @@ impl SessionPicker {
             .iter()
             .map(|session| {
                 ListItem::new(Line::from(vec![
-                    Span::styled(session_icon(session), Style::default().fg(session_icon_color(session))),
+                    Span::styled(
+                        session_icon(session),
+                        Style::default().fg(session_icon_color(session)),
+                    ),
                     Span::raw("  "),
-                    Span::styled(session.title.as_str(), Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        session.title.as_str(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
                     Span::raw("  "),
                     Span::styled(session.repo_name.as_str(), subtle_style()),
                     Span::raw("  "),
@@ -335,7 +345,11 @@ impl SessionPicker {
         frame.render_widget(query, chunks[0]);
         frame.render_stateful_widget(
             List::new(items)
-                .highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
                 .highlight_symbol("› "),
             chunks[1],
             &mut state,
@@ -350,12 +364,7 @@ impl SessionPicker {
         }
     }
 
-    fn render_new_session(
-        &self,
-        frame: &mut Frame,
-        area: ratatui::layout::Rect,
-        edit_agent: bool,
-    ) {
+    fn render_new_session(&self, frame: &mut Frame, area: ratatui::layout::Rect, edit_agent: bool) {
         let chunks = ratatui::layout::Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
             .constraints([
@@ -504,7 +513,10 @@ impl AttachOverlay {
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<Option<OverlayOutcome>> {
         if matches!(key.code, KeyCode::Esc)
-            && !matches!(self.mode, OverlayMode::GitStatus | OverlayMode::Diff | OverlayMode::Palette)
+            && !matches!(
+                self.mode,
+                OverlayMode::GitStatus | OverlayMode::Diff | OverlayMode::Palette
+            )
         {
             self.mode = OverlayMode::Palette;
             return Ok(None);
@@ -513,7 +525,9 @@ impl AttachOverlay {
         match self.mode {
             OverlayMode::Palette => self.handle_palette_key(key).await,
             OverlayMode::SessionSwitcher => self.handle_switcher_key(key).await,
-            OverlayMode::NewSession { edit_agent } => self.handle_new_session_key(key, edit_agent).await,
+            OverlayMode::NewSession { edit_agent } => {
+                self.handle_new_session_key(key, edit_agent).await
+            }
             OverlayMode::GitStatus | OverlayMode::Diff => self.handle_detail_key(key).await,
             OverlayMode::StopConfirm => self.handle_stop_confirm_key(key).await,
         }
@@ -599,7 +613,9 @@ impl AttachOverlay {
             }
             KeyCode::Enter => {
                 if let Some(session) = matches.get(self.switcher_selected) {
-                    return Ok(Some(OverlayOutcome::SwitchSession(session.session_id.clone())));
+                    return Ok(Some(OverlayOutcome::SwitchSession(
+                        session.session_id.clone(),
+                    )));
                 }
             }
             KeyCode::Char(ch)
@@ -716,10 +732,9 @@ impl AttachOverlay {
             Command::GitStatus => {
                 let session = daemon_get_session(&self.paths, &self.session_id).await?;
                 let sync = session.git_sync.as_str();
-                let summary = session
-                    .git_status_summary
-                    .clone()
-                    .unwrap_or_else(|| "TODO: live git status sync not implemented yet".to_string());
+                let summary = session.git_status_summary.clone().unwrap_or_else(|| {
+                    "TODO: live git status sync not implemented yet".to_string()
+                });
                 self.detail_text = format!(
                     "repo      {}\nrepo_path  {}\nworktree   {}\nbranch     {}\nbase       {}\ngit_sync   {}\nconflicts  {}\nstatus     {}\n\n{}",
                     session.repo_name,
@@ -778,7 +793,9 @@ impl AttachOverlay {
         match self.mode {
             OverlayMode::Palette => self.render_palette(frame, inner),
             OverlayMode::SessionSwitcher => self.render_switcher(frame, inner),
-            OverlayMode::NewSession { edit_agent } => self.render_new_session(frame, inner, edit_agent),
+            OverlayMode::NewSession { edit_agent } => {
+                self.render_new_session(frame, inner, edit_agent)
+            }
             OverlayMode::GitStatus | OverlayMode::Diff => self.render_detail(frame, inner),
             OverlayMode::StopConfirm => self.render_stop_confirm(frame, inner),
         }
@@ -791,7 +808,9 @@ impl AttachOverlay {
             .enumerate()
             .map(|(index, item)| {
                 let style = if index == self.palette_selected {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
@@ -830,12 +849,17 @@ impl AttachOverlay {
             .enumerate()
             .map(|(index, session)| {
                 let style = if index == self.switcher_selected {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
                 Line::from(vec![
-                    Span::styled(session_icon(session), Style::default().fg(session_icon_color(session))),
+                    Span::styled(
+                        session_icon(session),
+                        Style::default().fg(session_icon_color(session)),
+                    ),
                     Span::raw("  "),
                     Span::styled(session.title.as_str(), style),
                     Span::raw("  "),
@@ -862,12 +886,7 @@ impl AttachOverlay {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[1]);
     }
 
-    fn render_new_session(
-        &self,
-        frame: &mut Frame,
-        area: ratatui::layout::Rect,
-        edit_agent: bool,
-    ) {
+    fn render_new_session(&self, frame: &mut Frame, area: ratatui::layout::Rect, edit_agent: bool) {
         let chunks = ratatui::layout::Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
             .constraints([
@@ -996,13 +1015,18 @@ fn session_search_text(session: &SessionRecord) -> String {
 fn session_rank(session: &SessionRecord) -> u8 {
     if session.status == SessionStatus::NeedsInput {
         0
-    } else if matches!(session.status, SessionStatus::Failed | SessionStatus::UnknownRecovered)
-        || session.has_conflicts
+    } else if matches!(
+        session.status,
+        SessionStatus::Failed | SessionStatus::UnknownRecovered
+    ) || session.has_conflicts
     {
         1
     } else if session.integration_state == IntegrationState::PendingReview {
         2
-    } else if matches!(session.status, SessionStatus::Running | SessionStatus::Creating) {
+    } else if matches!(
+        session.status,
+        SessionStatus::Running | SessionStatus::Creating
+    ) {
         3
     } else if session.status == SessionStatus::Paused {
         4
@@ -1049,7 +1073,10 @@ fn session_status_text(session: &SessionRecord) -> String {
         SessionStatus::Paused => "paused".to_string(),
         SessionStatus::NeedsInput => "needs input".to_string(),
         SessionStatus::Exited => "complete".to_string(),
-        SessionStatus::Failed => session.error.clone().unwrap_or_else(|| "blocked".to_string()),
+        SessionStatus::Failed => session
+            .error
+            .clone()
+            .unwrap_or_else(|| "blocked".to_string()),
         SessionStatus::UnknownRecovered => "daemon lost the live process".to_string(),
     }
 }

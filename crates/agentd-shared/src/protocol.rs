@@ -715,7 +715,10 @@ fn encode_response(response: &Response) -> Result<(MessageKind, Vec<u8>)> {
             put_bool(&mut payload, *was_running);
             MessageKind::KillSessionResponse
         }
-        Response::Attached { attach_id, snapshot } => {
+        Response::Attached {
+            attach_id,
+            snapshot,
+        } => {
             put_string(&mut payload, attach_id)?;
             put_bytes(&mut payload, snapshot)?;
             MessageKind::AttachedResponse
@@ -1453,8 +1456,8 @@ mod tests {
     use crate::{
         event::{NewSessionEvent, SessionEvent},
         session::{
-            AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult,
-            GitSyncStatus, IntegrationState, SessionMode, SessionRecord, SessionStatus,
+            AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult, GitSyncStatus,
+            IntegrationState, SessionMode, SessionRecord, SessionStatus,
         },
     };
     use chrono::Utc;
@@ -1475,7 +1478,10 @@ mod tests {
 
     #[test]
     fn attach_resize_round_trips() {
-        let request = Request::AttachResize { cols: 120, rows: 48 };
+        let request = Request::AttachResize {
+            cols: 120,
+            rows: 48,
+        };
         let (kind, payload) = encode_request(&request).unwrap();
         let decoded = decode_request(kind, &payload).unwrap();
         assert_eq!(decoded, request);

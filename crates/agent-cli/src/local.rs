@@ -192,11 +192,7 @@ impl LocalStore {
             "thread_id",
             "ALTER TABLE sessions ADD COLUMN thread_id TEXT",
         )?;
-        ensure_column(
-            &conn,
-            "model",
-            "ALTER TABLE sessions ADD COLUMN model TEXT",
-        )?;
+        ensure_column(&conn, "model", "ALTER TABLE sessions ADD COLUMN model TEXT")?;
         ensure_column(
             &conn,
             "mode",
@@ -263,7 +259,8 @@ impl LocalStore {
              WHERE mode IS NULL OR repo_path IS NULL OR repo_name IS NULL OR title IS NULL OR base_branch IS NULL OR integration_state IS NULL OR git_sync IS NULL OR has_conflicts IS NULL OR attention IS NULL OR attention_summary IS NULL",
             [],
         )?;
-        let mut stmt = conn.prepare("SELECT session_id, repo_path, workspace, repo_name FROM sessions")?;
+        let mut stmt =
+            conn.prepare("SELECT session_id, repo_path, workspace, repo_name FROM sessions")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -392,17 +389,13 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         agent: row.get(2)?,
         model: row.get(3)?,
         mode: str_to_mode(&row.get::<_, String>(4)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(
-                4,
-                rusqlite::types::Type::Text,
-                Box::new(err),
-            )
+            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err))
         })?,
         workspace: row.get(5)?,
         repo_path: row.get(6)?,
-        repo_name: row.get::<_, Option<String>>(7)?.unwrap_or_else(|| {
-            repo_name_from_path(&row.get::<_, String>(6).unwrap_or_default())
-        }),
+        repo_name: row
+            .get::<_, Option<String>>(7)?
+            .unwrap_or_else(|| repo_name_from_path(&row.get::<_, String>(6).unwrap_or_default())),
         title: row.get(8)?,
         base_branch: row.get(9)?,
         branch: row.get(10)?,
@@ -414,15 +407,13 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
                 Box::new(err),
             )
         })?,
-        integration_state: str_to_integration_state(&row.get::<_, String>(13)?).map_err(
-            |err| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    13,
-                    rusqlite::types::Type::Text,
-                    Box::new(err),
-                )
-            },
-        )?,
+        integration_state: str_to_integration_state(&row.get::<_, String>(13)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                13,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?,
         git_sync: str_to_git_sync_status(&row.get::<_, String>(14)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 14,

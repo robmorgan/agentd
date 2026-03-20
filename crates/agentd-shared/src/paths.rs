@@ -83,9 +83,7 @@ fn discover_root(
         return Ok(runtime_dir.join(APP_DIR_NAME));
     }
 
-    if prefer_home_root
-        && let Some(home_dir) = home_dir
-    {
+    if prefer_home_root && let Some(home_dir) = home_dir {
         return Utf8PathBuf::from_path_buf(home_dir.join(format!(".{APP_DIR_NAME}")))
             .map_err(|_| anyhow::anyhow!("HOME is not valid UTF-8"));
     }

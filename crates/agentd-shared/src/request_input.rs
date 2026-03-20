@@ -78,7 +78,8 @@ impl UserInputQuestion {
             .get("options")
             .and_then(Value::as_array)
             .map(|items| {
-                items.iter()
+                items
+                    .iter()
                     .filter_map(UserInputOption::from_codex_value)
                     .collect::<Vec<_>>()
             })
@@ -108,7 +109,10 @@ impl UserInputOption {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
-            is_other: value.get("is_other").and_then(Value::as_bool).unwrap_or(false),
+            is_other: value
+                .get("is_other")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
     }
 }
@@ -139,6 +143,9 @@ mod tests {
         assert_eq!(request.turn_id.as_deref(), Some("turn-1"));
         assert_eq!(request.questions.len(), 1);
         assert_eq!(request.questions[0].header, "Scope");
-        assert_eq!(request.questions[0].options[1].description.as_deref(), Some("Use it everywhere."));
+        assert_eq!(
+            request.questions[0].options[1].description.as_deref(),
+            Some("Use it everywhere.")
+        );
     }
 }
