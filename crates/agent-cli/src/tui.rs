@@ -155,10 +155,9 @@ impl RuntimeApp {
 
     async fn refresh_sessions(&mut self) -> Result<()> {
         self.sessions = daemon_list_sessions(&self.paths).await?;
-        let existing = self
-            .sessions
-            .iter()
-            .any(|session| matches!(&self.focus, FocusTarget::Worker(id) if id == &session.session_id));
+        let existing = self.sessions.iter().any(
+            |session| matches!(&self.focus, FocusTarget::Worker(id) if id == &session.session_id),
+        );
         if matches!(self.focus, FocusTarget::Worker(_)) && !existing {
             self.focus = FocusTarget::Coordinator;
         }
@@ -169,7 +168,10 @@ impl RuntimeApp {
         let live_session_id = self.focused_worker_session_id().map(str::to_string);
         match live_session_id {
             Some(session_id) => {
-                let live_session = self.sessions.iter().find(|session| session.session_id == session_id);
+                let live_session = self
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_id == session_id);
                 let live_status = live_session.map(|session| session.status);
                 let needs_attach = self
                     .pty
@@ -179,12 +181,18 @@ impl RuntimeApp {
 
                 if needs_attach {
                     self.stop_pty();
-                    if matches!(live_status, Some(SessionStatus::Running | SessionStatus::NeedsInput)) {
+                    if matches!(
+                        live_status,
+                        Some(SessionStatus::Running | SessionStatus::NeedsInput)
+                    ) {
                         self.pty = Some(FocusedPty::spawn(self.paths.clone(), session_id.clone()));
                     }
                 }
 
-                if !matches!(live_status, Some(SessionStatus::Running | SessionStatus::NeedsInput)) {
+                if !matches!(
+                    live_status,
+                    Some(SessionStatus::Running | SessionStatus::NeedsInput)
+                ) {
                     self.stop_pty();
                 }
             }
@@ -406,8 +414,7 @@ impl RuntimeApp {
                 self.agent_input = "codex".to_string();
             }
             Command::WorktreeActions => {
-                self.modal = Modal::WorktreeActions;
-                self.detail_text = "fetch\nrebase main\nmerge main\ndetect conflicts\n\nTODO: wire these to thin daemon git helpers without turning agentd into a large git automation layer.".to_string();
+                self.open_review_actions();
             }
             Command::GitStatus => {
                 self.open_git_status();
@@ -557,7 +564,8 @@ impl RuntimeApp {
                     self.toast = Some("agent cannot be empty".to_string());
                     return Ok(());
                 }
-                let workspace = std::env::current_dir().context("failed to determine current directory")?;
+                let workspace =
+                    std::env::current_dir().context("failed to determine current directory")?;
                 let response = send_request(
                     &self.paths,
                     &Request::CreateSession {
@@ -602,6 +610,34 @@ impl RuntimeApp {
             KeyCode::Esc | KeyCode::Enter => self.close_modal(),
             _ => {}
         }
+    }
+
+    fn open_review_actions(&mut self) {
+        let Some(session) = self.focused_session() else {
+            self.toast = Some("focus a worker session first".to_string());
+            return;
+        };
+        let summary = session
+            .git_status_summary
+            .clone()
+            .unwrap_or_else(|| "review ready".to_string());
+        self.detail_text = format!(
+            "session    {}\nrepo       {}\nbase       {}\nbranch     {}\nworktree   {}\nstatus     {}\nreview     {}\nconflicts  {}\n\nCLI actions\nagent diff {}\nagent accept {}\nagent discard {}\n\n`accept` will only apply when the repo checkout is clean and on `{}`. It lands a squash commit and refuses to touch the upstream checkout if preflight predicts conflicts.",
+            session.session_id,
+            session.repo_name,
+            session.base_branch,
+            session.branch,
+            session.worktree,
+            session.status_string(),
+            summary,
+            if session.has_conflicts { "yes" } else { "no" },
+            session.session_id,
+            session.session_id,
+            session.session_id,
+            session.base_branch,
+        );
+        self.detail_scroll = 0;
+        self.modal = Modal::WorktreeActions;
     }
 
     fn handle_detail_modal_key(&mut self, key: KeyEvent) {
@@ -674,26 +710,43 @@ impl RuntimeApp {
             Span::styled("Sessions", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(format!(" ({})", self.sessions.len())),
         ]));
-        frame.render_widget(header, Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1));
+        frame.render_widget(
+            header,
+            Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1),
+        );
 
         let available = area.height.saturating_sub(2);
         let visible_cards = (available / CARD_HEIGHT).max(1) as usize;
-        let cards = ordered.into_iter().take(visible_cards.saturating_sub(1)).collect::<Vec<_>>();
+        let cards = ordered
+            .into_iter()
+            .take(visible_cards.saturating_sub(1))
+            .collect::<Vec<_>>();
 
         let mut y = area.y + 2;
         self.render_session_card(
             frame,
-            Rect::new(area.x + 1, y, area.width.saturating_sub(2), CARD_HEIGHT.saturating_sub(1)),
+            Rect::new(
+                area.x + 1,
+                y,
+                area.width.saturating_sub(2),
+                CARD_HEIGHT.saturating_sub(1),
+            ),
             SidebarCard::coordinator(self.focus == FocusTarget::Coordinator),
         );
         y = y.saturating_add(CARD_HEIGHT);
 
         for session in cards {
-            let is_focused = matches!(&self.focus, FocusTarget::Worker(id) if id == &session.session_id);
+            let is_focused =
+                matches!(&self.focus, FocusTarget::Worker(id) if id == &session.session_id);
             let card = SidebarCard::from_session(session, is_focused);
             self.render_session_card(
                 frame,
-                Rect::new(area.x + 1, y, area.width.saturating_sub(2), CARD_HEIGHT.saturating_sub(1)),
+                Rect::new(
+                    area.x + 1,
+                    y,
+                    area.width.saturating_sub(2),
+                    CARD_HEIGHT.saturating_sub(1),
+                ),
                 card,
             );
             y = y.saturating_add(CARD_HEIGHT);
@@ -709,13 +762,20 @@ impl RuntimeApp {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let block = Block::default().borders(Borders::ALL).border_style(border_style);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
         let lines = vec![
             Line::from(vec![
-                Span::styled(card.icon, Style::default().fg(card.icon_color).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    card.icon,
+                    Style::default()
+                        .fg(card.icon_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("  "),
                 Span::styled(card.title, Style::default().add_modifier(Modifier::BOLD)),
             ]),
@@ -727,12 +787,12 @@ impl RuntimeApp {
                 Span::styled("branch  ", subtle_style()),
                 Span::raw(card.branch),
             ]),
-            Line::from(Span::styled(card.status_text, Style::default().fg(card.icon_color))),
+            Line::from(Span::styled(
+                card.status_text,
+                Style::default().fg(card.icon_color),
+            )),
         ];
-        frame.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }),
-            inner,
-        );
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
     fn render_main(&mut self, frame: &mut Frame, area: Rect) {
@@ -743,16 +803,17 @@ impl RuntimeApp {
     }
 
     fn render_coordinator(&self, frame: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .title("Coordinator")
-            .borders(Borders::ALL);
+        let block = Block::default().title("Coordinator").borders(Borders::ALL);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
         let ordered = self.ordered_sessions();
         let mut lines = vec![
             Line::from(vec![
-                Span::styled("Attention queue", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "Attention queue",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("  "),
                 Span::styled("Ctrl-b opens commands", subtle_style()),
             ]),
@@ -766,9 +827,15 @@ impl RuntimeApp {
         } else {
             for session in ordered.iter().take(inner.height.saturating_sub(4) as usize) {
                 lines.push(Line::from(vec![
-                    Span::styled(session_icon(session), Style::default().fg(session_icon_color(session))),
+                    Span::styled(
+                        session_icon(session),
+                        Style::default().fg(session_icon_color(session)),
+                    ),
                     Span::raw("  "),
-                    Span::styled(session.title.as_str(), Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        session.title.as_str(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
                     Span::raw("  "),
                     Span::styled(session.repo_name.as_str(), subtle_style()),
                     Span::raw("  "),
@@ -804,9 +871,17 @@ impl RuntimeApp {
 
         let summary = vec![
             Line::from(vec![
-                Span::styled(session_icon(session), Style::default().fg(session_icon_color(session)).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    session_icon(session),
+                    Style::default()
+                        .fg(session_icon_color(session))
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("  "),
-                Span::styled(session.title.as_str(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    session.title.as_str(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("repo      ", subtle_style()),
@@ -824,7 +899,10 @@ impl RuntimeApp {
                 Span::raw(session.git_sync.as_str()),
             ]),
         ];
-        frame.render_widget(Paragraph::new(summary).wrap(Wrap { trim: false }), sections[0]);
+        frame.render_widget(
+            Paragraph::new(summary).wrap(Wrap { trim: false }),
+            sections[0],
+        );
 
         let pty_area = sections[1];
         let pane = Block::default().borders(Borders::TOP).title("PTY");
@@ -872,9 +950,23 @@ impl RuntimeApp {
             Modal::Palette => self.render_palette(frame, area),
             Modal::SessionSwitcher => self.render_switcher(frame, area),
             Modal::NewSession { edit_agent } => self.render_task_modal(frame, area, edit_agent),
-            Modal::WorktreeActions => self.render_detail_modal(frame, area, "Worktree Actions", &self.detail_text, self.detail_scroll),
-            Modal::GitStatus => self.render_detail_modal(frame, area, "Git Status", &self.detail_text, self.detail_scroll),
-            Modal::Diff => self.render_detail_modal(frame, area, "Diff", &self.diff_text, self.diff_scroll),
+            Modal::WorktreeActions => self.render_detail_modal(
+                frame,
+                area,
+                "Review Actions",
+                &self.detail_text,
+                self.detail_scroll,
+            ),
+            Modal::GitStatus => self.render_detail_modal(
+                frame,
+                area,
+                "Git Status",
+                &self.detail_text,
+                self.detail_scroll,
+            ),
+            Modal::Diff => {
+                self.render_detail_modal(frame, area, "Diff", &self.diff_text, self.diff_scroll)
+            }
             Modal::StopConfirm => self.render_stop_confirm(frame, area),
         }
 
@@ -907,7 +999,9 @@ impl RuntimeApp {
         lines.push(Line::from(""));
         for (index, item) in items.iter().take(9).enumerate() {
             let style = if index == self.palette_selected {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -920,7 +1014,11 @@ impl RuntimeApp {
         frame.render_widget(WidgetClear, overlay);
         frame.render_widget(
             Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title("Command Palette"))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Command Palette"),
+                )
                 .wrap(Wrap { trim: false }),
             overlay,
         );
@@ -936,12 +1034,17 @@ impl RuntimeApp {
         lines.push(Line::from(""));
         for (index, session) in matches.iter().take(9).enumerate() {
             let style = if index == self.switcher_selected {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
             lines.push(Line::from(vec![
-                Span::styled(session_icon(session), Style::default().fg(session_icon_color(session))),
+                Span::styled(
+                    session_icon(session),
+                    Style::default().fg(session_icon_color(session)),
+                ),
                 Span::raw("  "),
                 Span::styled(session.title.as_str(), style),
             ]));
@@ -955,7 +1058,11 @@ impl RuntimeApp {
         frame.render_widget(WidgetClear, overlay);
         frame.render_widget(
             Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title("Session Switcher"))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Session Switcher"),
+                )
                 .wrap(Wrap { trim: false }),
             overlay,
         );
@@ -1041,7 +1148,12 @@ impl FocusedPty {
     fn spawn(paths: AppPaths, session_id: String) -> Self {
         let (command_tx, command_rx) = unbounded_channel();
         let (message_tx, message_rx) = unbounded_channel();
-        tokio::spawn(run_pty_session(paths, session_id.clone(), command_rx, message_tx));
+        tokio::spawn(run_pty_session(
+            paths,
+            session_id.clone(),
+            command_rx,
+            message_tx,
+        ));
         Self {
             session_id,
             commands: command_tx,
@@ -1413,10 +1525,24 @@ impl TerminalSurface {
         let params = if private { &params[1..] } else { params };
         let parsed = parse_csi_params(params);
         match action {
-            'A' => self.cursor_row = self.cursor_row.saturating_sub(first_param(&parsed, 1) as usize),
-            'B' => self.cursor_row = (self.cursor_row + first_param(&parsed, 1) as usize).min(self.rows.saturating_sub(1) as usize),
-            'C' => self.cursor_col = (self.cursor_col + first_param(&parsed, 1) as usize).min(self.cols.saturating_sub(1) as usize),
-            'D' => self.cursor_col = self.cursor_col.saturating_sub(first_param(&parsed, 1) as usize),
+            'A' => {
+                self.cursor_row = self
+                    .cursor_row
+                    .saturating_sub(first_param(&parsed, 1) as usize)
+            }
+            'B' => {
+                self.cursor_row = (self.cursor_row + first_param(&parsed, 1) as usize)
+                    .min(self.rows.saturating_sub(1) as usize)
+            }
+            'C' => {
+                self.cursor_col = (self.cursor_col + first_param(&parsed, 1) as usize)
+                    .min(self.cols.saturating_sub(1) as usize)
+            }
+            'D' => {
+                self.cursor_col = self
+                    .cursor_col
+                    .saturating_sub(first_param(&parsed, 1) as usize)
+            }
             'G' => self.cursor_col = first_param(&parsed, 1).saturating_sub(1) as usize,
             'H' | 'f' => {
                 self.cursor_row = first_param(&parsed, 1).saturating_sub(1) as usize;
@@ -1854,28 +1980,79 @@ fn filtered_palette_items(query: &str) -> Vec<PaletteItem> {
 
 fn palette_items() -> Vec<PaletteItem> {
     vec![
-        PaletteItem { key_hint: "n", title: "Next Session", command: Command::NextSession },
-        PaletteItem { key_hint: "p", title: "Previous Session", command: Command::PreviousSession },
-        PaletteItem { key_hint: "a", title: "Next Attention", command: Command::NextAttention },
-        PaletteItem { key_hint: "c", title: "Focus Coordinator", command: Command::FocusCoordinator },
-        PaletteItem { key_hint: "s", title: "Session Switcher", command: Command::SessionSwitcher },
-        PaletteItem { key_hint: "t", title: "New Session", command: Command::NewSession },
-        PaletteItem { key_hint: "N", title: "New Agent", command: Command::NewAgent },
-        PaletteItem { key_hint: "w", title: "Worktree Actions", command: Command::WorktreeActions },
-        PaletteItem { key_hint: "g", title: "Git Status", command: Command::GitStatus },
-        PaletteItem { key_hint: "d", title: "Diff", command: Command::Diff },
-        PaletteItem { key_hint: "x", title: "Stop Session", command: Command::StopSession },
+        PaletteItem {
+            key_hint: "n",
+            title: "Next Session",
+            command: Command::NextSession,
+        },
+        PaletteItem {
+            key_hint: "p",
+            title: "Previous Session",
+            command: Command::PreviousSession,
+        },
+        PaletteItem {
+            key_hint: "a",
+            title: "Next Attention",
+            command: Command::NextAttention,
+        },
+        PaletteItem {
+            key_hint: "c",
+            title: "Focus Coordinator",
+            command: Command::FocusCoordinator,
+        },
+        PaletteItem {
+            key_hint: "s",
+            title: "Session Switcher",
+            command: Command::SessionSwitcher,
+        },
+        PaletteItem {
+            key_hint: "t",
+            title: "New Session",
+            command: Command::NewSession,
+        },
+        PaletteItem {
+            key_hint: "N",
+            title: "New Agent",
+            command: Command::NewAgent,
+        },
+        PaletteItem {
+            key_hint: "w",
+            title: "Review Actions",
+            command: Command::WorktreeActions,
+        },
+        PaletteItem {
+            key_hint: "g",
+            title: "Git Status",
+            command: Command::GitStatus,
+        },
+        PaletteItem {
+            key_hint: "d",
+            title: "Diff",
+            command: Command::Diff,
+        },
+        PaletteItem {
+            key_hint: "x",
+            title: "Stop Session",
+            command: Command::StopSession,
+        },
     ]
 }
 
 fn session_rank(session: &SessionRecord) -> u8 {
     if session.status == SessionStatus::NeedsInput {
         0
-    } else if matches!(session.status, SessionStatus::Failed | SessionStatus::UnknownRecovered) || session.has_conflicts {
+    } else if matches!(
+        session.status,
+        SessionStatus::Failed | SessionStatus::UnknownRecovered
+    ) || session.has_conflicts
+    {
         1
     } else if session.integration_state == IntegrationState::PendingReview {
         2
-    } else if matches!(session.status, SessionStatus::Running | SessionStatus::Creating) {
+    } else if matches!(
+        session.status,
+        SessionStatus::Running | SessionStatus::Creating
+    ) {
         3
     } else if session.status == SessionStatus::Paused {
         4
@@ -1931,7 +2108,10 @@ fn session_status_text(session: &SessionRecord) -> String {
         SessionStatus::Paused => "paused".to_string(),
         SessionStatus::NeedsInput => "needs input".to_string(),
         SessionStatus::Exited => "complete".to_string(),
-        SessionStatus::Failed => session.error.clone().unwrap_or_else(|| "blocked".to_string()),
+        SessionStatus::Failed => session
+            .error
+            .clone()
+            .unwrap_or_else(|| "blocked".to_string()),
         SessionStatus::UnknownRecovered => "daemon lost the live process".to_string(),
     }
 }
@@ -1954,7 +2134,11 @@ fn matches_query<T: AsRef<str>>(haystack: T, query: &str) -> bool {
 fn session_switcher_text(session: &SessionRecord) -> String {
     format!(
         "{} {} {} {} {}",
-        session.session_id, session.title, session.repo_name, session.branch, session.status_string()
+        session.session_id,
+        session.title,
+        session.repo_name,
+        session.branch,
+        session.status_string()
     )
 }
 
@@ -1973,7 +2157,9 @@ fn status_label(status: SessionStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{TerminalSurface, matches_query, session_icon, session_rank, session_status_text};
-    use agentd_shared::session::{AttentionLevel, GitSyncStatus, IntegrationState, SessionMode, SessionRecord, SessionStatus};
+    use agentd_shared::session::{
+        AttentionLevel, GitSyncStatus, IntegrationState, SessionMode, SessionRecord, SessionStatus,
+    };
     use chrono::Utc;
 
     fn demo(status: SessionStatus, integration_state: IntegrationState) -> SessionRecord {
@@ -2009,12 +2195,21 @@ mod tests {
 
     #[test]
     fn session_rank_prioritizes_needs_input() {
-        assert!(session_rank(&demo(SessionStatus::NeedsInput, IntegrationState::Clean)) < session_rank(&demo(SessionStatus::Running, IntegrationState::Clean)));
+        assert!(
+            session_rank(&demo(SessionStatus::NeedsInput, IntegrationState::Clean))
+                < session_rank(&demo(SessionStatus::Running, IntegrationState::Clean))
+        );
     }
 
     #[test]
     fn pending_review_uses_review_icon() {
-        assert_eq!(session_icon(&demo(SessionStatus::Exited, IntegrationState::PendingReview)), "R");
+        assert_eq!(
+            session_icon(&demo(
+                SessionStatus::Exited,
+                IntegrationState::PendingReview
+            )),
+            "R"
+        );
     }
 
     #[test]

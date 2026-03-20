@@ -198,20 +198,18 @@ async fn handle_connection(
         IncomingRequest::Standard(Request::DetachAttachment {
             session_id,
             attach_id,
-        }) => {
-            match state.detach_attachment(&session_id, &attach_id).await {
-                Ok(()) => send_response(&mut writer, &Response::Ok).await?,
-                Err(err) => {
-                    send_response(
-                        &mut writer,
-                        &Response::Error {
-                            message: err.to_string(),
-                        },
-                    )
-                    .await?
-                }
+        }) => match state.detach_attachment(&session_id, &attach_id).await {
+            Ok(()) => send_response(&mut writer, &Response::Ok).await?,
+            Err(err) => {
+                send_response(
+                    &mut writer,
+                    &Response::Error {
+                        message: err.to_string(),
+                    },
+                )
+                .await?
             }
-        }
+        },
         IncomingRequest::Standard(Request::AttachInput { .. }) => {
             send_response(
                 &mut writer,
@@ -259,26 +257,32 @@ async fn handle_connection(
             .await?
         }
         IncomingRequest::Standard(Request::ApplySession { session_id }) => {
-            let _ = session_id;
-            send_response(
-                &mut writer,
-                &Response::Error {
-                    message: "structured apply/discard review is disabled in interactive mode"
-                        .to_string(),
-                },
-            )
-            .await?
+            match state.apply_session(&session_id).await {
+                Ok(session) => send_response(&mut writer, &Response::Session { session }).await?,
+                Err(err) => {
+                    send_response(
+                        &mut writer,
+                        &Response::Error {
+                            message: err.to_string(),
+                        },
+                    )
+                    .await?
+                }
+            }
         }
         IncomingRequest::Standard(Request::DiscardSession { session_id, force }) => {
-            let _ = (session_id, force);
-            send_response(
-                &mut writer,
-                &Response::Error {
-                    message: "structured apply/discard review is disabled in interactive mode"
-                        .to_string(),
-                },
-            )
-            .await?
+            match state.discard_session(&session_id, force).await {
+                Ok(session) => send_response(&mut writer, &Response::Session { session }).await?,
+                Err(err) => {
+                    send_response(
+                        &mut writer,
+                        &Response::Error {
+                            message: err.to_string(),
+                        },
+                    )
+                    .await?
+                }
+            }
         }
         IncomingRequest::Standard(Request::SwitchAttachedSession {
             source_session_id,
@@ -545,17 +549,15 @@ fn session_ended_response(session: &SessionRecord) -> Option<Response> {
         SessionStatus::NeedsInput
         | SessionStatus::Exited
         | SessionStatus::Failed
-        | SessionStatus::UnknownRecovered => {
-            Some(Response::SessionEnded {
-                session_id: session.session_id.clone(),
-                status: session.status,
-                integration_state: session.integration_state,
-                branch: session.branch.clone(),
-                worktree: session.worktree.clone(),
-                exit_code: session.exit_code,
-                error: session.error.clone(),
-            })
-        }
+        | SessionStatus::UnknownRecovered => Some(Response::SessionEnded {
+            session_id: session.session_id.clone(),
+            status: session.status,
+            integration_state: session.integration_state,
+            branch: session.branch.clone(),
+            worktree: session.worktree.clone(),
+            exit_code: session.exit_code,
+            error: session.error.clone(),
+        }),
         SessionStatus::Creating | SessionStatus::Running | SessionStatus::Paused => None,
     }
 }

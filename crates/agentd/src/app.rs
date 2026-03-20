@@ -3,10 +3,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::Path,
-    sync::{
-        mpsc as std_mpsc,
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex, mpsc as std_mpsc},
     time::{Duration, Instant},
 };
 
@@ -19,16 +16,16 @@ use nix::{
     unistd::Pid,
 };
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
-use tokio::{sync::broadcast, task};
 use tokio::sync::mpsc;
+use tokio::{sync::broadcast, task};
 
 use agentd_shared::{
     config::Config,
     event::NewSessionEvent,
     paths::AppPaths,
     session::{
-        AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult, IntegrationState,
-        SessionDiff, SessionMode, SessionRecord, SessionStatus, WorktreeRecord,
+        AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult, GitSyncStatus,
+        IntegrationState, SessionDiff, SessionMode, SessionRecord, SessionStatus, WorktreeRecord,
         branch_name_from_title, repo_name_from_path,
     },
 };
@@ -170,12 +167,27 @@ impl AppState {
     pub async fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let db = self.db.clone();
         let session_id = session_id.to_string();
-        task::spawn_blocking(move || db.get_session(&session_id)).await?
+        task::spawn_blocking(move || {
+            let session = db.get_session(&session_id)?;
+            if let Some(session) = session {
+                Ok(Some(refresh_review_state(&db, session)?))
+            } else {
+                Ok(None)
+            }
+        })
+        .await?
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         let db = self.db.clone();
-        task::spawn_blocking(move || db.list_sessions()).await?
+        task::spawn_blocking(move || {
+            let sessions = db.list_sessions()?;
+            sessions
+                .into_iter()
+                .map(|session| refresh_review_state(&db, session))
+                .collect::<Result<Vec<_>>>()
+        })
+        .await?
     }
 
     pub async fn reconcile_sessions(&self) -> Result<()> {
@@ -409,6 +421,7 @@ impl AppState {
             let session = db
                 .get_session(&session_id)?
                 .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+            let session = refresh_review_state(&db, session)?;
             let worktree = Utf8PathBuf::from(session.worktree.clone());
             if !worktree.exists() {
                 bail!("worktree `{worktree}` does not exist");
@@ -422,6 +435,152 @@ impl AppState {
                 worktree: session.worktree,
                 diff,
             })
+        })
+        .await?
+    }
+
+    pub async fn apply_session(&self, session_id: &str) -> Result<SessionRecord> {
+        let db = self.db.clone();
+        let session_id = session_id.to_string();
+        task::spawn_blocking(move || {
+            let session = db
+                .get_session(&session_id)?
+                .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+            ensure_session_not_running(&session)?;
+            ensure_pending_review(&session, "accept")?;
+
+            let session = refresh_review_state(&db, session)?;
+            let review = review_state_for_accept(&session)?;
+            db.set_git_review_state(
+                &session.session_id,
+                review.git_sync,
+                Some(&review.summary),
+                review.has_conflicts,
+            )?;
+
+            match review.git_sync {
+                GitSyncStatus::NeedsSync => bail!(review.summary),
+                GitSyncStatus::Conflicted => bail!(review.summary),
+                GitSyncStatus::Unknown => {
+                    bail!("session `{}` is not ready to apply", session.session_id)
+                }
+                GitSyncStatus::InSync => {}
+            }
+
+            let repo_root = Utf8PathBuf::from(session.repo_path.clone());
+            if !git::has_branch_diff_against_base(
+                &repo_root,
+                &session.base_branch,
+                &session.branch,
+            )? {
+                db.set_integration_state(
+                    &session.session_id,
+                    IntegrationState::Applied,
+                    AttentionLevel::Info,
+                    "changes already present on base branch",
+                )?;
+                db.set_git_review_state(
+                    &session.session_id,
+                    GitSyncStatus::InSync,
+                    Some("changes already present on base branch"),
+                    false,
+                )?;
+            } else {
+                git::apply_squash_merge(
+                    &repo_root,
+                    &session.branch,
+                    &apply_commit_message(&session),
+                )?;
+                db.set_integration_state(
+                    &session.session_id,
+                    IntegrationState::Applied,
+                    AttentionLevel::Info,
+                    &format!("changes applied to {}", session.base_branch),
+                )?;
+                db.set_git_review_state(
+                    &session.session_id,
+                    GitSyncStatus::InSync,
+                    Some(&format!("changes applied to {}", session.base_branch)),
+                    false,
+                )?;
+            }
+            db.append_events(
+                &session.session_id,
+                &[daemon_event(
+                    "SESSION_APPLIED",
+                    serde_json::json!({
+                        "source": "daemon",
+                        "repo_path": session.repo_path,
+                        "base_branch": session.base_branch,
+                        "branch": session.branch,
+                        "worktree": session.worktree,
+                    }),
+                )],
+            )?;
+
+            db.get_session(&session_id)?
+                .ok_or_else(|| anyhow!("session `{session_id}` not found after apply"))
+        })
+        .await?
+    }
+
+    pub async fn discard_session(&self, session_id: &str, force: bool) -> Result<SessionRecord> {
+        let db = self.db.clone();
+        let session_id = session_id.to_string();
+        task::spawn_blocking(move || {
+            let session = db
+                .get_session(&session_id)?
+                .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+            if !force {
+                ensure_session_not_running(&session)?;
+            }
+            ensure_pending_review(&session, "discard")?;
+
+            let repo_root = Utf8PathBuf::from(session.repo_path.clone());
+            let worktree = Utf8PathBuf::from(session.worktree.clone());
+            if worktree.exists() {
+                git::remove_worktree(&repo_root, &worktree)?;
+            }
+            db.set_integration_state(
+                &session.session_id,
+                IntegrationState::Discarded,
+                AttentionLevel::Info,
+                "changes discarded",
+            )?;
+            db.set_git_review_state(
+                &session.session_id,
+                GitSyncStatus::Unknown,
+                Some("changes discarded"),
+                false,
+            )?;
+            db.append_events(
+                &session.session_id,
+                &[
+                    daemon_event(
+                        "WORKTREE_REMOVED",
+                        serde_json::json!({
+                            "source": "daemon",
+                            "repo_path": session.repo_path,
+                            "branch": session.branch,
+                            "worktree": session.worktree
+                        }),
+                    ),
+                    daemon_event(
+                        "SESSION_DISCARDED",
+                        serde_json::json!({
+                            "source": "daemon",
+                            "repo_path": session.repo_path,
+                            "base_branch": session.base_branch,
+                            "branch": session.branch,
+                            "worktree": session.worktree,
+                            "forced": force,
+                        }),
+                    ),
+                ],
+            )?;
+
+            db.get_session(&session_id)?
+                .ok_or_else(|| anyhow!("session `{session_id}` not found after discard"))
         })
         .await?
     }
@@ -1096,10 +1255,8 @@ fn session_has_pending_changes(session: &SessionRecord) -> Result<bool> {
     if !worktree.exists() {
         return Ok(false);
     }
-    Ok(
-        git::has_worktree_changes(&worktree)?
-            || git::has_committed_diff_against_base(&worktree, &session.base_branch)?,
-    )
+    Ok(git::has_worktree_changes(&worktree)?
+        || git::has_committed_diff_against_base(&worktree, &session.base_branch)?)
 }
 
 fn normalize_session_title(
@@ -1113,10 +1270,7 @@ fn normalize_session_title(
         return trimmed.to_string();
     }
 
-    let short_id = session_id
-        .split('-')
-        .next_back()
-        .unwrap_or(session_id);
+    let short_id = session_id.split('-').next_back().unwrap_or(session_id);
     format!("{agent_name} @ {repo_name} ({short_id})")
 }
 
@@ -1291,9 +1445,10 @@ fn preview_input(data: &[u8]) -> String {
 }
 
 fn ensure_session_running(session: &SessionRecord) -> Result<()> {
-    let accepts_live_io =
-        matches!(session.status, SessionStatus::Running | SessionStatus::NeedsInput)
-            && process_exists(session.pid);
+    let accepts_live_io = matches!(
+        session.status,
+        SessionStatus::Running | SessionStatus::NeedsInput
+    ) && process_exists(session.pid);
     if !accepts_live_io {
         bail!("session `{}` is not running", session.session_id);
     }
@@ -1320,14 +1475,155 @@ fn ensure_not_pending_review(session: &SessionRecord, action: &str) -> Result<()
     Ok(())
 }
 
+fn ensure_pending_review(session: &SessionRecord, action: &str) -> Result<()> {
+    if session.integration_state != IntegrationState::PendingReview {
+        bail!(
+            "session `{}` is not waiting for review; cannot {action}",
+            session.session_id
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ReviewState {
+    git_sync: GitSyncStatus,
+    summary: String,
+    has_conflicts: bool,
+}
+
+fn refresh_review_state(db: &Database, session: SessionRecord) -> Result<SessionRecord> {
+    if session.integration_state != IntegrationState::PendingReview {
+        if session.git_sync != GitSyncStatus::Unknown
+            || session.git_status_summary.is_some()
+            || session.has_conflicts
+        {
+            db.set_git_review_state(&session.session_id, GitSyncStatus::Unknown, None, false)?;
+            return db
+                .get_session(&session.session_id)?
+                .ok_or_else(|| anyhow!("session `{}` disappeared", session.session_id));
+        }
+        return Ok(session);
+    }
+
+    let review = inspect_review_state(&session)?;
+    if session.git_sync != review.git_sync
+        || session.git_status_summary.as_deref() != Some(review.summary.as_str())
+        || session.has_conflicts != review.has_conflicts
+    {
+        db.set_git_review_state(
+            &session.session_id,
+            review.git_sync,
+            Some(&review.summary),
+            review.has_conflicts,
+        )?;
+        return db
+            .get_session(&session.session_id)?
+            .ok_or_else(|| anyhow!("session `{}` disappeared", session.session_id));
+    }
+
+    Ok(session)
+}
+
+fn inspect_review_state(session: &SessionRecord) -> Result<ReviewState> {
+    let worktree = Utf8PathBuf::from(session.worktree.clone());
+    if !worktree.exists() {
+        return Ok(ReviewState {
+            git_sync: GitSyncStatus::NeedsSync,
+            summary: format!(
+                "worktree {} is missing; recreate or discard it",
+                session.worktree
+            ),
+            has_conflicts: false,
+        });
+    }
+    if git::has_worktree_changes(&worktree)? {
+        return Ok(ReviewState {
+            git_sync: GitSyncStatus::NeedsSync,
+            summary:
+                "session worktree has uncommitted changes; commit or discard them before accept"
+                    .to_string(),
+            has_conflicts: false,
+        });
+    }
+
+    let repo_root = Utf8PathBuf::from(session.repo_path.clone());
+    if git::has_worktree_changes(&repo_root)? {
+        return Ok(ReviewState {
+            git_sync: GitSyncStatus::NeedsSync,
+            summary: format!(
+                "repo {} has local changes; clean it before accept",
+                session.repo_path
+            ),
+            has_conflicts: false,
+        });
+    }
+
+    let current_branch = git::current_branch(&repo_root)?;
+    if current_branch != session.base_branch {
+        return Ok(ReviewState {
+            git_sync: GitSyncStatus::NeedsSync,
+            summary: format!(
+                "repo is on {}; switch to {} before accept",
+                current_branch, session.base_branch
+            ),
+            has_conflicts: false,
+        });
+    }
+
+    if !git::has_branch_diff_against_base(&repo_root, &session.base_branch, &session.branch)? {
+        return Ok(ReviewState {
+            git_sync: GitSyncStatus::InSync,
+            summary: "changes already present on base branch".to_string(),
+            has_conflicts: false,
+        });
+    }
+
+    Ok(ReviewState {
+        git_sync: GitSyncStatus::InSync,
+        summary: format!("review ready: squash into {}", session.base_branch),
+        has_conflicts: false,
+    })
+}
+
+fn review_state_for_accept(session: &SessionRecord) -> Result<ReviewState> {
+    let review = inspect_review_state(session)?;
+    if review.git_sync != GitSyncStatus::InSync {
+        return Ok(review);
+    }
+
+    let repo_root = Utf8PathBuf::from(session.repo_path.clone());
+    let merge_clean =
+        git::preflight_squash_merge(&repo_root, &session.base_branch, &session.branch)?;
+    if merge_clean {
+        return Ok(review);
+    }
+
+    Ok(ReviewState {
+        git_sync: GitSyncStatus::Conflicted,
+        summary: format!(
+            "squash apply would conflict with {}; resolve it manually",
+            session.base_branch
+        ),
+        has_conflicts: true,
+    })
+}
+
+fn apply_commit_message(session: &SessionRecord) -> String {
+    format!("Apply session {}: {}", session.session_id, session.title)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AttachControl, SessionRuntime, SessionStartMode, finalize_session_exit};
+    use super::{
+        AttachControl, SessionRuntime, SessionStartMode, apply_commit_message,
+        finalize_session_exit, inspect_review_state, review_state_for_accept,
+    };
     use crate::db::{Database, NewSession};
     use crate::terminal_state::TerminalStateEngine;
     use agentd_shared::{
         paths::AppPaths,
-        session::{AttachmentKind, SessionMode},
+        session::{AttachmentKind, GitSyncStatus, SessionMode},
     };
     use anyhow::{Error, Result};
     use nix::libc;
@@ -1337,8 +1633,11 @@ mod tests {
         io::{Read, Write},
         process::Command,
         sync::Arc,
+        sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct StubTerminalState;
 
@@ -1413,9 +1712,8 @@ mod tests {
             Box::new(StubTerminalState),
             8,
         ));
-        let (_handle, attachment, snapshot, _output_rx, mut control_rx) = runtime
-            .attach("demo", AttachmentKind::Attach)
-            .unwrap();
+        let (_handle, attachment, snapshot, _output_rx, mut control_rx) =
+            runtime.attach("demo", AttachmentKind::Attach).unwrap();
         assert_eq!(snapshot, b"snapshot".to_vec());
 
         runtime.request_detach(&attachment.attach_id).unwrap();
@@ -1432,12 +1730,10 @@ mod tests {
             Box::new(StubTerminalState),
             8,
         ));
-        let (_first_handle, first, _snapshot, _first_output, _first_control) = runtime
-            .attach("demo", AttachmentKind::Attach)
-            .unwrap();
-        let (_second_handle, second, _snapshot, _second_output, _second_control) = runtime
-            .attach("demo", AttachmentKind::Tui)
-            .unwrap();
+        let (_first_handle, first, _snapshot, _first_output, _first_control) =
+            runtime.attach("demo", AttachmentKind::Attach).unwrap();
+        let (_second_handle, second, _snapshot, _second_output, _second_control) =
+            runtime.attach("demo", AttachmentKind::Tui).unwrap();
 
         assert_ne!(first.attach_id, second.attach_id);
         assert_eq!(runtime.list_attachments("demo").unwrap().len(), 2);
@@ -1455,7 +1751,10 @@ mod tests {
         finalize_session_exit(&db, "demo", Some(0), SessionStartMode::Create).unwrap();
 
         let session = db.get_session("demo").unwrap().unwrap();
-        assert_eq!(session.status, agentd_shared::session::SessionStatus::Exited);
+        assert_eq!(
+            session.status,
+            agentd_shared::session::SessionStatus::Exited
+        );
         assert_eq!(
             session.integration_state,
             agentd_shared::session::IntegrationState::Clean
@@ -1475,10 +1774,86 @@ mod tests {
         finalize_session_exit(&db, "demo", Some(0), SessionStartMode::Create).unwrap();
 
         let session = db.get_session("demo").unwrap().unwrap();
-        assert_eq!(session.status, agentd_shared::session::SessionStatus::Exited);
+        assert_eq!(
+            session.status,
+            agentd_shared::session::SessionStatus::Exited
+        );
         assert_eq!(
             session.integration_state,
             agentd_shared::session::IntegrationState::PendingReview
+        );
+    }
+
+    #[test]
+    fn inspect_review_state_blocks_dirty_session_worktree() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        let repo = paths.root.join("repo");
+        init_git_repo(repo.as_str());
+
+        insert_session(&db, repo.as_str(), "demo", "changed");
+        fs::write(repo.join("README.md"), "repo dirty\n").unwrap();
+
+        let session = db.get_session("demo").unwrap().unwrap();
+        let review = inspect_review_state(&session).unwrap();
+        assert_eq!(review.git_sync, GitSyncStatus::NeedsSync);
+        assert!(
+            review
+                .summary
+                .contains("session worktree has uncommitted changes")
+        );
+    }
+
+    #[test]
+    fn review_state_for_accept_detects_conflicts() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        let repo = paths.root.join("repo");
+        init_git_repo(repo.as_str());
+
+        insert_session(&db, repo.as_str(), "demo", "changed");
+        assert!(
+            Command::new("git")
+                .args(["-C", repo.as_str(), "checkout", "agent/demo"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        fs::write(repo.join("README.md"), "agent version\n").unwrap();
+        commit_all(repo.as_str(), "session change");
+        assert!(
+            Command::new("git")
+                .args(["-C", repo.as_str(), "checkout", "main"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        fs::write(repo.join("README.md"), "base version\n").unwrap();
+        commit_all(repo.as_str(), "base change");
+
+        let session = db.get_session("demo").unwrap().unwrap();
+        let review = review_state_for_accept(&session).unwrap();
+        assert_eq!(review.git_sync, GitSyncStatus::Conflicted);
+        assert!(review.has_conflicts);
+    }
+
+    #[test]
+    fn apply_commit_message_uses_session_title() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        let repo = paths.root.join("repo");
+        init_git_repo(repo.as_str());
+
+        insert_session(&db, repo.as_str(), "demo", "changed");
+        let session = db.get_session("demo").unwrap().unwrap();
+        assert_eq!(
+            apply_commit_message(&session),
+            "Apply session demo: changed"
         );
     }
 
@@ -1486,7 +1861,8 @@ mod tests {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_nanos();
+            .as_nanos()
+            + u128::from(TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed));
         let root = camino::Utf8PathBuf::from(format!("/tmp/agentd-app-test-{suffix}"));
         AppPaths {
             socket: root.join("agentd.sock"),
@@ -1544,7 +1920,34 @@ mod tests {
         );
     }
 
+    fn commit_all(path: &str, message: &str) {
+        assert!(
+            Command::new("git")
+                .args(["-C", path, "add", "."])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["-C", path, "commit", "-m", message])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+
     fn insert_session(db: &Database, repo: &str, session_id: &str, title: &str) {
+        assert!(
+            Command::new("git")
+                .args(["-C", repo, "branch", "-f", "agent/demo"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
         db.insert_session(&NewSession {
             session_id,
             thread_id: None,

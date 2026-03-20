@@ -1,4 +1,7 @@
-use std::process::Command;
+use std::{
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -195,13 +198,106 @@ pub fn diff_against_base(worktree: &Utf8Path, base_branch: &str) -> Result<Strin
 }
 
 pub fn has_worktree_changes(worktree: &Utf8Path) -> Result<bool> {
-    Ok(!run_git(worktree, &["status", "--porcelain"])?.trim().is_empty())
+    Ok(!run_git(worktree, &["status", "--porcelain"])?
+        .trim()
+        .is_empty())
 }
 
 pub fn has_committed_diff_against_base(worktree: &Utf8Path, base_branch: &str) -> Result<bool> {
-    Ok(!run_git(worktree, &["diff", "--stat", &format!("{base_branch}...HEAD")])?
-        .trim()
-        .is_empty())
+    Ok(!run_git(
+        worktree,
+        &["diff", "--stat", &format!("{base_branch}...HEAD")],
+    )?
+    .trim()
+    .is_empty())
+}
+
+pub fn has_branch_diff_against_base(
+    repo_root: &Utf8Path,
+    base_branch: &str,
+    branch: &str,
+) -> Result<bool> {
+    Ok(!run_git(
+        repo_root,
+        &["diff", "--stat", &format!("{base_branch}...{branch}")],
+    )?
+    .trim()
+    .is_empty())
+}
+
+pub fn preflight_squash_merge(
+    repo_root: &Utf8Path,
+    base_branch: &str,
+    branch: &str,
+) -> Result<bool> {
+    let temp = temporary_apply_worktree_path();
+    let add = Command::new("git")
+        .arg("-C")
+        .arg(repo_root.as_str())
+        .args(["worktree", "add", "--detach", temp.as_str(), base_branch])
+        .output()
+        .with_context(|| format!("failed to create preflight worktree from {base_branch}"))?;
+    if !add.status.success() {
+        bail!(
+            "failed to create preflight worktree: {}",
+            String::from_utf8_lossy(&add.stderr).trim()
+        );
+    }
+
+    let merge = Command::new("git")
+        .arg("-C")
+        .arg(temp.as_str())
+        .args(["merge", "--squash", "--no-commit", branch])
+        .output()
+        .with_context(|| format!("failed to preflight squash merge for {branch}"))?;
+    let conflict =
+        !merge.status.success() && is_merge_conflict_output(&merge.stdout, &merge.stderr);
+
+    cleanup_preflight_worktree(repo_root, &temp)?;
+
+    if conflict {
+        return Ok(false);
+    }
+    if !merge.status.success() {
+        bail!(
+            "failed to preflight squash merge: {}",
+            merge_error_message(&merge.stdout, &merge.stderr)
+        );
+    }
+    Ok(true)
+}
+
+pub fn apply_squash_merge(repo_root: &Utf8Path, branch: &str, commit_message: &str) -> Result<()> {
+    let merge = Command::new("git")
+        .arg("-C")
+        .arg(repo_root.as_str())
+        .args(["merge", "--squash", "--no-commit", branch])
+        .output()
+        .with_context(|| format!("failed to squash merge {branch}"))?;
+    if !merge.status.success() {
+        let _ = reset_worktree(repo_root);
+        bail!(
+            "failed to squash merge {}: {}",
+            branch,
+            merge_error_message(&merge.stdout, &merge.stderr)
+        );
+    }
+
+    let commit = Command::new("git")
+        .arg("-C")
+        .arg(repo_root.as_str())
+        .args(["commit", "-m", commit_message])
+        .output()
+        .with_context(|| format!("failed to commit squashed merge for {branch}"))?;
+    if !commit.status.success() {
+        let _ = reset_worktree(repo_root);
+        bail!(
+            "failed to commit squashed merge: {}",
+            merge_error_message(&commit.stdout, &commit.stderr)
+        );
+    }
+
+    Ok(())
 }
 
 fn run_git(worktree: &Utf8Path, args: &[&str]) -> Result<String> {
@@ -215,4 +311,60 @@ fn run_git(worktree: &Utf8Path, args: &[&str]) -> Result<String> {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
     Ok(String::from_utf8(output.stdout)?)
+}
+
+fn temporary_apply_worktree_path() -> Utf8PathBuf {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!("agentd-apply-{suffix}")))
+        .expect("temporary worktree path should be valid UTF-8")
+}
+
+fn cleanup_preflight_worktree(repo_root: &Utf8Path, worktree: &Utf8Path) -> Result<()> {
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(worktree.as_str())
+        .args(["reset", "--hard", "HEAD"])
+        .output();
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(worktree.as_str())
+        .args(["merge", "--abort"])
+        .output();
+    remove_worktree(repo_root, worktree)
+}
+
+fn reset_worktree(worktree: &Utf8Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree.as_str())
+        .args(["reset", "--hard", "HEAD"])
+        .output()
+        .with_context(|| format!("failed to reset worktree {}", worktree))?;
+    if !output.status.success() {
+        bail!(
+            "failed to reset worktree: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn is_merge_conflict_output(stdout: &[u8], stderr: &[u8]) -> bool {
+    let output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(stdout),
+        String::from_utf8_lossy(stderr)
+    );
+    output.contains("CONFLICT") || output.contains("Automatic merge failed")
+}
+
+fn merge_error_message(stdout: &[u8], stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    String::from_utf8_lossy(stdout).trim().to_string()
 }

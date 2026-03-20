@@ -6,8 +6,8 @@ use agentd_shared::{
     event::{NewSessionEvent, SessionEvent},
     paths::AppPaths,
     session::{
-        AttentionLevel, GitSyncStatus, IntegrationState, SessionMode, SessionRecord,
-        SessionStatus, repo_name_from_path,
+        AttentionLevel, GitSyncStatus, IntegrationState, SessionMode, SessionRecord, SessionStatus,
+        repo_name_from_path,
     },
 };
 
@@ -459,6 +459,33 @@ impl Database {
         Ok(())
     }
 
+    pub fn set_git_review_state(
+        &self,
+        session_id: &str,
+        git_sync: GitSyncStatus,
+        git_status_summary: Option<&str>,
+        has_conflicts: bool,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE sessions
+             SET git_sync = ?2,
+                 git_status_summary = ?3,
+                 has_conflicts = ?4,
+                 updated_at = ?5
+             WHERE session_id = ?1",
+            params![
+                session_id,
+                git_sync_status_to_str(git_sync),
+                git_status_summary,
+                has_conflicts,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let conn = self.connect()?;
         conn.query_row(
@@ -549,8 +576,8 @@ impl Database {
             params![thread_id],
             row_to_thread,
         )
-            .optional()
-            .map_err(Into::into)
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
@@ -622,11 +649,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         agent: row.get(2)?,
         model: row.get(3)?,
         mode: str_to_session_mode(&row.get::<_, String>(4)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(
-                4,
-                rusqlite::types::Type::Text,
-                Box::new(err),
-            )
+            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err))
         })?,
         workspace: row.get(5)?,
         repo_path: row.get(6)?,
@@ -642,15 +665,13 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
                 Box::new(err),
             )
         })?,
-        integration_state: str_to_integration_state(&row.get::<_, String>(13)?).map_err(
-            |err| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    13,
-                    rusqlite::types::Type::Text,
-                    Box::new(err),
-                )
-            },
-        )?,
+        integration_state: str_to_integration_state(&row.get::<_, String>(13)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                13,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?,
         git_sync: str_to_git_sync_status(&row.get::<_, String>(14)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 14,
