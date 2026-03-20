@@ -39,6 +39,7 @@ pub async fn run_runtime_ui(paths: &AppPaths, initial_session_id: Option<&str>) 
 
     loop {
         app.refresh_sessions().await?;
+        app.advance_timers();
         app.sync_focus_runtime().await?;
 
         terminal.draw(|frame| app.render(frame))?;
@@ -75,12 +76,32 @@ enum FocusTarget {
 enum Modal {
     None,
     Palette,
-    SessionSwitcher,
-    NewSession { edit_agent: bool },
     WorktreeActions,
     GitStatus,
     Diff,
     StopConfirm,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComposerField {
+    Query,
+    Agent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ComposerRow {
+    Create,
+    Session(String),
+}
+
+#[derive(Clone, Debug)]
+struct InlineComposer {
+    active: bool,
+    query: String,
+    agent_input: String,
+    selected: usize,
+    field: ComposerField,
+    status_lines: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -113,15 +134,13 @@ struct RuntimeApp {
     modal: Modal,
     palette_query: String,
     palette_selected: usize,
-    switcher_query: String,
-    switcher_selected: usize,
-    title_input: String,
-    agent_input: String,
+    composer: InlineComposer,
     diff_text: String,
     diff_scroll: u16,
     detail_text: String,
     detail_scroll: u16,
     toast: Option<String>,
+    pending_focus: Option<(String, std::time::Instant)>,
     pty: Option<FocusedPty>,
     last_pane_size: Option<(u16, u16)>,
 }
@@ -139,15 +158,20 @@ impl RuntimeApp {
             modal: Modal::None,
             palette_query: String::new(),
             palette_selected: 0,
-            switcher_query: String::new(),
-            switcher_selected: 0,
-            title_input: String::new(),
-            agent_input: "codex".to_string(),
+            composer: InlineComposer {
+                active: initial_session_id.is_none(),
+                query: String::new(),
+                agent_input: "codex".to_string(),
+                selected: 0,
+                field: ComposerField::Query,
+                status_lines: Vec::new(),
+            },
             diff_text: String::new(),
             diff_scroll: 0,
             detail_text: String::new(),
             detail_scroll: 0,
             toast: None,
+            pending_focus: None,
             pty: None,
             last_pane_size: None,
         }
@@ -161,7 +185,23 @@ impl RuntimeApp {
         if matches!(self.focus, FocusTarget::Worker(_)) && !existing {
             self.focus = FocusTarget::Coordinator;
         }
+        self.clamp_composer_selection();
         Ok(())
+    }
+
+    fn advance_timers(&mut self) {
+        let should_switch = self
+            .pending_focus
+            .as_ref()
+            .map(|(_, deadline)| std::time::Instant::now() >= *deadline)
+            .unwrap_or(false);
+        if should_switch {
+            if let Some((session_id, _)) = self.pending_focus.take() {
+                self.focus = FocusTarget::Worker(session_id);
+                self.composer.active = false;
+                self.composer.status_lines.clear();
+            }
+        }
     }
 
     async fn sync_focus_runtime(&mut self) -> Result<()> {
@@ -268,6 +308,57 @@ impl RuntimeApp {
         self.focus = targets[next].clone();
     }
 
+    fn open_composer(&mut self, field: ComposerField, prefer_create: bool) {
+        self.focus = FocusTarget::Coordinator;
+        self.composer.active = true;
+        self.composer.field = field;
+        if !prefer_create {
+            self.composer.query.clear();
+        }
+        self.composer.status_lines.clear();
+        self.pending_focus = None;
+        self.clamp_composer_selection();
+        if prefer_create {
+            self.composer.selected = 0;
+        } else if self.composer_rows().len() > 1 {
+            self.composer.selected = 1;
+        }
+    }
+
+    fn close_composer(&mut self) {
+        self.composer.active = false;
+        self.composer.field = ComposerField::Query;
+        self.composer.status_lines.clear();
+        self.pending_focus = None;
+    }
+
+    fn composer_matches(&self) -> Vec<&SessionRecord> {
+        let query = self.composer.query.trim();
+        self.ordered_sessions()
+            .into_iter()
+            .filter(|session| matches_query(session_switcher_text(session), query))
+            .collect()
+    }
+
+    fn composer_rows(&self) -> Vec<ComposerRow> {
+        let mut rows = vec![ComposerRow::Create];
+        rows.extend(
+            self.composer_matches()
+                .into_iter()
+                .map(|session| ComposerRow::Session(session.session_id.clone())),
+        );
+        rows
+    }
+
+    fn clamp_composer_selection(&mut self) {
+        let len = self.composer_rows().len();
+        if len == 0 {
+            self.composer.selected = 0;
+        } else {
+            self.composer.selected = self.composer.selected.min(len.saturating_sub(1));
+        }
+    }
+
     fn on_resize(&mut self, width: u16, height: u16) {
         self.last_pane_size = Some((width, height));
     }
@@ -323,6 +414,14 @@ impl RuntimeApp {
             return Ok(true);
         }
 
+        if self.composer.active
+            && matches!(self.focus, FocusTarget::Coordinator)
+            && matches!(self.modal, Modal::None)
+        {
+            self.handle_composer_key(key).await?;
+            return Ok(false);
+        }
+
         if let Some(pty) = self.pty.as_mut()
             && matches!(self.focus, FocusTarget::Worker(_))
             && matches!(self.modal, Modal::None)
@@ -369,14 +468,6 @@ impl RuntimeApp {
                 self.handle_palette_key(key).await?;
                 Ok(true)
             }
-            Modal::SessionSwitcher => {
-                self.handle_switcher_key(key);
-                Ok(true)
-            }
-            Modal::NewSession { edit_agent } => {
-                self.handle_task_modal_key(key, edit_agent).await?;
-                Ok(true)
-            }
             Modal::WorktreeActions => {
                 self.handle_worktree_modal_key(key);
                 Ok(true)
@@ -398,21 +489,9 @@ impl RuntimeApp {
             Command::PreviousSession => self.cycle_focus(-1, false),
             Command::NextAttention => self.cycle_focus(1, true),
             Command::FocusCoordinator => self.focus = FocusTarget::Coordinator,
-            Command::SessionSwitcher => {
-                self.modal = Modal::SessionSwitcher;
-                self.switcher_query.clear();
-                self.switcher_selected = 0;
-            }
-            Command::NewSession => {
-                self.modal = Modal::NewSession { edit_agent: false };
-                self.title_input.clear();
-                self.agent_input = "codex".to_string();
-            }
-            Command::NewAgent => {
-                self.modal = Modal::NewSession { edit_agent: true };
-                self.title_input.clear();
-                self.agent_input = "codex".to_string();
-            }
+            Command::SessionSwitcher => self.open_composer(ComposerField::Query, false),
+            Command::NewSession => self.open_composer(ComposerField::Query, true),
+            Command::NewAgent => self.open_composer(ComposerField::Agent, true),
             Command::WorktreeActions => {
                 self.open_review_actions();
             }
@@ -513,91 +592,105 @@ impl RuntimeApp {
         Ok(())
     }
 
-    fn handle_switcher_key(&mut self, key: KeyEvent) {
-        let matches = self.filtered_sessions();
+    async fn handle_composer_key(&mut self, key: KeyEvent) -> Result<()> {
+        let row_count = self.composer_rows().len();
         match key.code {
-            KeyCode::Esc => self.close_modal(),
-            KeyCode::Up => self.switcher_selected = self.switcher_selected.saturating_sub(1),
-            KeyCode::Down => {
-                if self.switcher_selected + 1 < matches.len() {
-                    self.switcher_selected += 1;
+            KeyCode::Esc => {
+                if self.composer.query.is_empty() && self.composer.status_lines.is_empty() {
+                    self.close_composer();
+                } else {
+                    self.composer.query.clear();
+                    self.composer.status_lines.clear();
+                    self.pending_focus = None;
+                    self.clamp_composer_selection();
                 }
             }
-            KeyCode::Backspace => {
-                self.switcher_query.pop();
-                self.switcher_selected = 0;
-            }
-            KeyCode::Enter => {
-                if let Some(session) = matches.get(self.switcher_selected) {
-                    self.focus = FocusTarget::Worker(session.session_id.clone());
-                }
-                self.close_modal();
-            }
-            KeyCode::Char(ch)
-                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
-            {
-                self.switcher_query.push(ch);
-                self.switcher_selected = 0;
-            }
-            _ => {}
-        }
-    }
-
-    async fn handle_task_modal_key(&mut self, key: KeyEvent, mut edit_agent: bool) -> Result<()> {
-        match key.code {
-            KeyCode::Esc => self.close_modal(),
             KeyCode::Tab => {
-                edit_agent = !edit_agent;
-                self.modal = Modal::NewSession { edit_agent };
+                self.composer.field = match self.composer.field {
+                    ComposerField::Query => ComposerField::Agent,
+                    ComposerField::Agent => ComposerField::Query,
+                };
             }
             KeyCode::Backspace => {
-                if edit_agent {
-                    self.agent_input.pop();
+                self.composer.status_lines.clear();
+                self.pending_focus = None;
+                if self.composer.field == ComposerField::Agent {
+                    self.composer.agent_input.pop();
                 } else {
-                    self.title_input.pop();
+                    self.composer.query.pop();
+                    self.clamp_composer_selection();
                 }
             }
-            KeyCode::Enter => {
-                let title = self.title_input.trim();
-                let agent = self.agent_input.trim();
-                if agent.is_empty() {
-                    self.toast = Some("agent cannot be empty".to_string());
-                    return Ok(());
+            KeyCode::Up => {
+                self.composer.selected = self.composer.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if self.composer.selected + 1 < row_count {
+                    self.composer.selected += 1;
                 }
-                let workspace =
-                    std::env::current_dir().context("failed to determine current directory")?;
-                let response = send_request(
-                    &self.paths,
-                    &Request::CreateSession {
-                        workspace: workspace.to_string_lossy().to_string(),
-                        title: (!title.is_empty()).then(|| title.to_string()),
-                        agent: agent.to_string(),
-                        model: if agent == "codex" {
-                            Some(CODEX_MODELS[0].to_string())
-                        } else {
-                            None
-                        },
-                    },
-                )
-                .await?;
-                match response {
-                    Response::CreateSession { session } => {
-                        let created = daemon_get_session(&self.paths, &session.session_id).await?;
-                        self.focus = FocusTarget::Worker(created.session_id);
-                        self.toast = Some(format!("created {}", created.title));
-                        self.close_modal();
+            }
+            KeyCode::Enter => match self.composer_rows().get(self.composer.selected).cloned() {
+                Some(ComposerRow::Session(session_id)) => {
+                    self.focus = FocusTarget::Worker(session_id);
+                    self.close_composer();
+                }
+                Some(ComposerRow::Create) | None => {
+                    let title = self.composer.query.trim();
+                    let agent = self.composer.agent_input.trim();
+                    if agent.is_empty() {
+                        self.toast = Some("agent cannot be empty".to_string());
+                        return Ok(());
                     }
-                    Response::Error { message } => self.toast = Some(message),
-                    other => bail!("unexpected response: {:?}", other),
+                    let workspace =
+                        std::env::current_dir().context("failed to determine current directory")?;
+                    let response = send_request(
+                        &self.paths,
+                        &Request::CreateSession {
+                            workspace: workspace.to_string_lossy().to_string(),
+                            title: (!title.is_empty()).then(|| title.to_string()),
+                            agent: agent.to_string(),
+                            model: if agent == "codex" {
+                                Some(CODEX_MODELS[0].to_string())
+                            } else {
+                                None
+                            },
+                        },
+                    )
+                    .await?;
+                    match response {
+                        Response::CreateSession { session } => {
+                            let created =
+                                daemon_get_session(&self.paths, &session.session_id).await?;
+                            self.composer.status_lines = vec![
+                                format!("creating git worktree for {}", created.repo_name),
+                                format!("base branch  {}", created.base_branch),
+                                format!("new branch   {}", created.branch),
+                                format!("worktree     {}", created.worktree),
+                            ];
+                            self.pending_focus = Some((
+                                created.session_id.clone(),
+                                std::time::Instant::now() + Duration::from_millis(1200),
+                            ));
+                            self.toast = Some(format!("created {}", created.title));
+                        }
+                        Response::Error { message } => self.toast = Some(message),
+                        other => bail!("unexpected response: {:?}", other),
+                    }
                 }
-            }
+            },
             KeyCode::Char(ch)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
-                if edit_agent {
-                    self.agent_input.push(ch);
+                self.composer.status_lines.clear();
+                self.pending_focus = None;
+                if self.composer.field == ComposerField::Agent {
+                    self.composer.agent_input.push(ch);
                 } else {
-                    self.title_input.push(ch);
+                    self.composer.query.push(ch);
+                    self.clamp_composer_selection();
+                    if self.composer_rows().len() > 1 {
+                        self.composer.selected = 1;
+                    }
                 }
             }
             _ => {}
@@ -671,23 +764,7 @@ impl RuntimeApp {
         self.modal = Modal::None;
         self.palette_query.clear();
         self.palette_selected = 0;
-        self.switcher_query.clear();
-        self.switcher_selected = 0;
         self.detail_scroll = 0;
-    }
-
-    fn filtered_sessions(&self) -> Vec<&SessionRecord> {
-        let mut sessions = self
-            .ordered_sessions()
-            .into_iter()
-            .filter(|session| matches_query(session_switcher_text(session), &self.switcher_query))
-            .collect::<Vec<_>>();
-        sessions.sort_by(|left, right| {
-            session_rank(left)
-                .cmp(&session_rank(right))
-                .then_with(|| right.updated_at.cmp(&left.updated_at))
-        });
-        sessions
     }
 
     fn render(&mut self, frame: &mut Frame) {
@@ -807,6 +884,12 @@ impl RuntimeApp {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        let composer_height = if self.composer.active { 12 } else { 0 };
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(6), Constraint::Length(composer_height)])
+            .split(inner);
+
         let ordered = self.ordered_sessions();
         let mut lines = vec![
             Line::from(vec![
@@ -854,7 +937,13 @@ impl RuntimeApp {
             subtle_style(),
         )));
 
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }),
+            sections[0],
+        );
+        if self.composer.active {
+            self.render_inline_composer(frame, sections[1]);
+        }
     }
 
     fn render_worker(&mut self, frame: &mut Frame, area: Rect, session: &SessionRecord) {
@@ -948,12 +1037,10 @@ impl RuntimeApp {
         match self.modal {
             Modal::None => {}
             Modal::Palette => self.render_palette(frame, area),
-            Modal::SessionSwitcher => self.render_switcher(frame, area),
-            Modal::NewSession { edit_agent } => self.render_task_modal(frame, area, edit_agent),
             Modal::WorktreeActions => self.render_detail_modal(
                 frame,
                 area,
-                "Review Actions",
+                "Worktree Actions",
                 &self.detail_text,
                 self.detail_scroll,
             ),
@@ -1024,81 +1111,95 @@ impl RuntimeApp {
         );
     }
 
-    fn render_switcher(&self, frame: &mut Frame, area: Rect) {
-        let overlay = centered_rect(56, 50, area);
-        let matches = self.filtered_sessions();
-        let mut lines = vec![Line::from(vec![
-            Span::styled("> ", Style::default().fg(Color::Cyan)),
-            Span::raw(self.switcher_query.as_str()),
-        ])];
-        lines.push(Line::from(""));
-        for (index, session) in matches.iter().take(9).enumerate() {
-            let style = if index == self.switcher_selected {
+    fn render_inline_composer(&self, frame: &mut Frame, area: Rect) {
+        let block = Block::default().borders(Borders::TOP).title("Compose");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    if self.composer.field == ComposerField::Query {
+                        "> "
+                    } else {
+                        "  "
+                    },
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled("query  ", subtle_style()),
+                Span::raw(self.composer.query.as_str()),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    if self.composer.field == ComposerField::Agent {
+                        "> "
+                    } else {
+                        "  "
+                    },
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled("agent  ", subtle_style()),
+                Span::raw(self.composer.agent_input.as_str()),
+            ]),
+            Line::from(Span::styled(
+                "Type to filter sessions or name a new session. Enter opens the selected row. Tab switches field.",
+                subtle_style(),
+            )),
+            Line::from(""),
+        ];
+
+        for (index, row) in self.composer_rows().into_iter().take(5).enumerate() {
+            let style = if index == self.composer.selected {
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    session_icon(session),
-                    Style::default().fg(session_icon_color(session)),
-                ),
-                Span::raw("  "),
-                Span::styled(session.title.as_str(), style),
-            ]));
-            lines.push(Line::from(vec![
-                Span::raw("   "),
-                Span::styled(session.repo_name.as_str(), subtle_style()),
-                Span::raw("  "),
-                Span::styled(session.branch.as_str(), subtle_style()),
-            ]));
+            match row {
+                ComposerRow::Create => {
+                    let label = if self.composer.query.trim().is_empty() {
+                        "Create new session".to_string()
+                    } else {
+                        format!("Create new session: {}", self.composer.query.trim())
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled("+", Style::default().fg(Color::Green)),
+                        Span::raw("  "),
+                        Span::styled(label, style),
+                    ]));
+                }
+                ComposerRow::Session(session_id) => {
+                    if let Some(session) = self
+                        .sessions
+                        .iter()
+                        .find(|item| item.session_id == session_id)
+                    {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                session_icon(session),
+                                Style::default().fg(session_icon_color(session)),
+                            ),
+                            Span::raw("  "),
+                            Span::styled(session.title.as_str(), style),
+                            Span::raw("  "),
+                            Span::styled(session.repo_name.as_str(), subtle_style()),
+                            Span::raw("  "),
+                            Span::styled(session.branch.as_str(), subtle_style()),
+                        ]));
+                    }
+                }
+            }
         }
-        frame.render_widget(WidgetClear, overlay);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Session Switcher"),
-                )
-                .wrap(Wrap { trim: false }),
-            overlay,
-        );
-    }
 
-    fn render_task_modal(&self, frame: &mut Frame, area: Rect, edit_agent: bool) {
-        let overlay = centered_rect(56, 32, area);
-        let lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    if edit_agent { "  " } else { "> " },
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::styled("label  ", subtle_style()),
-                Span::raw(self.title_input.as_str()),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    if edit_agent { "> " } else { "  " },
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::styled("agent  ", subtle_style()),
-                Span::raw(self.agent_input.as_str()),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Enter creates, Tab switches field, Esc closes.",
-                subtle_style(),
-            )),
-        ];
-        frame.render_widget(WidgetClear, overlay);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title("New Session")),
-            overlay,
-        );
+        if !self.composer.status_lines.is_empty() {
+            lines.push(Line::from(""));
+            for line in &self.composer.status_lines {
+                lines.push(Line::from(Span::styled(line.as_str(), subtle_style())));
+            }
+        }
+
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
     fn render_detail_modal(
@@ -2156,10 +2257,15 @@ fn status_label(status: SessionStatus) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{TerminalSurface, matches_query, session_icon, session_rank, session_status_text};
+    use super::{
+        ComposerField, ComposerRow, RuntimeApp, TerminalSurface, matches_query, session_icon,
+        session_rank, session_status_text,
+    };
+    use agentd_shared::paths::AppPaths;
     use agentd_shared::session::{
         AttentionLevel, GitSyncStatus, IntegrationState, SessionMode, SessionRecord, SessionStatus,
     };
+    use camino::Utf8PathBuf;
     use chrono::Utc;
 
     fn demo(status: SessionStatus, integration_state: IntegrationState) -> SessionRecord {
@@ -2190,6 +2296,18 @@ mod tests {
             created_at: now,
             updated_at: now,
             exited_at: None,
+        }
+    }
+
+    fn demo_paths() -> AppPaths {
+        AppPaths {
+            root: Utf8PathBuf::from("/tmp/agentd"),
+            socket: Utf8PathBuf::from("/tmp/agentd/agentd.sock"),
+            pid_file: Utf8PathBuf::from("/tmp/agentd/agentd.pid"),
+            database: Utf8PathBuf::from("/tmp/agentd/state.db"),
+            config: Utf8PathBuf::from("/tmp/agentd/config.toml"),
+            logs_dir: Utf8PathBuf::from("/tmp/agentd/logs"),
+            worktrees_dir: Utf8PathBuf::from("/tmp/agentd/worktrees"),
         }
     }
 
@@ -2230,5 +2348,49 @@ mod tests {
     #[test]
     fn query_matching_is_case_insensitive() {
         assert!(matches_query("Auth Fix", "auth"));
+    }
+
+    #[test]
+    fn composer_rows_include_create_and_matching_sessions() {
+        let mut app = RuntimeApp::new(demo_paths(), None);
+        let mut alpha = demo(SessionStatus::Running, IntegrationState::Clean);
+        alpha.session_id = "alpha".to_string();
+        alpha.title = "auth fix".to_string();
+        let mut beta = demo(SessionStatus::Running, IntegrationState::Clean);
+        beta.session_id = "beta".to_string();
+        beta.title = "billing".to_string();
+        app.sessions = vec![alpha, beta];
+        app.composer.query = "auth".to_string();
+
+        let rows = app.composer_rows();
+        assert_eq!(rows[0], ComposerRow::Create);
+        assert_eq!(rows[1], ComposerRow::Session("alpha".to_string()));
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn open_composer_prefers_existing_session_for_switching() {
+        let mut app = RuntimeApp::new(demo_paths(), None);
+        let mut session = demo(SessionStatus::Running, IntegrationState::Clean);
+        session.session_id = "alpha".to_string();
+        app.sessions = vec![session];
+        app.composer.query = "stale".to_string();
+
+        app.open_composer(ComposerField::Query, false);
+
+        assert_eq!(app.composer.query, "");
+        assert_eq!(app.composer.selected, 1);
+    }
+
+    #[test]
+    fn open_composer_preserves_create_intent() {
+        let mut app = RuntimeApp::new(demo_paths(), None);
+        app.composer.query = "new task".to_string();
+
+        app.open_composer(ComposerField::Agent, true);
+
+        assert_eq!(app.composer.field, ComposerField::Agent);
+        assert_eq!(app.composer.query, "new task");
+        assert_eq!(app.composer.selected, 0);
     }
 }
