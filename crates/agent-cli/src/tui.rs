@@ -1981,7 +1981,7 @@ mod tests {
             session_id: "demo".to_string(),
             thread_id: Some("thread-demo".to_string()),
             agent: "codex".to_string(),
-            model: Some("gpt-5.4-codex".to_string()),
+            model: Some("gpt-5.4".to_string()),
             mode: SessionMode::Execute,
             workspace: "/tmp/repo".to_string(),
             repo_path: "/tmp/repo".to_string(),
