@@ -32,6 +32,7 @@ use tokio::{
 
 mod local;
 mod runtime;
+mod session_display;
 mod tui;
 
 use agentd_shared::{
@@ -726,11 +727,7 @@ async fn request_daemon_shutdown(paths: &AppPaths, force: bool) -> Result<()> {
     )
     .await;
     match shutdown_result {
-        Ok(Ok(DaemonManagementResponse::Shutdown {
-            stopped,
-            running_sessions: _,
-            message,
-        })) => {
+        Ok(Ok(DaemonManagementResponse::Shutdown { stopped, running_sessions: _, message })) => {
             if !stopped {
                 bail!(message);
             }
@@ -849,14 +846,8 @@ fn print_daemon_management_status(status: &DaemonManagementStatus) {
 
 async fn stream_logs(paths: &AppPaths, session_id: &str, follow: bool) -> Result<()> {
     let mut stream = try_connect(paths).await?;
-    write_request(
-        &mut stream,
-        &Request::StreamLogs {
-            session_id: session_id.to_string(),
-            follow,
-        },
-    )
-    .await?;
+    write_request(&mut stream, &Request::StreamLogs { session_id: session_id.to_string(), follow })
+        .await?;
 
     let mut reader = BufReader::new(stream);
     while let Some(response) = read_response(&mut reader).await? {
@@ -876,10 +867,7 @@ async fn stream_events(paths: &AppPaths, session_id: &str, follow: bool) -> Resu
     let mut stream = try_connect(paths).await?;
     write_request(
         &mut stream,
-        &Request::StreamEvents {
-            session_id: session_id.to_string(),
-            follow,
-        },
+        &Request::StreamEvents { session_id: session_id.to_string(), follow },
     )
     .await?;
 
@@ -997,10 +985,7 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
     };
 
     let (attach_id, initial_snapshot) = match response {
-        Response::Attached {
-            attach_id,
-            snapshot,
-        } => (attach_id, snapshot),
+        Response::Attached { attach_id, snapshot } => (attach_id, snapshot),
         Response::SessionEnded {
             session_id,
             status,
@@ -1192,10 +1177,7 @@ async fn fetch_session_snapshot(paths: &AppPaths, session_id: &str) -> Result<Ve
     let mut stream = try_connect(paths).await?;
     write_request(
         &mut stream,
-        &Request::AttachSession {
-            session_id: session_id.to_string(),
-            kind: AttachmentKind::Tui,
-        },
+        &Request::AttachSession { session_id: session_id.to_string(), kind: AttachmentKind::Tui },
     )
     .await?;
     let (read_half, _write_half) = stream.into_split();
@@ -1308,11 +1290,7 @@ fn print_diff(diff: &SessionDiff) {
 
 fn resolve_focus_log_path(paths: &AppPaths, session: &SessionRecord) -> camino::Utf8PathBuf {
     let rendered = paths.rendered_log_path(&session.session_id);
-    if rendered.exists() {
-        rendered
-    } else {
-        paths.log_path(&session.session_id)
-    }
+    if rendered.exists() { rendered } else { paths.log_path(&session.session_id) }
 }
 
 fn read_focus_log_contents(path: &camino::Utf8Path) -> Result<String> {
@@ -1321,10 +1299,7 @@ fn read_focus_log_contents(path: &camino::Utf8Path) -> Result<String> {
 }
 
 fn diff_color_enabled() -> bool {
-    should_colorize_diff_output(
-        std::io::stdout().is_terminal(),
-        std::env::var_os("NO_COLOR"),
-    )
+    should_colorize_diff_output(std::io::stdout().is_terminal(), std::env::var_os("NO_COLOR"))
 }
 
 fn should_colorize_diff_output(is_terminal: bool, no_color: Option<std::ffi::OsString>) -> bool {
@@ -1344,41 +1319,17 @@ fn render_diff_text(diff: &str, color: bool) -> String {
         {
             format!(
                 "{}",
-                line.with(CrosColor::Rgb {
-                    r: 153,
-                    g: 214,
-                    b: 255,
-                })
-                .attribute(CrosAttribute::Bold)
+                line.with(CrosColor::Rgb { r: 153, g: 214, b: 255 }).attribute(CrosAttribute::Bold)
             )
         } else if line.starts_with("@@") {
             format!(
                 "{}",
-                line.with(CrosColor::Rgb {
-                    r: 242,
-                    g: 201,
-                    b: 76,
-                })
-                .attribute(CrosAttribute::Bold)
+                line.with(CrosColor::Rgb { r: 242, g: 201, b: 76 }).attribute(CrosAttribute::Bold)
             )
         } else if line.starts_with('+') && !line.starts_with("+++") {
-            format!(
-                "{}",
-                line.with(CrosColor::Rgb {
-                    r: 111,
-                    g: 207,
-                    b: 151,
-                })
-            )
+            format!("{}", line.with(CrosColor::Rgb { r: 111, g: 207, b: 151 }))
         } else if line.starts_with('-') && !line.starts_with("---") {
-            format!(
-                "{}",
-                line.with(CrosColor::Rgb {
-                    r: 255,
-                    g: 107,
-                    b: 107,
-                })
-            )
+            format!("{}", line.with(CrosColor::Rgb { r: 255, g: 107, b: 107 }))
         } else {
             line.to_string()
         };
@@ -1551,9 +1502,7 @@ impl AttachRawInput {
         }
 
         let fd = unsafe { OwnedFd::from_raw_fd(duplicated) };
-        Ok(Self {
-            fd: AsyncFd::new(fd).context("failed to register stdin for async reads")?,
-        })
+        Ok(Self { fd: AsyncFd::new(fd).context("failed to register stdin for async reads")? })
     }
 
     async fn read_chunk(&self) -> Result<Option<Vec<u8>>> {
@@ -1674,10 +1623,7 @@ impl AttachTerminalGuard {
                 None
             }
         };
-        Ok(Self {
-            stdin_fd,
-            orig_termios: termios,
-        })
+        Ok(Self { stdin_fd, orig_termios: termios })
     }
 }
 
@@ -1696,25 +1642,15 @@ struct TerminalScreenGuard;
 
 impl TerminalScreenGuard {
     fn enter() -> Result<Self> {
-        execute!(
-            std::io::stdout(),
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            Hide
-        )
-        .context("failed to enter alternate screen")?;
+        execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)
+            .context("failed to enter alternate screen")?;
         Ok(Self)
     }
 }
 
 impl Drop for TerminalScreenGuard {
     fn drop(&mut self) {
-        let _ = execute!(
-            std::io::stdout(),
-            Show,
-            DisableMouseCapture,
-            LeaveAlternateScreen
-        );
+        let _ = execute!(std::io::stdout(), Show, DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
@@ -1791,13 +1727,9 @@ async fn daemon_list_attachments(
     paths: &AppPaths,
     session_id: &str,
 ) -> Result<Vec<AttachmentRecord>> {
-    let response = send_request(
-        paths,
-        &Request::ListAttachments {
-            session_id: session_id.to_string(),
-        },
-    )
-    .await?;
+    let response =
+        send_request(paths, &Request::ListAttachments { session_id: session_id.to_string() })
+            .await?;
     match response {
         Response::Attachments { attachments } => Ok(attachments),
         Response::Error { message } => bail!(message),
@@ -1806,13 +1738,8 @@ async fn daemon_list_attachments(
 }
 
 async fn daemon_get_session(paths: &AppPaths, session_id: &str) -> Result<SessionRecord> {
-    let response = send_request(
-        paths,
-        &Request::GetSession {
-            session_id: session_id.to_string(),
-        },
-    )
-    .await?;
+    let response =
+        send_request(paths, &Request::GetSession { session_id: session_id.to_string() }).await?;
     match response {
         Response::Session { session } => Ok(session),
         Response::Error { message } => bail!(message),
@@ -1823,10 +1750,7 @@ async fn daemon_get_session(paths: &AppPaths, session_id: &str) -> Result<Sessio
 async fn kill_session(paths: &AppPaths, session_id: &str) -> Result<()> {
     let response = send_request(
         paths,
-        &Request::KillSession {
-            session_id: session_id.to_string(),
-            remove: false,
-        },
+        &Request::KillSession { session_id: session_id.to_string(), remove: false },
     )
     .await?;
     match response {
@@ -1839,10 +1763,7 @@ async fn kill_session(paths: &AppPaths, session_id: &str) -> Result<()> {
 async fn reply_session(paths: &AppPaths, session_id: &str, prompt: &str) -> Result<SessionRecord> {
     let response = send_request(
         paths,
-        &Request::ReplyToSession {
-            session_id: session_id.to_string(),
-            prompt: prompt.to_string(),
-        },
+        &Request::ReplyToSession { session_id: session_id.to_string(), prompt: prompt.to_string() },
     )
     .await?;
     match response {
@@ -1897,11 +1818,7 @@ mod tests {
     fn new_command_parses_optional_title() {
         let cli = Cli::try_parse_from(["agent", "new", "fix failing tests"]).unwrap();
         match cli.command {
-            Some(Command::New {
-                title,
-                workspace,
-                agent,
-            }) => {
+            Some(Command::New { title, workspace, agent }) => {
                 assert_eq!(title.as_deref(), Some("fix failing tests"));
                 assert!(workspace.is_none());
                 assert!(agent.is_none());
@@ -1923,11 +1840,7 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Some(Command::New {
-                title,
-                workspace,
-                agent,
-            }) => {
+            Some(Command::New { title, workspace, agent }) => {
                 assert_eq!(title.as_deref(), Some("fix"));
                 assert_eq!(workspace, Some(PathBuf::from("/tmp/repo")));
                 assert_eq!(agent.as_deref(), Some("claude"));
@@ -1961,11 +1874,7 @@ mod tests {
     fn detach_command_parses_optional_session_id() {
         let cli = Cli::try_parse_from(["agent", "detach", "demo"]).unwrap();
         match cli.command {
-            Some(Command::Detach {
-                session_id,
-                attach,
-                all,
-            }) => {
+            Some(Command::Detach { session_id, attach, all }) => {
                 assert_eq!(session_id.as_deref(), Some("demo"));
                 assert!(attach.is_none());
                 assert!(!all);
@@ -1978,11 +1887,7 @@ mod tests {
     fn detach_command_parses_attachment_flag() {
         let cli = Cli::try_parse_from(["agent", "detach", "demo", "--attach", "attach-1"]).unwrap();
         match cli.command {
-            Some(Command::Detach {
-                session_id,
-                attach,
-                all,
-            }) => {
+            Some(Command::Detach { session_id, attach, all }) => {
                 assert_eq!(session_id.as_deref(), Some("demo"));
                 assert_eq!(attach.as_deref(), Some("attach-1"));
                 assert!(!all);
@@ -2004,9 +1909,7 @@ mod tests {
     fn daemon_restart_parses_force_flag() {
         let cli = Cli::try_parse_from(["agent", "daemon", "restart", "--force"]).unwrap();
         match cli.command {
-            Some(Command::Daemon {
-                command: DaemonCommand::Restart { force },
-            }) => assert!(force),
+            Some(Command::Daemon { command: DaemonCommand::Restart { force } }) => assert!(force),
             other => panic!("unexpected command: {other:?}"),
         }
     }
@@ -2015,9 +1918,7 @@ mod tests {
     fn daemon_upgrade_parses() {
         let cli = Cli::try_parse_from(["agent", "daemon", "upgrade"]).unwrap();
         match cli.command {
-            Some(Command::Daemon {
-                command: DaemonCommand::Upgrade,
-            }) => {}
+            Some(Command::Daemon { command: DaemonCommand::Upgrade }) => {}
             other => panic!("unexpected command: {other:?}"),
         }
     }
@@ -2046,10 +1947,7 @@ mod tests {
             std::env::remove_var("AGENTD_SESSION_ID");
         }
         let err = resolve_detach_session_id(None).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("only works inside a managed session")
-        );
+        assert!(err.to_string().contains("only works inside a managed session"));
     }
 
     #[test]
@@ -2077,29 +1975,20 @@ mod tests {
     #[test]
     fn attach_parser_detaches_on_ctrl_right_bracket_byte() {
         let mut parser = AttachInputParser::default();
-        assert_eq!(
-            parser.push_bytes(&[ATTACH_DETACH_BYTE]),
-            vec![AttachInputAction::Detach]
-        );
+        assert_eq!(parser.push_bytes(&[ATTACH_DETACH_BYTE]), vec![AttachInputAction::Detach]);
     }
 
     #[test]
     fn attach_parser_forwards_regular_bytes() {
         let mut parser = AttachInputParser::default();
-        assert_eq!(
-            parser.push_bytes(b"hello"),
-            vec![AttachInputAction::Data(b"hello".to_vec())]
-        );
+        assert_eq!(parser.push_bytes(b"hello"), vec![AttachInputAction::Data(b"hello".to_vec())]);
     }
 
     #[test]
     fn attach_parser_preserves_mouse_and_scroll_sequences() {
         let mut parser = AttachInputParser::default();
         let mouse = b"\x1b[<64;10;5M";
-        assert_eq!(
-            parser.push_bytes(mouse),
-            vec![AttachInputAction::Data(mouse.to_vec())]
-        );
+        assert_eq!(parser.push_bytes(mouse), vec![AttachInputAction::Data(mouse.to_vec())]);
     }
 
     #[test]
@@ -2128,9 +2017,7 @@ mod tests {
         parser.push_bytes(&[ATTACH_LEADER_BYTE]);
         assert_eq!(
             parser.push_bytes(b"s"),
-            vec![AttachInputAction::Leader(
-                AttachLeaderAction::SessionSwitcher
-            )]
+            vec![AttachInputAction::Leader(AttachLeaderAction::SessionSwitcher)]
         );
 
         parser.push_bytes(&[ATTACH_LEADER_BYTE]);
@@ -2142,9 +2029,7 @@ mod tests {
         parser.push_bytes(&[ATTACH_LEADER_BYTE]);
         assert_eq!(
             parser.push_bytes(b"g"),
-            vec![AttachInputAction::Leader(
-                AttachLeaderAction::SessionDetails
-            )]
+            vec![AttachInputAction::Leader(AttachLeaderAction::SessionDetails)]
         );
 
         parser.push_bytes(&[ATTACH_LEADER_BYTE]);
@@ -2200,10 +2085,7 @@ mod tests {
             exit_code: Some(0),
             error: None,
         };
-        assert_eq!(
-            format_session_end_summary(&summary),
-            "session demo finished (exit 0)"
-        );
+        assert_eq!(format_session_end_summary(&summary), "session demo finished (exit 0)");
     }
 
     #[test]
@@ -2217,10 +2099,7 @@ mod tests {
             exit_code: Some(1),
             error: Some("spawn failed".to_string()),
         };
-        assert_eq!(
-            format_session_end_summary(&summary),
-            "session demo failed: spawn failed"
-        );
+        assert_eq!(format_session_end_summary(&summary), "session demo failed: spawn failed");
     }
 
     #[test]
@@ -2244,10 +2123,7 @@ mod tests {
 
     #[test]
     fn diff_colorization_respects_no_color() {
-        assert!(!should_colorize_diff_output(
-            true,
-            Some(OsString::from("1"))
-        ));
+        assert!(!should_colorize_diff_output(true, Some(OsString::from("1"))));
     }
 
     #[test]
@@ -2263,10 +2139,7 @@ mod tests {
     }
 
     fn test_paths() -> AppPaths {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
             + u128::from(TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed));
         let root = camino::Utf8PathBuf::from(format!("/tmp/agent-cli-test-{suffix}"));
         AppPaths {

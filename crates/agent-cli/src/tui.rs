@@ -25,6 +25,7 @@ use agentd_shared::{
 use crate::{
     CODEX_MODELS, RawModeGuard, StatusString, TerminalScreenGuard, centered_rect,
     daemon_get_session, daemon_list_sessions, encode_attach_key, kill_session, send_request,
+    session_display::session_elapsed_label,
 };
 
 const LEADER_KEY: (KeyCode, KeyModifiers) = (KeyCode::Char('b'), KeyModifiers::CONTROL);
@@ -208,16 +209,11 @@ impl RuntimeApp {
         let live_session_id = self.focused_worker_session_id().map(str::to_string);
         match live_session_id {
             Some(session_id) => {
-                let live_session = self
-                    .sessions
-                    .iter()
-                    .find(|session| session.session_id == session_id);
+                let live_session =
+                    self.sessions.iter().find(|session| session.session_id == session_id);
                 let live_status = live_session.map(|session| session.status);
-                let needs_attach = self
-                    .pty
-                    .as_ref()
-                    .map(|pty| pty.session_id != session_id)
-                    .unwrap_or(true);
+                let needs_attach =
+                    self.pty.as_ref().map(|pty| pty.session_id != session_id).unwrap_or(true);
 
                 if needs_attach {
                     self.stop_pty();
@@ -229,10 +225,8 @@ impl RuntimeApp {
                     }
                 }
 
-                if !matches!(
-                    live_status,
-                    Some(SessionStatus::Running | SessionStatus::NeedsInput)
-                ) {
+                if !matches!(live_status, Some(SessionStatus::Running | SessionStatus::NeedsInput))
+                {
                     self.stop_pty();
                 }
             }
@@ -257,9 +251,7 @@ impl RuntimeApp {
 
     fn focused_session(&self) -> Option<&SessionRecord> {
         let session_id = self.focused_worker_session_id()?;
-        self.sessions
-            .iter()
-            .find(|session| session.session_id == session_id)
+        self.sessions.iter().find(|session| session.session_id == session_id)
     }
 
     fn ordered_sessions(&self) -> Vec<&SessionRecord> {
@@ -291,18 +283,12 @@ impl RuntimeApp {
     }
 
     fn cycle_focus(&mut self, direction: isize, attention_only: bool) {
-        let targets = if attention_only {
-            self.attention_targets()
-        } else {
-            self.ordered_targets()
-        };
+        let targets =
+            if attention_only { self.attention_targets() } else { self.ordered_targets() };
         if targets.is_empty() {
             return;
         }
-        let current_index = targets
-            .iter()
-            .position(|target| *target == self.focus)
-            .unwrap_or(0);
+        let current_index = targets.iter().position(|target| *target == self.focus).unwrap_or(0);
         let len = targets.len() as isize;
         let next = (current_index as isize + direction).rem_euclid(len) as usize;
         self.focus = targets[next].clone();
@@ -542,13 +528,9 @@ impl RuntimeApp {
             self.toast = Some("focus a worker session first".to_string());
             return Ok(());
         };
-        let response = send_request(
-            &self.paths,
-            &Request::DiffSession {
-                session_id: session_id.to_string(),
-            },
-        )
-        .await?;
+        let response =
+            send_request(&self.paths, &Request::DiffSession { session_id: session_id.to_string() })
+                .await?;
         match response {
             Response::Diff { diff } => {
                 self.diff_text = diff.diff;
@@ -710,10 +692,8 @@ impl RuntimeApp {
             self.toast = Some("focus a worker session first".to_string());
             return;
         };
-        let summary = session
-            .git_status_summary
-            .clone()
-            .unwrap_or_else(|| "review ready".to_string());
+        let summary =
+            session.git_status_summary.clone().unwrap_or_else(|| "review ready".to_string());
         self.detail_text = format!(
             "session    {}\nrepo       {}\nbase       {}\nbranch     {}\nworktree   {}\nstatus     {}\nreview     {}\nconflicts  {}\n\nCLI actions\nagent diff {}\nagent accept {}\nagent discard {}\n\n`accept` will only apply when the repo checkout is clean and on `{}`. It performs a normal git merge and refuses to touch the upstream checkout if preflight predicts conflicts.",
             session.session_id,
@@ -787,27 +767,16 @@ impl RuntimeApp {
             Span::styled("Sessions", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(format!(" ({})", self.sessions.len())),
         ]));
-        frame.render_widget(
-            header,
-            Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1),
-        );
+        frame.render_widget(header, Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1));
 
         let available = area.height.saturating_sub(2);
         let visible_cards = (available / CARD_HEIGHT).max(1) as usize;
-        let cards = ordered
-            .into_iter()
-            .take(visible_cards.saturating_sub(1))
-            .collect::<Vec<_>>();
+        let cards = ordered.into_iter().take(visible_cards.saturating_sub(1)).collect::<Vec<_>>();
 
         let mut y = area.y + 2;
         self.render_session_card(
             frame,
-            Rect::new(
-                area.x + 1,
-                y,
-                area.width.saturating_sub(2),
-                CARD_HEIGHT.saturating_sub(1),
-            ),
+            Rect::new(area.x + 1, y, area.width.saturating_sub(2), CARD_HEIGHT.saturating_sub(1)),
             SidebarCard::coordinator(self.focus == FocusTarget::Coordinator),
         );
         y = y.saturating_add(CARD_HEIGHT);
@@ -839,9 +808,7 @@ impl RuntimeApp {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(border_style);
+        let block = Block::default().borders(Borders::ALL).border_style(border_style);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -849,25 +816,14 @@ impl RuntimeApp {
             Line::from(vec![
                 Span::styled(
                     card.icon,
-                    Style::default()
-                        .fg(card.icon_color)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(card.icon_color).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
                 Span::styled(card.title, Style::default().add_modifier(Modifier::BOLD)),
             ]),
-            Line::from(vec![
-                Span::styled("repo    ", subtle_style()),
-                Span::raw(card.repo_name),
-            ]),
-            Line::from(vec![
-                Span::styled("branch  ", subtle_style()),
-                Span::raw(card.branch),
-            ]),
-            Line::from(Span::styled(
-                card.status_text,
-                Style::default().fg(card.icon_color),
-            )),
+            Line::from(vec![Span::styled("repo    ", subtle_style()), Span::raw(card.repo_name)]),
+            Line::from(vec![Span::styled("branch  ", subtle_style()), Span::raw(card.branch)]),
+            Line::from(Span::styled(card.status_text, Style::default().fg(card.icon_color))),
         ];
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
@@ -893,10 +849,7 @@ impl RuntimeApp {
         let ordered = self.ordered_sessions();
         let mut lines = vec![
             Line::from(vec![
-                Span::styled(
-                    "Attention queue",
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
+                Span::styled("Attention queue", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw("  "),
                 Span::styled("Ctrl-b opens commands", subtle_style()),
             ]),
@@ -921,10 +874,7 @@ impl RuntimeApp {
                     Span::raw("  "),
                     Span::styled(session.branch.as_str(), subtle_style()),
                 ]));
-                lines.push(Line::from(Span::styled(
-                    session_status_text(session),
-                    subtle_style(),
-                )));
+                lines.push(Line::from(Span::styled(session_status_text(session), subtle_style())));
             }
         }
 
@@ -934,10 +884,7 @@ impl RuntimeApp {
             subtle_style(),
         )));
 
-        frame.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }),
-            sections[0],
-        );
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), sections[0]);
         if self.composer.active {
             self.render_inline_composer(frame, sections[1]);
         }
@@ -962,10 +909,7 @@ impl RuntimeApp {
                     session_icon_style(session).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
-                Span::styled(
-                    session.title.as_str(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(session.title.as_str(), Style::default().add_modifier(Modifier::BOLD)),
             ]),
             Line::from(vec![
                 Span::styled("repo      ", subtle_style()),
@@ -983,10 +927,7 @@ impl RuntimeApp {
                 Span::raw(session.git_sync.as_str()),
             ]),
         ];
-        frame.render_widget(
-            Paragraph::new(summary).wrap(Wrap { trim: false }),
-            sections[0],
-        );
+        frame.render_widget(Paragraph::new(summary).wrap(Wrap { trim: false }), sections[0]);
 
         let pty_area = sections[1];
         let pane = Block::default().borders(Borders::TOP).title("PTY");
@@ -1000,10 +941,7 @@ impl RuntimeApp {
             if self.last_pane_size != Some(size) {
                 self.last_pane_size = Some(size);
                 pty.resize(size.0, size.1);
-                let _ = pty.commands.send(PtyCommand::Resize {
-                    cols: size.0,
-                    rows: size.1,
-                });
+                let _ = pty.commands.send(PtyCommand::Resize { cols: size.0, rows: size.1 });
             }
         }
 
@@ -1020,9 +958,7 @@ impl RuntimeApp {
             let path = super::resolve_focus_log_path(&self.paths, session);
             let body = super::read_focus_log_contents(&path).unwrap_or_default();
             frame.render_widget(
-                Paragraph::new(body)
-                    .wrap(Wrap { trim: false })
-                    .block(Block::default()),
+                Paragraph::new(body).wrap(Wrap { trim: false }).block(Block::default()),
                 pty_inner,
             );
         }
@@ -1081,9 +1017,7 @@ impl RuntimeApp {
         lines.push(Line::from(""));
         for (index, item) in items.iter().take(9).enumerate() {
             let style = if index == self.palette_selected {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -1096,11 +1030,7 @@ impl RuntimeApp {
         frame.render_widget(WidgetClear, overlay);
         frame.render_widget(
             Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Command Palette"),
-                )
+                .block(Block::default().borders(Borders::ALL).title("Command Palette"))
                 .wrap(Wrap { trim: false }),
             overlay,
         );
@@ -1114,11 +1044,7 @@ impl RuntimeApp {
         let mut lines = vec![
             Line::from(vec![
                 Span::styled(
-                    if self.composer.field == ComposerField::Query {
-                        "> "
-                    } else {
-                        "  "
-                    },
+                    if self.composer.field == ComposerField::Query { "> " } else { "  " },
                     Style::default().fg(Color::Cyan),
                 ),
                 Span::styled("query  ", subtle_style()),
@@ -1126,11 +1052,7 @@ impl RuntimeApp {
             ]),
             Line::from(vec![
                 Span::styled(
-                    if self.composer.field == ComposerField::Agent {
-                        "> "
-                    } else {
-                        "  "
-                    },
+                    if self.composer.field == ComposerField::Agent { "> " } else { "  " },
                     Style::default().fg(Color::Cyan),
                 ),
                 Span::styled("agent  ", subtle_style()),
@@ -1145,9 +1067,7 @@ impl RuntimeApp {
 
         for (index, row) in self.composer_rows().into_iter().take(5).enumerate() {
             let style = if index == self.composer.selected {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -1165,13 +1085,13 @@ impl RuntimeApp {
                     ]));
                 }
                 ComposerRow::Session(session_id) => {
-                    if let Some(session) = self
-                        .sessions
-                        .iter()
-                        .find(|item| item.session_id == session_id)
+                    if let Some(session) =
+                        self.sessions.iter().find(|item| item.session_id == session_id)
                     {
                         lines.push(Line::from(vec![
                             Span::styled(session_icon(session), session_icon_style(session)),
+                            Span::raw("  "),
+                            Span::styled(session_elapsed_label(session), style),
                             Span::raw("  "),
                             Span::styled(session.title.as_str(), style),
                             Span::raw("  "),
@@ -1241,12 +1161,7 @@ impl FocusedPty {
     fn spawn(paths: AppPaths, session_id: String) -> Self {
         let (command_tx, command_rx) = unbounded_channel();
         let (message_tx, message_rx) = unbounded_channel();
-        tokio::spawn(run_pty_session(
-            paths,
-            session_id.clone(),
-            command_rx,
-            message_tx,
-        ));
+        tokio::spawn(run_pty_session(paths, session_id.clone(), command_rx, message_tx));
         Self {
             session_id,
             commands: command_tx,
@@ -1276,10 +1191,7 @@ impl FocusedPty {
             if !lines.is_empty() {
                 lines.push(Line::from(""));
             }
-            lines.push(Line::from(Span::styled(
-                error.clone(),
-                Style::default().fg(Color::Red),
-            )));
+            lines.push(Line::from(Span::styled(error.clone(), Style::default().fg(Color::Red))));
         }
         lines
     }
@@ -1408,10 +1320,7 @@ struct TerminalCell {
 
 impl Default for TerminalCell {
     fn default() -> Self {
-        Self {
-            ch: ' ',
-            style: TerminalCellStyle::default(),
-        }
+        Self { ch: ' ', style: TerminalCellStyle::default() }
     }
 }
 
@@ -1523,10 +1432,7 @@ impl TerminalSurface {
                 }
             }
             if !current_text.is_empty() {
-                spans.push(Span::styled(
-                    current_text,
-                    current_style.unwrap_or_default(),
-                ));
+                spans.push(Span::styled(current_text, current_style.unwrap_or_default()));
             }
             lines.push(Line::from(spans));
         }
@@ -1606,11 +1512,8 @@ impl TerminalSurface {
     }
 
     fn process_osc_escape(&mut self, ch: char) {
-        self.parser_state = if ch == '\\' {
-            TerminalParserState::Ground
-        } else {
-            TerminalParserState::Osc
-        };
+        self.parser_state =
+            if ch == '\\' { TerminalParserState::Ground } else { TerminalParserState::Osc };
     }
 
     fn dispatch_csi(&mut self, params: &str, action: char) {
@@ -1619,9 +1522,7 @@ impl TerminalSurface {
         let parsed = parse_csi_params(params);
         match action {
             'A' => {
-                self.cursor_row = self
-                    .cursor_row
-                    .saturating_sub(first_param(&parsed, 1) as usize)
+                self.cursor_row = self.cursor_row.saturating_sub(first_param(&parsed, 1) as usize)
             }
             'B' => {
                 self.cursor_row = (self.cursor_row + first_param(&parsed, 1) as usize)
@@ -1632,9 +1533,7 @@ impl TerminalSurface {
                     .min(self.cols.saturating_sub(1) as usize)
             }
             'D' => {
-                self.cursor_col = self
-                    .cursor_col
-                    .saturating_sub(first_param(&parsed, 1) as usize)
+                self.cursor_col = self.cursor_col.saturating_sub(first_param(&parsed, 1) as usize)
             }
             'G' => self.cursor_col = first_param(&parsed, 1).saturating_sub(1) as usize,
             'H' | 'f' => {
@@ -1715,10 +1614,7 @@ impl TerminalSurface {
             self.clamp_cursor();
         }
         let index = self.index(self.cursor_row, self.cursor_col);
-        self.cells[index] = TerminalCell {
-            ch,
-            style: self.style,
-        };
+        self.cells[index] = TerminalCell { ch, style: self.style };
         if self.cursor_col + 1 >= self.cols as usize {
             self.cursor_col = 0;
             self.index_line();
@@ -1926,13 +1822,7 @@ fn parse_csi_params(params: &str) -> Vec<Option<u16>> {
     }
     params
         .split(';')
-        .map(|part| {
-            if part.is_empty() {
-                None
-            } else {
-                part.parse::<u16>().ok()
-            }
-        })
+        .map(|part| if part.is_empty() { None } else { part.parse::<u16>().ok() })
         .collect()
 }
 
@@ -1990,11 +1880,7 @@ fn ansi_256_color(index: u16) -> Color {
             let g = (value / 6) % 6;
             let b = value % 6;
             let convert = |component: u16| -> u8 {
-                if component == 0 {
-                    0
-                } else {
-                    (component * 40 + 55) as u8
-                }
+                if component == 0 { 0 } else { (component * 40 + 55) as u8 }
             };
             Color::Rgb(convert(r), convert(g), convert(b))
         }
@@ -2008,11 +1894,7 @@ fn ansi_256_color(index: u16) -> Color {
 
 fn terminal_style(cell: TerminalCellStyle) -> Style {
     let mut style = Style::default();
-    let (fg, bg) = if cell.reversed {
-        (cell.bg, cell.fg)
-    } else {
-        (cell.fg, cell.bg)
-    };
+    let (fg, bg) = if cell.reversed { (cell.bg, cell.fg) } else { (cell.fg, cell.bg) };
     if let Some(fg) = fg {
         style = style.fg(fg);
     }
@@ -2073,79 +1955,34 @@ fn filtered_palette_items(query: &str) -> Vec<PaletteItem> {
 
 fn palette_items() -> Vec<PaletteItem> {
     vec![
-        PaletteItem {
-            key_hint: "n",
-            title: "Next Session",
-            command: Command::NextSession,
-        },
-        PaletteItem {
-            key_hint: "p",
-            title: "Previous Session",
-            command: Command::PreviousSession,
-        },
-        PaletteItem {
-            key_hint: "a",
-            title: "Next Attention",
-            command: Command::NextAttention,
-        },
+        PaletteItem { key_hint: "n", title: "Next Session", command: Command::NextSession },
+        PaletteItem { key_hint: "p", title: "Previous Session", command: Command::PreviousSession },
+        PaletteItem { key_hint: "a", title: "Next Attention", command: Command::NextAttention },
         PaletteItem {
             key_hint: "c",
             title: "Focus Coordinator",
             command: Command::FocusCoordinator,
         },
-        PaletteItem {
-            key_hint: "s",
-            title: "Session Switcher",
-            command: Command::SessionSwitcher,
-        },
-        PaletteItem {
-            key_hint: "t",
-            title: "New Session",
-            command: Command::NewSession,
-        },
-        PaletteItem {
-            key_hint: "N",
-            title: "New Agent",
-            command: Command::NewAgent,
-        },
-        PaletteItem {
-            key_hint: "w",
-            title: "Review Actions",
-            command: Command::WorktreeActions,
-        },
-        PaletteItem {
-            key_hint: "g",
-            title: "Git Status",
-            command: Command::GitStatus,
-        },
-        PaletteItem {
-            key_hint: "d",
-            title: "Diff",
-            command: Command::Diff,
-        },
-        PaletteItem {
-            key_hint: "x",
-            title: "Stop Session",
-            command: Command::StopSession,
-        },
+        PaletteItem { key_hint: "s", title: "Session Switcher", command: Command::SessionSwitcher },
+        PaletteItem { key_hint: "t", title: "New Session", command: Command::NewSession },
+        PaletteItem { key_hint: "N", title: "New Agent", command: Command::NewAgent },
+        PaletteItem { key_hint: "w", title: "Review Actions", command: Command::WorktreeActions },
+        PaletteItem { key_hint: "g", title: "Git Status", command: Command::GitStatus },
+        PaletteItem { key_hint: "d", title: "Diff", command: Command::Diff },
+        PaletteItem { key_hint: "x", title: "Stop Session", command: Command::StopSession },
     ]
 }
 
 fn session_rank(session: &SessionRecord) -> u8 {
     if session.status == SessionStatus::NeedsInput {
         0
-    } else if matches!(
-        session.status,
-        SessionStatus::Failed | SessionStatus::UnknownRecovered
-    ) || session.has_conflicts
+    } else if matches!(session.status, SessionStatus::Failed | SessionStatus::UnknownRecovered)
+        || session.has_conflicts
     {
         1
     } else if session.integration_state == IntegrationState::PendingReview {
         2
-    } else if matches!(
-        session.status,
-        SessionStatus::Running | SessionStatus::Creating
-    ) {
+    } else if matches!(session.status, SessionStatus::Running | SessionStatus::Creating) {
         3
     } else if session.status == SessionStatus::Paused {
         4
@@ -2186,10 +2023,7 @@ fn session_icon_color(session: &SessionRecord) -> Color {
 
 fn session_icon_style(session: &SessionRecord) -> Style {
     let mut style = Style::default().fg(session_icon_color(session));
-    if matches!(
-        session.status,
-        SessionStatus::NeedsInput | SessionStatus::Paused
-    ) {
+    if matches!(session.status, SessionStatus::NeedsInput | SessionStatus::Paused) {
         style = style.add_modifier(Modifier::DIM);
     }
     style
@@ -2214,10 +2048,7 @@ fn session_status_text(session: &SessionRecord) -> String {
         SessionStatus::Paused => "paused".to_string(),
         SessionStatus::NeedsInput => "needs input".to_string(),
         SessionStatus::Exited => "complete".to_string(),
-        SessionStatus::Failed => session
-            .error
-            .clone()
-            .unwrap_or_else(|| "blocked".to_string()),
+        SessionStatus::Failed => session.error.clone().unwrap_or_else(|| "blocked".to_string()),
         SessionStatus::UnknownRecovered => "daemon lost the live process".to_string(),
     }
 }
@@ -2231,15 +2062,13 @@ fn matches_query<T: AsRef<str>>(haystack: T, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
-    haystack
-        .as_ref()
-        .to_ascii_lowercase()
-        .contains(&query.to_ascii_lowercase())
+    haystack.as_ref().to_ascii_lowercase().contains(&query.to_ascii_lowercase())
 }
 
 fn session_switcher_text(session: &SessionRecord) -> String {
     format!(
-        "{} {} {} {} {}",
+        "{} {} {} {} {} {}",
+        session_elapsed_label(session),
         session.session_id,
         session.title,
         session.repo_name,
@@ -2264,14 +2093,14 @@ fn status_label(status: SessionStatus) -> &'static str {
 mod tests {
     use super::{
         ComposerField, ComposerRow, RuntimeApp, TerminalSurface, matches_query, session_icon,
-        session_icon_color, session_rank, session_status_text,
+        session_icon_color, session_rank, session_status_text, session_switcher_text,
     };
     use agentd_shared::paths::AppPaths;
     use agentd_shared::session::{
         AttentionLevel, GitSyncStatus, IntegrationState, SessionMode, SessionRecord, SessionStatus,
     };
     use camino::Utf8PathBuf;
-    use chrono::Utc;
+    use chrono::{Duration, Utc};
     use ratatui::style::Color;
 
     fn demo(status: SessionStatus, integration_state: IntegrationState) -> SessionRecord {
@@ -2328,43 +2157,22 @@ mod tests {
     #[test]
     fn pending_review_uses_review_icon() {
         assert_eq!(
-            session_icon(&demo(
-                SessionStatus::Exited,
-                IntegrationState::PendingReview
-            )),
+            session_icon(&demo(SessionStatus::Exited, IntegrationState::PendingReview)),
             "⧖"
         );
     }
 
     #[test]
     fn session_icons_match_requested_symbols() {
+        assert_eq!(session_icon(&demo(SessionStatus::NeedsInput, IntegrationState::Clean)), "◦");
+        assert_eq!(session_icon(&demo(SessionStatus::Failed, IntegrationState::Clean)), "✖");
         assert_eq!(
-            session_icon(&demo(SessionStatus::NeedsInput, IntegrationState::Clean)),
-            "◦"
-        );
-        assert_eq!(
-            session_icon(&demo(SessionStatus::Failed, IntegrationState::Clean)),
-            "✖"
-        );
-        assert_eq!(
-            session_icon(&demo(
-                SessionStatus::UnknownRecovered,
-                IntegrationState::Clean
-            )),
+            session_icon(&demo(SessionStatus::UnknownRecovered, IntegrationState::Clean)),
             "⚠"
         );
-        assert_eq!(
-            session_icon(&demo(SessionStatus::Running, IntegrationState::Clean)),
-            "●"
-        );
-        assert_eq!(
-            session_icon(&demo(SessionStatus::Paused, IntegrationState::Clean)),
-            "⏸"
-        );
-        assert_eq!(
-            session_icon(&demo(SessionStatus::Exited, IntegrationState::Clean)),
-            "✔"
-        );
+        assert_eq!(session_icon(&demo(SessionStatus::Running, IntegrationState::Clean)), "●");
+        assert_eq!(session_icon(&demo(SessionStatus::Paused, IntegrationState::Clean)), "⏸");
+        assert_eq!(session_icon(&demo(SessionStatus::Exited, IntegrationState::Clean)), "✔");
     }
 
     #[test]
@@ -2378,17 +2186,11 @@ mod tests {
             Color::Red
         );
         assert_eq!(
-            session_icon_color(&demo(
-                SessionStatus::UnknownRecovered,
-                IntegrationState::Clean
-            )),
+            session_icon_color(&demo(SessionStatus::UnknownRecovered, IntegrationState::Clean)),
             Color::Yellow
         );
         assert_eq!(
-            session_icon_color(&demo(
-                SessionStatus::Exited,
-                IntegrationState::PendingReview
-            )),
+            session_icon_color(&demo(SessionStatus::Exited, IntegrationState::PendingReview)),
             Color::Blue
         );
         assert_eq!(
@@ -2463,5 +2265,28 @@ mod tests {
         assert_eq!(app.composer.field, ComposerField::Agent);
         assert_eq!(app.composer.query, "new task");
         assert_eq!(app.composer.selected, 0);
+    }
+
+    #[test]
+    fn session_switcher_text_includes_elapsed_prefix() {
+        let mut session = demo(SessionStatus::Running, IntegrationState::Clean);
+        session.created_at = Utc::now() - Duration::minutes(23);
+
+        let rendered = session_switcher_text(&session);
+
+        assert!(rendered.starts_with("23m "));
+        assert!(rendered.contains("demo"));
+    }
+
+    #[test]
+    fn session_switcher_text_uses_exit_time_for_finished_sessions() {
+        let mut session = demo(SessionStatus::Exited, IntegrationState::Clean);
+        let created_at = Utc::now() - Duration::hours(5);
+        session.created_at = created_at;
+        session.exited_at = Some(created_at + Duration::minutes(90));
+
+        let rendered = session_switcher_text(&session);
+
+        assert!(rendered.starts_with("1h "));
     }
 }

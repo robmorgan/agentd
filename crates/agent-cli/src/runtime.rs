@@ -25,7 +25,7 @@ use agentd_shared::{
 
 use crate::{
     CODEX_MODELS, RawModeGuard, StatusString, centered_rect, daemon_get_session,
-    daemon_list_sessions, kill_session, send_request,
+    daemon_list_sessions, kill_session, send_request, session_display::session_elapsed_label,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1631,9 +1631,10 @@ fn render_host_picker_session_row(session: &SessionRecord, width: usize, selecte
     let max_chars = width.saturating_sub(1).max(1);
     let leader = if selected { "› ".to_string() } else { "  ".to_string() };
     let separator = "  ";
+    let elapsed = session_elapsed_label(session);
     let tail = format!(
-        "{}  {}  {}  {}",
-        session.session_id, session.title, session.repo_name, session.branch
+        "{}  {}  {}  {}  {}",
+        elapsed, session.session_id, session.title, session.repo_name, session.branch
     );
     let used = leader.chars().count() + session_icon(session).chars().count() + separator.len();
     let remaining = max_chars.saturating_sub(used);
@@ -1801,7 +1802,7 @@ mod tests {
         },
     };
     use camino::Utf8PathBuf;
-    use chrono::Utc;
+    use chrono::{Duration, Utc};
 
     #[test]
     fn picker_rows_include_create_and_matching_sessions() {
@@ -2197,11 +2198,10 @@ mod tests {
 
     #[test]
     fn host_picker_session_row_includes_status_color_escape() {
-        let running = render_host_picker_session_row(
-            &demo_with("alpha", "repo-a", SessionStatus::Running, IntegrationState::Clean),
-            120,
-            true,
-        );
+        let mut running_session =
+            demo_with("alpha", "repo-a", SessionStatus::Running, IntegrationState::Clean);
+        running_session.created_at = Utc::now() - Duration::minutes(23);
+        let running = render_host_picker_session_row(&running_session, 120, true);
         let review = render_host_picker_session_row(
             &demo_with("alpha", "repo-a", SessionStatus::Exited, IntegrationState::PendingReview),
             120,
@@ -2219,7 +2219,7 @@ mod tests {
         assert!(running.contains(HOST_PICKER_SELECTED_STYLE));
         assert!(running.contains("› "));
         assert!(running.contains("●"));
-        assert!(running.contains("alpha  title-alpha"));
+        assert!(running.contains("23m  alpha  title-alpha"));
         assert!(review.contains("⧖"));
         assert!(failed.contains("✖"));
         let needs_input = render_host_picker_session_row(
@@ -2284,6 +2284,19 @@ mod tests {
         let rendered = picker.render_lines(200, true).join("\n");
         assert!(!rendered.contains("needs input"));
         assert!(!rendered.contains("pending review"));
+    }
+
+    #[test]
+    fn host_picker_session_row_uses_exit_time_for_finished_sessions() {
+        let mut session =
+            demo_with("alpha", "repo-a", SessionStatus::Exited, IntegrationState::Clean);
+        let created_at = Utc::now() - Duration::hours(5);
+        session.created_at = created_at;
+        session.exited_at = Some(created_at + Duration::minutes(90));
+
+        let rendered = render_host_picker_session_row(&session, 120, false);
+
+        assert!(rendered.contains("1h  alpha"));
     }
 
     #[test]
