@@ -133,11 +133,7 @@ pub struct PlanRecord {
 pub fn branch_name_from_title(title: &str) -> String {
     let slug = slugify(title);
     let trimmed = slug.trim_matches('-');
-    let branch = if trimmed.is_empty() {
-        "session".to_string()
-    } else {
-        trimmed.to_string()
-    };
+    let branch = if trimmed.is_empty() { "session".to_string() } else { trimmed.to_string() };
     format!("agent/{branch}")
 }
 
@@ -206,10 +202,7 @@ mod tests {
 
     #[test]
     fn branch_names_are_slugified() {
-        assert_eq!(
-            branch_name_from_title("fix failing tests"),
-            "agent/fix-failing-tests"
-        );
+        assert_eq!(branch_name_from_title("fix failing tests"), "agent/fix-failing-tests");
     }
 
     #[test]

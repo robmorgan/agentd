@@ -47,12 +47,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(paths: AppPaths, db: Database, config: Config) -> Self {
-        Self {
-            paths,
-            db,
-            config,
-            runtimes: SessionRuntimeRegistry::default(),
-        }
+        Self { paths, db, config, runtimes: SessionRuntimeRegistry::default() }
     }
 
     pub async fn create_session(
@@ -766,10 +761,7 @@ struct SessionStartRequest<'a> {
 }
 
 pub fn is_resumable_command(command: &str) -> bool {
-    Path::new(command)
-        .file_name()
-        .and_then(|value| value.to_str())
-        == Some("codex")
+    Path::new(command).file_name().and_then(|value| value.to_str()) == Some("codex")
 }
 
 fn resolve_launch_command(
@@ -784,17 +776,9 @@ fn resolve_launch_command(
     };
     let args = match launch.args {
         Some(args) => args,
-        None => config
-            .agents
-            .get(agent_name)
-            .map(|agent| agent.args.clone())
-            .unwrap_or_default(),
+        None => config.agents.get(agent_name).map(|agent| agent.args.clone()).unwrap_or_default(),
     };
-    Ok(LaunchCommand {
-        agent_name: agent_name.to_string(),
-        command,
-        args,
-    })
+    Ok(LaunchCommand { agent_name: agent_name.to_string(), command, args })
 }
 
 fn prepare_log_file(log_path: &Utf8PathBuf, mode: SessionStartMode) -> Result<()> {
@@ -873,25 +857,14 @@ fn start_session_runtime(
         )],
     )?;
 
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .context("failed to clone PTY reader")?;
-    let writer = pair
-        .master
-        .take_writer()
-        .context("failed to clone PTY writer")?;
+    let reader = pair.master.try_clone_reader().context("failed to clone PTY reader")?;
+    let writer = pair.master.take_writer().context("failed to clone PTY writer")?;
     let terminal_state =
         GhosttyTerminalState::new(DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS, MAX_SCROLLBACK_BYTES)
             .context("failed to initialize libghostty-vt state")?;
     let runtime = runtimes.insert(
         request.session_id.to_string(),
-        SessionRuntime::new(
-            pair.master,
-            writer,
-            Box::new(terminal_state),
-            OUTPUT_BUFFER_CAPACITY,
-        ),
+        SessionRuntime::new(pair.master, writer, Box::new(terminal_state), OUTPUT_BUFFER_CAPACITY),
     );
     let writer_db = db.clone();
     let writer_session_id = request.session_id.to_string();
@@ -934,27 +907,18 @@ struct SessionRuntimeRegistry {
 impl SessionRuntimeRegistry {
     fn insert(&self, session_id: String, runtime: SessionRuntime) -> Arc<SessionRuntime> {
         let runtime = Arc::new(runtime);
-        let mut inner = self
-            .inner
-            .lock()
-            .expect("session runtime registry poisoned");
+        let mut inner = self.inner.lock().expect("session runtime registry poisoned");
         inner.insert(session_id, runtime.clone());
         runtime
     }
 
     fn get(&self, session_id: &str) -> Option<Arc<SessionRuntime>> {
-        let inner = self
-            .inner
-            .lock()
-            .expect("session runtime registry poisoned");
+        let inner = self.inner.lock().expect("session runtime registry poisoned");
         inner.get(session_id).cloned()
     }
 
     fn remove(&self, session_id: &str) {
-        let mut inner = self
-            .inner
-            .lock()
-            .expect("session runtime registry poisoned");
+        let mut inner = self.inner.lock().expect("session runtime registry poisoned");
         inner.remove(session_id);
     }
 }
@@ -987,34 +951,20 @@ impl SessionRuntime {
     }
 
     fn write_input(&self, data: &[u8]) -> Result<()> {
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|_| anyhow!("PTY writer poisoned"))?;
+        let mut writer = self.writer.lock().map_err(|_| anyhow!("PTY writer poisoned"))?;
         writer.write_all(data)?;
         writer.flush()?;
         Ok(())
     }
 
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
-        let master = self
-            .master
-            .lock()
-            .map_err(|_| anyhow!("PTY master poisoned"))?;
-        master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
+        let master = self.master.lock().map_err(|_| anyhow!("PTY master poisoned"))?;
+        master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
         Ok(())
     }
 
     fn publish_output(&self, data: &[u8]) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("session runtime state poisoned"))?;
+        let mut state = self.state.lock().map_err(|_| anyhow!("session runtime state poisoned"))?;
         state.terminal_state.feed(data)?;
         let _ = self.output_tx.send(data.to_vec());
         Ok(())
@@ -1031,35 +981,19 @@ impl SessionRuntime {
         broadcast::Receiver<Vec<u8>>,
         mpsc::UnboundedReceiver<AttachControl>,
     )> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("session runtime state poisoned"))?;
+        let mut state = self.state.lock().map_err(|_| anyhow!("session runtime state poisoned"))?;
         let attach_id = format!("{}-{}", kind.as_str(), state.next_attach_ordinal);
         state.next_attach_ordinal += 1;
         let connected_at = Utc::now();
         let snapshot = state.terminal_state.snapshot()?;
         let (control_tx, control_rx) = mpsc::unbounded_channel();
-        state.attachments.insert(
-            attach_id.clone(),
-            RuntimeAttachment {
-                kind,
-                connected_at,
-                control_tx,
-            },
-        );
+        state
+            .attachments
+            .insert(attach_id.clone(), RuntimeAttachment { kind, connected_at, control_tx });
         let receiver = self.output_tx.subscribe();
         Ok((
-            AttachmentHandle {
-                runtime: self.clone(),
-                attach_id: attach_id.clone(),
-            },
-            AttachmentRecord {
-                attach_id,
-                session_id: session_id.to_string(),
-                kind,
-                connected_at,
-            },
+            AttachmentHandle { runtime: self.clone(), attach_id: attach_id.clone() },
+            AttachmentRecord { attach_id, session_id: session_id.to_string(), kind, connected_at },
             snapshot,
             receiver,
             control_rx,
@@ -1067,10 +1001,7 @@ impl SessionRuntime {
     }
 
     fn list_attachments(&self, session_id: &str) -> Result<Vec<AttachmentRecord>> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("session runtime state poisoned"))?;
+        let state = self.state.lock().map_err(|_| anyhow!("session runtime state poisoned"))?;
         let mut attachments = state
             .attachments
             .iter()
@@ -1086,10 +1017,7 @@ impl SessionRuntime {
     }
 
     fn request_detach(&self, attach_id: &str) -> Result<()> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("session runtime state poisoned"))?;
+        let state = self.state.lock().map_err(|_| anyhow!("session runtime state poisoned"))?;
         let attachment = state
             .attachments
             .get(attach_id)
@@ -1102,10 +1030,7 @@ impl SessionRuntime {
     }
 
     fn request_detach_all(&self) -> Result<()> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("session runtime state poisoned"))?;
+        let state = self.state.lock().map_err(|_| anyhow!("session runtime state poisoned"))?;
         for (attach_id, attachment) in &state.attachments {
             attachment
                 .control_tx
@@ -1161,10 +1086,7 @@ fn unique_session_id(db: &Database) -> Result<String> {
 }
 
 fn daemon_event(event_type: &str, payload_json: serde_json::Value) -> NewSessionEvent {
-    NewSessionEvent {
-        event_type: event_type.to_string(),
-        payload_json,
-    }
+    NewSessionEvent { event_type: event_type.to_string(), payload_json }
 }
 
 fn record_session_failure(db: &Database, session_id: &str, error: String) -> Result<()> {
@@ -1376,9 +1298,8 @@ fn send_signal(pid: Pid, signal: Signal, session_id: &str) -> Result<()> {
     match kill(pid, Some(signal)) {
         Ok(()) => Ok(()),
         Err(Errno::ESRCH) => bail!("session `{session_id}` is not running"),
-        Err(err) => Err(anyhow!(err)).context(format!(
-            "failed to send {signal:?} to session `{session_id}`"
-        )),
+        Err(err) => Err(anyhow!(err))
+            .context(format!("failed to send {signal:?} to session `{session_id}`")),
     }
 }
 
@@ -1424,10 +1345,9 @@ fn remove_worktree_if_present(session: &SessionRecord) -> Result<()> {
 }
 
 fn remove_log_if_present(paths: &AppPaths, session: &SessionRecord) -> Result<()> {
-    for log_path in [
-        paths.log_path(&session.session_id),
-        paths.rendered_log_path(&session.session_id),
-    ] {
+    for log_path in
+        [paths.log_path(&session.session_id), paths.rendered_log_path(&session.session_id)]
+    {
         match fs::remove_file(log_path.as_std_path()) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -1438,9 +1358,7 @@ fn remove_log_if_present(paths: &AppPaths, session: &SessionRecord) -> Result<()
 }
 
 fn preview_input(data: &[u8]) -> String {
-    let mut preview = String::from_utf8_lossy(data)
-        .replace('\n', "\\n")
-        .replace('\r', "\\r");
+    let mut preview = String::from_utf8_lossy(data).replace('\n', "\\n").replace('\r', "\\r");
     if preview.len() > 120 {
         preview.truncate(120);
         preview.push_str("...");
@@ -1449,10 +1367,9 @@ fn preview_input(data: &[u8]) -> String {
 }
 
 fn ensure_session_running(session: &SessionRecord) -> Result<()> {
-    let accepts_live_io = matches!(
-        session.status,
-        SessionStatus::Running | SessionStatus::NeedsInput
-    ) && process_exists(session.pid);
+    let accepts_live_io =
+        matches!(session.status, SessionStatus::Running | SessionStatus::NeedsInput)
+            && process_exists(session.pid);
     if !accepts_live_io {
         bail!("session `{}` is not running", session.session_id);
     }
@@ -1481,10 +1398,7 @@ fn ensure_not_pending_review(session: &SessionRecord, action: &str) -> Result<()
 
 fn ensure_pending_review(session: &SessionRecord, action: &str) -> Result<()> {
     if session.integration_state != IntegrationState::PendingReview {
-        bail!(
-            "session `{}` is not waiting for review; cannot {action}",
-            session.session_id
-        );
+        bail!("session `{}` is not waiting for review; cannot {action}", session.session_id);
     }
     Ok(())
 }
@@ -1534,10 +1448,7 @@ fn inspect_review_state(session: &SessionRecord) -> Result<ReviewState> {
     if !worktree.exists() {
         return Ok(ReviewState {
             git_sync: GitSyncStatus::NeedsSync,
-            summary: format!(
-                "worktree {} is missing; recreate or discard it",
-                session.worktree
-            ),
+            summary: format!("worktree {} is missing; recreate or discard it", session.worktree),
             has_conflicts: false,
         });
     }
@@ -1668,12 +1579,7 @@ mod tests {
         }
 
         fn get_size(&self) -> std::result::Result<PtySize, Error> {
-            Ok(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+            Ok(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
         }
 
         fn try_clone_reader(&self) -> std::result::Result<Box<dyn Read + Send>, Error> {
@@ -1759,14 +1665,8 @@ mod tests {
         finalize_session_exit(&db, "demo", Some(0), SessionStartMode::Create).unwrap();
 
         let session = db.get_session("demo").unwrap().unwrap();
-        assert_eq!(
-            session.status,
-            agentd_shared::session::SessionStatus::Exited
-        );
-        assert_eq!(
-            session.integration_state,
-            agentd_shared::session::IntegrationState::Clean
-        );
+        assert_eq!(session.status, agentd_shared::session::SessionStatus::Exited);
+        assert_eq!(session.integration_state, agentd_shared::session::IntegrationState::Clean);
     }
 
     #[test]
@@ -1782,10 +1682,7 @@ mod tests {
         finalize_session_exit(&db, "demo", Some(0), SessionStartMode::Create).unwrap();
 
         let session = db.get_session("demo").unwrap().unwrap();
-        assert_eq!(
-            session.status,
-            agentd_shared::session::SessionStatus::Exited
-        );
+        assert_eq!(session.status, agentd_shared::session::SessionStatus::Exited);
         assert_eq!(
             session.integration_state,
             agentd_shared::session::IntegrationState::PendingReview
@@ -1806,11 +1703,7 @@ mod tests {
         let session = db.get_session("demo").unwrap().unwrap();
         let review = inspect_review_state(&session).unwrap();
         assert_eq!(review.git_sync, GitSyncStatus::NeedsSync);
-        assert!(
-            review
-                .summary
-                .contains("session worktree has uncommitted changes")
-        );
+        assert!(review.summary.contains("session worktree has uncommitted changes"));
     }
 
     #[test]
@@ -1949,10 +1842,7 @@ mod tests {
     }
 
     fn test_paths() -> AppPaths {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
             + u128::from(TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed));
         let root = camino::Utf8PathBuf::from(format!("/tmp/agentd-app-test-{suffix}"));
         AppPaths {
@@ -2013,12 +1903,7 @@ mod tests {
 
     fn commit_all(path: &str, message: &str) {
         assert!(
-            Command::new("git")
-                .args(["-C", path, "add", "."])
-                .output()
-                .unwrap()
-                .status
-                .success()
+            Command::new("git").args(["-C", path, "add", "."]).output().unwrap().status.success()
         );
         assert!(
             Command::new("git")
@@ -2044,16 +1929,7 @@ mod tests {
         if worktree != repo {
             assert!(
                 Command::new("git")
-                    .args([
-                        "-C",
-                        repo,
-                        "worktree",
-                        "add",
-                        "-b",
-                        "agent/demo",
-                        worktree,
-                        "main"
-                    ])
+                    .args(["-C", repo, "worktree", "add", "-b", "agent/demo", worktree, "main"])
                     .output()
                     .unwrap()
                     .status

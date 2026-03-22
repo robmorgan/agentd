@@ -164,19 +164,13 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(
-            root,
-            Utf8PathBuf::from("/var/tmp").join(format!("{APP_DIR_NAME}-501"))
-        );
+        assert_eq!(root, Utf8PathBuf::from("/var/tmp").join(format!("{APP_DIR_NAME}-501")));
     }
 
     #[test]
     fn tmpdir_uses_uid_suffix_when_home_root_is_unavailable() {
         let root = discover_root(None, None, None, Some("/var/tmp".into()), 501, true).unwrap();
-        assert_eq!(
-            root,
-            Utf8PathBuf::from("/var/tmp").join(format!("{APP_DIR_NAME}-501"))
-        );
+        assert_eq!(root, Utf8PathBuf::from("/var/tmp").join(format!("{APP_DIR_NAME}-501")));
     }
 
     #[test]
@@ -194,29 +188,11 @@ mod tests {
     #[test]
     fn derived_paths_follow_selected_root() {
         let paths = AppPaths::from_root(Utf8PathBuf::from("/Users/tester/.agentd"));
-        assert_eq!(
-            paths.socket,
-            Utf8PathBuf::from("/Users/tester/.agentd/agentd.sock")
-        );
-        assert_eq!(
-            paths.pid_file,
-            Utf8PathBuf::from("/Users/tester/.agentd/agentd.pid")
-        );
-        assert_eq!(
-            paths.database,
-            Utf8PathBuf::from("/Users/tester/.agentd/state.db")
-        );
-        assert_eq!(
-            paths.config,
-            Utf8PathBuf::from("/Users/tester/.agentd/config.toml")
-        );
-        assert_eq!(
-            paths.logs_dir,
-            Utf8PathBuf::from("/Users/tester/.agentd/logs")
-        );
-        assert_eq!(
-            paths.worktrees_dir,
-            Utf8PathBuf::from("/Users/tester/.agentd/worktrees")
-        );
+        assert_eq!(paths.socket, Utf8PathBuf::from("/Users/tester/.agentd/agentd.sock"));
+        assert_eq!(paths.pid_file, Utf8PathBuf::from("/Users/tester/.agentd/agentd.pid"));
+        assert_eq!(paths.database, Utf8PathBuf::from("/Users/tester/.agentd/state.db"));
+        assert_eq!(paths.config, Utf8PathBuf::from("/Users/tester/.agentd/config.toml"));
+        assert_eq!(paths.logs_dir, Utf8PathBuf::from("/Users/tester/.agentd/logs"));
+        assert_eq!(paths.worktrees_dir, Utf8PathBuf::from("/Users/tester/.agentd/worktrees"));
     }
 }

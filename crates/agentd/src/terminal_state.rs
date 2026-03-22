@@ -21,11 +21,7 @@ impl GhosttyTerminalState {
             ghostty_terminal_new(
                 ptr::null(),
                 &mut terminal,
-                GhosttyTerminalOptions {
-                    cols,
-                    rows,
-                    max_scrollback,
-                },
+                GhosttyTerminalOptions { cols, rows, max_scrollback },
             )
         };
         ensure_success(result, "ghostty_terminal_new")?;
@@ -67,10 +63,7 @@ impl GhosttyTerminalState {
             return Err(err);
         }
 
-        Ok(Self {
-            terminal,
-            formatter,
-        })
+        Ok(Self { terminal, formatter })
     }
 }
 

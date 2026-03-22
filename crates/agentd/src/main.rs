@@ -99,10 +99,7 @@ async fn upgrade_daemon() -> Result<()> {
     }
 
     if !unsupported.is_empty() {
-        bail!(
-            "cannot upgrade with non-resumable running sessions: {}",
-            unsupported.join(", ")
-        );
+        bail!("cannot upgrade with non-resumable running sessions: {}", unsupported.join(", "));
     }
 
     for (session, launch, resume_session_id) in &resolved {
@@ -133,10 +130,7 @@ async fn upgrade_daemon() -> Result<()> {
     daemonize_self()?;
     wait_for_new_daemon(&paths).await?;
 
-    println!(
-        "✓ Upgraded daemon and resumed {} session(s)",
-        resolved.len()
-    );
+    println!("✓ Upgraded daemon and resumed {} session(s)", resolved.len());
     Ok(())
 }
 
@@ -152,27 +146,15 @@ fn resolve_launch_for_upgrade(
     let configured = config.agents.get(&session.agent);
     let command = match launch.command {
         Some(command) => command,
-        None => configured
-            .map(|agent| agent.command.clone())
-            .ok_or_else(|| {
-                anyhow!(
-                    "agent `{}` is not configured in {}",
-                    session.agent,
-                    paths.config
-                )
-            })?,
+        None => configured.map(|agent| agent.command.clone()).ok_or_else(|| {
+            anyhow!("agent `{}` is not configured in {}", session.agent, paths.config)
+        })?,
     };
     let args = match launch.args {
         Some(args) => args,
-        None => configured
-            .map(|agent| agent.args.clone())
-            .unwrap_or_default(),
+        None => configured.map(|agent| agent.args.clone()).unwrap_or_default(),
     };
-    Ok(LaunchCommand {
-        agent_name: session.agent.clone(),
-        command,
-        args,
-    })
+    Ok(LaunchCommand { agent_name: session.agent.clone(), command, args })
 }
 
 fn resolve_resume_session_id_for_upgrade(
@@ -276,10 +258,7 @@ async fn terminate_process_if_running(name: &str, pid: Option<u32>) -> Result<()
 async fn wait_for_new_daemon(paths: &AppPaths) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if tokio::net::UnixStream::connect(paths.socket.as_std_path())
-            .await
-            .is_ok()
-        {
+        if tokio::net::UnixStream::connect(paths.socket.as_std_path()).await.is_ok() {
             return Ok(());
         }
         if Instant::now() >= deadline {

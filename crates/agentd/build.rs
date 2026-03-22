@@ -16,22 +16,10 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", lock_path.display());
 
-    println!(
-        "cargo:rerun-if-changed={}",
-        ghostty_dir.join("include").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        ghostty_dir.join("src").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        ghostty_dir.join("build.zig").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        ghostty_dir.join("build.zig.zon").display()
-    );
+    println!("cargo:rerun-if-changed={}", ghostty_dir.join("include").display());
+    println!("cargo:rerun-if-changed={}", ghostty_dir.join("src").display());
+    println!("cargo:rerun-if-changed={}", ghostty_dir.join("build.zig").display());
+    println!("cargo:rerun-if-changed={}", ghostty_dir.join("build.zig.zon").display());
 
     if !ghostty_dir.join(".git").exists() {
         panic!(
@@ -107,8 +95,5 @@ fn git_stdout(repo_dir: &Path, args: &[&str]) -> String {
         );
     }
 
-    String::from_utf8(output.stdout)
-        .expect("git output should be valid UTF-8")
-        .trim()
-        .to_string()
+    String::from_utf8(output.stdout).expect("git output should be valid UTF-8").trim().to_string()
 }

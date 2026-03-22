@@ -38,10 +38,7 @@ impl PendingUserInputRequest {
             return None;
         }
         Some(Self {
-            turn_id: raw
-                .get("turn_id")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            turn_id: raw.get("turn_id").and_then(Value::as_str).map(str::to_string),
             questions,
         })
     }
@@ -78,19 +75,11 @@ impl UserInputQuestion {
             .get("options")
             .and_then(Value::as_array)
             .map(|items| {
-                items
-                    .iter()
-                    .filter_map(UserInputOption::from_codex_value)
-                    .collect::<Vec<_>>()
+                items.iter().filter_map(UserInputOption::from_codex_value).collect::<Vec<_>>()
             })
             .unwrap_or_default();
 
-        Some(Self {
-            id,
-            header,
-            question: question.to_string(),
-            options,
-        })
+        Some(Self { id, header, question: question.to_string(), options })
     }
 }
 
@@ -109,10 +98,7 @@ impl UserInputOption {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
-            is_other: value
-                .get("is_other")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            is_other: value.get("is_other").and_then(Value::as_bool).unwrap_or(false),
         })
     }
 }

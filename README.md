@@ -139,6 +139,12 @@ Then build:
 cargo build
 ```
 
+For local development, run the debug binaries directly without reinstalling:
+
+```sh
+make dev-run ARGS="sessions"
+```
+
 ## Install
 
 ```sh

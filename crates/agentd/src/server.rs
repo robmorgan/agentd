@@ -106,36 +106,25 @@ async fn handle_connection(
                 let _ = shutdown_tx.send(true);
             }
         }
-        IncomingRequest::Standard(Request::CreateSession {
-            workspace,
-            title,
-            agent,
-            model,
-        }) => match state.create_session(workspace, title, agent, model).await {
-            Ok(session) => send_response(&mut writer, &Response::CreateSession { session }).await?,
-            Err(err) => {
-                send_response(
-                    &mut writer,
-                    &Response::Error {
-                        message: err.to_string(),
-                    },
-                )
-                .await?
+        IncomingRequest::Standard(Request::CreateSession { workspace, title, agent, model }) => {
+            match state.create_session(workspace, title, agent, model).await {
+                Ok(session) => {
+                    send_response(&mut writer, &Response::CreateSession { session }).await?
+                }
+                Err(err) => {
+                    send_response(&mut writer, &Response::Error { message: err.to_string() })
+                        .await?
+                }
             }
-        },
+        }
         IncomingRequest::Standard(Request::CreateWorktree { session_id }) => {
             match state.create_worktree(&session_id).await {
                 Ok(worktree) => {
                     send_response(&mut writer, &Response::Worktree { worktree }).await?
                 }
                 Err(err) => {
-                    send_response(
-                        &mut writer,
-                        &Response::Error {
-                            message: err.to_string(),
-                        },
-                    )
-                    .await?
+                    send_response(&mut writer, &Response::Error { message: err.to_string() })
+                        .await?
                 }
             }
         }
@@ -145,36 +134,20 @@ async fn handle_connection(
                     send_response(&mut writer, &Response::Worktree { worktree }).await?
                 }
                 Err(err) => {
-                    send_response(
-                        &mut writer,
-                        &Response::Error {
-                            message: err.to_string(),
-                        },
-                    )
-                    .await?
+                    send_response(&mut writer, &Response::Error { message: err.to_string() })
+                        .await?
                 }
             }
         }
         IncomingRequest::Standard(Request::KillSession { session_id, remove }) => {
             match state.kill_session(&session_id, remove).await {
                 Ok((removed, was_running)) => {
-                    send_response(
-                        &mut writer,
-                        &Response::KillSession {
-                            removed,
-                            was_running,
-                        },
-                    )
-                    .await?
+                    send_response(&mut writer, &Response::KillSession { removed, was_running })
+                        .await?
                 }
                 Err(err) => {
-                    send_response(
-                        &mut writer,
-                        &Response::Error {
-                            message: err.to_string(),
-                        },
-                    )
-                    .await?
+                    send_response(&mut writer, &Response::Error { message: err.to_string() })
+                        .await?
                 }
             }
         }
@@ -185,31 +158,20 @@ async fn handle_connection(
             match state.detach_session(&session_id, all).await {
                 Ok(()) => send_response(&mut writer, &Response::Ok).await?,
                 Err(err) => {
-                    send_response(
-                        &mut writer,
-                        &Response::Error {
-                            message: err.to_string(),
-                        },
-                    )
-                    .await?
+                    send_response(&mut writer, &Response::Error { message: err.to_string() })
+                        .await?
                 }
             }
         }
-        IncomingRequest::Standard(Request::DetachAttachment {
-            session_id,
-            attach_id,
-        }) => match state.detach_attachment(&session_id, &attach_id).await {
-            Ok(()) => send_response(&mut writer, &Response::Ok).await?,
-            Err(err) => {
-                send_response(
-                    &mut writer,
-                    &Response::Error {
-                        message: err.to_string(),
-                    },
-                )
-                .await?
+        IncomingRequest::Standard(Request::DetachAttachment { session_id, attach_id }) => {
+            match state.detach_attachment(&session_id, &attach_id).await {
+                Ok(()) => send_response(&mut writer, &Response::Ok).await?,
+                Err(err) => {
+                    send_response(&mut writer, &Response::Error { message: err.to_string() })
+                        .await?
+                }
             }
-        },
+        }
         IncomingRequest::Standard(Request::AttachInput { .. }) => {
             send_response(
                 &mut writer,
@@ -228,22 +190,15 @@ async fn handle_connection(
             )
             .await?;
         }
-        IncomingRequest::Standard(Request::SendInput {
-            session_id,
-            data,
-            source_session_id,
-        }) => match state.send_input(&session_id, data, source_session_id).await {
-            Ok(()) => send_response(&mut writer, &Response::InputAccepted).await?,
-            Err(err) => {
-                send_response(
-                    &mut writer,
-                    &Response::Error {
-                        message: err.to_string(),
-                    },
-                )
-                .await?
+        IncomingRequest::Standard(Request::SendInput { session_id, data, source_session_id }) => {
+            match state.send_input(&session_id, data, source_session_id).await {
+                Ok(()) => send_response(&mut writer, &Response::InputAccepted).await?,
+                Err(err) => {
+                    send_response(&mut writer, &Response::Error { message: err.to_string() })
+                        .await?
+                }
             }
-        },
+        }
         IncomingRequest::Standard(Request::ReplyToSession { session_id, prompt }) => {
             let _ = (session_id, prompt);
             send_response(
@@ -260,13 +215,8 @@ async fn handle_connection(
             match state.apply_session(&session_id).await {
                 Ok(session) => send_response(&mut writer, &Response::Session { session }).await?,
                 Err(err) => {
-                    send_response(
-                        &mut writer,
-                        &Response::Error {
-                            message: err.to_string(),
-                        },
-                    )
-                    .await?
+                    send_response(&mut writer, &Response::Error { message: err.to_string() })
+                        .await?
                 }
             }
         }
@@ -274,13 +224,8 @@ async fn handle_connection(
             match state.discard_session(&session_id, force).await {
                 Ok(session) => send_response(&mut writer, &Response::Session { session }).await?,
                 Err(err) => {
-                    send_response(
-                        &mut writer,
-                        &Response::Error {
-                            message: err.to_string(),
-                        },
-                    )
-                    .await?
+                    send_response(&mut writer, &Response::Error { message: err.to_string() })
+                        .await?
                 }
             }
         }
@@ -301,13 +246,8 @@ async fn handle_connection(
             match state.diff_session(&session_id).await {
                 Ok(diff) => send_response(&mut writer, &Response::Diff { diff }).await?,
                 Err(err) => {
-                    send_response(
-                        &mut writer,
-                        &Response::Error {
-                            message: err.to_string(),
-                        },
-                    )
-                    .await?
+                    send_response(&mut writer, &Response::Error { message: err.to_string() })
+                        .await?
                 }
             }
         }
@@ -317,9 +257,7 @@ async fn handle_connection(
                 None => {
                     send_response(
                         &mut writer,
-                        &Response::Error {
-                            message: format!("session `{session_id}` not found"),
-                        },
+                        &Response::Error { message: format!("session `{session_id}` not found") },
                     )
                     .await?
                 }
@@ -335,13 +273,8 @@ async fn handle_connection(
                     send_response(&mut writer, &Response::Attachments { attachments }).await?
                 }
                 Err(err) => {
-                    send_response(
-                        &mut writer,
-                        &Response::Error {
-                            message: err.to_string(),
-                        },
-                    )
-                    .await?
+                    send_response(&mut writer, &Response::Error { message: err.to_string() })
+                        .await?
                 }
             }
         }
@@ -358,13 +291,7 @@ async fn handle_connection(
         }
         IncomingRequest::Standard(Request::StreamLogs { session_id, follow }) => {
             if let Err(err) = stream_logs(&state, &session_id, follow, &mut writer).await {
-                send_response(
-                    &mut writer,
-                    &Response::Error {
-                        message: err.to_string(),
-                    },
-                )
-                .await?;
+                send_response(&mut writer, &Response::Error { message: err.to_string() }).await?;
             } else {
                 send_response(&mut writer, &Response::EndOfStream).await?;
             }
@@ -446,23 +373,15 @@ async fn attach_session(
             Err(err) => {
                 let response = match ended_session_response(state, session_id).await? {
                     Some(response) => response,
-                    None => Response::Error {
-                        message: err.to_string(),
-                    },
+                    None => Response::Error { message: err.to_string() },
                 };
                 send_response(writer, &response).await?;
                 return Ok(());
             }
         };
 
-    send_response(
-        writer,
-        &Response::Attached {
-            attach_id: attachment.attach_id,
-            snapshot,
-        },
-    )
-    .await?;
+    send_response(writer, &Response::Attached { attach_id: attachment.attach_id, snapshot })
+        .await?;
     let mut final_response = Some(Response::EndOfStream);
 
     loop {
@@ -595,10 +514,8 @@ async fn stream_logs(
         }
 
         let session = state.get_session(session_id).await?;
-        let is_running = matches!(
-            session.as_ref().map(|item| item.status),
-            Some(SessionStatus::Running)
-        );
+        let is_running =
+            matches!(session.as_ref().map(|item| item.status), Some(SessionStatus::Running));
         if !follow || !is_running {
             let (remainder, _) = read_from_offset(&log_path, position)?;
             if !remainder.is_empty() {

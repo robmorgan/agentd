@@ -46,17 +46,9 @@ pub enum DaemonManagementRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DaemonManagementResponse {
-    Status {
-        status: DaemonManagementStatus,
-    },
-    Shutdown {
-        stopped: bool,
-        running_sessions: bool,
-        message: String,
-    },
-    Error {
-        message: String,
-    },
+    Status { status: DaemonManagementStatus },
+    Shutdown { stopped: bool, running_sessions: bool, message: String },
+    Error { message: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,83 +61,27 @@ pub enum IncomingRequest {
 pub enum Request {
     GetDaemonInfo,
     ShutdownDaemon,
-    CreateSession {
-        workspace: String,
-        title: Option<String>,
-        agent: String,
-        model: Option<String>,
-    },
-    CreateWorktree {
-        session_id: String,
-    },
-    CleanupWorktree {
-        session_id: String,
-    },
-    KillSession {
-        session_id: String,
-        remove: bool,
-    },
-    AttachSession {
-        session_id: String,
-        kind: AttachmentKind,
-    },
-    AttachResize {
-        cols: u16,
-        rows: u16,
-    },
-    DetachSession {
-        session_id: String,
-        all: bool,
-    },
-    DetachAttachment {
-        session_id: String,
-        attach_id: String,
-    },
-    AttachInput {
-        data: Vec<u8>,
-    },
-    SendInput {
-        session_id: String,
-        data: Vec<u8>,
-        source_session_id: Option<String>,
-    },
-    ReplyToSession {
-        session_id: String,
-        prompt: String,
-    },
-    ApplySession {
-        session_id: String,
-    },
-    DiscardSession {
-        session_id: String,
-        force: bool,
-    },
-    SwitchAttachedSession {
-        source_session_id: String,
-        target_session_id: String,
-    },
-    DiffSession {
-        session_id: String,
-    },
-    GetSession {
-        session_id: String,
-    },
+    CreateSession { workspace: String, title: Option<String>, agent: String, model: Option<String> },
+    CreateWorktree { session_id: String },
+    CleanupWorktree { session_id: String },
+    KillSession { session_id: String, remove: bool },
+    AttachSession { session_id: String, kind: AttachmentKind },
+    AttachResize { cols: u16, rows: u16 },
+    DetachSession { session_id: String, all: bool },
+    DetachAttachment { session_id: String, attach_id: String },
+    AttachInput { data: Vec<u8> },
+    SendInput { session_id: String, data: Vec<u8>, source_session_id: Option<String> },
+    ReplyToSession { session_id: String, prompt: String },
+    ApplySession { session_id: String },
+    DiscardSession { session_id: String, force: bool },
+    SwitchAttachedSession { source_session_id: String, target_session_id: String },
+    DiffSession { session_id: String },
+    GetSession { session_id: String },
     ListSessions,
-    ListAttachments {
-        session_id: String,
-    },
-    AppendSessionEvents {
-        session_id: String,
-        events: Vec<NewSessionEvent>,
-    },
-    StreamLogs {
-        session_id: String,
-        follow: bool,
-    },
-    StreamEvents {
-        session_id: String,
-        follow: bool,
-    },
+    ListAttachments { session_id: String },
+    AppendSessionEvents { session_id: String, events: Vec<NewSessionEvent> },
+    StreamLogs { session_id: String, follow: bool },
+    StreamEvents { session_id: String, follow: bool },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -358,9 +294,7 @@ where
         header.version
     );
     let kind = MessageKind::from_u16(header.kind)?;
-    Ok(Some(IncomingRequest::Standard(decode_request(
-        kind, &payload,
-    )?)))
+    Ok(Some(IncomingRequest::Standard(decode_request(kind, &payload)?)))
 }
 
 pub async fn write_daemon_management_request<W>(
@@ -406,11 +340,7 @@ async fn write_frame<W>(writer: &mut W, version: u16, kind: u16, payload: &[u8])
 where
     W: AsyncWrite + Unpin,
 {
-    ensure!(
-        payload.len() <= u32::MAX as usize,
-        "payload too large: {} bytes",
-        payload.len()
-    );
+    ensure!(payload.len() <= u32::MAX as usize, "payload too large: {} bytes", payload.len());
 
     let mut header = [0_u8; FRAME_HEADER_LEN];
     header[0..4].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
@@ -484,12 +414,7 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
     let kind = match request {
         Request::GetDaemonInfo => MessageKind::GetDaemonInfoRequest,
         Request::ShutdownDaemon => MessageKind::ShutdownDaemonRequest,
-        Request::CreateSession {
-            workspace,
-            title,
-            agent,
-            model,
-        } => {
+        Request::CreateSession { workspace, title, agent, model } => {
             put_string(&mut payload, workspace)?;
             put_optional_string(&mut payload, title.as_deref())?;
             put_string(&mut payload, agent)?;
@@ -524,10 +449,7 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             put_bool(&mut payload, *all);
             MessageKind::DetachSessionRequest
         }
-        Request::DetachAttachment {
-            session_id,
-            attach_id,
-        } => {
+        Request::DetachAttachment { session_id, attach_id } => {
             put_string(&mut payload, session_id)?;
             put_string(&mut payload, attach_id)?;
             MessageKind::DetachAttachmentRequest
@@ -536,11 +458,7 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             put_bytes(&mut payload, data)?;
             MessageKind::AttachInputRequest
         }
-        Request::SendInput {
-            session_id,
-            data,
-            source_session_id,
-        } => {
+        Request::SendInput { session_id, data, source_session_id } => {
             put_string(&mut payload, session_id)?;
             put_bytes(&mut payload, data)?;
             put_optional_string(&mut payload, source_session_id.as_deref())?;
@@ -560,10 +478,7 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             put_bool(&mut payload, *force);
             MessageKind::DiscardSessionRequest
         }
-        Request::SwitchAttachedSession {
-            source_session_id,
-            target_session_id,
-        } => {
+        Request::SwitchAttachedSession { source_session_id, target_session_id } => {
             put_string(&mut payload, source_session_id)?;
             put_string(&mut payload, target_session_id)?;
             MessageKind::SwitchAttachedSessionRequest
@@ -614,35 +529,30 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
             agent: cursor.take_string()?,
             model: cursor.take_optional_string()?,
         },
-        MessageKind::CreateWorktreeRequest => Request::CreateWorktree {
-            session_id: cursor.take_string()?,
-        },
-        MessageKind::CleanupWorktreeRequest => Request::CleanupWorktree {
-            session_id: cursor.take_string()?,
-        },
-        MessageKind::KillSessionRequest => Request::KillSession {
-            session_id: cursor.take_string()?,
-            remove: cursor.take_bool()?,
-        },
+        MessageKind::CreateWorktreeRequest => {
+            Request::CreateWorktree { session_id: cursor.take_string()? }
+        }
+        MessageKind::CleanupWorktreeRequest => {
+            Request::CleanupWorktree { session_id: cursor.take_string()? }
+        }
+        MessageKind::KillSessionRequest => {
+            Request::KillSession { session_id: cursor.take_string()?, remove: cursor.take_bool()? }
+        }
         MessageKind::AttachSessionRequest => Request::AttachSession {
             session_id: cursor.take_string()?,
             kind: cursor.take_attachment_kind()?,
         },
-        MessageKind::AttachResizeRequest => Request::AttachResize {
-            cols: cursor.take_u16()?,
-            rows: cursor.take_u16()?,
-        },
-        MessageKind::DetachSessionRequest => Request::DetachSession {
-            session_id: cursor.take_string()?,
-            all: cursor.take_bool()?,
-        },
+        MessageKind::AttachResizeRequest => {
+            Request::AttachResize { cols: cursor.take_u16()?, rows: cursor.take_u16()? }
+        }
+        MessageKind::DetachSessionRequest => {
+            Request::DetachSession { session_id: cursor.take_string()?, all: cursor.take_bool()? }
+        }
         MessageKind::DetachAttachmentRequest => Request::DetachAttachment {
             session_id: cursor.take_string()?,
             attach_id: cursor.take_string()?,
         },
-        MessageKind::AttachInputRequest => Request::AttachInput {
-            data: cursor.take_bytes()?,
-        },
+        MessageKind::AttachInputRequest => Request::AttachInput { data: cursor.take_bytes()? },
         MessageKind::SendInputRequest => Request::SendInput {
             session_id: cursor.take_string()?,
             data: cursor.take_bytes()?,
@@ -652,9 +562,9 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
             session_id: cursor.take_string()?,
             prompt: cursor.take_string()?,
         },
-        MessageKind::ApplySessionRequest => Request::ApplySession {
-            session_id: cursor.take_string()?,
-        },
+        MessageKind::ApplySessionRequest => {
+            Request::ApplySession { session_id: cursor.take_string()? }
+        }
         MessageKind::DiscardSessionRequest => Request::DiscardSession {
             session_id: cursor.take_string()?,
             force: cursor.take_bool()?,
@@ -663,16 +573,14 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
             source_session_id: cursor.take_string()?,
             target_session_id: cursor.take_string()?,
         },
-        MessageKind::DiffSessionRequest => Request::DiffSession {
-            session_id: cursor.take_string()?,
-        },
-        MessageKind::GetSessionRequest => Request::GetSession {
-            session_id: cursor.take_string()?,
-        },
+        MessageKind::DiffSessionRequest => {
+            Request::DiffSession { session_id: cursor.take_string()? }
+        }
+        MessageKind::GetSessionRequest => Request::GetSession { session_id: cursor.take_string()? },
         MessageKind::ListSessionsRequest => Request::ListSessions,
-        MessageKind::ListAttachmentsRequest => Request::ListAttachments {
-            session_id: cursor.take_string()?,
-        },
+        MessageKind::ListAttachmentsRequest => {
+            Request::ListAttachments { session_id: cursor.take_string()? }
+        }
         MessageKind::AppendSessionEventsRequest => {
             let session_id = cursor.take_string()?;
             let len = cursor.take_len()?;
@@ -682,14 +590,12 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
             }
             Request::AppendSessionEvents { session_id, events }
         }
-        MessageKind::StreamLogsRequest => Request::StreamLogs {
-            session_id: cursor.take_string()?,
-            follow: cursor.take_bool()?,
-        },
-        MessageKind::StreamEventsRequest => Request::StreamEvents {
-            session_id: cursor.take_string()?,
-            follow: cursor.take_bool()?,
-        },
+        MessageKind::StreamLogsRequest => {
+            Request::StreamLogs { session_id: cursor.take_string()?, follow: cursor.take_bool()? }
+        }
+        MessageKind::StreamEventsRequest => {
+            Request::StreamEvents { session_id: cursor.take_string()?, follow: cursor.take_bool()? }
+        }
         other => bail!("unexpected response message kind `{other:?}` while decoding request"),
     };
     cursor.finish()?;
@@ -707,18 +613,12 @@ fn encode_response(response: &Response) -> Result<(MessageKind, Vec<u8>)> {
             put_create_session_result(&mut payload, session)?;
             MessageKind::CreateSessionResponse
         }
-        Response::KillSession {
-            removed,
-            was_running,
-        } => {
+        Response::KillSession { removed, was_running } => {
             put_bool(&mut payload, *removed);
             put_bool(&mut payload, *was_running);
             MessageKind::KillSessionResponse
         }
-        Response::Attached {
-            attach_id,
-            snapshot,
-        } => {
+        Response::Attached { attach_id, snapshot } => {
             put_string(&mut payload, attach_id)?;
             put_bytes(&mut payload, snapshot)?;
             MessageKind::AttachedResponse
@@ -797,20 +697,18 @@ fn encode_response(response: &Response) -> Result<(MessageKind, Vec<u8>)> {
 fn decode_response(kind: MessageKind, payload: &[u8]) -> Result<Response> {
     let mut cursor = Cursor::new(payload);
     let response = match kind {
-        MessageKind::DaemonInfoResponse => Response::DaemonInfo {
-            info: cursor.take_daemon_info()?,
-        },
-        MessageKind::CreateSessionResponse => Response::CreateSession {
-            session: cursor.take_create_session_result()?,
-        },
-        MessageKind::KillSessionResponse => Response::KillSession {
-            removed: cursor.take_bool()?,
-            was_running: cursor.take_bool()?,
-        },
-        MessageKind::AttachedResponse => Response::Attached {
-            attach_id: cursor.take_string()?,
-            snapshot: cursor.take_bytes()?,
-        },
+        MessageKind::DaemonInfoResponse => {
+            Response::DaemonInfo { info: cursor.take_daemon_info()? }
+        }
+        MessageKind::CreateSessionResponse => {
+            Response::CreateSession { session: cursor.take_create_session_result()? }
+        }
+        MessageKind::KillSessionResponse => {
+            Response::KillSession { removed: cursor.take_bool()?, was_running: cursor.take_bool()? }
+        }
+        MessageKind::AttachedResponse => {
+            Response::Attached { attach_id: cursor.take_string()?, snapshot: cursor.take_bytes()? }
+        }
         MessageKind::SessionEndedResponse => Response::SessionEnded {
             session_id: cursor.take_string()?,
             status: cursor.take_session_status()?,
@@ -821,15 +719,13 @@ fn decode_response(kind: MessageKind, payload: &[u8]) -> Result<Response> {
             error: cursor.take_optional_string()?,
         },
         MessageKind::InputAcceptedResponse => Response::InputAccepted,
-        MessageKind::WorktreeResponse => Response::Worktree {
-            worktree: cursor.take_worktree_record()?,
-        },
-        MessageKind::DiffResponse => Response::Diff {
-            diff: cursor.take_session_diff()?,
-        },
-        MessageKind::SessionResponse => Response::Session {
-            session: cursor.take_session_record()?,
-        },
+        MessageKind::WorktreeResponse => {
+            Response::Worktree { worktree: cursor.take_worktree_record()? }
+        }
+        MessageKind::DiffResponse => Response::Diff { diff: cursor.take_session_diff()? },
+        MessageKind::SessionResponse => {
+            Response::Session { session: cursor.take_session_record()? }
+        }
         MessageKind::SessionsResponse => {
             let len = cursor.take_len()?;
             let mut sessions = Vec::with_capacity(len);
@@ -846,22 +742,14 @@ fn decode_response(kind: MessageKind, payload: &[u8]) -> Result<Response> {
             }
             Response::Attachments { attachments }
         }
-        MessageKind::EventResponse => Response::Event {
-            event: cursor.take_session_event()?,
-        },
-        MessageKind::LogChunkResponse => Response::LogChunk {
-            data: cursor.take_string()?,
-        },
-        MessageKind::PtyOutputResponse => Response::PtyOutput {
-            data: cursor.take_bytes()?,
-        },
-        MessageKind::SwitchSessionResponse => Response::SwitchSession {
-            session_id: cursor.take_string()?,
-        },
+        MessageKind::EventResponse => Response::Event { event: cursor.take_session_event()? },
+        MessageKind::LogChunkResponse => Response::LogChunk { data: cursor.take_string()? },
+        MessageKind::PtyOutputResponse => Response::PtyOutput { data: cursor.take_bytes()? },
+        MessageKind::SwitchSessionResponse => {
+            Response::SwitchSession { session_id: cursor.take_string()? }
+        }
         MessageKind::EndOfStreamResponse => Response::EndOfStream,
-        MessageKind::ErrorResponse => Response::Error {
-            message: cursor.take_string()?,
-        },
+        MessageKind::ErrorResponse => Response::Error { message: cursor.take_string()? },
         MessageKind::OkResponse => Response::Ok,
         other => bail!("unexpected request message kind `{other:?}` while decoding response"),
     };
@@ -893,9 +781,7 @@ fn decode_daemon_management_request(kind: u16, payload: &[u8]) -> Result<DaemonM
             }
 
             let payload: ShutdownPayload = serde_json::from_slice(payload)?;
-            Ok(DaemonManagementRequest::Shutdown {
-                force: payload.force,
-            })
+            Ok(DaemonManagementRequest::Shutdown { force: payload.force })
         }
         other => bail!("unknown daemon management request kind `{other}`"),
     }
@@ -908,11 +794,7 @@ fn encode_daemon_management_response(
         DaemonManagementResponse::Status { status } => {
             (DAEMON_STATUS_RESPONSE_KIND, serde_json::to_vec(status)?)
         }
-        DaemonManagementResponse::Shutdown {
-            stopped,
-            running_sessions,
-            message,
-        } => (
+        DaemonManagementResponse::Shutdown { stopped, running_sessions, message } => (
             DAEMON_SHUTDOWN_RESPONSE_KIND,
             serde_json::to_vec(&serde_json::json!({
                 "stopped": stopped,
@@ -933,9 +815,9 @@ fn decode_daemon_management_response(
     payload: &[u8],
 ) -> Result<DaemonManagementResponse> {
     match kind {
-        DAEMON_STATUS_RESPONSE_KIND => Ok(DaemonManagementResponse::Status {
-            status: serde_json::from_slice(payload)?,
-        }),
+        DAEMON_STATUS_RESPONSE_KIND => {
+            Ok(DaemonManagementResponse::Status { status: serde_json::from_slice(payload)? })
+        }
         DAEMON_SHUTDOWN_RESPONSE_KIND => {
             #[derive(Deserialize)]
             struct ShutdownPayload {
@@ -958,9 +840,7 @@ fn decode_daemon_management_response(
             }
 
             let payload: ErrorPayload = serde_json::from_slice(payload)?;
-            Ok(DaemonManagementResponse::Error {
-                message: payload.message,
-            })
+            Ok(DaemonManagementResponse::Error { message: payload.message })
         }
         other => bail!("unknown daemon management response kind `{other}`"),
     }
@@ -1181,17 +1061,11 @@ struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     fn new(payload: &'a [u8]) -> Self {
-        Self {
-            payload,
-            position: 0,
-        }
+        Self { payload, position: 0 }
     }
 
     fn finish(&self) -> Result<()> {
-        ensure!(
-            self.position == self.payload.len(),
-            "unexpected trailing payload bytes"
-        );
+        ensure!(self.position == self.payload.len(), "unexpected trailing payload bytes");
         Ok(())
     }
 
@@ -1214,27 +1088,15 @@ impl<'a> Cursor<'a> {
     }
 
     fn take_optional_string(&mut self) -> Result<Option<String>> {
-        Ok(if self.take_bool()? {
-            Some(self.take_string()?)
-        } else {
-            None
-        })
+        Ok(if self.take_bool()? { Some(self.take_string()?) } else { None })
     }
 
     fn take_optional_u32(&mut self) -> Result<Option<u32>> {
-        Ok(if self.take_bool()? {
-            Some(self.take_u32()?)
-        } else {
-            None
-        })
+        Ok(if self.take_bool()? { Some(self.take_u32()?) } else { None })
     }
 
     fn take_optional_i32(&mut self) -> Result<Option<i32>> {
-        Ok(if self.take_bool()? {
-            Some(self.take_i32()?)
-        } else {
-            None
-        })
+        Ok(if self.take_bool()? { Some(self.take_i32()?) } else { None })
     }
 
     fn take_len(&mut self) -> Result<usize> {
@@ -1302,17 +1164,11 @@ impl<'a> Cursor<'a> {
     fn take_datetime(&mut self) -> Result<DateTime<Utc>> {
         let seconds = self.take_i64()?;
         let nanos = self.take_u32()?;
-        Utc.timestamp_opt(seconds, nanos)
-            .single()
-            .ok_or_else(|| anyhow!("invalid UTC timestamp"))
+        Utc.timestamp_opt(seconds, nanos).single().ok_or_else(|| anyhow!("invalid UTC timestamp"))
     }
 
     fn take_optional_datetime(&mut self) -> Result<Option<DateTime<Utc>>> {
-        Ok(if self.take_bool()? {
-            Some(self.take_datetime()?)
-        } else {
-            None
-        })
+        Ok(if self.take_bool()? { Some(self.take_datetime()?) } else { None })
     }
 
     fn take_json_value(&mut self) -> Result<serde_json::Value> {
@@ -1320,10 +1176,7 @@ impl<'a> Cursor<'a> {
     }
 
     fn take_daemon_info(&mut self) -> Result<DaemonInfo> {
-        Ok(DaemonInfo {
-            daemon_version: self.take_string()?,
-            protocol_version: self.take_u16()?,
-        })
+        Ok(DaemonInfo { daemon_version: self.take_string()?, protocol_version: self.take_u16()? })
     }
 
     fn take_create_session_result(&mut self) -> Result<CreateSessionResult> {
@@ -1434,10 +1287,8 @@ impl<'a> Cursor<'a> {
     }
 
     fn take_exact(&mut self, len: usize) -> Result<&'a [u8]> {
-        let end = self
-            .position
-            .checked_add(len)
-            .ok_or_else(|| anyhow!("payload length overflow"))?;
+        let end =
+            self.position.checked_add(len).ok_or_else(|| anyhow!("payload length overflow"))?;
         ensure!(end <= self.payload.len(), "truncated payload");
         let bytes = &self.payload[self.position..end];
         self.position = end;
@@ -1478,10 +1329,7 @@ mod tests {
 
     #[test]
     fn attach_resize_round_trips() {
-        let request = Request::AttachResize {
-            cols: 120,
-            rows: 48,
-        };
+        let request = Request::AttachResize { cols: 120, rows: 48 };
         let (kind, payload) = encode_request(&request).unwrap();
         let decoded = decode_request(kind, &payload).unwrap();
         assert_eq!(decoded, request);
@@ -1511,10 +1359,7 @@ mod tests {
 
     #[test]
     fn detach_session_round_trips() {
-        let request = Request::DetachSession {
-            session_id: "demo".to_string(),
-            all: true,
-        };
+        let request = Request::DetachSession { session_id: "demo".to_string(), all: true };
         let (kind, payload) = encode_request(&request).unwrap();
         let decoded = decode_request(kind, &payload).unwrap();
         assert_eq!(decoded, request);
@@ -1522,10 +1367,8 @@ mod tests {
 
     #[test]
     fn attach_session_round_trips_kind() {
-        let request = Request::AttachSession {
-            session_id: "demo".to_string(),
-            kind: AttachmentKind::Tui,
-        };
+        let request =
+            Request::AttachSession { session_id: "demo".to_string(), kind: AttachmentKind::Tui };
         let (kind, payload) = encode_request(&request).unwrap();
         let decoded = decode_request(kind, &payload).unwrap();
         assert_eq!(decoded, request);
@@ -1544,9 +1387,7 @@ mod tests {
 
     #[test]
     fn list_attachments_round_trips() {
-        let request = Request::ListAttachments {
-            session_id: "demo".to_string(),
-        };
+        let request = Request::ListAttachments { session_id: "demo".to_string() };
         let (kind, payload) = encode_request(&request).unwrap();
         let decoded = decode_request(kind, &payload).unwrap();
         assert_eq!(decoded, request);
@@ -1554,9 +1395,7 @@ mod tests {
 
     #[test]
     fn apply_session_round_trips() {
-        let request = Request::ApplySession {
-            session_id: "demo".to_string(),
-        };
+        let request = Request::ApplySession { session_id: "demo".to_string() };
         let (kind, payload) = encode_request(&request).unwrap();
         let decoded = decode_request(kind, &payload).unwrap();
         assert_eq!(decoded, request);
@@ -1564,10 +1403,7 @@ mod tests {
 
     #[test]
     fn discard_session_round_trips() {
-        let request = Request::DiscardSession {
-            session_id: "demo".to_string(),
-            force: true,
-        };
+        let request = Request::DiscardSession { session_id: "demo".to_string(), force: true };
         let (kind, payload) = encode_request(&request).unwrap();
         let decoded = decode_request(kind, &payload).unwrap();
         assert_eq!(decoded, request);
@@ -1575,10 +1411,8 @@ mod tests {
 
     #[test]
     fn response_round_trips_snapshot_bytes() {
-        let response = Response::Attached {
-            attach_id: "attach-1".to_string(),
-            snapshot: vec![0, 1, 2, 3, 4],
-        };
+        let response =
+            Response::Attached { attach_id: "attach-1".to_string(), snapshot: vec![0, 1, 2, 3, 4] };
         let (kind, payload) = encode_response(&response).unwrap();
         let decoded = decode_response(kind, &payload).unwrap();
         assert_eq!(decoded, response);
@@ -1586,9 +1420,7 @@ mod tests {
 
     #[test]
     fn switch_session_response_round_trips() {
-        let response = Response::SwitchSession {
-            session_id: "target".to_string(),
-        };
+        let response = Response::SwitchSession { session_id: "target".to_string() };
         let (kind, payload) = encode_response(&response).unwrap();
         let decoded = decode_response(kind, &payload).unwrap();
         assert_eq!(decoded, response);
@@ -1696,9 +1528,7 @@ mod tests {
     async fn daemon_management_status_round_trips() {
         let (mut writer, mut reader) = tokio::io::duplex(1024);
         let request = DaemonManagementRequest::Shutdown { force: true };
-        write_daemon_management_request(&mut writer, &request)
-            .await
-            .unwrap();
+        write_daemon_management_request(&mut writer, &request).await.unwrap();
         drop(writer);
 
         let incoming = read_incoming_request(&mut reader).await.unwrap().unwrap();
@@ -1718,43 +1548,26 @@ mod tests {
                 running_sessions: false,
             },
         };
-        write_daemon_management_response(&mut writer, &response)
-            .await
-            .unwrap();
+        write_daemon_management_response(&mut writer, &response).await.unwrap();
         drop(writer);
 
-        let decoded = super::read_daemon_management_response(&mut reader)
-            .await
-            .unwrap()
-            .unwrap();
+        let decoded = super::read_daemon_management_response(&mut reader).await.unwrap().unwrap();
         assert_eq!(decoded, response);
     }
 
     #[tokio::test]
     async fn incoming_request_accepts_daemon_management_version() {
         let (mut writer, mut reader) = tokio::io::duplex(1024);
-        writer
-            .write_all(&super::FRAME_MAGIC.to_le_bytes())
-            .await
-            .unwrap();
-        writer
-            .write_all(&DAEMON_MANAGEMENT_VERSION.to_le_bytes())
-            .await
-            .unwrap();
-        writer
-            .write_all(&super::DAEMON_STATUS_REQUEST_KIND.to_le_bytes())
-            .await
-            .unwrap();
+        writer.write_all(&super::FRAME_MAGIC.to_le_bytes()).await.unwrap();
+        writer.write_all(&DAEMON_MANAGEMENT_VERSION.to_le_bytes()).await.unwrap();
+        writer.write_all(&super::DAEMON_STATUS_REQUEST_KIND.to_le_bytes()).await.unwrap();
         writer.write_all(&0_u16.to_le_bytes()).await.unwrap();
         writer.write_all(&0_u16.to_le_bytes()).await.unwrap();
         writer.write_all(&0_u32.to_le_bytes()).await.unwrap();
         drop(writer);
 
         let incoming = read_incoming_request(&mut reader).await.unwrap().unwrap();
-        assert_eq!(
-            incoming,
-            IncomingRequest::DaemonManagement(DaemonManagementRequest::Status)
-        );
+        assert_eq!(incoming, IncomingRequest::DaemonManagement(DaemonManagementRequest::Status));
     }
 
     #[test]

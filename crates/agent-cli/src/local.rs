@@ -30,9 +30,7 @@ pub struct LocalStore {
 
 impl LocalStore {
     pub fn open(paths: &AppPaths) -> Result<Self> {
-        let store = Self {
-            path: paths.database.to_string(),
-        };
+        let store = Self { path: paths.database.to_string() };
         store.init()?;
         Ok(store)
     }
@@ -46,8 +44,7 @@ impl LocalStore {
              FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
@@ -78,8 +75,7 @@ impl LocalStore {
              ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![session_id, after_id], row_to_event)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
     pub fn mark_exited(&self, session_id: &str, exit_code: Option<i32>) -> Result<()> {
@@ -89,12 +85,7 @@ impl LocalStore {
             "UPDATE sessions
              SET status = ?2, exit_code = ?3, updated_at = ?4, exited_at = ?4
              WHERE session_id = ?1",
-            params![
-                session_id,
-                status_to_str(SessionStatus::Exited),
-                exit_code,
-                now
-            ],
+            params![session_id, status_to_str(SessionStatus::Exited), exit_code, now],
         )?;
         Ok(())
     }
@@ -106,29 +97,16 @@ impl LocalStore {
             "UPDATE sessions
              SET status = ?2, updated_at = ?3
              WHERE session_id = ?1",
-            params![
-                session_id,
-                status_to_str(SessionStatus::UnknownRecovered),
-                now
-            ],
+            params![session_id, status_to_str(SessionStatus::UnknownRecovered), now],
         )?;
         Ok(())
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
         let conn = self.connect()?;
-        conn.execute(
-            "DELETE FROM events WHERE session_id = ?1",
-            params![session_id],
-        )?;
-        let _ = conn.execute(
-            "DELETE FROM threads WHERE session_id = ?1",
-            params![session_id],
-        );
-        conn.execute(
-            "DELETE FROM sessions WHERE session_id = ?1",
-            params![session_id],
-        )?;
+        conn.execute("DELETE FROM events WHERE session_id = ?1", params![session_id])?;
+        let _ = conn.execute("DELETE FROM threads WHERE session_id = ?1", params![session_id]);
+        conn.execute("DELETE FROM sessions WHERE session_id = ?1", params![session_id])?;
         Ok(())
     }
 
@@ -187,33 +165,17 @@ impl LocalStore {
             CREATE INDEX IF NOT EXISTS idx_events_session_id_id
                 ON events (session_id, id);",
         )?;
-        ensure_column(
-            &conn,
-            "thread_id",
-            "ALTER TABLE sessions ADD COLUMN thread_id TEXT",
-        )?;
+        ensure_column(&conn, "thread_id", "ALTER TABLE sessions ADD COLUMN thread_id TEXT")?;
         ensure_column(&conn, "model", "ALTER TABLE sessions ADD COLUMN model TEXT")?;
         ensure_column(
             &conn,
             "mode",
             "ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'execute'",
         )?;
-        ensure_column(
-            &conn,
-            "repo_path",
-            "ALTER TABLE sessions ADD COLUMN repo_path TEXT",
-        )?;
-        ensure_column(
-            &conn,
-            "repo_name",
-            "ALTER TABLE sessions ADD COLUMN repo_name TEXT",
-        )?;
+        ensure_column(&conn, "repo_path", "ALTER TABLE sessions ADD COLUMN repo_path TEXT")?;
+        ensure_column(&conn, "repo_name", "ALTER TABLE sessions ADD COLUMN repo_name TEXT")?;
         ensure_column(&conn, "title", "ALTER TABLE sessions ADD COLUMN title TEXT")?;
-        ensure_column(
-            &conn,
-            "base_branch",
-            "ALTER TABLE sessions ADD COLUMN base_branch TEXT",
-        )?;
+        ensure_column(&conn, "base_branch", "ALTER TABLE sessions ADD COLUMN base_branch TEXT")?;
         ensure_column(
             &conn,
             "integration_state",
@@ -334,11 +296,7 @@ pub fn remove_session_artifacts(paths: &AppPaths, session: &SessionRecord) -> Re
 
 pub fn print_log_file(paths: &AppPaths, session_id: &str, follow: bool) -> Result<()> {
     let rendered = paths.rendered_log_path(session_id);
-    let path = if rendered.exists() {
-        rendered
-    } else {
-        paths.log_path(session_id)
-    };
+    let path = if rendered.exists() { rendered } else { paths.log_path(session_id) };
     let mut file =
         File::open(path.as_std_path()).with_context(|| format!("failed to open {}", path))?;
     let mut buffer = Vec::new();
@@ -436,10 +394,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         attention_summary: row.get(21)?,
         created_at: parse_time(row.get::<_, String>(22)?)?,
         updated_at: parse_time(row.get::<_, String>(23)?)?,
-        exited_at: row
-            .get::<_, Option<String>>(24)?
-            .map(parse_time)
-            .transpose()?,
+        exited_at: row.get::<_, Option<String>>(24)?.map(parse_time).transpose()?,
     })
 }
 
@@ -454,11 +409,9 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
 }
 
 fn parse_time(value: String) -> rusqlite::Result<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(&value)
-        .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
-        })
+    DateTime::parse_from_rfc3339(&value).map(|dt| dt.with_timezone(&Utc)).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
 }
 
 fn parse_payload(value: String) -> rusqlite::Result<Value> {
@@ -548,9 +501,8 @@ fn send_signal(pid: Pid, signal: Signal, session_id: &str) -> Result<()> {
     match kill(pid, Some(signal)) {
         Ok(()) => Ok(()),
         Err(Errno::ESRCH) => bail!("session `{session_id}` is not running"),
-        Err(err) => Err(anyhow!(err)).context(format!(
-            "failed to send {signal:?} to session `{session_id}`"
-        )),
+        Err(err) => Err(anyhow!(err))
+            .context(format!("failed to send {signal:?} to session `{session_id}`")),
     }
 }
 
@@ -581,10 +533,7 @@ fn remove_worktree_if_present(session: &SessionRecord) -> Result<()> {
         .output()
         .with_context(|| format!("failed to remove worktree {}", session.worktree))?;
     if !output.status.success() {
-        bail!(
-            "failed to remove worktree: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        bail!("failed to remove worktree: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
 
     let prune = Command::new("git")
@@ -594,20 +543,16 @@ fn remove_worktree_if_present(session: &SessionRecord) -> Result<()> {
         .output()
         .with_context(|| format!("failed to prune worktrees for {}", session.repo_path))?;
     if !prune.status.success() {
-        bail!(
-            "failed to prune worktrees: {}",
-            String::from_utf8_lossy(&prune.stderr).trim()
-        );
+        bail!("failed to prune worktrees: {}", String::from_utf8_lossy(&prune.stderr).trim());
     }
 
     Ok(())
 }
 
 fn remove_log_if_present(paths: &AppPaths, session: &SessionRecord) -> Result<()> {
-    for log_path in [
-        paths.log_path(&session.session_id),
-        paths.rendered_log_path(&session.session_id),
-    ] {
+    for log_path in
+        [paths.log_path(&session.session_id), paths.rendered_log_path(&session.session_id)]
+    {
         match fs::remove_file(log_path.as_std_path()) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -625,10 +570,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_paths() -> AppPaths {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let root = camino::Utf8PathBuf::from(format!("/tmp/agent-local-test-{suffix}"));
         AppPaths {
             socket: root.join("agentd.sock"),

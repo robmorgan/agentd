@@ -96,10 +96,7 @@ mod tests {
     #[test]
     fn require_agent_error_mentions_resolved_config_path() {
         let paths = test_paths();
-        let err = Config::default()
-            .require_agent(&paths, "missing")
-            .unwrap_err()
-            .to_string();
+        let err = Config::default().require_agent(&paths, "missing").unwrap_err().to_string();
         assert!(err.contains(paths.config.as_str()));
     }
 }

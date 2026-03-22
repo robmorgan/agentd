@@ -68,10 +68,7 @@ pub fn create_worktree(
             .with_context(|| format!("failed to recreate worktree {}", worktree))?;
 
         if !output.status.success() {
-            bail!(
-                "failed to create worktree: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            bail!("failed to create worktree: {}", String::from_utf8_lossy(&output.stderr).trim());
         }
         return Ok(());
     }
@@ -79,21 +76,12 @@ pub fn create_worktree(
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root.as_str())
-        .args([
-            "worktree",
-            "add",
-            "--detach",
-            worktree.as_str(),
-            base_branch,
-        ])
+        .args(["worktree", "add", "--detach", worktree.as_str(), base_branch])
         .output()
         .with_context(|| format!("failed to create worktree {}", worktree))?;
 
     if !output.status.success() {
-        bail!(
-            "failed to create worktree: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        bail!("failed to create worktree: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
 
     let checkout = Command::new("git")
@@ -121,10 +109,7 @@ pub fn remove_worktree(repo_root: &Utf8Path, worktree: &Utf8Path) -> Result<()> 
         .with_context(|| format!("failed to remove worktree {}", worktree))?;
 
     if !output.status.success() {
-        bail!(
-            "failed to remove worktree: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        bail!("failed to remove worktree: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
 
     let prune = Command::new("git")
@@ -134,10 +119,7 @@ pub fn remove_worktree(repo_root: &Utf8Path, worktree: &Utf8Path) -> Result<()> 
         .output()
         .with_context(|| format!("failed to prune worktrees for {}", repo_root))?;
     if !prune.status.success() {
-        bail!(
-            "failed to prune worktrees: {}",
-            String::from_utf8_lossy(&prune.stderr).trim()
-        );
+        bail!("failed to prune worktrees: {}", String::from_utf8_lossy(&prune.stderr).trim());
     }
 
     Ok(())
@@ -145,10 +127,7 @@ pub fn remove_worktree(repo_root: &Utf8Path, worktree: &Utf8Path) -> Result<()> 
 
 pub fn diff_against_base(worktree: &Utf8Path, base_branch: &str) -> Result<String> {
     let status = run_git(worktree, &["status", "--short"])?;
-    let committed = run_git(
-        worktree,
-        &["diff", "--stat", &format!("{base_branch}...HEAD")],
-    )?;
+    let committed = run_git(worktree, &["diff", "--stat", &format!("{base_branch}...HEAD")])?;
     let patch = run_git(worktree, &["diff", &format!("{base_branch}...HEAD")])?;
     let working_tree = run_git(worktree, &["diff"])?;
 
@@ -198,18 +177,11 @@ pub fn diff_against_base(worktree: &Utf8Path, base_branch: &str) -> Result<Strin
 }
 
 pub fn has_worktree_changes(worktree: &Utf8Path) -> Result<bool> {
-    Ok(!run_git(worktree, &["status", "--porcelain"])?
-        .trim()
-        .is_empty())
+    Ok(!run_git(worktree, &["status", "--porcelain"])?.trim().is_empty())
 }
 
 pub fn has_committed_diff_against_base(worktree: &Utf8Path, base_branch: &str) -> Result<bool> {
-    Ok(!run_git(
-        worktree,
-        &["diff", "--stat", &format!("{base_branch}...HEAD")],
-    )?
-    .trim()
-    .is_empty())
+    Ok(!run_git(worktree, &["diff", "--stat", &format!("{base_branch}...HEAD")])?.trim().is_empty())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,11 +218,7 @@ pub fn preview_merge(
         .with_context(|| format!("failed to preview merge for {branch}"))?;
     let conflict =
         !merge.status.success() && is_merge_conflict_output(&merge.stdout, &merge.stderr);
-    let has_changes = if merge.status.success() {
-        has_worktree_changes(&temp)?
-    } else {
-        false
-    };
+    let has_changes = if merge.status.success() { has_worktree_changes(&temp)? } else { false };
 
     cleanup_preflight_worktree(repo_root, &temp)?;
 
@@ -258,16 +226,9 @@ pub fn preview_merge(
         return Ok(MergePreview::Conflicted);
     }
     if !merge.status.success() {
-        bail!(
-            "failed to preview merge: {}",
-            merge_error_message(&merge.stdout, &merge.stderr)
-        );
+        bail!("failed to preview merge: {}", merge_error_message(&merge.stdout, &merge.stderr));
     }
-    if has_changes {
-        Ok(MergePreview::HasChanges)
-    } else {
-        Ok(MergePreview::NoChanges)
-    }
+    if has_changes { Ok(MergePreview::HasChanges) } else { Ok(MergePreview::NoChanges) }
 }
 
 pub fn apply_merge(repo_root: &Utf8Path, branch: &str) -> Result<()> {
@@ -279,11 +240,7 @@ pub fn apply_merge(repo_root: &Utf8Path, branch: &str) -> Result<()> {
         .with_context(|| format!("failed to merge {branch}"))?;
     if !merge.status.success() {
         let _ = abort_merge(repo_root);
-        bail!(
-            "failed to merge {}: {}",
-            branch,
-            merge_error_message(&merge.stdout, &merge.stderr)
-        );
+        bail!("failed to merge {}: {}", branch, merge_error_message(&merge.stdout, &merge.stderr));
     }
     Ok(())
 }
@@ -302,10 +259,7 @@ fn run_git(worktree: &Utf8Path, args: &[&str]) -> Result<String> {
 }
 
 fn temporary_apply_worktree_path() -> Utf8PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
+    let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
     let temp_dir =
         std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
     Utf8PathBuf::from_path_buf(temp_dir.join(format!("agentd-apply-{suffix}")))
@@ -318,11 +272,8 @@ fn cleanup_preflight_worktree(repo_root: &Utf8Path, worktree: &Utf8Path) -> Resu
 }
 
 fn abort_merge(worktree: &Utf8Path) -> Result<()> {
-    let _ = Command::new("git")
-        .arg("-C")
-        .arg(worktree.as_str())
-        .args(["merge", "--abort"])
-        .output();
+    let _ =
+        Command::new("git").arg("-C").arg(worktree.as_str()).args(["merge", "--abort"]).output();
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree.as_str())
@@ -330,20 +281,14 @@ fn abort_merge(worktree: &Utf8Path) -> Result<()> {
         .output()
         .with_context(|| format!("failed to reset worktree {}", worktree))?;
     if !output.status.success() {
-        bail!(
-            "failed to reset worktree: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        bail!("failed to reset worktree: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
     Ok(())
 }
 
 fn is_merge_conflict_output(stdout: &[u8], stderr: &[u8]) -> bool {
-    let output = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(stdout),
-        String::from_utf8_lossy(stderr)
-    );
+    let output =
+        format!("{}\n{}", String::from_utf8_lossy(stdout), String::from_utf8_lossy(stderr));
     output.contains("CONFLICT") || output.contains("Automatic merge failed")
 }
 

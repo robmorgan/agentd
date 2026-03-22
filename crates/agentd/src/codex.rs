@@ -92,10 +92,7 @@ mod tests {
     };
 
     fn temp_root(label: &str) -> PathBuf {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         PathBuf::from(format!("/tmp/agentd-codex-{label}-{suffix}"))
     }
 
@@ -115,13 +112,8 @@ mod tests {
         fs::write(codex_root.join("state_5.sqlite"), "").unwrap();
         fs::write(codex_root.join("state_3.sqlite"), "").unwrap();
 
-        let path = discover_state_database_path_from_home(&root)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            path.file_name().and_then(|value| value.to_str()),
-            Some("state_5.sqlite")
-        );
+        let path = discover_state_database_path_from_home(&root).unwrap().unwrap();
+        assert_eq!(path.file_name().and_then(|value| value.to_str()), Some("state_5.sqlite"));
     }
 
     #[test]

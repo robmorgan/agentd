@@ -54,9 +54,7 @@ pub struct ThreadRecord {
 
 impl Database {
     pub fn open(paths: &AppPaths) -> Result<Self> {
-        let db = Self {
-            path: paths.database.to_string(),
-        };
+        let db = Self { path: paths.database.to_string() };
         db.init()?;
         Ok(db)
     }
@@ -133,27 +131,15 @@ impl Database {
                 ON plans (session_id, version DESC);
             ",
         )?;
-        self.ensure_column(
-            &conn,
-            "thread_id",
-            "ALTER TABLE sessions ADD COLUMN thread_id TEXT",
-        )?;
+        self.ensure_column(&conn, "thread_id", "ALTER TABLE sessions ADD COLUMN thread_id TEXT")?;
         self.ensure_column(&conn, "model", "ALTER TABLE sessions ADD COLUMN model TEXT")?;
         self.ensure_column(
             &conn,
             "mode",
             "ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'execute'",
         )?;
-        self.ensure_column(
-            &conn,
-            "repo_path",
-            "ALTER TABLE sessions ADD COLUMN repo_path TEXT",
-        )?;
-        self.ensure_column(
-            &conn,
-            "repo_name",
-            "ALTER TABLE sessions ADD COLUMN repo_name TEXT",
-        )?;
+        self.ensure_column(&conn, "repo_path", "ALTER TABLE sessions ADD COLUMN repo_path TEXT")?;
+        self.ensure_column(&conn, "repo_name", "ALTER TABLE sessions ADD COLUMN repo_name TEXT")?;
         self.ensure_column(&conn, "title", "ALTER TABLE sessions ADD COLUMN title TEXT")?;
         self.ensure_column(
             &conn,
@@ -509,8 +495,7 @@ impl Database {
              FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
     pub fn set_launch_info(&self, session_id: &str, command: &str, args_json: &str) -> Result<()> {
@@ -582,22 +567,10 @@ impl Database {
 
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
         let conn = self.connect()?;
-        conn.execute(
-            "DELETE FROM events WHERE session_id = ?1",
-            params![session_id],
-        )?;
-        conn.execute(
-            "DELETE FROM threads WHERE session_id = ?1",
-            params![session_id],
-        )?;
-        conn.execute(
-            "DELETE FROM plans WHERE session_id = ?1",
-            params![session_id],
-        )?;
-        conn.execute(
-            "DELETE FROM sessions WHERE session_id = ?1",
-            params![session_id],
-        )?;
+        conn.execute("DELETE FROM events WHERE session_id = ?1", params![session_id])?;
+        conn.execute("DELETE FROM threads WHERE session_id = ?1", params![session_id])?;
+        conn.execute("DELETE FROM plans WHERE session_id = ?1", params![session_id])?;
+        conn.execute("DELETE FROM sessions WHERE session_id = ?1", params![session_id])?;
         Ok(())
     }
 
@@ -621,12 +594,7 @@ impl Database {
             tx.execute(
                 "INSERT INTO events (session_id, timestamp, type, payload_json)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    session_id,
-                    timestamp.to_rfc3339(),
-                    event.event_type,
-                    payload_json,
-                ],
+                params![session_id, timestamp.to_rfc3339(), event.event_type, payload_json,],
             )?;
             inserted.push(SessionEvent {
                 id: tx.last_insert_rowid(),
@@ -694,10 +662,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         attention_summary: row.get(21)?,
         created_at: parse_time(row.get::<_, String>(22)?)?,
         updated_at: parse_time(row.get::<_, String>(23)?)?,
-        exited_at: row
-            .get::<_, Option<String>>(24)?
-            .map(parse_time)
-            .transpose()?,
+        exited_at: row.get::<_, Option<String>>(24)?.map(parse_time).transpose()?,
     })
 }
 
@@ -715,11 +680,9 @@ fn row_to_thread(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRecord> {
 }
 
 fn parse_time(value: String) -> rusqlite::Result<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(&value)
-        .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
-        })
+    DateTime::parse_from_rfc3339(&value).map(|dt| dt.with_timezone(&Utc)).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
 }
 
 fn parse_agent_args_json(value: Option<String>) -> rusqlite::Result<Option<Vec<String>>> {
@@ -846,10 +809,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_paths() -> AppPaths {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let root = camino::Utf8PathBuf::from(format!("/tmp/agentd-db-test-{suffix}"));
         AppPaths {
             socket: root.join("agentd.sock"),
@@ -964,9 +924,6 @@ mod tests {
 
         assert!(db.get_resume_session_id("demo").unwrap().is_none());
         db.set_resume_session_id("demo", "thread-123").unwrap();
-        assert_eq!(
-            db.get_resume_session_id("demo").unwrap().as_deref(),
-            Some("thread-123")
-        );
+        assert_eq!(db.get_resume_session_id("demo").unwrap().as_deref(), Some("thread-123"));
     }
 }
