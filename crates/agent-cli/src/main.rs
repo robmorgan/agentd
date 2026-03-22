@@ -1523,7 +1523,9 @@ impl AttachRawInput {
                     }
                 }
             }) {
-                Ok(result) => return result.context("failed to read attach input"),
+                Ok(Ok(result)) => return Ok(result),
+                Ok(Err(err)) if err.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Ok(Err(err)) => return Err(err).context("failed to read attach input"),
                 Err(_) => continue,
             }
         }
@@ -1708,9 +1710,30 @@ impl StatusString for SessionRecord {
 }
 
 fn write_attach_bytes(data: &[u8]) -> Result<()> {
-    let mut stdout = std::io::stdout();
-    stdout.write_all(data)?;
-    stdout.flush()?;
+    let stdout = std::io::stdout();
+    let fd = stdout.as_raw_fd();
+    let mut written = 0usize;
+    while written < data.len() {
+        let remaining = &data[written..];
+        let result = unsafe { libc::write(fd, remaining.as_ptr().cast(), remaining.len()) };
+        if result >= 0 {
+            written += result as usize;
+            continue;
+        }
+
+        let err = std::io::Error::last_os_error();
+        if matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ) {
+            std::thread::yield_now();
+            continue;
+        }
+
+        return Err(err.into());
+    }
+
+    stdout.lock().flush()?;
     Ok(())
 }
 

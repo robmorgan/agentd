@@ -42,11 +42,11 @@ fn main() {
 
     let status = Command::new("zig")
         .current_dir(&ghostty_dir)
-        .args(["build", "lib-vt"])
+        .args(["build", "-Demit-lib-vt"])
         .status()
         .expect("failed to execute `zig`; install Zig to build libghostty-vt");
     if !status.success() {
-        panic!("`zig build lib-vt` failed in {}", ghostty_dir.display());
+        panic!("`zig build -Demit-lib-vt` failed in {}", ghostty_dir.display());
     }
 
     let lib_dir = ghostty_dir.join("zig-out/lib");
