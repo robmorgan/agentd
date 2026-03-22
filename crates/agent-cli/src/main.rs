@@ -71,9 +71,6 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Focus {
-        session_id: Option<String>,
-    },
     #[command(hide = true)]
     Runtime {
         session_id: Option<String>,
@@ -191,34 +188,24 @@ async fn main() -> Result<()> {
     let paths = AppPaths::discover()?;
     paths.ensure_layout()?;
     ensure_config(&paths)?;
-    let command = cli.command.unwrap_or(Command::Focus { session_id: None });
-    let execution = resolve_execution_mode(&paths, &command).await?;
+    let execution = resolve_execution_mode(&paths, cli.command.as_ref()).await?;
 
-    match (command, execution) {
-        (Command::Focus { session_id }, ExecutionMode::Daemon) => {
-            if let Some(session_id) = session_id {
-                attach_session(&paths, &session_id).await?;
-            } else if let Some(session_id) = runtime::pick_session(&paths).await? {
+    match (cli.command, execution) {
+        (None, ExecutionMode::Daemon) => {
+            if let Some(session_id) = runtime::pick_session(&paths).await? {
                 attach_session(&paths, &session_id).await?;
             }
         }
-        (Command::Focus { .. }, ExecutionMode::Local(reason)) => {
-            bail!("{reason}. `agent focus` requires a compatible daemon");
+        (None, ExecutionMode::Local(reason)) => {
+            bail!("{reason}. `agent` requires a compatible daemon");
         }
-        (Command::Runtime { session_id }, ExecutionMode::Daemon) => {
+        (Some(Command::Runtime { session_id }), ExecutionMode::Daemon) => {
             tui::run_runtime_ui(&paths, session_id.as_deref()).await?;
         }
-        (Command::Runtime { .. }, ExecutionMode::Local(reason)) => {
+        (Some(Command::Runtime { .. }), ExecutionMode::Local(reason)) => {
             bail!("{reason}. `agent runtime` requires a compatible daemon");
         }
-        (
-            Command::New {
-                title,
-                workspace,
-                agent,
-            },
-            ExecutionMode::Daemon,
-        ) => {
+        (Some(Command::New { title, workspace, agent }), ExecutionMode::Daemon) => {
             let options = resolve_new_session_options(workspace, title, agent)?;
             let response = send_request(
                 &paths,
@@ -239,17 +226,10 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Command::New { .. }, ExecutionMode::Local(reason)) => {
+        (Some(Command::New { .. }), ExecutionMode::Local(reason)) => {
             bail_live_command(&reason)?;
         }
-        (
-            Command::Create {
-                workspace,
-                title,
-                agent,
-            },
-            ExecutionMode::Daemon,
-        ) => {
+        (Some(Command::Create { workspace, title, agent }), ExecutionMode::Daemon) => {
             let response = send_request(
                 &paths,
                 &Request::CreateSession {
@@ -272,59 +252,46 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Command::Create { .. }, ExecutionMode::Local(reason)) => {
+        (Some(Command::Create { .. }), ExecutionMode::Local(reason)) => {
             bail_live_command(&reason)?;
         }
-        (Command::Kill { rm, session_id }, ExecutionMode::Daemon) => {
+        (Some(Command::Kill { rm, session_id }), ExecutionMode::Daemon) => {
             let response = send_request(
                 &paths,
-                &Request::KillSession {
-                    session_id: session_id.clone(),
-                    remove: rm,
-                },
+                &Request::KillSession { session_id: session_id.clone(), remove: rm },
             )
             .await?;
 
             match response {
-                Response::KillSession {
-                    removed,
-                    was_running,
-                } => print_kill_result(&session_id, was_running, removed),
+                Response::KillSession { removed, was_running } => {
+                    print_kill_result(&session_id, was_running, removed)
+                }
                 Response::Error { message } => bail!(message),
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Command::Kill { rm, session_id }, ExecutionMode::Local(reason)) => {
+        (Some(Command::Kill { rm, session_id }), ExecutionMode::Local(reason)) => {
             print_degraded_notice(&reason);
             local_kill(&paths, &session_id, rm)?;
         }
-        (Command::Attach { session_id }, ExecutionMode::Daemon) => {
+        (Some(Command::Attach { session_id }), ExecutionMode::Daemon) => {
             attach_session(&paths, &session_id).await?;
         }
-        (Command::Attach { .. }, ExecutionMode::Local(reason)) => {
+        (Some(Command::Attach { .. }), ExecutionMode::Local(reason)) => {
             bail_live_command(&reason)?;
         }
-        (
-            Command::Detach {
-                session_id,
-                attach,
-                all,
-            },
-            ExecutionMode::Daemon,
-        ) => {
+        (Some(Command::Detach { session_id, attach, all }), ExecutionMode::Daemon) => {
             let session_id = resolve_detach_session_id(session_id)?;
             if all && attach.is_some() {
                 bail!("use either `--all` or `--attach <attach_id>`, not both");
             }
             let request = match (all, attach) {
-                (true, None) => Request::DetachSession {
-                    session_id: session_id.clone(),
-                    all: true,
-                },
-                (false, Some(attach_id)) => Request::DetachAttachment {
-                    session_id: session_id.clone(),
-                    attach_id,
-                },
+                (true, None) => {
+                    Request::DetachSession { session_id: session_id.clone(), all: true }
+                }
+                (false, Some(attach_id)) => {
+                    Request::DetachAttachment { session_id: session_id.clone(), attach_id }
+                }
                 (false, None) => bail!(
                     "shared attach requires either `--all` or `--attach <attach_id>`; use Ctrl-] to detach the local client"
                 ),
@@ -338,15 +305,11 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Command::Detach { .. }, ExecutionMode::Local(reason)) => {
+        (Some(Command::Detach { .. }), ExecutionMode::Local(reason)) => {
             bail_live_command(&reason)?;
         }
         (
-            Command::SendInput {
-                session_id,
-                source_session_id,
-                data,
-            },
+            Some(Command::SendInput { session_id, source_session_id, data }),
             ExecutionMode::Daemon,
         ) => {
             let response = send_request(
@@ -365,17 +328,17 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Command::SendInput { .. }, ExecutionMode::Local(reason)) => {
+        (Some(Command::SendInput { .. }), ExecutionMode::Local(reason)) => {
             bail_live_command(&reason)?;
         }
-        (Command::Reply { session_id, prompt }, ExecutionMode::Daemon) => {
+        (Some(Command::Reply { session_id, prompt }), ExecutionMode::Daemon) => {
             let session = reply_session(&paths, &session_id, &prompt.join(" ")).await?;
             print_session(&session);
         }
-        (Command::Reply { .. }, ExecutionMode::Local(reason)) => {
+        (Some(Command::Reply { .. }), ExecutionMode::Local(reason)) => {
             bail_live_command(&reason)?;
         }
-        (Command::Accept { session_id }, ExecutionMode::Daemon) => {
+        (Some(Command::Accept { session_id }), ExecutionMode::Daemon) => {
             let response = send_request(&paths, &Request::ApplySession { session_id }).await?;
             match response {
                 Response::Session { session } => print_session(&session),
@@ -383,10 +346,10 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Command::Accept { .. }, ExecutionMode::Local(reason)) => {
+        (Some(Command::Accept { .. }), ExecutionMode::Local(reason)) => {
             bail_daemon_command(&reason, "agent accept")?;
         }
-        (Command::Discard { session_id, force }, ExecutionMode::Daemon) => {
+        (Some(Command::Discard { session_id, force }), ExecutionMode::Daemon) => {
             let response =
                 send_request(&paths, &Request::DiscardSession { session_id, force }).await?;
             match response {
@@ -395,45 +358,42 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Command::Discard { .. }, ExecutionMode::Local(reason)) => {
+        (Some(Command::Discard { .. }), ExecutionMode::Local(reason)) => {
             bail_live_command(&reason)?;
         }
-        (Command::Logs { session_id, follow }, ExecutionMode::Daemon) => {
+        (Some(Command::Logs { session_id, follow }), ExecutionMode::Daemon) => {
             stream_logs(&paths, &session_id, follow).await?;
         }
-        (Command::Logs { session_id, follow }, ExecutionMode::Local(reason)) => {
+        (Some(Command::Logs { session_id, follow }), ExecutionMode::Local(reason)) => {
             print_degraded_notice(&reason);
             local_logs(&paths, &session_id, follow)?;
         }
-        (Command::Events { session_id, follow }, ExecutionMode::Daemon) => {
+        (Some(Command::Events { session_id, follow }), ExecutionMode::Daemon) => {
             stream_events(&paths, &session_id, follow).await?;
         }
-        (Command::Events { session_id, follow }, ExecutionMode::Local(reason)) => {
+        (Some(Command::Events { session_id, follow }), ExecutionMode::Local(reason)) => {
             print_degraded_notice(&reason);
             local_events(&paths, &session_id, follow).await?;
         }
-        (Command::List, ExecutionMode::Daemon) => {
+        (Some(Command::List), ExecutionMode::Daemon) => {
             let sessions = daemon_list_sessions(&paths).await?;
             print_sessions(&sessions);
         }
-        (Command::List, ExecutionMode::Local(reason)) => {
+        (Some(Command::List), ExecutionMode::Local(reason)) => {
             print_degraded_notice(&reason);
             let store = LocalStore::open(&paths)?;
-            let sessions = store
-                .list_sessions()?
-                .into_iter()
-                .map(normalize_session)
-                .collect::<Vec<_>>();
+            let sessions =
+                store.list_sessions()?.into_iter().map(normalize_session).collect::<Vec<_>>();
             print_sessions(&sessions);
         }
-        (Command::Attachments { session_id }, ExecutionMode::Daemon) => {
+        (Some(Command::Attachments { session_id }), ExecutionMode::Daemon) => {
             let attachments = daemon_list_attachments(&paths, &session_id).await?;
             print_attachments(&attachments);
         }
-        (Command::Attachments { .. }, ExecutionMode::Local(reason)) => {
+        (Some(Command::Attachments { .. }), ExecutionMode::Local(reason)) => {
             bail!("{reason}. `agent attachments` requires a compatible daemon");
         }
-        (Command::Diff { session_id }, ExecutionMode::Daemon) => {
+        (Some(Command::Diff { session_id }), ExecutionMode::Daemon) => {
             let response = send_request(&paths, &Request::DiffSession { session_id }).await?;
             match response {
                 Response::Diff { diff } => print_diff(&diff),
@@ -441,12 +401,12 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Command::Diff { .. }, ExecutionMode::Local(reason)) => {
+        (Some(Command::Diff { .. }), ExecutionMode::Local(reason)) => {
             bail!(
                 "{reason}. `agent diff` requires a compatible daemon; use `agent sessions` and `agent kill` to recover first"
             );
         }
-        (Command::Status { session_id }, ExecutionMode::Daemon) => {
+        (Some(Command::Status { session_id }), ExecutionMode::Daemon) => {
             let response = send_request(&paths, &Request::GetSession { session_id }).await?;
             match response {
                 Response::Session { session } => print_session(&session),
@@ -454,7 +414,7 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Command::Status { session_id }, ExecutionMode::Local(reason)) => {
+        (Some(Command::Status { session_id }), ExecutionMode::Local(reason)) => {
             print_degraded_notice(&reason);
             let store = LocalStore::open(&paths)?;
             let session = store
@@ -463,7 +423,7 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("session `{session_id}` not found"))?;
             print_session(&session);
         }
-        (Command::Worktree { command }, ExecutionMode::Daemon) => match command {
+        (Some(Command::Worktree { command }), ExecutionMode::Daemon) => match command {
             WorktreeCommand::Create { session_id } => {
                 let response =
                     send_request(&paths, &Request::CreateWorktree { session_id }).await?;
@@ -486,12 +446,12 @@ async fn main() -> Result<()> {
                 }
             }
         },
-        (Command::Worktree { .. }, ExecutionMode::Local(reason)) => {
+        (Some(Command::Worktree { .. }), ExecutionMode::Local(reason)) => {
             bail!(
                 "{reason}. worktree management requires a compatible daemon or a manual cleanup flow"
             );
         }
-        (Command::Daemon { command }, ExecutionMode::Daemon) => match command {
+        (Some(Command::Daemon { command }), ExecutionMode::Daemon) => match command {
             DaemonCommand::Info => {
                 let status = daemon_management_status(&paths).await?;
                 print_daemon_management_status(&status);
@@ -505,7 +465,7 @@ async fn main() -> Result<()> {
                 upgrade_daemon(&paths).await?;
             }
         },
-        (Command::Daemon { .. }, ExecutionMode::Local(reason)) => {
+        (Some(Command::Daemon { .. }), ExecutionMode::Local(reason)) => {
             bail!("{reason}. daemon management requires a reachable daemon");
         }
     }
@@ -524,17 +484,15 @@ struct NewSessionOptions {
     agent: String,
 }
 
-async fn resolve_execution_mode(paths: &AppPaths, command: &Command) -> Result<ExecutionMode> {
-    if matches!(
-        command,
-        Command::Daemon {
-            command: DaemonCommand::Upgrade
-        }
-    ) {
+async fn resolve_execution_mode(
+    paths: &AppPaths,
+    command: Option<&Command>,
+) -> Result<ExecutionMode> {
+    if matches!(command, Some(Command::Daemon { command: DaemonCommand::Upgrade })) {
         return Ok(ExecutionMode::Daemon);
     }
 
-    if matches!(command, Command::Daemon { .. }) {
+    if matches!(command, Some(Command::Daemon { .. })) {
         if try_connect(paths).await.is_err() {
             spawn_daemon(paths).await?;
         }
@@ -552,14 +510,16 @@ async fn resolve_execution_mode(paths: &AppPaths, command: &Command) -> Result<E
     Ok(ExecutionMode::Daemon)
 }
 
-fn command_supports_local_mode(command: &Command) -> bool {
+fn command_supports_local_mode(command: Option<&Command>) -> bool {
     matches!(
         command,
-        Command::Kill { .. }
-            | Command::Logs { .. }
-            | Command::Events { .. }
-            | Command::List
-            | Command::Status { .. }
+        Some(
+            Command::Kill { .. }
+                | Command::Logs { .. }
+                | Command::Events { .. }
+                | Command::List
+                | Command::Status { .. }
+        )
     )
 }
 
