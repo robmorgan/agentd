@@ -715,7 +715,7 @@ impl RuntimeApp {
             .clone()
             .unwrap_or_else(|| "review ready".to_string());
         self.detail_text = format!(
-            "session    {}\nrepo       {}\nbase       {}\nbranch     {}\nworktree   {}\nstatus     {}\nreview     {}\nconflicts  {}\n\nCLI actions\nagent diff {}\nagent accept {}\nagent discard {}\n\n`accept` will only apply when the repo checkout is clean and on `{}`. It lands a squash commit and refuses to touch the upstream checkout if preflight predicts conflicts.",
+            "session    {}\nrepo       {}\nbase       {}\nbranch     {}\nworktree   {}\nstatus     {}\nreview     {}\nconflicts  {}\n\nCLI actions\nagent diff {}\nagent accept {}\nagent discard {}\n\n`accept` will only apply when the repo checkout is clean and on `{}`. It performs a normal git merge and refuses to touch the upstream checkout if preflight predicts conflicts.",
             session.session_id,
             session.repo_name,
             session.base_branch,

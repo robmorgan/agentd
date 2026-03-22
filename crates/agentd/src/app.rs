@@ -468,41 +468,45 @@ impl AppState {
             }
 
             let repo_root = Utf8PathBuf::from(session.repo_path.clone());
-            if !git::has_branch_diff_against_base(
-                &repo_root,
-                &session.base_branch,
-                &session.branch,
-            )? {
-                db.set_integration_state(
-                    &session.session_id,
-                    IntegrationState::Applied,
-                    AttentionLevel::Info,
-                    "changes already present on base branch",
-                )?;
-                db.set_git_review_state(
-                    &session.session_id,
-                    GitSyncStatus::InSync,
-                    Some("changes already present on base branch"),
-                    false,
-                )?;
-            } else {
-                git::apply_squash_merge(
-                    &repo_root,
-                    &session.branch,
-                    &apply_commit_message(&session),
-                )?;
-                db.set_integration_state(
-                    &session.session_id,
-                    IntegrationState::Applied,
-                    AttentionLevel::Info,
-                    &format!("changes applied to {}", session.base_branch),
-                )?;
-                db.set_git_review_state(
-                    &session.session_id,
-                    GitSyncStatus::InSync,
-                    Some(&format!("changes applied to {}", session.base_branch)),
-                    false,
-                )?;
+            match git::preview_merge(&repo_root, &session.base_branch, &session.branch)? {
+                git::MergePreview::NoChanges => {
+                    db.set_integration_state(
+                        &session.session_id,
+                        IntegrationState::Applied,
+                        AttentionLevel::Info,
+                        "changes already present on base branch",
+                    )?;
+                    db.set_git_review_state(
+                        &session.session_id,
+                        GitSyncStatus::InSync,
+                        Some("changes already present on base branch"),
+                        false,
+                    )?;
+                }
+                git::MergePreview::HasChanges => {
+                    git::apply_merge(&repo_root, &session.branch)?;
+                    db.set_integration_state(
+                        &session.session_id,
+                        IntegrationState::Applied,
+                        AttentionLevel::Info,
+                        &format!("changes merged into {}", session.base_branch),
+                    )?;
+                    db.set_git_review_state(
+                        &session.session_id,
+                        GitSyncStatus::InSync,
+                        Some(&format!("changes merged into {}", session.base_branch)),
+                        false,
+                    )?;
+                }
+                git::MergePreview::Conflicted => {
+                    db.set_git_review_state(
+                        &session.session_id,
+                        GitSyncStatus::Conflicted,
+                        Some(&manual_accept_conflict_summary(&session)),
+                        true,
+                    )?;
+                    bail!(manual_accept_conflict_summary(&session));
+                }
             }
             db.append_events(
                 &session.session_id,
@@ -1579,55 +1583,37 @@ fn inspect_review_state(session: &SessionRecord) -> Result<ReviewState> {
         });
     }
 
-    if !git::has_branch_diff_against_base(&repo_root, &session.base_branch, &session.branch)? {
-        return Ok(ReviewState {
+    match git::preview_merge(&repo_root, &session.base_branch, &session.branch)? {
+        git::MergePreview::NoChanges => Ok(ReviewState {
             git_sync: GitSyncStatus::InSync,
             summary: "changes already present on base branch".to_string(),
             has_conflicts: false,
-        });
+        }),
+        git::MergePreview::HasChanges => Ok(ReviewState {
+            git_sync: GitSyncStatus::InSync,
+            summary: format!("review ready: merge into {}", session.base_branch),
+            has_conflicts: false,
+        }),
+        git::MergePreview::Conflicted => Ok(ReviewState {
+            git_sync: GitSyncStatus::Conflicted,
+            summary: manual_accept_conflict_summary(session),
+            has_conflicts: true,
+        }),
     }
-
-    Ok(ReviewState {
-        git_sync: GitSyncStatus::InSync,
-        summary: format!("review ready: squash into {}", session.base_branch),
-        has_conflicts: false,
-    })
 }
 
 fn review_state_for_accept(session: &SessionRecord) -> Result<ReviewState> {
-    let review = inspect_review_state(session)?;
-    if review.git_sync != GitSyncStatus::InSync {
-        return Ok(review);
-    }
-
-    let repo_root = Utf8PathBuf::from(session.repo_path.clone());
-    let merge_clean =
-        git::preflight_squash_merge(&repo_root, &session.base_branch, &session.branch)?;
-    if merge_clean {
-        return Ok(review);
-    }
-
-    Ok(ReviewState {
-        git_sync: GitSyncStatus::Conflicted,
-        summary: manual_accept_conflict_summary(session),
-        has_conflicts: true,
-    })
-}
-
-fn apply_commit_message(session: &SessionRecord) -> String {
-    format!("Apply session {}: {}", session.session_id, session.title)
+    inspect_review_state(session)
 }
 
 fn manual_accept_conflict_summary(session: &SessionRecord) -> String {
     format!(
-        "squash apply would conflict with {}\nrun:\n  git -C {} checkout {}\n  git -C {} merge --squash --no-commit {}\nthen resolve conflicts and commit:\n  git -C {} commit -m {}",
+        "merge would conflict with {}\nrun:\n  git -C {} checkout {}\n  git -C {} merge {}",
         session.base_branch,
         shell_quote(&session.repo_path),
         shell_quote(&session.base_branch),
         shell_quote(&session.repo_path),
         shell_quote(&session.branch),
-        shell_quote(&session.repo_path),
-        shell_quote(&apply_commit_message(session)),
     )
 }
 
@@ -1638,9 +1624,8 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachControl, SessionRuntime, SessionStartMode, apply_commit_message,
-        finalize_session_exit, inspect_review_state, manual_accept_conflict_summary,
-        review_state_for_accept, shell_quote,
+        AttachControl, SessionRuntime, SessionStartMode, finalize_session_exit,
+        inspect_review_state, manual_accept_conflict_summary, review_state_for_accept, shell_quote,
     };
     use crate::db::{Database, NewSession};
     use crate::terminal_state::TerminalStateEngine;
@@ -1864,16 +1849,7 @@ mod tests {
         assert!(review.has_conflicts);
         assert!(review.summary.contains("git -C"));
         assert!(review.summary.contains("checkout 'main'"));
-        assert!(
-            review
-                .summary
-                .contains("merge --squash --no-commit 'agent/demo'")
-        );
-        assert!(
-            review
-                .summary
-                .contains("commit -m 'Apply session demo: changed'")
-        );
+        assert!(review.summary.contains("merge 'agent/demo'"));
     }
 
     #[test]
@@ -1893,22 +1869,6 @@ mod tests {
         assert_eq!(review.git_sync, GitSyncStatus::NeedsSync);
         assert!(review.summary.contains("upstream checkout"));
         assert!(review.summary.contains("main"));
-    }
-
-    #[test]
-    fn apply_commit_message_uses_session_title() {
-        let paths = test_paths();
-        paths.ensure_layout().unwrap();
-        let db = Database::open(&paths).unwrap();
-        let repo = paths.root.join("repo");
-        init_git_repo(repo.as_str());
-
-        insert_session(&db, repo.as_str(), "demo", "changed");
-        let session = db.get_session("demo").unwrap().unwrap();
-        assert_eq!(
-            apply_commit_message(&session),
-            "Apply session demo: changed"
-        );
     }
 
     #[test]
@@ -1943,7 +1903,44 @@ mod tests {
 
         let summary = manual_accept_conflict_summary(&session);
         assert!(summary.contains("git -C '/tmp/repo path/it'\"'\"'s' checkout 'main'"));
-        assert!(summary.contains("commit -m 'Apply session demo: ship it'\"'\"'s'"));
+        assert!(summary.contains("git -C '/tmp/repo path/it'\"'\"'s' merge 'agent/demo'"));
+    }
+
+    #[test]
+    fn inspect_review_state_marks_noop_merge_as_already_present() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        let repo = paths.root.join("repo");
+        init_git_repo(repo.as_str());
+
+        insert_session(&db, repo.as_str(), "demo", "changed");
+        assert!(
+            Command::new("git")
+                .args(["-C", repo.as_str(), "checkout", "agent/demo"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        fs::write(repo.join("README.md"), "branch copy\n").unwrap();
+        commit_all(repo.as_str(), "session change");
+        assert!(
+            Command::new("git")
+                .args(["-C", repo.as_str(), "checkout", "main"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        fs::write(repo.join("README.md"), "branch copy\n").unwrap();
+        commit_all(repo.as_str(), "same change on main");
+
+        let session = db.get_session("demo").unwrap().unwrap();
+        let review = inspect_review_state(&session).unwrap();
+        assert_eq!(review.git_sync, GitSyncStatus::InSync);
+        assert_eq!(review.summary, "changes already present on base branch");
+        assert!(!review.has_conflicts);
     }
 
     #[test]

@@ -212,24 +212,18 @@ pub fn has_committed_diff_against_base(worktree: &Utf8Path, base_branch: &str) -
     .is_empty())
 }
 
-pub fn has_branch_diff_against_base(
-    repo_root: &Utf8Path,
-    base_branch: &str,
-    branch: &str,
-) -> Result<bool> {
-    Ok(!run_git(
-        repo_root,
-        &["diff", "--stat", &format!("{base_branch}...{branch}")],
-    )?
-    .trim()
-    .is_empty())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergePreview {
+    HasChanges,
+    NoChanges,
+    Conflicted,
 }
 
-pub fn preflight_squash_merge(
+pub fn preview_merge(
     repo_root: &Utf8Path,
     base_branch: &str,
     branch: &str,
-) -> Result<bool> {
+) -> Result<MergePreview> {
     let temp = temporary_apply_worktree_path();
     let add = Command::new("git")
         .arg("-C")
@@ -247,56 +241,50 @@ pub fn preflight_squash_merge(
     let merge = Command::new("git")
         .arg("-C")
         .arg(temp.as_str())
-        .args(["merge", "--squash", "--no-commit", branch])
+        .args(["merge", "--no-ff", "--no-commit", branch])
         .output()
-        .with_context(|| format!("failed to preflight squash merge for {branch}"))?;
+        .with_context(|| format!("failed to preview merge for {branch}"))?;
     let conflict =
         !merge.status.success() && is_merge_conflict_output(&merge.stdout, &merge.stderr);
+    let has_changes = if merge.status.success() {
+        has_worktree_changes(&temp)?
+    } else {
+        false
+    };
 
     cleanup_preflight_worktree(repo_root, &temp)?;
 
     if conflict {
-        return Ok(false);
+        return Ok(MergePreview::Conflicted);
     }
     if !merge.status.success() {
         bail!(
-            "failed to preflight squash merge: {}",
+            "failed to preview merge: {}",
             merge_error_message(&merge.stdout, &merge.stderr)
         );
     }
-    Ok(true)
+    if has_changes {
+        Ok(MergePreview::HasChanges)
+    } else {
+        Ok(MergePreview::NoChanges)
+    }
 }
 
-pub fn apply_squash_merge(repo_root: &Utf8Path, branch: &str, commit_message: &str) -> Result<()> {
+pub fn apply_merge(repo_root: &Utf8Path, branch: &str) -> Result<()> {
     let merge = Command::new("git")
         .arg("-C")
         .arg(repo_root.as_str())
-        .args(["merge", "--squash", "--no-commit", branch])
+        .args(["merge", branch])
         .output()
-        .with_context(|| format!("failed to squash merge {branch}"))?;
+        .with_context(|| format!("failed to merge {branch}"))?;
     if !merge.status.success() {
-        let _ = reset_worktree(repo_root);
+        let _ = abort_merge(repo_root);
         bail!(
-            "failed to squash merge {}: {}",
+            "failed to merge {}: {}",
             branch,
             merge_error_message(&merge.stdout, &merge.stderr)
         );
     }
-
-    let commit = Command::new("git")
-        .arg("-C")
-        .arg(repo_root.as_str())
-        .args(["commit", "-m", commit_message])
-        .output()
-        .with_context(|| format!("failed to commit squashed merge for {branch}"))?;
-    if !commit.status.success() {
-        let _ = reset_worktree(repo_root);
-        bail!(
-            "failed to commit squashed merge: {}",
-            merge_error_message(&commit.stdout, &commit.stderr)
-        );
-    }
-
     Ok(())
 }
 
@@ -318,25 +306,23 @@ fn temporary_apply_worktree_path() -> Utf8PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!("agentd-apply-{suffix}")))
+    let temp_dir =
+        std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+    Utf8PathBuf::from_path_buf(temp_dir.join(format!("agentd-apply-{suffix}")))
         .expect("temporary worktree path should be valid UTF-8")
 }
 
 fn cleanup_preflight_worktree(repo_root: &Utf8Path, worktree: &Utf8Path) -> Result<()> {
-    let _ = Command::new("git")
-        .arg("-C")
-        .arg(worktree.as_str())
-        .args(["reset", "--hard", "HEAD"])
-        .output();
+    let _ = abort_merge(worktree);
+    remove_worktree(repo_root, worktree)
+}
+
+fn abort_merge(worktree: &Utf8Path) -> Result<()> {
     let _ = Command::new("git")
         .arg("-C")
         .arg(worktree.as_str())
         .args(["merge", "--abort"])
         .output();
-    remove_worktree(repo_root, worktree)
-}
-
-fn reset_worktree(worktree: &Utf8Path) -> Result<()> {
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree.as_str())
