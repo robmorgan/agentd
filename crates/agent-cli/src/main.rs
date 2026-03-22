@@ -1009,14 +1009,16 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
         other => bail!("unexpected response: {:?}", other),
     };
 
-    eprintln!("attached to {session_id} ({attach_id}); detach with Ctrl-]");
+    eprintln!(
+        "attached to {session_id} ({attach_id}); detach with Ctrl-]; open overlay with Ctrl-\\"
+    );
     let _screen = AttachScreenGuard::enter()?;
     let _terminal = AttachTerminalGuard::enter()?;
     let raw_input = AttachRawInput::new()?;
     let mut resize_signal =
         signal(SignalKind::window_change()).context("failed to watch terminal resize")?;
     if let Ok((cols, rows)) = crossterm::terminal::size() {
-        write_request(&mut write_half, &Request::AttachResize { cols, rows }).await?;
+        send_attach_resize(&mut write_half, cols, rows).await?;
     }
     if let Ok(snapshot) = fetch_session_snapshot(paths, session_id).await {
         write_session_snapshot(&snapshot)?;
@@ -1042,27 +1044,13 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
                             drop(write_half);
                             return Ok(AttachOutcome::Detached);
                         }
-                        AttachInputAction::Leader(action) => {
+                        AttachInputAction::OpenOverlay => {
                             let mut active_overlay =
                                 runtime::AttachOverlay::new(paths.clone(), session_id.to_string());
-                            if let Some(outcome) = active_overlay.open_leader_action(action).await? {
-                                match outcome {
-                                    runtime::OverlayOutcome::Close => {
-                                        write_attach_bytes(AGENTD_ATTACH_CLEAR_SEQUENCE)?;
-                                        if let Ok(snapshot) = fetch_session_snapshot(paths, session_id).await {
-                                            write_attach_bytes(&snapshot)?;
-                                        }
-                                    }
-                                    runtime::OverlayOutcome::SwitchSession(next_session_id) => {
-                                        drop(write_half);
-                                        return Ok(AttachOutcome::SwitchSession(next_session_id));
-                                    }
-                                }
-                            } else {
-                                active_overlay.draw()?;
-                                overlay_events = Some(EventStream::new());
-                                overlay = Some(active_overlay);
-                            }
+                            active_overlay.open().await?;
+                            active_overlay.draw()?;
+                            overlay_events = Some(EventStream::new());
+                            overlay = Some(active_overlay);
                         }
                     }
                 }
@@ -1072,7 +1060,7 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
                     break;
                 }
                 if let Ok((cols, rows)) = crossterm::terminal::size() {
-                    write_request(&mut write_half, &Request::AttachResize { cols, rows }).await?;
+                    send_attach_resize(&mut write_half, cols, rows).await?;
                     if let Some(overlay) = overlay.as_ref() {
                         overlay.draw()?;
                     }
@@ -1099,6 +1087,16 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
                             if let Ok(snapshot) = fetch_session_snapshot(paths, session_id).await {
                                 write_attach_bytes(&snapshot)?;
                             }
+                            continue;
+                        }
+                        runtime::OverlayOutcome::ForwardInput(data) => {
+                            overlay_events = None;
+                            overlay = None;
+                            write_attach_bytes(AGENTD_ATTACH_CLEAR_SEQUENCE)?;
+                            if let Ok(snapshot) = fetch_session_snapshot(paths, session_id).await {
+                                write_attach_bytes(&snapshot)?;
+                            }
+                            write_request(&mut write_half, &Request::AttachInput { data }).await?;
                             continue;
                         }
                         runtime::OverlayOutcome::SwitchSession(next_session_id) => {
@@ -1155,6 +1153,14 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
 
     drop(write_half);
     Ok(AttachOutcome::Detached)
+}
+
+async fn send_attach_resize(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    cols: u16,
+    rows: u16,
+) -> Result<()> {
+    write_request(write_half, &Request::AttachResize { cols, rows }).await
 }
 
 async fn next_overlay_event(stream: Option<&mut EventStream>) -> Result<Option<Event>> {
@@ -1406,46 +1412,58 @@ fn control_char_byte(ch: char) -> Option<u8> {
 }
 
 const ATTACH_DETACH_BYTE: u8 = 0x1d;
-const ATTACH_LEADER_BYTE: u8 = 0x02;
+const ATTACH_LEADER_BYTE: u8 = 0x1c;
+const ATTACH_ALT_LEADER_BYTE: u8 = 0x1e;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AttachInputAction {
     Data(Vec<u8>),
     Detach,
-    Leader(runtime::AttachLeaderAction),
+    OpenOverlay,
 }
 
 #[derive(Default)]
 struct AttachInputParser {
-    leader_pending: bool,
+    pending_escape: Vec<u8>,
 }
 
 impl AttachInputParser {
     fn push_bytes(&mut self, bytes: &[u8]) -> Vec<AttachInputAction> {
         let mut actions = Vec::new();
         let mut forwarded = Vec::new();
+        let mut input = std::mem::take(&mut self.pending_escape);
+        input.extend_from_slice(bytes);
+        let mut index = 0;
 
-        for &byte in bytes {
-            if self.leader_pending {
-                self.leader_pending = false;
-                if let Some(action) = attach_leader_action(byte) {
-                    flush_attach_bytes(&mut actions, &mut forwarded);
-                    actions.push(action);
+        while index < input.len() {
+            if input[index] == 0x1b {
+                match parse_attach_csi_u_action(&input[index..]) {
+                    Some(AttachCsiUParse::Action(action, consumed)) => {
+                        flush_attach_bytes(&mut actions, &mut forwarded);
+                        actions.push(action);
+                        index += consumed;
+                        continue;
+                    }
+                    Some(AttachCsiUParse::Incomplete) => {
+                        self.pending_escape.extend_from_slice(&input[index..]);
+                        break;
+                    }
+                    None => {}
                 }
-                continue;
             }
 
-            match byte {
-                ATTACH_LEADER_BYTE => {
+            match input[index] {
+                ATTACH_LEADER_BYTE | ATTACH_ALT_LEADER_BYTE => {
                     flush_attach_bytes(&mut actions, &mut forwarded);
-                    self.leader_pending = true;
+                    actions.push(AttachInputAction::OpenOverlay);
                 }
                 ATTACH_DETACH_BYTE => {
                     flush_attach_bytes(&mut actions, &mut forwarded);
                     actions.push(AttachInputAction::Detach);
                 }
-                _ => forwarded.push(byte),
+                byte => forwarded.push(byte),
             }
+            index += 1;
         }
 
         flush_attach_bytes(&mut actions, &mut forwarded);
@@ -1453,18 +1471,118 @@ impl AttachInputParser {
     }
 }
 
-fn attach_leader_action(byte: u8) -> Option<AttachInputAction> {
-    Some(match byte {
-        ATTACH_LEADER_BYTE => AttachInputAction::Data(vec![ATTACH_LEADER_BYTE]),
-        b' ' => AttachInputAction::Leader(runtime::AttachLeaderAction::OpenPalette),
-        b's' => AttachInputAction::Leader(runtime::AttachLeaderAction::SessionSwitcher),
-        b't' => AttachInputAction::Leader(runtime::AttachLeaderAction::NewSession),
-        b'g' => AttachInputAction::Leader(runtime::AttachLeaderAction::SessionDetails),
-        b'd' => AttachInputAction::Leader(runtime::AttachLeaderAction::Diff),
-        b'x' => AttachInputAction::Leader(runtime::AttachLeaderAction::StopSession),
-        0x1b => return None,
-        _ => return None,
-    })
+enum AttachCsiUParse {
+    Action(AttachInputAction, usize),
+    Incomplete,
+}
+
+fn parse_attach_csi_u_action(bytes: &[u8]) -> Option<AttachCsiUParse> {
+    if bytes.len() < 2 || bytes[0] != 0x1b || bytes[1] != b'[' {
+        return None;
+    }
+
+    let mut index = 2;
+    let key_code = parse_csi_u_decimal(bytes, &mut index)?;
+
+    let mut alternates = Vec::new();
+    while index < bytes.len() && bytes[index] == b':' {
+        index += 1;
+        let Some(value) = parse_csi_u_decimal_optional(bytes, &mut index) else {
+            return Some(AttachCsiUParse::Incomplete);
+        };
+        if let Some(value) = value {
+            alternates.push(value);
+        }
+    }
+
+    if index >= bytes.len() {
+        return Some(AttachCsiUParse::Incomplete);
+    }
+    if bytes[index] != b';' {
+        return None;
+    }
+    index += 1;
+    if index >= bytes.len() {
+        return Some(AttachCsiUParse::Incomplete);
+    }
+
+    let mod_encoded = parse_csi_u_decimal(bytes, &mut index)?;
+    if mod_encoded == 0 {
+        return None;
+    }
+    let modifiers = mod_encoded - 1;
+    let intentional_modifiers = modifiers & 0b00_111111;
+    if intentional_modifiers != 0b100 {
+        return None;
+    }
+
+    if index < bytes.len() && bytes[index] == b':' {
+        index += 1;
+        if index >= bytes.len() {
+            return Some(AttachCsiUParse::Incomplete);
+        }
+        let event_type = parse_csi_u_decimal(bytes, &mut index)?;
+        if event_type == 3 {
+            return None;
+        }
+    }
+
+    if index < bytes.len() && bytes[index] == b';' {
+        index += 1;
+        if index >= bytes.len() {
+            return Some(AttachCsiUParse::Incomplete);
+        }
+        while index < bytes.len() && (bytes[index].is_ascii_digit() || bytes[index] == b':') {
+            index += 1;
+        }
+    }
+
+    if index >= bytes.len() {
+        return Some(AttachCsiUParse::Incomplete);
+    }
+    if bytes[index] != b'u' {
+        return None;
+    }
+
+    let action = if matches_attach_overlay_key(key_code, &alternates) {
+        AttachInputAction::OpenOverlay
+    } else if key_code == 93 {
+        AttachInputAction::Detach
+    } else {
+        return None;
+    };
+
+    Some(AttachCsiUParse::Action(action, index + 1))
+}
+
+fn matches_attach_overlay_key(key_code: u32, alternates: &[u32]) -> bool {
+    key_code == 92
+        || key_code == 54
+        || key_code == 94
+        || alternates.iter().any(|value| matches!(*value, 92 | 54 | 94))
+}
+
+fn parse_csi_u_decimal(bytes: &[u8], index: &mut usize) -> Option<u32> {
+    let start = *index;
+    let mut value = 0_u32;
+    while *index < bytes.len() && bytes[*index].is_ascii_digit() {
+        value = value
+            .checked_mul(10)?
+            .checked_add((bytes[*index] - b'0') as u32)?;
+        *index += 1;
+    }
+
+    if *index == start {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn parse_csi_u_decimal_optional(bytes: &[u8], index: &mut usize) -> Option<Option<u32>> {
+    let start = *index;
+    let value = parse_csi_u_decimal(bytes, index);
+    if *index == start { Some(None) } else { value.map(Some) }
 }
 
 fn flush_attach_bytes(actions: &mut Vec<AttachInputAction>, forwarded: &mut Vec<u8>) {
@@ -1818,12 +1936,12 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENTD_ATTACH_RESTORE_SEQUENCE, ATTACH_DETACH_BYTE, ATTACH_LEADER_BYTE, AttachInputAction,
-        AttachInputParser, Cli, Command, DaemonCommand, SessionEndSummary, bail_daemon_command,
-        clear_stale_daemon_state, format_session_end_summary, render_diff_text,
-        resolve_detach_session_id, resolve_new_session_options, should_colorize_diff_output,
+        AGENTD_ATTACH_RESTORE_SEQUENCE, ATTACH_ALT_LEADER_BYTE, ATTACH_DETACH_BYTE,
+        ATTACH_LEADER_BYTE, AttachInputAction, AttachInputParser, Cli, Command, DaemonCommand,
+        SessionEndSummary, bail_daemon_command, clear_stale_daemon_state,
+        format_session_end_summary, render_diff_text, resolve_detach_session_id,
+        resolve_new_session_options, should_colorize_diff_output,
     };
-    use crate::runtime::AttachLeaderAction;
     use agentd_shared::paths::AppPaths;
     use agentd_shared::session::{IntegrationState, SessionStatus};
     use clap::Parser;
@@ -2015,74 +2133,99 @@ mod tests {
     }
 
     #[test]
-    fn attach_parser_treats_ctrl_b_as_leader_prefix() {
+    fn attach_parser_opens_overlay_on_ctrl_backslash() {
         let mut parser = AttachInputParser::default();
-        assert!(parser.push_bytes(&[ATTACH_LEADER_BYTE]).is_empty());
-        assert_eq!(
-            parser.push_bytes(b" "),
-            vec![AttachInputAction::Leader(AttachLeaderAction::OpenPalette)]
-        );
-    }
-
-    #[test]
-    fn attach_parser_sends_literal_ctrl_b_on_double_prefix() {
-        let mut parser = AttachInputParser::default();
-        assert!(parser.push_bytes(&[ATTACH_LEADER_BYTE]).is_empty());
         assert_eq!(
             parser.push_bytes(&[ATTACH_LEADER_BYTE]),
-            vec![AttachInputAction::Data(vec![ATTACH_LEADER_BYTE])]
+            vec![AttachInputAction::OpenOverlay]
         );
     }
 
     #[test]
-    fn attach_parser_maps_leader_commands() {
+    fn attach_parser_opens_overlay_on_ctrl_caret() {
         let mut parser = AttachInputParser::default();
-        parser.push_bytes(&[ATTACH_LEADER_BYTE]);
         assert_eq!(
-            parser.push_bytes(b"s"),
-            vec![AttachInputAction::Leader(AttachLeaderAction::SessionSwitcher)]
-        );
-
-        parser.push_bytes(&[ATTACH_LEADER_BYTE]);
-        assert_eq!(
-            parser.push_bytes(b"t"),
-            vec![AttachInputAction::Leader(AttachLeaderAction::NewSession)]
-        );
-
-        parser.push_bytes(&[ATTACH_LEADER_BYTE]);
-        assert_eq!(
-            parser.push_bytes(b"g"),
-            vec![AttachInputAction::Leader(AttachLeaderAction::SessionDetails)]
-        );
-
-        parser.push_bytes(&[ATTACH_LEADER_BYTE]);
-        assert_eq!(
-            parser.push_bytes(b"d"),
-            vec![AttachInputAction::Leader(AttachLeaderAction::Diff)]
-        );
-
-        parser.push_bytes(&[ATTACH_LEADER_BYTE]);
-        assert_eq!(
-            parser.push_bytes(b"x"),
-            vec![AttachInputAction::Leader(AttachLeaderAction::StopSession)]
+            parser.push_bytes(&[ATTACH_ALT_LEADER_BYTE]),
+            vec![AttachInputAction::OpenOverlay]
         );
     }
 
     #[test]
-    fn attach_parser_drops_unknown_leader_keys() {
+    fn attach_parser_opens_overlay_twice_on_double_ctrl_backslash() {
         let mut parser = AttachInputParser::default();
-        parser.push_bytes(&[ATTACH_LEADER_BYTE]);
-        assert!(parser.push_bytes(b"q").is_empty());
+        assert_eq!(
+            parser.push_bytes(&[ATTACH_LEADER_BYTE, ATTACH_LEADER_BYTE]),
+            vec![AttachInputAction::OpenOverlay, AttachInputAction::OpenOverlay]
+        );
+    }
+
+    #[test]
+    fn attach_parser_forwards_following_bytes_after_ctrl_backslash() {
+        let mut parser = AttachInputParser::default();
+        assert_eq!(
+            parser.push_bytes(b"\x1cs"),
+            vec![AttachInputAction::OpenOverlay, AttachInputAction::Data(b"s".to_vec())]
+        );
+    }
+
+    #[test]
+    fn attach_parser_does_not_drop_unknown_bytes_after_ctrl_backslash() {
+        let mut parser = AttachInputParser::default();
+        assert_eq!(
+            parser.push_bytes(b"\x1cq"),
+            vec![AttachInputAction::OpenOverlay, AttachInputAction::Data(b"q".to_vec())]
+        );
+    }
+
+    #[test]
+    fn attach_parser_opens_overlay_on_kitty_ctrl_backslash() {
+        let mut parser = AttachInputParser::default();
+        assert_eq!(
+            parser.push_bytes(b"\x1b[92;5u"),
+            vec![AttachInputAction::OpenOverlay]
+        );
+    }
+
+    #[test]
+    fn attach_parser_opens_overlay_on_kitty_ctrl_caret() {
+        let mut parser = AttachInputParser::default();
+        assert_eq!(
+            parser.push_bytes(b"\x1b[54:94;5u"),
+            vec![AttachInputAction::OpenOverlay]
+        );
+    }
+
+    #[test]
+    fn attach_parser_detaches_on_kitty_ctrl_right_bracket() {
+        let mut parser = AttachInputParser::default();
+        assert_eq!(parser.push_bytes(b"\x1b[93;5u"), vec![AttachInputAction::Detach]);
+    }
+
+    #[test]
+    fn attach_parser_ignores_kitty_key_release_events() {
+        let mut parser = AttachInputParser::default();
+        assert_eq!(
+            parser.push_bytes(b"\x1b[92;5:3u"),
+            vec![AttachInputAction::Data(b"\x1b[92;5:3u".to_vec())]
+        );
+    }
+
+    #[test]
+    fn attach_parser_carries_incomplete_kitty_sequences_between_reads() {
+        let mut parser = AttachInputParser::default();
+        assert!(parser.push_bytes(b"\x1b[92;").is_empty());
+        assert_eq!(parser.push_bytes(b"5u"), vec![AttachInputAction::OpenOverlay]);
     }
 
     #[test]
     fn attach_parser_flushes_bytes_around_control_sequences() {
         let mut parser = AttachInputParser::default();
         assert_eq!(
-            parser.push_bytes(b"ab\x02\x02cd\x1d"),
+            parser.push_bytes(b"ab\x1c\x1ccd\x1d"),
             vec![
                 AttachInputAction::Data(b"ab".to_vec()),
-                AttachInputAction::Data(vec![ATTACH_LEADER_BYTE]),
+                AttachInputAction::OpenOverlay,
+                AttachInputAction::OpenOverlay,
                 AttachInputAction::Data(b"cd".to_vec()),
                 AttachInputAction::Detach,
             ]

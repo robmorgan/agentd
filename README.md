@@ -62,8 +62,9 @@ agent attach fix-tests
 Multiple clients can attach to the same running session at once, including the TUI and one or
 more `agent attach` processes.
 
-Detach the local `agent attach` client using `ctrl + ]`. To inspect or manage other attached
-clients:
+Detach the local `agent attach` client using `ctrl + ]`. Open the attach overlay with
+`ctrl + \`. Overlay actions such as switching sessions or opening session
+details now run from the overlay itself. To inspect or manage other attached clients:
 
 ```sh
 agent attachments fix-tests

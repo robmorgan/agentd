@@ -38,16 +38,6 @@ enum Command {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AttachLeaderAction {
-    OpenPalette,
-    SessionSwitcher,
-    NewSession,
-    SessionDetails,
-    Diff,
-    StopSession,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OverlayMode {
     Palette,
     SessionSwitcher,
@@ -64,8 +54,10 @@ struct PaletteItem {
     command: Command,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum OverlayOutcome {
     Close,
+    ForwardInput(Vec<u8>),
     SwitchSession(String),
 }
 
@@ -1065,21 +1057,6 @@ impl AttachOverlay {
         self.refresh_sessions().await
     }
 
-    pub async fn open_leader_action(
-        &mut self,
-        action: AttachLeaderAction,
-    ) -> Result<Option<OverlayOutcome>> {
-        self.open().await?;
-        match action {
-            AttachLeaderAction::OpenPalette => Ok(None),
-            AttachLeaderAction::SessionSwitcher => self.run_command(Command::SessionSwitcher).await,
-            AttachLeaderAction::NewSession => self.run_command(Command::NewSession).await,
-            AttachLeaderAction::SessionDetails => self.run_command(Command::GitStatus).await,
-            AttachLeaderAction::Diff => self.run_command(Command::Diff).await,
-            AttachLeaderAction::StopSession => self.run_command(Command::StopSession).await,
-        }
-    }
-
     pub async fn handle_event(&mut self, event: Event) -> Result<Option<OverlayOutcome>> {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key).await,
@@ -1148,7 +1125,12 @@ impl AttachOverlay {
         match key.code {
             KeyCode::Esc => return Ok(Some(OverlayOutcome::Close)),
             KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return Ok(Some(OverlayOutcome::Close));
+                return Ok(Some(OverlayOutcome::ForwardInput(vec![0x02])));
+            }
+            KeyCode::Enter => {
+                if let Some(item) = items.get(self.palette_selected) {
+                    return self.run_command(item.command).await;
+                }
             }
             KeyCode::Up => self.palette_selected = self.palette_selected.saturating_sub(1),
             KeyCode::Down => {
@@ -1159,26 +1141,6 @@ impl AttachOverlay {
             KeyCode::Backspace => {
                 self.palette_query.pop();
                 self.palette_selected = 0;
-            }
-            KeyCode::Enter => {
-                if let Some(item) = items.get(self.palette_selected) {
-                    return self.run_command(item.command).await;
-                }
-            }
-            KeyCode::Char('s') if key.modifiers.is_empty() => {
-                return self.run_command(Command::SessionSwitcher).await;
-            }
-            KeyCode::Char('t') if key.modifiers.is_empty() => {
-                return self.run_command(Command::NewSession).await;
-            }
-            KeyCode::Char('g') if key.modifiers.is_empty() => {
-                return self.run_command(Command::GitStatus).await;
-            }
-            KeyCode::Char('d') if key.modifiers.is_empty() => {
-                return self.run_command(Command::Diff).await;
-            }
-            KeyCode::Char('x') if key.modifiers.is_empty() => {
-                return self.run_command(Command::StopSession).await;
             }
             KeyCode::Char(ch)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
@@ -1784,10 +1746,11 @@ mod tests {
     use super::{
         ANSI_RESET, HOST_PICKER_CURSOR, HOST_PICKER_DIFF_ADD_STYLE, HOST_PICKER_DIFF_HEADER_STYLE,
         HOST_PICKER_DIFF_HUNK_STYLE, HOST_PICKER_DIFF_REMOVE_STYLE, HOST_PICKER_LEGEND_TEXT_STYLE,
-        HOST_PICKER_PLACEHOLDER_FG, HOST_PICKER_QUERY_BG, HOST_PICKER_SELECTED_STYLE,
-        HOST_PICKER_STATUS_BLUE_FG, HOST_PICKER_STATUS_GRAY_FG, HOST_PICKER_STATUS_GREEN_FG,
-        HOST_PICKER_STATUS_RED_FG, HOST_PICKER_STATUS_YELLOW_FG, HOST_PICKER_TEXT_FG,
-        PickerComposer, PickerMode, PickerRow, SessionAction, SessionPicker,
+        AttachOverlay, HOST_PICKER_PLACEHOLDER_FG, HOST_PICKER_QUERY_BG,
+        HOST_PICKER_SELECTED_STYLE, HOST_PICKER_STATUS_BLUE_FG, HOST_PICKER_STATUS_GRAY_FG,
+        HOST_PICKER_STATUS_GREEN_FG, HOST_PICKER_STATUS_RED_FG, HOST_PICKER_STATUS_YELLOW_FG,
+        HOST_PICKER_TEXT_FG, OverlayMode, OverlayOutcome, PickerComposer, PickerMode, PickerRow,
+        SessionAction, SessionPicker,
         configured_agent_names, fit_host_picker_line, render_host_picker_brand,
         render_host_picker_legend_row, render_host_picker_session_row, render_host_picker_subtitle,
         render_host_picker_title_line, session_icon, session_icon_color,
@@ -1803,6 +1766,8 @@ mod tests {
     };
     use camino::Utf8PathBuf;
     use chrono::{Duration, Utc};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use futures::executor::block_on;
 
     #[test]
     fn picker_rows_include_create_and_matching_sessions() {
@@ -1833,6 +1798,36 @@ mod tests {
         picker.clamp_selection();
 
         assert_eq!(picker.composer.selected, 1);
+    }
+
+    #[test]
+    fn attach_overlay_ctrl_b_forwards_literal_byte() {
+        let mut overlay = AttachOverlay::new(test_paths(), "alpha".to_string());
+        overlay.mode = OverlayMode::Palette;
+
+        let outcome = block_on(overlay.handle_key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+
+        assert_eq!(outcome, Some(OverlayOutcome::ForwardInput(vec![0x02])));
+    }
+
+    #[test]
+    fn attach_overlay_escape_closes_palette() {
+        let mut overlay = AttachOverlay::new(test_paths(), "alpha".to_string());
+        overlay.mode = OverlayMode::Palette;
+
+        let outcome = block_on(overlay.handle_event(Event::Key(KeyEvent {
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })))
+        .unwrap();
+
+        assert_eq!(outcome, Some(OverlayOutcome::Close));
     }
 
     #[test]
