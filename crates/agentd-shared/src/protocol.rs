@@ -71,7 +71,6 @@ pub enum Request {
     DetachAttachment { session_id: String, attach_id: String },
     AttachInput { data: Vec<u8> },
     SendInput { session_id: String, data: Vec<u8>, source_session_id: Option<String> },
-    ReplyToSession { session_id: String, prompt: String },
     ApplySession { session_id: String },
     DiscardSession { session_id: String, force: bool },
     SwitchAttachedSession { source_session_id: String, target_session_id: String },
@@ -159,7 +158,6 @@ enum MessageKind {
     ListAttachmentsRequest = 22,
     DetachAttachmentRequest = 23,
     AttachResizeRequest = 21,
-    ReplyToSessionRequest = 18,
     ApplySessionRequest = 19,
     DiscardSessionRequest = 20,
     DetachSessionRequest = 17,
@@ -205,7 +203,6 @@ impl MessageKind {
             22 => Self::ListAttachmentsRequest,
             23 => Self::DetachAttachmentRequest,
             21 => Self::AttachResizeRequest,
-            18 => Self::ReplyToSessionRequest,
             19 => Self::ApplySessionRequest,
             20 => Self::DiscardSessionRequest,
             17 => Self::DetachSessionRequest,
@@ -464,11 +461,6 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             put_optional_string(&mut payload, source_session_id.as_deref())?;
             MessageKind::SendInputRequest
         }
-        Request::ReplyToSession { session_id, prompt } => {
-            put_string(&mut payload, session_id)?;
-            put_string(&mut payload, prompt)?;
-            MessageKind::ReplyToSessionRequest
-        }
         Request::ApplySession { session_id } => {
             put_string(&mut payload, session_id)?;
             MessageKind::ApplySessionRequest
@@ -557,10 +549,6 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
             session_id: cursor.take_string()?,
             data: cursor.take_bytes()?,
             source_session_id: cursor.take_optional_string()?,
-        },
-        MessageKind::ReplyToSessionRequest => Request::ReplyToSession {
-            session_id: cursor.take_string()?,
-            prompt: cursor.take_string()?,
         },
         MessageKind::ApplySessionRequest => {
             Request::ApplySession { session_id: cursor.take_string()? }
@@ -1330,17 +1318,6 @@ mod tests {
     #[test]
     fn attach_resize_round_trips() {
         let request = Request::AttachResize { cols: 120, rows: 48 };
-        let (kind, payload) = encode_request(&request).unwrap();
-        let decoded = decode_request(kind, &payload).unwrap();
-        assert_eq!(decoded, request);
-    }
-
-    #[test]
-    fn reply_to_session_round_trips() {
-        let request = Request::ReplyToSession {
-            session_id: "demo".to_string(),
-            prompt: "answer the question and continue".to_string(),
-        };
         let (kind, payload) = encode_request(&request).unwrap();
         let decoded = decode_request(kind, &payload).unwrap();
         assert_eq!(decoded, request);

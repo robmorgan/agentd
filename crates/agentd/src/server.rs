@@ -199,18 +199,6 @@ async fn handle_connection(
                 }
             }
         }
-        IncomingRequest::Standard(Request::ReplyToSession { session_id, prompt }) => {
-            let _ = (session_id, prompt);
-            send_response(
-                &mut writer,
-                &Response::Error {
-                    message:
-                        "structured reply is disabled; focus the worker and type directly into the PTY"
-                            .to_string(),
-                },
-            )
-            .await?
-        }
         IncomingRequest::Standard(Request::ApplySession { session_id }) => {
             match state.apply_session(&session_id).await {
                 Ok(session) => send_response(&mut writer, &Response::Session { session }).await?,

@@ -117,16 +117,6 @@ enum Command {
         )]
         data: Vec<String>,
     },
-    Reply {
-        session_id: String,
-        #[arg(
-            required = true,
-            trailing_var_arg = true,
-            allow_hyphen_values = true,
-            value_name = "PROMPT"
-        )]
-        prompt: Vec<String>,
-    },
     Accept {
         session_id: String,
     },
@@ -329,13 +319,6 @@ async fn main() -> Result<()> {
             }
         }
         (Some(Command::SendInput { .. }), ExecutionMode::Local(reason)) => {
-            bail_live_command(&reason)?;
-        }
-        (Some(Command::Reply { session_id, prompt }), ExecutionMode::Daemon) => {
-            let session = reply_session(&paths, &session_id, &prompt.join(" ")).await?;
-            print_session(&session);
-        }
-        (Some(Command::Reply { .. }), ExecutionMode::Local(reason)) => {
             bail_live_command(&reason)?;
         }
         (Some(Command::Accept { session_id }), ExecutionMode::Daemon) => {
@@ -1778,19 +1761,6 @@ async fn kill_session(paths: &AppPaths, session_id: &str) -> Result<()> {
     .await?;
     match response {
         Response::KillSession { .. } => Ok(()),
-        Response::Error { message } => bail!(message),
-        other => bail!("unexpected response: {:?}", other),
-    }
-}
-
-async fn reply_session(paths: &AppPaths, session_id: &str, prompt: &str) -> Result<SessionRecord> {
-    let response = send_request(
-        paths,
-        &Request::ReplyToSession { session_id: session_id.to_string(), prompt: prompt.to_string() },
-    )
-    .await?;
-    match response {
-        Response::Session { session } => Ok(session),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected response: {:?}", other),
     }
