@@ -66,8 +66,6 @@ impl AppState {
             let repo_root = git::canonical_repo_root(&workspace)?;
             let base_branch = git::current_branch(&repo_root)?;
             let agent = config.require_agent(&paths, &agent_name)?.clone();
-            let agent_args_json =
-                serde_json::to_string(&agent.args).context("failed to serialize agent args")?;
             let repo_name = repo_name_from_path(repo_root.as_str());
             let mode = SessionMode::Execute;
 
@@ -82,9 +80,6 @@ impl AppState {
                 agent: &agent_name,
                 model: model.as_deref(),
                 mode,
-                agent_command: &agent.command,
-                agent_args_json: &agent_args_json,
-                resume_session_id: None,
                 workspace: repo_root.as_str(),
                 repo_path: repo_root.as_str(),
                 repo_name: &repo_name,
@@ -1884,9 +1879,6 @@ mod tests {
             agent: "codex",
             model: Some("gpt-5.3-codex"),
             mode: SessionMode::Execute,
-            agent_command: "codex",
-            agent_args_json: "[]",
-            resume_session_id: None,
             workspace: repo,
             repo_path: repo,
             repo_name: "repo",

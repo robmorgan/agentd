@@ -8,8 +8,9 @@ use agentd_shared::{
     paths::AppPaths,
     session::{
         AttentionLevel, GitSyncStatus, IntegrationPolicy, IntegrationState, SessionMode,
-        SessionRecord, SessionStatus, repo_name_from_path,
+        SessionRecord, SessionStatus,
     },
+    sqlite_schema::init_state_db,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
@@ -83,7 +84,6 @@ impl LocalStore {
 
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
         let conn = self.connect()?;
-        let _ = conn.execute("DELETE FROM threads WHERE session_id = ?1", params![session_id]);
         conn.execute("DELETE FROM sessions WHERE session_id = ?1", params![session_id])?;
         Ok(())
     }
@@ -93,133 +93,8 @@ impl LocalStore {
     }
 
     fn init(&self) -> Result<()> {
-        let conn = self.connect()?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sessions (
-                session_id TEXT PRIMARY KEY,
-                thread_id TEXT,
-                agent TEXT NOT NULL,
-                model TEXT,
-                mode TEXT NOT NULL DEFAULT 'execute',
-                workspace TEXT NOT NULL,
-                repo_path TEXT,
-                repo_name TEXT,
-                title TEXT,
-                task TEXT NOT NULL,
-                base_branch TEXT,
-                branch TEXT NOT NULL,
-                worktree TEXT NOT NULL,
-                status TEXT NOT NULL,
-                integration_policy TEXT NOT NULL DEFAULT 'manual_review',
-                pid INTEGER,
-                exit_code INTEGER,
-                error TEXT,
-                integration_state TEXT NOT NULL DEFAULT 'clean',
-                git_sync TEXT NOT NULL DEFAULT 'unknown',
-                git_status_summary TEXT,
-                has_conflicts INTEGER NOT NULL DEFAULT 0,
-                attention TEXT NOT NULL DEFAULT 'info',
-                attention_summary TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                exited_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS threads (
-                thread_id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL UNIQUE,
-                agent TEXT NOT NULL,
-                title TEXT NOT NULL,
-                initial_prompt TEXT NOT NULL,
-                upstream_thread_id TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            ",
-        )?;
-        conn.execute("DROP TABLE IF EXISTS events", [])?;
-        ensure_column(&conn, "thread_id", "ALTER TABLE sessions ADD COLUMN thread_id TEXT")?;
-        ensure_column(&conn, "model", "ALTER TABLE sessions ADD COLUMN model TEXT")?;
-        ensure_column(
-            &conn,
-            "mode",
-            "ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'execute'",
-        )?;
-        ensure_column(&conn, "repo_path", "ALTER TABLE sessions ADD COLUMN repo_path TEXT")?;
-        ensure_column(&conn, "repo_name", "ALTER TABLE sessions ADD COLUMN repo_name TEXT")?;
-        ensure_column(&conn, "title", "ALTER TABLE sessions ADD COLUMN title TEXT")?;
-        ensure_column(&conn, "base_branch", "ALTER TABLE sessions ADD COLUMN base_branch TEXT")?;
-        ensure_column(
-            &conn,
-            "integration_policy",
-            "ALTER TABLE sessions ADD COLUMN integration_policy TEXT NOT NULL DEFAULT 'manual_review'",
-        )?;
-        ensure_column(
-            &conn,
-            "integration_state",
-            "ALTER TABLE sessions ADD COLUMN integration_state TEXT NOT NULL DEFAULT 'clean'",
-        )?;
-        ensure_column(
-            &conn,
-            "git_sync",
-            "ALTER TABLE sessions ADD COLUMN git_sync TEXT NOT NULL DEFAULT 'unknown'",
-        )?;
-        ensure_column(
-            &conn,
-            "git_status_summary",
-            "ALTER TABLE sessions ADD COLUMN git_status_summary TEXT",
-        )?;
-        ensure_column(
-            &conn,
-            "has_conflicts",
-            "ALTER TABLE sessions ADD COLUMN has_conflicts INTEGER NOT NULL DEFAULT 0",
-        )?;
-        ensure_column(
-            &conn,
-            "attention",
-            "ALTER TABLE sessions ADD COLUMN attention TEXT NOT NULL DEFAULT 'info'",
-        )?;
-        ensure_column(
-            &conn,
-            "attention_summary",
-            "ALTER TABLE sessions ADD COLUMN attention_summary TEXT",
-        )?;
-        conn.execute(
-            "UPDATE sessions
-             SET mode = COALESCE(mode, 'execute'),
-                 repo_path = COALESCE(repo_path, workspace),
-                 repo_name = COALESCE(repo_name, repo_path, workspace),
-                 title = COALESCE(title, task, repo_name, workspace),
-                 base_branch = COALESCE(base_branch, 'HEAD'),
-                 integration_policy = COALESCE(integration_policy, 'manual_review'),
-                 integration_state = COALESCE(integration_state, 'clean'),
-                 git_sync = COALESCE(git_sync, 'unknown'),
-                 has_conflicts = COALESCE(has_conflicts, 0),
-                 attention = COALESCE(attention, 'info'),
-                 attention_summary = COALESCE(attention_summary, title, task)
-             WHERE mode IS NULL OR repo_path IS NULL OR repo_name IS NULL OR title IS NULL OR base_branch IS NULL OR integration_policy IS NULL OR integration_state IS NULL OR git_sync IS NULL OR has_conflicts IS NULL OR attention IS NULL OR attention_summary IS NULL",
-            [],
-        )?;
-        let mut stmt =
-            conn.prepare("SELECT session_id, repo_path, workspace, repo_name FROM sessions")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        })?;
-        for row in rows {
-            let (session_id, repo_path, workspace, repo_name) = row?;
-            let desired = repo_name_from_path(repo_path.as_deref().unwrap_or(&workspace));
-            if repo_name.unwrap_or_default() != desired {
-                conn.execute(
-                    "UPDATE sessions SET repo_name = ?2 WHERE session_id = ?1",
-                    params![session_id, desired],
-                )?;
-            }
-        }
-        Ok(())
+        let mut conn = self.connect()?;
+        init_state_db(&mut conn)
     }
 }
 
@@ -272,19 +147,6 @@ pub fn remove_session_artifacts(paths: &AppPaths, session: &SessionRecord) -> Re
     Ok(())
 }
 
-fn ensure_column(conn: &Connection, column: &str, ddl: &str) -> Result<()> {
-    let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let existing: String = row.get(1)?;
-        if existing == column {
-            return Ok(());
-        }
-    }
-    conn.execute(ddl, [])?;
-    Ok(())
-}
-
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     Ok(SessionRecord {
         session_id: row.get(0)?,
@@ -296,9 +158,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         })?,
         workspace: row.get(5)?,
         repo_path: row.get(6)?,
-        repo_name: row
-            .get::<_, Option<String>>(7)?
-            .unwrap_or_else(|| repo_name_from_path(&row.get::<_, String>(6).unwrap_or_default())),
+        repo_name: row.get(7)?,
         title: row.get(8)?,
         base_branch: row.get(9)?,
         branch: row.get(10)?,
@@ -310,13 +170,15 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
                 Box::new(err),
             )
         })?,
-        integration_policy: str_to_integration_policy(&row.get::<_, String>(13)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(
-                13,
-                rusqlite::types::Type::Text,
-                Box::new(err),
-            )
-        })?,
+        integration_policy: str_to_integration_policy(&row.get::<_, String>(13)?).map_err(
+            |err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    13,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            },
+        )?,
         integration_state: str_to_integration_state(&row.get::<_, String>(14)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 14,
@@ -514,7 +376,7 @@ fn remove_log_if_present(paths: &AppPaths, session: &SessionRecord) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::LocalStore;
-    use agentd_shared::{paths::AppPaths, session::SessionStatus};
+    use agentd_shared::paths::AppPaths;
     use rusqlite::params;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -533,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_legacy_rows() {
+    fn open_resets_legacy_rows() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
         let conn = rusqlite::Connection::open(paths.database.as_str()).unwrap();
@@ -573,13 +435,11 @@ mod tests {
         .unwrap();
 
         let store = LocalStore::open(&paths).unwrap();
-        let session = store.get_session("demo").unwrap().unwrap();
-        assert_eq!(session.repo_path, "/tmp/repo");
-        assert_eq!(session.base_branch, "HEAD");
+        assert!(store.get_session("demo").unwrap().is_none());
     }
 
     #[test]
-    fn open_maps_legacy_paused_rows_to_unknown_recovered() {
+    fn open_drops_legacy_threads_table() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
         let conn = rusqlite::Connection::open(paths.database.as_str()).unwrap();
@@ -592,34 +452,28 @@ mod tests {
                 branch TEXT NOT NULL,
                 worktree TEXT NOT NULL,
                 status TEXT NOT NULL,
-                pid INTEGER,
-                exit_code INTEGER,
-                error TEXT,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                exited_at TEXT
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE threads (
+                thread_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL UNIQUE
             );",
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO sessions (
-                session_id, agent, workspace, task, branch, worktree, status, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-            params![
-                "legacy",
-                "codex",
-                "/tmp/repo",
-                "paused",
-                "agent/legacy",
-                "/tmp/worktree",
-                "paused",
-                chrono::Utc::now().to_rfc3339(),
-            ],
-        )
-        .unwrap();
 
-        let store = LocalStore::open(&paths).unwrap();
-        let session = store.get_session("legacy").unwrap().unwrap();
-        assert_eq!(session.status, SessionStatus::UnknownRecovered);
+        let _store = LocalStore::open(&paths).unwrap();
+        let conn = rusqlite::Connection::open(paths.database.as_str()).unwrap();
+        let has_threads_table: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'threads'
+            )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(!has_threads_table);
     }
 }

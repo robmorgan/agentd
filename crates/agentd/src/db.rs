@@ -6,8 +6,9 @@ use agentd_shared::{
     paths::AppPaths,
     session::{
         AttentionLevel, GitSyncStatus, IntegrationPolicy, IntegrationState, SessionMode,
-        SessionRecord, SessionStatus, repo_name_from_path,
+        SessionRecord, SessionStatus,
     },
+    sqlite_schema::init_state_db,
 };
 
 #[derive(Clone)]
@@ -21,9 +22,6 @@ pub struct NewSession<'a> {
     pub agent: &'a str,
     pub model: Option<&'a str>,
     pub mode: SessionMode,
-    pub agent_command: &'a str,
-    pub agent_args_json: &'a str,
-    pub resume_session_id: Option<&'a str>,
     pub workspace: &'a str,
     pub repo_path: &'a str,
     pub repo_name: &'a str,
@@ -46,181 +44,8 @@ impl Database {
     }
 
     fn init(&self) -> Result<()> {
-        let conn = self.connect()?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sessions (
-                session_id TEXT PRIMARY KEY,
-                thread_id TEXT,
-                agent TEXT NOT NULL,
-                model TEXT,
-                mode TEXT NOT NULL DEFAULT 'execute',
-                agent_command TEXT,
-                agent_args_json TEXT,
-                resume_session_id TEXT,
-                workspace TEXT NOT NULL,
-                repo_path TEXT,
-                repo_name TEXT,
-                title TEXT,
-                task TEXT NOT NULL,
-                base_branch TEXT,
-                branch TEXT NOT NULL,
-                worktree TEXT NOT NULL,
-                status TEXT NOT NULL,
-                integration_policy TEXT NOT NULL DEFAULT 'manual_review',
-                pid INTEGER,
-                exit_code INTEGER,
-                error TEXT,
-                integration_state TEXT NOT NULL DEFAULT 'clean',
-                git_sync TEXT NOT NULL DEFAULT 'unknown',
-                git_status_summary TEXT,
-                has_conflicts INTEGER NOT NULL DEFAULT 0,
-                attention TEXT NOT NULL DEFAULT 'info',
-                attention_summary TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                exited_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS threads (
-                thread_id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL UNIQUE,
-                agent TEXT NOT NULL,
-                title TEXT NOT NULL,
-                initial_prompt TEXT NOT NULL,
-                upstream_thread_id TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_threads_session_id
-                ON threads (session_id);
-            ",
-        )?;
-        conn.execute("DROP TABLE IF EXISTS events", [])?;
-        conn.execute("DROP TABLE IF EXISTS plans", [])?;
-        self.ensure_column(&conn, "thread_id", "ALTER TABLE sessions ADD COLUMN thread_id TEXT")?;
-        self.ensure_column(&conn, "model", "ALTER TABLE sessions ADD COLUMN model TEXT")?;
-        self.ensure_column(
-            &conn,
-            "mode",
-            "ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'execute'",
-        )?;
-        self.ensure_column(&conn, "repo_path", "ALTER TABLE sessions ADD COLUMN repo_path TEXT")?;
-        self.ensure_column(&conn, "repo_name", "ALTER TABLE sessions ADD COLUMN repo_name TEXT")?;
-        self.ensure_column(&conn, "title", "ALTER TABLE sessions ADD COLUMN title TEXT")?;
-        self.ensure_column(
-            &conn,
-            "agent_command",
-            "ALTER TABLE sessions ADD COLUMN agent_command TEXT",
-        )?;
-        self.ensure_column(
-            &conn,
-            "agent_args_json",
-            "ALTER TABLE sessions ADD COLUMN agent_args_json TEXT",
-        )?;
-        self.ensure_column(
-            &conn,
-            "resume_session_id",
-            "ALTER TABLE sessions ADD COLUMN resume_session_id TEXT",
-        )?;
-        self.ensure_column(
-            &conn,
-            "base_branch",
-            "ALTER TABLE sessions ADD COLUMN base_branch TEXT",
-        )?;
-        self.ensure_column(
-            &conn,
-            "integration_policy",
-            "ALTER TABLE sessions ADD COLUMN integration_policy TEXT NOT NULL DEFAULT 'manual_review'",
-        )?;
-        self.ensure_column(
-            &conn,
-            "integration_state",
-            "ALTER TABLE sessions ADD COLUMN integration_state TEXT NOT NULL DEFAULT 'clean'",
-        )?;
-        self.ensure_column(
-            &conn,
-            "git_sync",
-            "ALTER TABLE sessions ADD COLUMN git_sync TEXT NOT NULL DEFAULT 'unknown'",
-        )?;
-        self.ensure_column(
-            &conn,
-            "git_status_summary",
-            "ALTER TABLE sessions ADD COLUMN git_status_summary TEXT",
-        )?;
-        self.ensure_column(
-            &conn,
-            "has_conflicts",
-            "ALTER TABLE sessions ADD COLUMN has_conflicts INTEGER NOT NULL DEFAULT 0",
-        )?;
-        self.ensure_column(
-            &conn,
-            "attention",
-            "ALTER TABLE sessions ADD COLUMN attention TEXT NOT NULL DEFAULT 'info'",
-        )?;
-        self.ensure_column(
-            &conn,
-            "attention_summary",
-            "ALTER TABLE sessions ADD COLUMN attention_summary TEXT",
-        )?;
-        conn.execute(
-            "UPDATE sessions
-             SET mode = COALESCE(mode, 'execute'),
-                 repo_path = COALESCE(repo_path, workspace),
-                 repo_name = COALESCE(repo_name, repo_path, workspace),
-                 title = COALESCE(title, task, repo_name, workspace),
-                 base_branch = COALESCE(base_branch, 'HEAD'),
-                 integration_policy = COALESCE(integration_policy, 'manual_review'),
-                 integration_state = COALESCE(integration_state, 'clean'),
-                 git_sync = COALESCE(git_sync, 'unknown'),
-                 has_conflicts = COALESCE(has_conflicts, 0),
-                 attention = COALESCE(attention, 'info'),
-                 attention_summary = COALESCE(attention_summary, title, task)
-             WHERE mode IS NULL OR repo_path IS NULL OR repo_name IS NULL OR title IS NULL OR base_branch IS NULL OR integration_policy IS NULL OR integration_state IS NULL OR git_sync IS NULL OR has_conflicts IS NULL OR attention IS NULL OR attention_summary IS NULL",
-            [],
-        )?;
-        self.backfill_repo_names(&conn)?;
-        Ok(())
-    }
-
-    fn ensure_column(&self, conn: &Connection, column: &str, ddl: &str) -> Result<()> {
-        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let existing: String = row.get(1)?;
-            if existing == column {
-                return Ok(());
-            }
-        }
-        conn.execute(ddl, [])?;
-        Ok(())
-    }
-
-    fn backfill_repo_names(&self, conn: &Connection) -> Result<()> {
-        let mut stmt = conn.prepare(
-            "SELECT session_id, repo_path, workspace, repo_name
-             FROM sessions",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        })?;
-
-        for row in rows {
-            let (session_id, repo_path, workspace, repo_name) = row?;
-            let current = repo_name.unwrap_or_default();
-            let desired = repo_name_from_path(repo_path.as_deref().unwrap_or(&workspace));
-            if current != desired {
-                conn.execute(
-                    "UPDATE sessions SET repo_name = ?2 WHERE session_id = ?1",
-                    params![session_id, desired],
-                )?;
-            }
-        }
-
-        Ok(())
+        let mut conn = self.connect()?;
+        init_state_db(&mut conn)
     }
 
     pub fn insert_session(&self, new_session: &NewSession<'_>) -> Result<()> {
@@ -228,19 +53,16 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO sessions (
-                session_id, thread_id, agent, model, mode, agent_command, agent_args_json, resume_session_id, workspace,
-                repo_path, repo_name, title, task, base_branch, branch, worktree, status, integration_policy, attention, attention_summary,
+                session_id, thread_id, agent, model, mode, workspace,
+                repo_path, repo_name, title, base_branch, branch, worktree, status, integration_policy, attention, attention_summary,
                 integration_state, git_sync, git_status_summary, has_conflicts, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?24)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21)",
             params![
                 new_session.session_id,
                 new_session.thread_id,
                 new_session.agent,
                 new_session.model,
                 session_mode_to_str(new_session.mode),
-                new_session.agent_command,
-                new_session.agent_args_json,
-                new_session.resume_session_id,
                 new_session.workspace,
                 new_session.repo_path,
                 new_session.repo_name,
@@ -447,7 +269,6 @@ impl Database {
 
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
         let conn = self.connect()?;
-        conn.execute("DELETE FROM threads WHERE session_id = ?1", params![session_id])?;
         conn.execute("DELETE FROM sessions WHERE session_id = ?1", params![session_id])?;
         Ok(())
     }
@@ -476,13 +297,15 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
                 Box::new(err),
             )
         })?,
-        integration_policy: str_to_integration_policy(&row.get::<_, String>(13)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(
-                13,
-                rusqlite::types::Type::Text,
-                Box::new(err),
-            )
-        })?,
+        integration_policy: str_to_integration_policy(&row.get::<_, String>(13)?).map_err(
+            |err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    13,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            },
+        )?,
         integration_state: str_to_integration_state(&row.get::<_, String>(14)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 14,
@@ -641,7 +464,7 @@ mod tests {
     use super::Database;
     use agentd_shared::{
         paths::AppPaths,
-        session::{IntegrationPolicy, SessionMode, SessionStatus},
+        session::{IntegrationPolicy, SessionMode},
     };
     use rusqlite::params;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -671,9 +494,6 @@ mod tests {
             agent: "codex",
             model: Some("gpt-5.3-codex"),
             mode: SessionMode::Execute,
-            agent_command: "codex",
-            agent_args_json: "[]",
-            resume_session_id: None,
             workspace: "/tmp/repo",
             repo_path: "/tmp/repo",
             repo_name: "repo",
@@ -692,37 +512,42 @@ mod tests {
     }
 
     #[test]
-    fn legacy_paused_rows_decode_as_unknown_recovered() {
+    fn open_resets_legacy_schema() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
-        let db = Database::open(&paths).unwrap();
-        db.insert_session(&super::NewSession {
-            session_id: "legacy",
-            thread_id: None,
-            agent: "codex",
-            model: None,
-            mode: SessionMode::Execute,
-            agent_command: "codex",
-            agent_args_json: "[]",
-            resume_session_id: None,
-            workspace: "/tmp/repo",
-            repo_path: "/tmp/repo",
-            repo_name: "repo",
-            title: "legacy",
-            base_branch: "main",
-            branch: "agent/legacy",
-            worktree: "/tmp/worktree",
-            integration_policy: IntegrationPolicy::AutoApplySafe,
-        })
-        .unwrap();
         let conn = rusqlite::Connection::open(paths.database.as_str()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                session_id TEXT PRIMARY KEY,
+                agent TEXT NOT NULL,
+                workspace TEXT NOT NULL,
+                task TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                worktree TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );",
+        )
+        .unwrap();
         conn.execute(
-            "UPDATE sessions SET status = ?2, attention = ?3, attention_summary = ?4 WHERE session_id = ?1",
-            params!["legacy", "paused", "notice", "paused"],
+            "INSERT INTO sessions (
+                session_id, agent, workspace, task, branch, worktree, status, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            params![
+                "legacy",
+                "codex",
+                "/tmp/repo",
+                "legacy",
+                "agent/legacy",
+                "/tmp/worktree",
+                "running",
+                chrono::Utc::now().to_rfc3339(),
+            ],
         )
         .unwrap();
 
-        let session = db.get_session("legacy").unwrap().unwrap();
-        assert_eq!(session.status, SessionStatus::UnknownRecovered);
+        let db = Database::open(&paths).unwrap();
+        assert!(db.get_session("legacy").unwrap().is_none());
     }
 }
