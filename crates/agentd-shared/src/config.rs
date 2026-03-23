@@ -1,14 +1,17 @@
-use std::{collections::HashMap, fs};
+use std::fs;
 
 use anyhow::{Context, Result, bail};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::paths::AppPaths;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default = "default_agent_name")]
+    pub default_agent: String,
     #[serde(default)]
-    pub agents: HashMap<String, AgentConfig>,
+    pub agents: IndexMap<String, AgentConfig>,
     #[serde(default)]
     pub git: GitConfig,
 }
@@ -34,6 +37,10 @@ fn default_model_flag() -> Option<String> {
     Some("--model".to_string())
 }
 
+fn default_agent_name() -> String {
+    "codex".to_string()
+}
+
 fn default_integration_policy() -> String {
     "auto_apply_safe".to_string()
 }
@@ -50,7 +57,9 @@ impl Config {
 
         let contents = fs::read_to_string(paths.config.as_std_path())
             .with_context(|| format!("failed to read {}", paths.config))?;
-        toml::from_str(&contents).with_context(|| format!("failed to parse {}", paths.config))
+        let config: Self =
+            toml::from_str(&contents).with_context(|| format!("failed to parse {}", paths.config))?;
+        config.validate(paths)
     }
 
     pub fn write_default(paths: &AppPaths) -> Result<()> {
@@ -67,19 +76,30 @@ impl Config {
             None => bail!("agent `{name}` is not configured in {}", paths.config),
         }
     }
+
+    pub fn default_agent_name<'a>(&'a self, paths: &AppPaths) -> Result<&'a str> {
+        if self.agents.is_empty() {
+            return Ok(self.default_agent.as_str());
+        }
+        if self.agents.contains_key(&self.default_agent) {
+            return Ok(self.default_agent.as_str());
+        }
+        bail!(
+            "default_agent `{}` is not configured under [agents] in {}",
+            self.default_agent,
+            paths.config
+        )
+    }
+
+    fn validate(self, paths: &AppPaths) -> Result<Self> {
+        self.default_agent_name(paths)?;
+        Ok(self)
+    }
 }
 
 impl Default for Config {
     fn default() -> Self {
-        let mut agents = HashMap::new();
-        agents.insert(
-            "claude".to_string(),
-            AgentConfig {
-                command: "claude".to_string(),
-                args: Vec::new(),
-                model_flag: default_model_flag(),
-            },
-        );
+        let mut agents = IndexMap::new();
         agents.insert(
             "codex".to_string(),
             AgentConfig {
@@ -88,7 +108,15 @@ impl Default for Config {
                 model_flag: default_model_flag(),
             },
         );
-        Self { agents, git: GitConfig::default() }
+        agents.insert(
+            "claude".to_string(),
+            AgentConfig {
+                command: "claude".to_string(),
+                args: Vec::new(),
+                model_flag: default_model_flag(),
+            },
+        );
+        Self { default_agent: default_agent_name(), agents, git: GitConfig::default() }
     }
 }
 
@@ -124,6 +152,77 @@ mod tests {
     fn require_agent_error_mentions_resolved_config_path() {
         let paths = test_paths();
         let err = Config::default().require_agent(&paths, "missing").unwrap_err().to_string();
+        assert!(err.contains(paths.config.as_str()));
+    }
+
+    #[test]
+    fn default_config_uses_codex_default_agent_and_order() {
+        let config = Config::default();
+        assert_eq!(config.default_agent, "codex");
+        assert_eq!(
+            config.agents.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["codex", "claude"]
+        );
+    }
+
+    #[test]
+    fn load_preserves_agent_order_from_toml() {
+        let paths = test_paths();
+        let config: Config = toml::from_str(
+            r#"
+default_agent = "claude"
+
+[agents.claude]
+command = "claude"
+
+[agents.codex]
+command = "codex"
+
+[agents.zed]
+command = "zed"
+"#,
+        )
+        .unwrap();
+
+        let config = config.validate(&paths).unwrap();
+        assert_eq!(
+            config.agents.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["claude", "codex", "zed"]
+        );
+        assert_eq!(config.default_agent_name(&paths).unwrap(), "claude");
+    }
+
+    #[test]
+    fn missing_default_agent_defaults_to_codex() {
+        let paths = test_paths();
+        let config: Config = toml::from_str(
+            r#"
+[agents.codex]
+command = "codex"
+"#,
+        )
+        .unwrap();
+
+        let config = config.validate(&paths).unwrap();
+        assert_eq!(config.default_agent, "codex");
+        assert_eq!(config.default_agent_name(&paths).unwrap(), "codex");
+    }
+
+    #[test]
+    fn invalid_default_agent_returns_clear_error() {
+        let paths = test_paths();
+        let config: Config = toml::from_str(
+            r#"
+default_agent = "missing"
+
+[agents.codex]
+command = "codex"
+"#,
+        )
+        .unwrap();
+
+        let err = config.validate(&paths).unwrap_err().to_string();
+        assert!(err.contains("default_agent `missing`"));
         assert!(err.contains(paths.config.as_str()));
     }
 }

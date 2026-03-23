@@ -618,13 +618,17 @@ fn resolve_new_session_options(
     agent: Option<String>,
     review: bool,
 ) -> Result<NewSessionOptions> {
+    let config = Config::load(paths)?;
     Ok(NewSessionOptions {
         workspace: match workspace {
             Some(workspace) => workspace,
             None => std::env::current_dir().context("failed to resolve current directory")?,
         },
         title: title.filter(|value| !value.trim().is_empty()),
-        agent: agent.unwrap_or_else(|| "codex".to_string()),
+        agent: match agent {
+            Some(agent) => agent,
+            None => config.default_agent_name(paths)?.to_string(),
+        },
         integration_policy: resolve_integration_policy(paths, review)?,
     })
 }
@@ -1902,6 +1906,28 @@ mod tests {
         assert!(options.title.is_none());
         assert_eq!(options.agent, "codex");
         assert_eq!(options.integration_policy, IntegrationPolicy::AutoApplySafe);
+    }
+
+    #[test]
+    fn resolve_new_session_options_uses_configured_default_agent() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        std::fs::write(
+            paths.config.as_std_path(),
+            r#"
+default_agent = "claude"
+
+[agents.codex]
+command = "codex"
+
+[agents.claude]
+command = "claude"
+"#,
+        )
+        .unwrap();
+
+        let options = resolve_new_session_options(&paths, None, None, None, false).unwrap();
+        assert_eq!(options.agent, "claude");
     }
 
     #[test]

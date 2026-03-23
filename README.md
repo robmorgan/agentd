@@ -161,14 +161,19 @@ make install
 Create `<runtime-root>/config.toml`:
 
 ```toml
-[agents.claude]
-command = "claude"
-args = []
+default_agent = "codex"
 
 [agents.codex]
 command = "codex"
 args = []
+
+[agents.claude]
+command = "claude"
+args = []
 ```
+
+Agent picker order follows the order of the `[agents.*]` tables in this file. `default_agent`
+must name one of those configured agents.
 
 The daemon injects:
 

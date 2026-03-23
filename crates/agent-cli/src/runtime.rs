@@ -139,15 +139,17 @@ impl Drop for PickerScreenGuard {
     }
 }
 
-fn configured_agent_names(paths: &AppPaths) -> Vec<String> {
-    let mut names = Config::load(paths)
-        .map(|config| config.agents.into_keys().collect::<Vec<_>>())
-        .unwrap_or_else(|_| vec!["codex".to_string()]);
-    names.sort();
+fn configured_agent_names(paths: &AppPaths) -> Result<Vec<String>> {
+    let mut names = Config::load(paths)?.agents.into_keys().collect::<Vec<_>>();
     if names.is_empty() {
         names.push("codex".to_string());
     }
-    names
+    Ok(names)
+}
+
+fn configured_default_agent(paths: &AppPaths) -> Result<String> {
+    let config = Config::load(paths)?;
+    Ok(config.default_agent_name(paths)?.to_string())
 }
 
 pub async fn pick_session(paths: &AppPaths) -> Result<Option<String>> {
@@ -281,7 +283,8 @@ struct PickerComposer {
 
 impl SessionPicker {
     fn new(paths: AppPaths) -> Self {
-        let create_agents = configured_agent_names(&paths);
+        let create_agents =
+            configured_agent_names(&paths).unwrap_or_else(|_| vec!["codex".to_string()]);
         Self {
             paths,
             sessions: Vec::new(),
@@ -296,7 +299,7 @@ impl SessionPicker {
 
     async fn refresh_sessions(&mut self) -> Result<()> {
         self.sessions = daemon_list_sessions(&self.paths).await?;
-        self.refresh_agent_names();
+        self.refresh_agent_names()?;
         self.clamp_selection();
         self.clamp_mode_selection();
         Ok(())
@@ -779,12 +782,13 @@ impl SessionPicker {
         self.sessions.iter().find(|session| session.session_id == session_id)
     }
 
-    fn refresh_agent_names(&mut self) {
-        self.create_agents = configured_agent_names(&self.paths);
+    fn refresh_agent_names(&mut self) -> Result<()> {
+        self.create_agents = configured_agent_names(&self.paths)?;
         if self.create_agents.is_empty() {
             self.toast = Some("no configured agents found; falling back to codex".to_string());
             self.create_agents = vec!["codex".to_string()];
         }
+        Ok(())
     }
 
     fn open_create_agent_menu(&mut self) {
@@ -838,7 +842,9 @@ impl SessionPicker {
     }
 
     fn default_create_agent_selection(&self) -> usize {
-        self.create_agents.iter().position(|agent| agent == "codex").unwrap_or(0)
+        let default_agent =
+            configured_default_agent(&self.paths).unwrap_or_else(|_| "codex".to_string());
+        self.create_agents.iter().position(|agent| agent == &default_agent).unwrap_or(0)
     }
 
     fn action_index(&self, session_id: &str, action: SessionAction) -> usize {
@@ -2264,7 +2270,7 @@ mod tests {
         let mut picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![demo("alpha", "repo-a")],
-            create_agents: vec!["claude".to_string(), "codex".to_string()],
+            create_agents: vec!["codex".to_string(), "claude".to_string()],
             composer: default_composer(),
             mode: PickerMode::Browse,
             detail_text: String::new(),
@@ -2274,7 +2280,7 @@ mod tests {
 
         picker.open_create_agent_menu();
 
-        assert_eq!(picker.mode, PickerMode::CreateAgentSelect { selected: 1 });
+        assert_eq!(picker.mode, PickerMode::CreateAgentSelect { selected: 0 });
     }
 
     #[test]
@@ -2282,7 +2288,7 @@ mod tests {
         let mut picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![demo("alpha", "repo-a")],
-            create_agents: vec!["claude".to_string(), "codex".to_string()],
+            create_agents: vec!["codex".to_string(), "claude".to_string()],
             composer: default_composer(),
             mode: PickerMode::CreateAgentSelect { selected: 9 },
             detail_text: String::new(),
@@ -2294,15 +2300,15 @@ mod tests {
         let rendered = picker.render_lines(120, true).join("\n");
 
         assert_eq!(picker.mode, PickerMode::CreateAgentSelect { selected: 1 });
-        assert!(rendered.contains("1. claude"));
-        assert!(rendered.contains("› 2. codex"));
+        assert!(rendered.contains("1. codex"));
+        assert!(rendered.contains("› 2. claude"));
         assert!(!rendered.contains("title-alpha"));
     }
 
     #[test]
-    fn configured_agent_names_use_sorted_defaults() {
-        let names = configured_agent_names(&test_paths());
-        assert_eq!(names, vec!["claude".to_string(), "codex".to_string()]);
+    fn configured_agent_names_use_default_config_order() {
+        let names = configured_agent_names(&test_paths()).unwrap();
+        assert_eq!(names, vec!["codex".to_string(), "claude".to_string()]);
     }
 
     #[test]
