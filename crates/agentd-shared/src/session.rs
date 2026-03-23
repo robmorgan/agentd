@@ -24,10 +24,9 @@ pub enum AttentionLevel {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum IntegrationState {
-    Clean,
+pub enum ApplyState {
+    Idle,
     AutoApplying,
-    PendingReview,
     Applied,
     Discarded,
 }
@@ -41,10 +40,11 @@ pub enum IntegrationPolicy {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum GitSyncStatus {
+pub enum MergeStatus {
     Unknown,
-    InSync,
-    NeedsSync,
+    UpToDate,
+    Ready,
+    Blocked,
     Conflicted,
 }
 
@@ -78,9 +78,9 @@ pub struct SessionRecord {
     pub worktree: String,
     pub status: SessionStatus,
     pub integration_policy: IntegrationPolicy,
-    pub integration_state: IntegrationState,
-    pub git_sync: GitSyncStatus,
-    pub git_status_summary: Option<String>,
+    pub apply_state: ApplyState,
+    pub merge_status: MergeStatus,
+    pub merge_summary: Option<String>,
     pub has_conflicts: bool,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
@@ -155,12 +155,11 @@ impl AttentionLevel {
     }
 }
 
-impl IntegrationState {
+impl ApplyState {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Clean => "clean",
+            Self::Idle => "idle",
             Self::AutoApplying => "auto_applying",
-            Self::PendingReview => "pending_review",
             Self::Applied => "applied",
             Self::Discarded => "discarded",
         }
@@ -176,12 +175,13 @@ impl IntegrationPolicy {
     }
 }
 
-impl GitSyncStatus {
+impl MergeStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
-            Self::InSync => "in_sync",
-            Self::NeedsSync => "needs_sync",
+            Self::UpToDate => "up_to_date",
+            Self::Ready => "ready",
+            Self::Blocked => "blocked",
             Self::Conflicted => "conflicted",
         }
     }

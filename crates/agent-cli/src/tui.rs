@@ -10,22 +10,20 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear as WidgetClear, Paragraph, Wrap},
 };
-use tokio::{
-    io::BufReader,
-    net::UnixStream,
-    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
-};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use agentd_shared::{
     paths::AppPaths,
     protocol::{Request, Response, read_response, write_request},
-    session::{AttachmentKind, IntegrationPolicy, IntegrationState, SessionRecord, SessionStatus},
+    session::{
+        ApplyState, AttachmentKind, IntegrationPolicy, MergeStatus, SessionRecord, SessionStatus,
+    },
 };
 
 use crate::{
-    CODEX_MODELS, RawModeGuard, StatusString, TerminalScreenGuard, centered_rect,
-    daemon_get_session, daemon_list_sessions, encode_attach_key, kill_session, send_request,
-    session_display::session_elapsed_label,
+    AttachHandshake, CODEX_MODELS, RawModeGuard, StatusString, TerminalScreenGuard, centered_rect,
+    connect_attached_session, daemon_get_session, daemon_list_sessions, encode_attach_key,
+    kill_session, send_request, session_display::session_elapsed_label,
 };
 
 const LEADER_KEY: (KeyCode, KeyModifiers) = (KeyCode::Char('b'), KeyModifiers::CONTROL);
@@ -257,7 +255,12 @@ impl RuntimeApp {
                         live_status,
                         Some(SessionStatus::Running | SessionStatus::NeedsInput)
                     ) {
-                        self.pty = Some(FocusedPty::spawn(self.paths.clone(), session_id.clone()));
+                        let initial_size = self.last_pane_size.unwrap_or((80, 24));
+                        self.pty = Some(FocusedPty::spawn(
+                            self.paths.clone(),
+                            session_id.clone(),
+                            initial_size,
+                        ));
                     }
                 }
 
@@ -539,13 +542,11 @@ impl RuntimeApp {
             self.toast = Some("focus a worker session first".to_string());
             return;
         };
-        let sync = session.git_sync.as_str();
-        let summary = session
-            .git_status_summary
-            .clone()
-            .unwrap_or_else(|| "TODO: live git status sync not implemented yet".to_string());
+        let sync = session.merge_status.as_str();
+        let summary =
+            session.merge_summary.clone().unwrap_or_else(|| "merge status unavailable".to_string());
         self.detail_text = format!(
-            "repo       {}\nrepo_path  {}\nworktree   {}\nbranch     {}\nbase       {}\npolicy     {}\ngit_sync   {}\nconflicts  {}\n\n{}",
+            "repo       {}\nrepo_path  {}\nworktree   {}\nbranch     {}\nbase       {}\npolicy     {}\nmerge      {}\nconflicts  {}\n\n{}",
             session.repo_name,
             session.repo_path,
             session.worktree,
@@ -739,10 +740,9 @@ impl RuntimeApp {
             self.toast = Some("focus a worker session first".to_string());
             return;
         };
-        let summary =
-            session.git_status_summary.clone().unwrap_or_else(|| "review ready".to_string());
+        let summary = session.merge_summary.clone().unwrap_or_else(|| "ready to merge".to_string());
         self.detail_text = format!(
-            "session    {}\nrepo       {}\nbase       {}\nbranch     {}\nworktree   {}\npolicy     {}\nstatus     {}\nreview     {}\nconflicts  {}\n\nCLI actions\nagent diff {}\nagent accept {}\nagent discard {}\n\n`accept` will only apply when the repo checkout is clean and on `{}`. It performs a normal git merge and refuses to touch the upstream checkout if preflight predicts conflicts.",
+            "session    {}\nrepo       {}\nbase       {}\nbranch     {}\nworktree   {}\npolicy     {}\nstatus     {}\nmerge      {}\nconflicts  {}\n\nCLI actions\nagent diff {}\nagent merge {}\nagent discard {}\n\n`merge` applies committed branch HEAD into `{}` when the upstream checkout is clean and preflight predicts no conflicts. Uncommitted worktree changes stay local.",
             session.session_id,
             session.repo_name,
             session.base_branch,
@@ -971,8 +971,8 @@ impl RuntimeApp {
                 Span::styled("status    ", subtle_style()),
                 Span::raw(session_status_text(session)),
                 Span::raw("  "),
-                Span::styled("git ", subtle_style()),
-                Span::raw(session.git_sync.as_str()),
+                Span::styled("merge ", subtle_style()),
+                Span::raw(session.merge_status.as_str()),
             ]),
         ];
         frame.render_widget(Paragraph::new(summary).wrap(Wrap { trim: false }), sections[0]);
@@ -1211,15 +1211,21 @@ struct FocusedPty {
 }
 
 impl FocusedPty {
-    fn spawn(paths: AppPaths, session_id: String) -> Self {
+    fn spawn(paths: AppPaths, session_id: String, initial_size: (u16, u16)) -> Self {
         let (command_tx, command_rx) = unbounded_channel();
         let (message_tx, message_rx) = unbounded_channel();
-        tokio::spawn(run_pty_session(paths, session_id.clone(), command_rx, message_tx));
+        tokio::spawn(run_pty_session(
+            paths,
+            session_id.clone(),
+            initial_size,
+            command_rx,
+            message_tx,
+        ));
         Self {
             session_id,
             commands: command_tx,
             messages: message_rx,
-            terminal: TerminalSurface::new(80, 24),
+            terminal: TerminalSurface::new(initial_size.0, initial_size.1),
             connected: true,
             last_error: None,
         }
@@ -1267,42 +1273,21 @@ enum PtyEvent {
 async fn run_pty_session(
     paths: AppPaths,
     session_id: String,
+    initial_size: (u16, u16),
     mut commands: UnboundedReceiver<PtyCommand>,
     messages: UnboundedSender<PtyEvent>,
 ) {
     let result = async {
-        let mut stream = UnixStream::connect(paths.socket.as_std_path())
-            .await
-            .with_context(|| format!("failed to connect to {}", paths.socket))?;
-        write_request(
-            &mut stream,
-            &Request::AttachSession {
-                session_id: session_id.clone(),
-                kind: AttachmentKind::Tui,
-            },
-        )
-        .await?;
-
-        let (read_half, mut write_half) = stream.into_split();
-        let mut reader = BufReader::new(read_half);
-        let Some(initial) = read_response(&mut reader).await? else {
-            bail!("agentd closed the connection");
-        };
-
-        match initial {
-            Response::Attached { snapshot, .. } => {
-                let _ = messages.send(PtyEvent::Snapshot(snapshot));
-            }
-            Response::SessionEnded { status, .. } => {
-                let _ = messages.send(PtyEvent::Ended(format!("session ended: {}", status_label(status))));
+        let (cols, rows) = initial_size;
+        let attached = connect_attached_session(&paths, &session_id, AttachmentKind::Tui, cols, rows).await?;
+        let (mut reader, mut write_half, snapshot) = match attached {
+            AttachHandshake::Attached(attached) => (attached.reader, attached.write_half, attached.snapshot),
+            AttachHandshake::SessionEnded(summary) => {
+                let _ = messages.send(PtyEvent::Ended(format!("session ended: {}", status_label(summary.status))));
                 return Ok::<(), anyhow::Error>(());
             }
-            Response::Error { message } => {
-                let _ = messages.send(PtyEvent::Error(message));
-                return Ok(());
-            }
-            other => bail!("unexpected response: {:?}", other),
-        }
+        };
+        let _ = messages.send(PtyEvent::Snapshot(snapshot));
 
         loop {
             tokio::select! {
@@ -2033,9 +2018,9 @@ fn session_rank(session: &SessionRecord) -> u8 {
         || session.has_conflicts
     {
         1
-    } else if session.integration_state == IntegrationState::AutoApplying {
+    } else if session.apply_state == ApplyState::AutoApplying {
         2
-    } else if session.integration_state == IntegrationState::PendingReview {
+    } else if session.merge_status == MergeStatus::Ready {
         3
     } else if matches!(session.status, SessionStatus::Running | SessionStatus::Creating) {
         4
@@ -2045,9 +2030,9 @@ fn session_rank(session: &SessionRecord) -> u8 {
 }
 
 fn session_icon(session: &SessionRecord) -> &'static str {
-    if session.integration_state == IntegrationState::AutoApplying {
+    if session.apply_state == ApplyState::AutoApplying {
         "↺"
-    } else if session.integration_state == IntegrationState::PendingReview {
+    } else if session.merge_status == MergeStatus::Ready {
         "⧖"
     } else {
         match session.status {
@@ -2061,9 +2046,9 @@ fn session_icon(session: &SessionRecord) -> &'static str {
 }
 
 fn session_icon_color(session: &SessionRecord) -> Color {
-    if session.integration_state == IntegrationState::AutoApplying {
+    if session.apply_state == ApplyState::AutoApplying {
         Color::Yellow
-    } else if session.integration_state == IntegrationState::PendingReview {
+    } else if session.merge_status == MergeStatus::Ready {
         Color::Blue
     } else {
         match session.status {
@@ -2091,17 +2076,14 @@ fn session_status_text(session: &SessionRecord) -> String {
     if session.has_conflicts {
         return "conflicts detected".to_string();
     }
-    if session.integration_state == IntegrationState::AutoApplying {
+    if session.apply_state == ApplyState::AutoApplying {
         return "auto applying".to_string();
     }
-    if session.integration_state == IntegrationState::Applied {
+    if session.apply_state == ApplyState::Applied {
         return "applied".to_string();
     }
-    if let Some(summary) = &session.git_status_summary {
+    if let Some(summary) = &session.merge_summary {
         return summary.clone();
-    }
-    if session.integration_state == IntegrationState::PendingReview {
-        return "review ready".to_string();
     }
     match session.status {
         SessionStatus::Creating => "starting".to_string(),
@@ -2156,14 +2138,24 @@ mod tests {
     };
     use agentd_shared::paths::AppPaths;
     use agentd_shared::session::{
-        AttentionLevel, GitSyncStatus, IntegrationPolicy, IntegrationState, SessionMode,
-        SessionRecord, SessionStatus,
+        ApplyState, AttentionLevel, IntegrationPolicy, MergeStatus, SessionMode, SessionRecord,
+        SessionStatus,
     };
     use camino::Utf8PathBuf;
     use chrono::{Duration, Utc};
     use ratatui::style::Color;
 
+    #[derive(Clone, Copy)]
+    enum IntegrationState {
+        Clean,
+        PendingReview,
+    }
+
     fn demo(status: SessionStatus, integration_state: IntegrationState) -> SessionRecord {
+        let (apply_state, merge_status) = match integration_state {
+            IntegrationState::Clean => (ApplyState::Idle, MergeStatus::Unknown),
+            IntegrationState::PendingReview => (ApplyState::Idle, MergeStatus::Ready),
+        };
         let now = Utc::now();
         SessionRecord {
             session_id: "demo".to_string(),
@@ -2180,9 +2172,9 @@ mod tests {
             worktree: "/tmp/worktree".to_string(),
             status,
             integration_policy: IntegrationPolicy::AutoApplySafe,
-            integration_state,
-            git_sync: GitSyncStatus::Unknown,
-            git_status_summary: None,
+            apply_state,
+            merge_status,
+            merge_summary: None,
             has_conflicts: false,
             pid: Some(1),
             exit_code: None,

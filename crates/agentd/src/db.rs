@@ -5,10 +5,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use agentd_shared::{
     paths::AppPaths,
     session::{
-        AttentionLevel, GitSyncStatus, IntegrationPolicy, IntegrationState, SessionMode,
-        SessionRecord, SessionStatus,
+        ApplyState, AttentionLevel, IntegrationPolicy, MergeStatus, SessionMode, SessionRecord,
+        SessionStatus, repo_name_from_path,
     },
-    sqlite_schema::init_state_db,
 };
 
 #[derive(Clone)]
@@ -44,8 +43,185 @@ impl Database {
     }
 
     fn init(&self) -> Result<()> {
-        let mut conn = self.connect()?;
-        init_state_db(&mut conn)
+        let conn = self.connect()?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                thread_id TEXT,
+                agent TEXT NOT NULL,
+                model TEXT,
+                mode TEXT NOT NULL DEFAULT 'execute',
+                agent_command TEXT,
+                agent_args_json TEXT,
+                resume_session_id TEXT,
+                workspace TEXT NOT NULL,
+                repo_path TEXT,
+                repo_name TEXT,
+                title TEXT,
+                task TEXT NOT NULL,
+                base_branch TEXT,
+                branch TEXT NOT NULL,
+                worktree TEXT NOT NULL,
+                status TEXT NOT NULL,
+                integration_policy TEXT NOT NULL DEFAULT 'manual_review',
+                pid INTEGER,
+                exit_code INTEGER,
+                error TEXT,
+                integration_state TEXT NOT NULL DEFAULT 'idle',
+                git_sync TEXT NOT NULL DEFAULT 'unknown',
+                git_status_summary TEXT,
+                has_conflicts INTEGER NOT NULL DEFAULT 0,
+                attention TEXT NOT NULL DEFAULT 'info',
+                attention_summary TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                exited_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS threads (
+                thread_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL UNIQUE,
+                agent TEXT NOT NULL,
+                title TEXT NOT NULL,
+                initial_prompt TEXT NOT NULL,
+                upstream_thread_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_threads_session_id
+                ON threads (session_id);
+            ",
+        )?;
+        conn.execute("DROP TABLE IF EXISTS events", [])?;
+        conn.execute("DROP TABLE IF EXISTS plans", [])?;
+        self.ensure_column(&conn, "thread_id", "ALTER TABLE sessions ADD COLUMN thread_id TEXT")?;
+        self.ensure_column(&conn, "model", "ALTER TABLE sessions ADD COLUMN model TEXT")?;
+        self.ensure_column(
+            &conn,
+            "mode",
+            "ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'execute'",
+        )?;
+        self.ensure_column(&conn, "repo_path", "ALTER TABLE sessions ADD COLUMN repo_path TEXT")?;
+        self.ensure_column(&conn, "repo_name", "ALTER TABLE sessions ADD COLUMN repo_name TEXT")?;
+        self.ensure_column(&conn, "title", "ALTER TABLE sessions ADD COLUMN title TEXT")?;
+        self.ensure_column(
+            &conn,
+            "agent_command",
+            "ALTER TABLE sessions ADD COLUMN agent_command TEXT",
+        )?;
+        self.ensure_column(
+            &conn,
+            "agent_args_json",
+            "ALTER TABLE sessions ADD COLUMN agent_args_json TEXT",
+        )?;
+        self.ensure_column(
+            &conn,
+            "resume_session_id",
+            "ALTER TABLE sessions ADD COLUMN resume_session_id TEXT",
+        )?;
+        self.ensure_column(
+            &conn,
+            "base_branch",
+            "ALTER TABLE sessions ADD COLUMN base_branch TEXT",
+        )?;
+        self.ensure_column(
+            &conn,
+            "integration_policy",
+            "ALTER TABLE sessions ADD COLUMN integration_policy TEXT NOT NULL DEFAULT 'manual_review'",
+        )?;
+        self.ensure_column(
+            &conn,
+            "integration_state",
+            "ALTER TABLE sessions ADD COLUMN integration_state TEXT NOT NULL DEFAULT 'idle'",
+        )?;
+        self.ensure_column(
+            &conn,
+            "git_sync",
+            "ALTER TABLE sessions ADD COLUMN git_sync TEXT NOT NULL DEFAULT 'unknown'",
+        )?;
+        self.ensure_column(
+            &conn,
+            "git_status_summary",
+            "ALTER TABLE sessions ADD COLUMN git_status_summary TEXT",
+        )?;
+        self.ensure_column(
+            &conn,
+            "has_conflicts",
+            "ALTER TABLE sessions ADD COLUMN has_conflicts INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.ensure_column(
+            &conn,
+            "attention",
+            "ALTER TABLE sessions ADD COLUMN attention TEXT NOT NULL DEFAULT 'info'",
+        )?;
+        self.ensure_column(
+            &conn,
+            "attention_summary",
+            "ALTER TABLE sessions ADD COLUMN attention_summary TEXT",
+        )?;
+        conn.execute(
+            "UPDATE sessions
+             SET mode = COALESCE(mode, 'execute'),
+                 repo_path = COALESCE(repo_path, workspace),
+                 repo_name = COALESCE(repo_name, repo_path, workspace),
+                 title = COALESCE(title, task, repo_name, workspace),
+                 base_branch = COALESCE(base_branch, 'HEAD'),
+                 integration_policy = COALESCE(integration_policy, 'manual_review'),
+                 integration_state = CASE
+                     WHEN integration_state IS NULL THEN 'idle'
+                     WHEN integration_state IN ('clean', 'pending_review') THEN 'idle'
+                     ELSE integration_state
+                 END,
+                 git_sync = COALESCE(git_sync, 'unknown'),
+                 has_conflicts = COALESCE(has_conflicts, 0),
+                 attention = COALESCE(attention, 'info'),
+                 attention_summary = COALESCE(attention_summary, title, task)
+             WHERE mode IS NULL OR repo_path IS NULL OR repo_name IS NULL OR title IS NULL OR base_branch IS NULL OR integration_policy IS NULL OR integration_state IS NULL OR git_sync IS NULL OR has_conflicts IS NULL OR attention IS NULL OR attention_summary IS NULL",
+            [],
+        )?;
+        self.backfill_repo_names(&conn)?;
+        Ok(())
+    }
+
+    fn ensure_column(&self, conn: &Connection, column: &str, ddl: &str) -> Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let existing: String = row.get(1)?;
+            if existing == column {
+                return Ok(());
+            }
+        }
+        conn.execute(ddl, [])?;
+        Ok(())
+    }
+
+    fn backfill_repo_names(&self, conn: &Connection) -> Result<()> {
+        let mut stmt = conn.prepare(
+            "SELECT session_id, repo_path, workspace, repo_name
+             FROM sessions",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+
+        for row in rows {
+            let (session_id, repo_path, workspace, repo_name) = row?;
+            let current = repo_name.unwrap_or_default();
+            let desired = repo_name_from_path(repo_path.as_deref().unwrap_or(&workspace));
+            if current != desired {
+                conn.execute(
+                    "UPDATE sessions SET repo_name = ?2 WHERE session_id = ?1",
+                    params![session_id, desired],
+                )?;
+            }
+        }
+
+        Ok(())
     }
 
     pub fn insert_session(&self, new_session: &NewSession<'_>) -> Result<()> {
@@ -74,8 +250,8 @@ impl Database {
                 integration_policy_to_str(new_session.integration_policy),
                 attention_to_str(AttentionLevel::Info),
                 new_session.title,
-                integration_state_to_str(IntegrationState::Clean),
-                git_sync_status_to_str(GitSyncStatus::Unknown),
+                apply_state_to_str(ApplyState::Idle),
+                merge_status_to_str(MergeStatus::Unknown),
                 Option::<String>::None,
                 false,
                 now,
@@ -102,7 +278,7 @@ impl Database {
             params![
                 session_id,
                 status_to_str(SessionStatus::Running),
-                integration_state_to_str(IntegrationState::Clean),
+                apply_state_to_str(ApplyState::Idle),
                 pid,
                 attention_to_str(AttentionLevel::Info),
                 "running",
@@ -153,7 +329,7 @@ impl Database {
                 session_id,
                 status_to_str(SessionStatus::Exited),
                 exit_code,
-                integration_state_to_str(IntegrationState::Clean),
+                apply_state_to_str(ApplyState::Idle),
                 attention_to_str(AttentionLevel::Notice),
                 match exit_code {
                     Some(code) => format!("finished (exit {code})"),
@@ -187,10 +363,10 @@ impl Database {
         Ok(())
     }
 
-    pub fn set_integration_state(
+    pub fn set_apply_state(
         &self,
         session_id: &str,
-        integration_state: IntegrationState,
+        apply_state: ApplyState,
         attention: AttentionLevel,
         attention_summary: &str,
     ) -> Result<()> {
@@ -205,36 +381,9 @@ impl Database {
              WHERE session_id = ?1",
             params![
                 session_id,
-                integration_state_to_str(integration_state),
+                apply_state_to_str(apply_state),
                 attention_to_str(attention),
                 attention_summary,
-                now
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_git_review_state(
-        &self,
-        session_id: &str,
-        git_sync: GitSyncStatus,
-        git_status_summary: Option<&str>,
-        has_conflicts: bool,
-    ) -> Result<()> {
-        let conn = self.connect()?;
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE sessions
-             SET git_sync = ?2,
-                 git_status_summary = ?3,
-                 has_conflicts = ?4,
-                 updated_at = ?5
-             WHERE session_id = ?1",
-            params![
-                session_id,
-                git_sync_status_to_str(git_sync),
-                git_status_summary,
-                has_conflicts,
                 now
             ],
         )?;
@@ -306,21 +455,21 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
                 )
             },
         )?,
-        integration_state: str_to_integration_state(&row.get::<_, String>(14)?).map_err(|err| {
+        apply_state: str_to_apply_state(&row.get::<_, String>(14)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 14,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        git_sync: str_to_git_sync_status(&row.get::<_, String>(15)?).map_err(|err| {
+        merge_status: str_to_merge_status(&row.get::<_, String>(15)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 15,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        git_status_summary: row.get(16)?,
+        merge_summary: row.get(16)?,
         has_conflicts: row.get::<_, bool>(17)?,
         pid: row.get::<_, Option<u32>>(18)?,
         exit_code: row.get(19)?,
@@ -380,7 +529,7 @@ fn attention_to_str(attention: AttentionLevel) -> &'static str {
     }
 }
 
-fn git_sync_status_to_str(status: GitSyncStatus) -> &'static str {
+fn merge_status_to_str(status: MergeStatus) -> &'static str {
     status.as_str()
 }
 
@@ -388,7 +537,7 @@ fn integration_policy_to_str(policy: IntegrationPolicy) -> &'static str {
     policy.as_str()
 }
 
-fn integration_state_to_str(state: IntegrationState) -> &'static str {
+fn apply_state_to_str(state: ApplyState) -> &'static str {
     state.as_str()
 }
 
@@ -396,16 +545,15 @@ fn session_mode_to_str(mode: SessionMode) -> &'static str {
     mode.as_str()
 }
 
-fn str_to_integration_state(value: &str) -> std::result::Result<IntegrationState, std::io::Error> {
+fn str_to_apply_state(value: &str) -> std::result::Result<ApplyState, std::io::Error> {
     match value {
-        "clean" => Ok(IntegrationState::Clean),
-        "auto_applying" => Ok(IntegrationState::AutoApplying),
-        "pending_review" => Ok(IntegrationState::PendingReview),
-        "applied" => Ok(IntegrationState::Applied),
-        "discarded" => Ok(IntegrationState::Discarded),
+        "idle" | "clean" | "pending_review" => Ok(ApplyState::Idle),
+        "auto_applying" => Ok(ApplyState::AutoApplying),
+        "applied" => Ok(ApplyState::Applied),
+        "discarded" => Ok(ApplyState::Discarded),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("unknown integration state `{value}`"),
+            format!("unknown apply state `{value}`"),
         )),
     }
 }
@@ -423,15 +571,16 @@ fn str_to_integration_policy(
     }
 }
 
-fn str_to_git_sync_status(value: &str) -> std::result::Result<GitSyncStatus, std::io::Error> {
+fn str_to_merge_status(value: &str) -> std::result::Result<MergeStatus, std::io::Error> {
     match value {
-        "unknown" => Ok(GitSyncStatus::Unknown),
-        "in_sync" => Ok(GitSyncStatus::InSync),
-        "needs_sync" => Ok(GitSyncStatus::NeedsSync),
-        "conflicted" => Ok(GitSyncStatus::Conflicted),
+        "unknown" => Ok(MergeStatus::Unknown),
+        "up_to_date" => Ok(MergeStatus::UpToDate),
+        "ready" | "in_sync" => Ok(MergeStatus::Ready),
+        "blocked" | "needs_sync" => Ok(MergeStatus::Blocked),
+        "conflicted" => Ok(MergeStatus::Conflicted),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("unknown git sync status `{value}`"),
+            format!("unknown merge status `{value}`"),
         )),
     }
 }

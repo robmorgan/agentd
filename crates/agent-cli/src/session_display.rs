@@ -28,8 +28,8 @@ fn format_elapsed_seconds(seconds: u64) -> String {
 mod tests {
     use super::{format_elapsed_seconds, session_elapsed_label_at};
     use agentd_shared::session::{
-        AttentionLevel, GitSyncStatus, IntegrationPolicy, IntegrationState, SessionMode,
-        SessionRecord, SessionStatus,
+        ApplyState, AttentionLevel, IntegrationPolicy, MergeStatus, SessionMode, SessionRecord,
+        SessionStatus,
     };
     use chrono::{Duration, Utc};
 
@@ -79,9 +79,9 @@ mod tests {
             worktree: "/tmp/worktree".to_string(),
             status: SessionStatus::Running,
             integration_policy: IntegrationPolicy::AutoApplySafe,
-            integration_state: IntegrationState::Clean,
-            git_sync: GitSyncStatus::Unknown,
-            git_status_summary: None,
+            apply_state: ApplyState::Idle,
+            merge_status: MergeStatus::Unknown,
+            merge_summary: None,
             has_conflicts: false,
             pid: Some(1),
             exit_code: None,
