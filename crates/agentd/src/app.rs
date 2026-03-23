@@ -23,8 +23,8 @@ use agentd_shared::{
     paths::AppPaths,
     session::{
         AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult, GitSyncStatus,
-        IntegrationState, SessionDiff, SessionMode, SessionRecord, SessionStatus, WorktreeRecord,
-        branch_name_from_title, repo_name_from_path,
+        IntegrationPolicy, IntegrationState, SessionDiff, SessionMode, SessionRecord,
+        SessionStatus, WorktreeRecord, branch_name_from_title, repo_name_from_path,
     },
 };
 
@@ -54,6 +54,7 @@ impl AppState {
         title: Option<String>,
         agent_name: String,
         model: Option<String>,
+        integration_policy: IntegrationPolicy,
     ) -> Result<CreateSessionResult> {
         let paths = self.paths.clone();
         let db = self.db.clone();
@@ -91,6 +92,7 @@ impl AppState {
                 base_branch: &base_branch,
                 branch: &branch,
                 worktree: worktree.as_str(),
+                integration_policy,
             })?;
 
             if let Err(err) = git::create_worktree(&repo_root, &base_branch, &branch, &worktree) {
@@ -128,6 +130,7 @@ impl AppState {
                 worktree: worktree.to_string(),
                 status: SessionStatus::Running,
                 mode,
+                integration_policy,
             })
         })
         .await?
@@ -889,12 +892,29 @@ fn finalize_session_exit(db: &Database, session_id: &str, exit_code: Option<i32>
     if exit_code == Some(0) {
         db.mark_exited(session_id, exit_code)?;
         if has_changes {
-            db.set_integration_state(
-                session_id,
-                IntegrationState::PendingReview,
-                AttentionLevel::Notice,
-                "changes ready to review",
-            )?;
+            match session.integration_policy {
+                IntegrationPolicy::ManualReview => {
+                    db.set_integration_state(
+                        session_id,
+                        IntegrationState::PendingReview,
+                        AttentionLevel::Notice,
+                        "changes ready to review",
+                    )?;
+                }
+                IntegrationPolicy::AutoApplySafe => {
+                    if let Err(err) = auto_apply_session_on_exit(db, &session) {
+                        let summary = format!("auto-apply stopped: {err}");
+                        set_pending_review_state(
+                            db,
+                            &session,
+                            GitSyncStatus::NeedsSync,
+                            &summary,
+                            false,
+                            AttentionLevel::Action,
+                        )?;
+                    }
+                }
+            }
         }
     } else {
         let error = match exit_code {
@@ -906,6 +926,150 @@ fn finalize_session_exit(db: &Database, session_id: &str, exit_code: Option<i32>
     Ok(())
 }
 
+fn auto_apply_session_on_exit(db: &Database, session: &SessionRecord) -> Result<()> {
+    db.set_integration_state(
+        &session.session_id,
+        IntegrationState::AutoApplying,
+        AttentionLevel::Notice,
+        "auto-applying changes",
+    )?;
+
+    let worktree = Utf8PathBuf::from(&session.worktree);
+    if !worktree.exists() {
+        set_pending_review_state(
+            db,
+            session,
+            GitSyncStatus::NeedsSync,
+            &format!("worktree {} is missing; recreate or discard it", session.worktree),
+            false,
+            AttentionLevel::Action,
+        )?;
+        return Ok(());
+    }
+
+    if git::has_worktree_changes(&worktree)? {
+        git::commit_all(&worktree, &auto_commit_message(session))?;
+    }
+
+    match git::rebase_onto_base(&worktree, &session.base_branch)? {
+        git::RebaseOutcome::RebasingClean => {}
+        git::RebaseOutcome::Conflicted => {
+            let summary = auto_apply_rebase_conflict_summary(session);
+            set_pending_review_state(
+                db,
+                session,
+                GitSyncStatus::Conflicted,
+                &summary,
+                true,
+                AttentionLevel::Action,
+            )?;
+            return Ok(());
+        }
+    }
+
+    let review = review_state_for_accept(session)?;
+    match review.git_sync {
+        GitSyncStatus::InSync => {}
+        GitSyncStatus::NeedsSync => {
+            set_pending_review_state(
+                db,
+                session,
+                review.git_sync,
+                &review.summary,
+                review.has_conflicts,
+                AttentionLevel::Notice,
+            )?;
+            return Ok(());
+        }
+        GitSyncStatus::Conflicted => {
+            set_pending_review_state(
+                db,
+                session,
+                review.git_sync,
+                &review.summary,
+                review.has_conflicts,
+                AttentionLevel::Action,
+            )?;
+            return Ok(());
+        }
+        GitSyncStatus::Unknown => {
+            set_pending_review_state(
+                db,
+                session,
+                review.git_sync,
+                "auto-apply could not determine integration readiness",
+                review.has_conflicts,
+                AttentionLevel::Action,
+            )?;
+            return Ok(());
+        }
+    }
+
+    let repo_root = Utf8PathBuf::from(&session.repo_path);
+    match git::preview_merge(&repo_root, &session.base_branch, &session.branch)? {
+        git::MergePreview::NoChanges => {
+            db.set_integration_state(
+                &session.session_id,
+                IntegrationState::Applied,
+                AttentionLevel::Info,
+                "changes already present on base branch",
+            )?;
+            db.set_git_review_state(
+                &session.session_id,
+                GitSyncStatus::InSync,
+                Some("changes already present on base branch"),
+                false,
+            )?;
+        }
+        git::MergePreview::HasChanges => {
+            git::apply_fast_forward(&repo_root, &session.branch)?;
+            let summary = format!("changes auto-applied into {}", session.base_branch);
+            db.set_integration_state(
+                &session.session_id,
+                IntegrationState::Applied,
+                AttentionLevel::Info,
+                &summary,
+            )?;
+            db.set_git_review_state(
+                &session.session_id,
+                GitSyncStatus::InSync,
+                Some(&summary),
+                false,
+            )?;
+        }
+        git::MergePreview::Conflicted => {
+            let summary = manual_accept_conflict_summary(session);
+            set_pending_review_state(
+                db,
+                session,
+                GitSyncStatus::Conflicted,
+                &summary,
+                true,
+                AttentionLevel::Action,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn set_pending_review_state(
+    db: &Database,
+    session: &SessionRecord,
+    git_sync: GitSyncStatus,
+    summary: &str,
+    has_conflicts: bool,
+    attention: AttentionLevel,
+) -> Result<()> {
+    db.set_integration_state(
+        &session.session_id,
+        IntegrationState::PendingReview,
+        attention,
+        summary,
+    )?;
+    db.set_git_review_state(&session.session_id, git_sync, Some(summary), has_conflicts)
+}
+
 fn session_has_pending_changes(session: &SessionRecord) -> Result<bool> {
     let worktree = Utf8PathBuf::from(&session.worktree);
     if !worktree.exists() {
@@ -913,6 +1077,21 @@ fn session_has_pending_changes(session: &SessionRecord) -> Result<bool> {
     }
     Ok(git::has_worktree_changes(&worktree)?
         || git::has_committed_diff_against_base(&worktree, &session.base_branch)?)
+}
+
+fn auto_commit_message(session: &SessionRecord) -> String {
+    format!("agentd: finalize session {}", session.session_id)
+}
+
+fn auto_apply_rebase_conflict_summary(session: &SessionRecord) -> String {
+    format!(
+        "auto-apply rebase would conflict with {}\nrun:\n  git -C {} checkout {}\n  git -C {} rebase {}",
+        session.base_branch,
+        shell_quote(&session.worktree),
+        shell_quote(&session.branch),
+        shell_quote(&session.worktree),
+        shell_quote(&session.base_branch),
+    )
 }
 
 fn normalize_session_title(
@@ -1111,12 +1290,18 @@ struct ReviewState {
 }
 
 fn refresh_review_state(db: &Database, session: SessionRecord) -> Result<SessionRecord> {
-    if session.integration_state != IntegrationState::PendingReview {
-        if session.git_sync != GitSyncStatus::Unknown
-            || session.git_status_summary.is_some()
-            || session.has_conflicts
+    if session.integration_state == IntegrationState::PendingReview {
+        let review = inspect_review_state(&session)?;
+        if session.git_sync != review.git_sync
+            || session.git_status_summary.as_deref() != Some(review.summary.as_str())
+            || session.has_conflicts != review.has_conflicts
         {
-            db.set_git_review_state(&session.session_id, GitSyncStatus::Unknown, None, false)?;
+            db.set_git_review_state(
+                &session.session_id,
+                review.git_sync,
+                Some(&review.summary),
+                review.has_conflicts,
+            )?;
             return db
                 .get_session(&session.session_id)?
                 .ok_or_else(|| anyhow!("session `{}` disappeared", session.session_id));
@@ -1124,17 +1309,18 @@ fn refresh_review_state(db: &Database, session: SessionRecord) -> Result<Session
         return Ok(session);
     }
 
-    let review = inspect_review_state(&session)?;
-    if session.git_sync != review.git_sync
-        || session.git_status_summary.as_deref() != Some(review.summary.as_str())
-        || session.has_conflicts != review.has_conflicts
+    if matches!(
+        session.integration_state,
+        IntegrationState::AutoApplying | IntegrationState::Applied
+    ) {
+        return Ok(session);
+    }
+
+    if session.git_sync != GitSyncStatus::Unknown
+        || session.git_status_summary.is_some()
+        || session.has_conflicts
     {
-        db.set_git_review_state(
-            &session.session_id,
-            review.git_sync,
-            Some(&review.summary),
-            review.has_conflicts,
-        )?;
+        db.set_git_review_state(&session.session_id, GitSyncStatus::Unknown, None, false)?;
         return db
             .get_session(&session.session_id)?
             .ok_or_else(|| anyhow!("session `{}` disappeared", session.session_id));
@@ -1243,7 +1429,10 @@ mod tests {
     use crate::terminal_state::TerminalStateEngine;
     use agentd_shared::{
         paths::AppPaths,
-        session::{AttachmentKind, GitSyncStatus, SessionMode, SessionRecord, SessionStatus},
+        session::{
+            AttachmentKind, GitSyncStatus, IntegrationPolicy, SessionMode, SessionRecord,
+            SessionStatus,
+        },
     };
     use anyhow::{Error, Result};
     use nix::libc;
@@ -1415,7 +1604,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_session_exit_marks_changed_sessions_pending_review() {
+    fn finalize_session_exit_auto_applies_changed_sessions_when_safe() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
         let db = Database::open(&paths).unwrap();
@@ -1428,10 +1617,7 @@ mod tests {
 
         let session = db.get_session("demo").unwrap().unwrap();
         assert_eq!(session.status, agentd_shared::session::SessionStatus::Exited);
-        assert_eq!(
-            session.integration_state,
-            agentd_shared::session::IntegrationState::PendingReview
-        );
+        assert_eq!(session.integration_state, agentd_shared::session::IntegrationState::Applied);
     }
 
     #[test]
@@ -1525,6 +1711,7 @@ mod tests {
             branch: "agent/demo".to_string(),
             worktree: "/tmp/worktree".to_string(),
             status: SessionStatus::Exited,
+            integration_policy: IntegrationPolicy::AutoApplySafe,
             integration_state: agentd_shared::session::IntegrationState::PendingReview,
             git_sync: GitSyncStatus::InSync,
             git_status_summary: None,
@@ -1707,6 +1894,7 @@ mod tests {
             base_branch: "main",
             branch: "agent/demo",
             worktree,
+            integration_policy: IntegrationPolicy::AutoApplySafe,
         })
         .unwrap();
     }

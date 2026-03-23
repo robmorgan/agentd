@@ -46,8 +46,8 @@ use agentd_shared::{
         write_daemon_management_request, write_request,
     },
     session::{
-        AttachmentKind, AttachmentRecord, AttentionLevel, IntegrationState, SessionDiff,
-        SessionRecord, SessionStatus, WorktreeRecord,
+        AttachmentKind, AttachmentRecord, AttentionLevel, IntegrationPolicy, IntegrationState,
+        SessionDiff, SessionRecord, SessionStatus, WorktreeRecord,
     },
 };
 
@@ -125,6 +125,8 @@ enum Command {
         workspace: Option<PathBuf>,
         #[arg(long)]
         agent: Option<String>,
+        #[arg(long, help = "Leave the session in manual review instead of auto-applying safely")]
+        review: bool,
     },
     #[command(about = "Create a session without attaching", display_order = 2)]
     Create {
@@ -134,6 +136,8 @@ enum Command {
         title: Option<String>,
         #[arg(long)]
         agent: String,
+        #[arg(long, help = "Leave the session in manual review instead of auto-applying safely")]
+        review: bool,
     },
     #[command(about = "Stop a running session or remove its record", display_order = 3)]
     Kill {
@@ -273,8 +277,8 @@ async fn main() -> Result<()> {
         (Some(Command::Runtime { .. }), ExecutionMode::Local(reason)) => {
             bail!("{reason}. `agent runtime` requires a compatible daemon");
         }
-        (Some(Command::New { title, workspace, agent }), ExecutionMode::Daemon) => {
-            let options = resolve_new_session_options(workspace, title, agent)?;
+        (Some(Command::New { title, workspace, agent, review }), ExecutionMode::Daemon) => {
+            let options = resolve_new_session_options(&paths, workspace, title, agent, review)?;
             let response = send_request(
                 &paths,
                 &Request::CreateSession {
@@ -282,6 +286,7 @@ async fn main() -> Result<()> {
                     title: options.title,
                     agent: options.agent,
                     model: None,
+                    integration_policy: options.integration_policy,
                 },
             )
             .await?;
@@ -297,7 +302,8 @@ async fn main() -> Result<()> {
         (Some(Command::New { .. }), ExecutionMode::Local(reason)) => {
             bail_live_command(&reason)?;
         }
-        (Some(Command::Create { workspace, title, agent }), ExecutionMode::Daemon) => {
+        (Some(Command::Create { workspace, title, agent, review }), ExecutionMode::Daemon) => {
+            let integration_policy = resolve_integration_policy(&paths, review)?;
             let response = send_request(
                 &paths,
                 &Request::CreateSession {
@@ -305,6 +311,7 @@ async fn main() -> Result<()> {
                     title,
                     agent,
                     model: None,
+                    integration_policy,
                 },
             )
             .await?;
@@ -315,6 +322,7 @@ async fn main() -> Result<()> {
                     println!("base_branch: {}", session.base_branch);
                     println!("branch: {}", session.branch);
                     println!("worktree: {}", session.worktree);
+                    println!("integration_policy: {}", session.integration_policy.as_str());
                 }
                 Response::Error { message } => bail!(message),
                 other => bail!("unexpected response: {:?}", other),
@@ -535,6 +543,7 @@ struct NewSessionOptions {
     workspace: PathBuf,
     title: Option<String>,
     agent: String,
+    integration_policy: IntegrationPolicy,
 }
 
 async fn resolve_execution_mode(
@@ -603,9 +612,11 @@ fn bail_daemon_command(reason: &str, command: &str) -> Result<()> {
 }
 
 fn resolve_new_session_options(
+    paths: &AppPaths,
     workspace: Option<PathBuf>,
     title: Option<String>,
     agent: Option<String>,
+    review: bool,
 ) -> Result<NewSessionOptions> {
     Ok(NewSessionOptions {
         workspace: match workspace {
@@ -614,7 +625,24 @@ fn resolve_new_session_options(
         },
         title: title.filter(|value| !value.trim().is_empty()),
         agent: agent.unwrap_or_else(|| "codex".to_string()),
+        integration_policy: resolve_integration_policy(paths, review)?,
     })
+}
+
+fn resolve_integration_policy(paths: &AppPaths, review: bool) -> Result<IntegrationPolicy> {
+    if review {
+        return Ok(IntegrationPolicy::ManualReview);
+    }
+
+    let config = Config::load(paths)?;
+    match config.git.default_integration_policy.as_str() {
+        "manual_review" => Ok(IntegrationPolicy::ManualReview),
+        "auto_apply_safe" => Ok(IntegrationPolicy::AutoApplySafe),
+        other => bail!(
+            "invalid git.default_integration_policy `{other}` in {}",
+            paths.config
+        ),
+    }
 }
 
 fn resolve_detach_session_id(session_id: Option<String>) -> Result<String> {
@@ -1152,6 +1180,7 @@ fn print_session(session: &SessionRecord) {
         println!("model: {model}");
     }
     println!("status: {}", session.status_string());
+    println!("integration_policy: {}", session.integration_policy.as_str());
     println!("integration_state: {}", session.integration_string());
     println!("attention: {}", session.attention_string());
     if let Some(summary) = &session.attention_summary {
@@ -1562,6 +1591,12 @@ fn format_session_end_summary(summary: &SessionEndSummary) -> String {
         },
         SessionStatus::NeedsInput => format!("session {} needs input", summary.session_id),
         SessionStatus::Exited | SessionStatus::UnknownRecovered => {
+            if summary.integration_state == IntegrationState::Applied {
+                return format!(
+                    "session {} finished and auto-applied from {} ({})",
+                    summary.session_id, summary.branch, summary.worktree
+                );
+            }
             if summary.integration_state == IntegrationState::PendingReview {
                 return format!(
                     "session {} finished with changes on {} ({})\nrun: agent diff {} | agent accept {} | agent discard {}",
@@ -1693,6 +1728,7 @@ impl StatusString for SessionRecord {
     fn integration_string(&self) -> &'static str {
         match self.integration_state {
             IntegrationState::Clean => "clean",
+            IntegrationState::AutoApplying => "auto_applying",
             IntegrationState::PendingReview => "pending_review",
             IntegrationState::Applied => "applied",
             IntegrationState::Discarded => "discarded",
@@ -1807,7 +1843,7 @@ mod tests {
         resolve_detach_session_id, resolve_new_session_options, should_colorize_diff_output,
     };
     use agentd_shared::paths::AppPaths;
-    use agentd_shared::session::{IntegrationState, SessionStatus};
+    use agentd_shared::session::{IntegrationPolicy, IntegrationState, SessionStatus};
     use clap::Parser;
     use std::{
         ffi::OsString,
@@ -1825,10 +1861,11 @@ mod tests {
     fn new_command_parses_optional_title() {
         let cli = Cli::try_parse_from(["agent", "new", "fix failing tests"]).unwrap();
         match cli.command {
-            Some(Command::New { title, workspace, agent }) => {
+            Some(Command::New { title, workspace, agent, review }) => {
                 assert_eq!(title.as_deref(), Some("fix failing tests"));
                 assert!(workspace.is_none());
                 assert!(agent.is_none());
+                assert!(!review);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1847,10 +1884,11 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Some(Command::New { title, workspace, agent }) => {
+            Some(Command::New { title, workspace, agent, review }) => {
                 assert_eq!(title.as_deref(), Some("fix"));
                 assert_eq!(workspace, Some(PathBuf::from("/tmp/repo")));
                 assert_eq!(agent.as_deref(), Some("claude"));
+                assert!(!review);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1858,23 +1896,29 @@ mod tests {
 
     #[test]
     fn resolve_new_session_options_uses_defaults() {
-        let options = resolve_new_session_options(None, None, None).unwrap();
+        let paths = test_paths();
+        let options = resolve_new_session_options(&paths, None, None, None, false).unwrap();
         assert_eq!(options.workspace, std::env::current_dir().unwrap());
         assert!(options.title.is_none());
         assert_eq!(options.agent, "codex");
+        assert_eq!(options.integration_policy, IntegrationPolicy::AutoApplySafe);
     }
 
     #[test]
     fn resolve_new_session_options_preserves_explicit_values() {
+        let paths = test_paths();
         let options = resolve_new_session_options(
+            &paths,
             Some(PathBuf::from("/tmp/repo")),
             Some("fix tests".to_string()),
             Some("claude".to_string()),
+            true,
         )
         .unwrap();
         assert_eq!(options.workspace, PathBuf::from("/tmp/repo"));
         assert_eq!(options.title.as_deref(), Some("fix tests"));
         assert_eq!(options.agent, "claude");
+        assert_eq!(options.integration_policy, IntegrationPolicy::ManualReview);
     }
 
     #[test]
@@ -2109,6 +2153,20 @@ mod tests {
             error: None,
         };
         assert!(format_session_end_summary(&summary).contains("agent accept demo"));
+    }
+
+    #[test]
+    fn format_session_end_summary_reports_auto_applied_sessions() {
+        let summary = SessionEndSummary {
+            session_id: "demo".to_string(),
+            status: SessionStatus::Exited,
+            integration_state: IntegrationState::Applied,
+            branch: "agent/demo".to_string(),
+            worktree: "/tmp/worktree".to_string(),
+            exit_code: Some(0),
+            error: None,
+        };
+        assert!(format_session_end_summary(&summary).contains("auto-applied"));
     }
 
     #[test]

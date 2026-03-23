@@ -7,8 +7,8 @@ use std::{
 use agentd_shared::{
     paths::AppPaths,
     session::{
-        AttentionLevel, GitSyncStatus, IntegrationState, SessionMode, SessionRecord, SessionStatus,
-        repo_name_from_path,
+        AttentionLevel, GitSyncStatus, IntegrationPolicy, IntegrationState, SessionMode,
+        SessionRecord, SessionStatus, repo_name_from_path,
     },
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -35,7 +35,7 @@ impl LocalStore {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, repo_name, title, base_branch, branch,
-                    worktree, status, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
+                    worktree, status, integration_policy, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
         )?;
@@ -47,7 +47,7 @@ impl LocalStore {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, repo_name, title, base_branch, branch,
-                    worktree, status, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
+                    worktree, status, integration_policy, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
             params![session_id],
@@ -110,6 +110,7 @@ impl LocalStore {
                 branch TEXT NOT NULL,
                 worktree TEXT NOT NULL,
                 status TEXT NOT NULL,
+                integration_policy TEXT NOT NULL DEFAULT 'manual_review',
                 pid INTEGER,
                 exit_code INTEGER,
                 error TEXT,
@@ -149,6 +150,11 @@ impl LocalStore {
         ensure_column(&conn, "base_branch", "ALTER TABLE sessions ADD COLUMN base_branch TEXT")?;
         ensure_column(
             &conn,
+            "integration_policy",
+            "ALTER TABLE sessions ADD COLUMN integration_policy TEXT NOT NULL DEFAULT 'manual_review'",
+        )?;
+        ensure_column(
+            &conn,
             "integration_state",
             "ALTER TABLE sessions ADD COLUMN integration_state TEXT NOT NULL DEFAULT 'clean'",
         )?;
@@ -184,12 +190,13 @@ impl LocalStore {
                  repo_name = COALESCE(repo_name, repo_path, workspace),
                  title = COALESCE(title, task, repo_name, workspace),
                  base_branch = COALESCE(base_branch, 'HEAD'),
+                 integration_policy = COALESCE(integration_policy, 'manual_review'),
                  integration_state = COALESCE(integration_state, 'clean'),
                  git_sync = COALESCE(git_sync, 'unknown'),
                  has_conflicts = COALESCE(has_conflicts, 0),
                  attention = COALESCE(attention, 'info'),
                  attention_summary = COALESCE(attention_summary, title, task)
-             WHERE mode IS NULL OR repo_path IS NULL OR repo_name IS NULL OR title IS NULL OR base_branch IS NULL OR integration_state IS NULL OR git_sync IS NULL OR has_conflicts IS NULL OR attention IS NULL OR attention_summary IS NULL",
+             WHERE mode IS NULL OR repo_path IS NULL OR repo_name IS NULL OR title IS NULL OR base_branch IS NULL OR integration_policy IS NULL OR integration_state IS NULL OR git_sync IS NULL OR has_conflicts IS NULL OR attention IS NULL OR attention_summary IS NULL",
             [],
         )?;
         let mut stmt =
@@ -303,36 +310,43 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
                 Box::new(err),
             )
         })?,
-        integration_state: str_to_integration_state(&row.get::<_, String>(13)?).map_err(|err| {
+        integration_policy: str_to_integration_policy(&row.get::<_, String>(13)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 13,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        git_sync: str_to_git_sync_status(&row.get::<_, String>(14)?).map_err(|err| {
+        integration_state: str_to_integration_state(&row.get::<_, String>(14)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 14,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        git_status_summary: row.get(15)?,
-        has_conflicts: row.get::<_, bool>(16)?,
-        pid: row.get::<_, Option<u32>>(17)?,
-        exit_code: row.get(18)?,
-        error: row.get(19)?,
-        attention: str_to_attention(&row.get::<_, String>(20)?).map_err(|err| {
+        git_sync: str_to_git_sync_status(&row.get::<_, String>(15)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                20,
+                15,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        attention_summary: row.get(21)?,
-        created_at: parse_time(row.get::<_, String>(22)?)?,
-        updated_at: parse_time(row.get::<_, String>(23)?)?,
-        exited_at: row.get::<_, Option<String>>(24)?.map(parse_time).transpose()?,
+        git_status_summary: row.get(16)?,
+        has_conflicts: row.get::<_, bool>(17)?,
+        pid: row.get::<_, Option<u32>>(18)?,
+        exit_code: row.get(19)?,
+        error: row.get(20)?,
+        attention: str_to_attention(&row.get::<_, String>(21)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                21,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?,
+        attention_summary: row.get(22)?,
+        created_at: parse_time(row.get::<_, String>(23)?)?,
+        updated_at: parse_time(row.get::<_, String>(24)?)?,
+        exited_at: row.get::<_, Option<String>>(25)?.map(parse_time).transpose()?,
     })
 }
 
@@ -372,12 +386,26 @@ fn str_to_status(value: &str) -> std::result::Result<SessionStatus, std::io::Err
 fn str_to_integration_state(value: &str) -> std::result::Result<IntegrationState, std::io::Error> {
     match value {
         "clean" => Ok(IntegrationState::Clean),
+        "auto_applying" => Ok(IntegrationState::AutoApplying),
         "pending_review" => Ok(IntegrationState::PendingReview),
         "applied" => Ok(IntegrationState::Applied),
         "discarded" => Ok(IntegrationState::Discarded),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown integration state `{value}`"),
+        )),
+    }
+}
+
+fn str_to_integration_policy(
+    value: &str,
+) -> std::result::Result<IntegrationPolicy, std::io::Error> {
+    match value {
+        "manual_review" => Ok(IntegrationPolicy::ManualReview),
+        "auto_apply_safe" => Ok(IntegrationPolicy::AutoApplySafe),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown integration policy `{value}`"),
         )),
     }
 }

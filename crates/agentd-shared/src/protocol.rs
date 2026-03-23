@@ -5,10 +5,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::session::{
     AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult, GitSyncStatus,
-    IntegrationState, SessionDiff, SessionMode, SessionRecord, SessionStatus, WorktreeRecord,
+    IntegrationPolicy, IntegrationState, SessionDiff, SessionMode, SessionRecord, SessionStatus,
+    WorktreeRecord,
 };
 
-pub const PROTOCOL_VERSION: u16 = 21;
+pub const PROTOCOL_VERSION: u16 = 22;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
@@ -58,7 +59,13 @@ pub enum IncomingRequest {
 pub enum Request {
     GetDaemonInfo,
     ShutdownDaemon,
-    CreateSession { workspace: String, title: Option<String>, agent: String, model: Option<String> },
+    CreateSession {
+        workspace: String,
+        title: Option<String>,
+        agent: String,
+        model: Option<String>,
+        integration_policy: IntegrationPolicy,
+    },
     CreateWorktree { session_id: String },
     CleanupWorktree { session_id: String },
     KillSession { session_id: String, remove: bool },
@@ -397,11 +404,12 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
     let kind = match request {
         Request::GetDaemonInfo => MessageKind::GetDaemonInfoRequest,
         Request::ShutdownDaemon => MessageKind::ShutdownDaemonRequest,
-        Request::CreateSession { workspace, title, agent, model } => {
+        Request::CreateSession { workspace, title, agent, model, integration_policy } => {
             put_string(&mut payload, workspace)?;
             put_optional_string(&mut payload, title.as_deref())?;
             put_string(&mut payload, agent)?;
             put_optional_string(&mut payload, model.as_deref())?;
+            put_integration_policy(&mut payload, *integration_policy);
             MessageKind::CreateSessionRequest
         }
         Request::CreateWorktree { session_id } => {
@@ -493,6 +501,7 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
             title: cursor.take_optional_string()?,
             agent: cursor.take_string()?,
             model: cursor.take_optional_string()?,
+            integration_policy: cursor.take_integration_policy()?,
         },
         MessageKind::CreateWorktreeRequest => {
             Request::CreateWorktree { session_id: cursor.take_string()? }
@@ -825,9 +834,17 @@ fn put_attention_level(buf: &mut Vec<u8>, attention: AttentionLevel) {
 fn put_integration_state(buf: &mut Vec<u8>, state: IntegrationState) {
     buf.push(match state {
         IntegrationState::Clean => 1,
-        IntegrationState::PendingReview => 2,
-        IntegrationState::Applied => 3,
-        IntegrationState::Discarded => 4,
+        IntegrationState::AutoApplying => 2,
+        IntegrationState::PendingReview => 3,
+        IntegrationState::Applied => 4,
+        IntegrationState::Discarded => 5,
+    });
+}
+
+fn put_integration_policy(buf: &mut Vec<u8>, policy: IntegrationPolicy) {
+    buf.push(match policy {
+        IntegrationPolicy::ManualReview => 1,
+        IntegrationPolicy::AutoApplySafe => 2,
     });
 }
 
@@ -854,6 +871,7 @@ fn put_create_session_result(buf: &mut Vec<u8>, session: &CreateSessionResult) -
     put_string(buf, &session.worktree)?;
     put_session_status(buf, session.status);
     put_session_mode(buf, session.mode);
+    put_integration_policy(buf, session.integration_policy);
     Ok(())
 }
 
@@ -889,6 +907,7 @@ fn put_session_record(buf: &mut Vec<u8>, session: &SessionRecord) -> Result<()> 
     put_string(buf, &session.branch)?;
     put_string(buf, &session.worktree)?;
     put_session_status(buf, session.status);
+    put_integration_policy(buf, session.integration_policy);
     put_integration_state(buf, session.integration_state);
     put_git_sync_status(buf, session.git_sync);
     put_optional_string(buf, session.git_status_summary.as_deref())?;
@@ -1060,10 +1079,19 @@ impl<'a> Cursor<'a> {
     fn take_integration_state(&mut self) -> Result<IntegrationState> {
         Ok(match self.take_u8()? {
             1 => IntegrationState::Clean,
-            2 => IntegrationState::PendingReview,
-            3 => IntegrationState::Applied,
-            4 => IntegrationState::Discarded,
+            2 => IntegrationState::AutoApplying,
+            3 => IntegrationState::PendingReview,
+            4 => IntegrationState::Applied,
+            5 => IntegrationState::Discarded,
             other => bail!("invalid integration state `{other}`"),
+        })
+    }
+
+    fn take_integration_policy(&mut self) -> Result<IntegrationPolicy> {
+        Ok(match self.take_u8()? {
+            1 => IntegrationPolicy::ManualReview,
+            2 => IntegrationPolicy::AutoApplySafe,
+            other => bail!("invalid integration policy `{other}`"),
         })
     }
 
@@ -1107,6 +1135,7 @@ impl<'a> Cursor<'a> {
             worktree: self.take_string()?,
             status: self.take_session_status()?,
             mode: self.take_session_mode()?,
+            integration_policy: self.take_integration_policy()?,
         })
     }
 
@@ -1145,6 +1174,7 @@ impl<'a> Cursor<'a> {
             branch: self.take_string()?,
             worktree: self.take_string()?,
             status: self.take_session_status()?,
+            integration_policy: self.take_integration_policy()?,
             integration_state: self.take_integration_state()?,
             git_sync: self.take_git_sync_status()?,
             git_status_summary: self.take_optional_string()?,
@@ -1210,7 +1240,7 @@ mod tests {
     };
     use crate::session::{
         AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult, GitSyncStatus,
-        IntegrationState, SessionMode, SessionRecord, SessionStatus,
+        IntegrationPolicy, IntegrationState, SessionMode, SessionRecord, SessionStatus,
     };
     use chrono::Utc;
     use tokio::io::AsyncWriteExt;
@@ -1355,6 +1385,7 @@ mod tests {
                 branch: "agent/fix".to_string(),
                 worktree: "/tmp/worktree".to_string(),
                 status: SessionStatus::Running,
+                integration_policy: IntegrationPolicy::AutoApplySafe,
                 integration_state: IntegrationState::Clean,
                 git_sync: GitSyncStatus::Unknown,
                 git_status_summary: None,
@@ -1475,6 +1506,7 @@ mod tests {
                 worktree: "/tmp/demo".to_string(),
                 status: SessionStatus::Running,
                 mode: SessionMode::Execute,
+                integration_policy: IntegrationPolicy::AutoApplySafe,
             },
         };
         let (kind, payload) = encode_response(&response).unwrap();

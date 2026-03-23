@@ -26,9 +26,17 @@ pub enum AttentionLevel {
 #[serde(rename_all = "snake_case")]
 pub enum IntegrationState {
     Clean,
+    AutoApplying,
     PendingReview,
     Applied,
     Discarded,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationPolicy {
+    ManualReview,
+    AutoApplySafe,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,6 +77,7 @@ pub struct SessionRecord {
     pub branch: String,
     pub worktree: String,
     pub status: SessionStatus,
+    pub integration_policy: IntegrationPolicy,
     pub integration_state: IntegrationState,
     pub git_sync: GitSyncStatus,
     pub git_status_summary: Option<String>,
@@ -91,6 +100,7 @@ pub struct CreateSessionResult {
     pub worktree: String,
     pub status: SessionStatus,
     pub mode: SessionMode,
+    pub integration_policy: IntegrationPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -149,9 +159,19 @@ impl IntegrationState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Clean => "clean",
+            Self::AutoApplying => "auto_applying",
             Self::PendingReview => "pending_review",
             Self::Applied => "applied",
             Self::Discarded => "discarded",
+        }
+    }
+}
+
+impl IntegrationPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ManualReview => "manual_review",
+            Self::AutoApplySafe => "auto_apply_safe",
         }
     }
 }

@@ -9,6 +9,8 @@ use crate::paths::AppPaths;
 pub struct Config {
     #[serde(default)]
     pub agents: HashMap<String, AgentConfig>,
+    #[serde(default)]
+    pub git: GitConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,8 +22,24 @@ pub struct AgentConfig {
     pub model_flag: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitConfig {
+    #[serde(default = "default_integration_policy")]
+    pub default_integration_policy: String,
+    #[serde(default = "default_auto_commit_message")]
+    pub auto_commit_message: String,
+}
+
 fn default_model_flag() -> Option<String> {
     Some("--model".to_string())
+}
+
+fn default_integration_policy() -> String {
+    "auto_apply_safe".to_string()
+}
+
+fn default_auto_commit_message() -> String {
+    "agentd: finalize session {session_id}".to_string()
 }
 
 impl Config {
@@ -70,7 +88,16 @@ impl Default for Config {
                 model_flag: default_model_flag(),
             },
         );
-        Self { agents }
+        Self { agents, git: GitConfig::default() }
+    }
+}
+
+impl Default for GitConfig {
+    fn default() -> Self {
+        Self {
+            default_integration_policy: default_integration_policy(),
+            auto_commit_message: default_auto_commit_message(),
+        }
     }
 }
 

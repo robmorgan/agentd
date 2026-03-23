@@ -1,10 +1,13 @@
 use std::{
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
+
+static APPLY_WORKTREE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn canonical_repo_root(workspace: &Utf8Path) -> Result<Utf8PathBuf> {
     let output = Command::new("git")
@@ -184,6 +187,60 @@ pub fn has_committed_diff_against_base(worktree: &Utf8Path, base_branch: &str) -
     Ok(!run_git(worktree, &["diff", "--stat", &format!("{base_branch}...HEAD")])?.trim().is_empty())
 }
 
+pub fn commit_all(worktree: &Utf8Path, message: &str) -> Result<()> {
+    let add = Command::new("git")
+        .arg("-C")
+        .arg(worktree.as_str())
+        .args(["add", "--all"])
+        .output()
+        .with_context(|| format!("failed to stage changes in {}", worktree))?;
+    if !add.status.success() {
+        bail!("failed to stage changes: {}", String::from_utf8_lossy(&add.stderr).trim());
+    }
+
+    let commit = Command::new("git")
+        .arg("-C")
+        .arg(worktree.as_str())
+        .args(["commit", "-m", message])
+        .output()
+        .with_context(|| format!("failed to commit changes in {}", worktree))?;
+    if !commit.status.success() {
+        bail!("failed to commit changes: {}", String::from_utf8_lossy(&commit.stderr).trim());
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebaseOutcome {
+    RebasingClean,
+    Conflicted,
+}
+
+pub fn rebase_onto_base(worktree: &Utf8Path, base_branch: &str) -> Result<RebaseOutcome> {
+    let rebase = Command::new("git")
+        .arg("-C")
+        .arg(worktree.as_str())
+        .args(["rebase", base_branch])
+        .output()
+        .with_context(|| format!("failed to rebase {} onto {}", worktree, base_branch))?;
+
+    if rebase.status.success() {
+        return Ok(RebaseOutcome::RebasingClean);
+    }
+
+    if is_merge_conflict_output(&rebase.stdout, &rebase.stderr) {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(worktree.as_str())
+            .args(["rebase", "--abort"])
+            .output();
+        return Ok(RebaseOutcome::Conflicted);
+    }
+
+    bail!("failed to rebase: {}", merge_error_message(&rebase.stdout, &rebase.stderr));
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergePreview {
     HasChanges,
@@ -245,6 +302,23 @@ pub fn apply_merge(repo_root: &Utf8Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn apply_fast_forward(repo_root: &Utf8Path, branch: &str) -> Result<()> {
+    let merge = Command::new("git")
+        .arg("-C")
+        .arg(repo_root.as_str())
+        .args(["merge", "--ff-only", branch])
+        .output()
+        .with_context(|| format!("failed to fast-forward {branch}"))?;
+    if !merge.status.success() {
+        bail!(
+            "failed to fast-forward {}: {}",
+            branch,
+            merge_error_message(&merge.stdout, &merge.stderr)
+        );
+    }
+    Ok(())
+}
+
 fn run_git(worktree: &Utf8Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
@@ -259,7 +333,8 @@ fn run_git(worktree: &Utf8Path, args: &[&str]) -> Result<String> {
 }
 
 fn temporary_apply_worktree_path() -> Utf8PathBuf {
-    let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()
+        + u128::from(APPLY_WORKTREE_COUNTER.fetch_add(1, Ordering::Relaxed));
     let temp_dir =
         std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
     Utf8PathBuf::from_path_buf(temp_dir.join(format!("agentd-apply-{suffix}")))

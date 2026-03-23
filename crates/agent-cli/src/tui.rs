@@ -19,7 +19,7 @@ use tokio::{
 use agentd_shared::{
     paths::AppPaths,
     protocol::{Request, Response, read_response, write_request},
-    session::{AttachmentKind, IntegrationState, SessionRecord, SessionStatus},
+    session::{AttachmentKind, IntegrationPolicy, IntegrationState, SessionRecord, SessionStatus},
 };
 
 use crate::{
@@ -100,6 +100,7 @@ struct InlineComposer {
     active: bool,
     query: String,
     agent_input: String,
+    integration_policy: IntegrationPolicy,
     selected: usize,
     field: ComposerField,
     status_lines: Vec<String>,
@@ -165,6 +166,7 @@ impl RuntimeApp {
                 active: initial_session_id.is_none(),
                 query: String::new(),
                 agent_input: "codex".to_string(),
+                integration_policy: IntegrationPolicy::AutoApplySafe,
                 selected: 0,
                 field: ComposerField::Query,
                 status_lines: Vec::new(),
@@ -543,12 +545,13 @@ impl RuntimeApp {
             .clone()
             .unwrap_or_else(|| "TODO: live git status sync not implemented yet".to_string());
         self.detail_text = format!(
-            "repo      {}\nrepo_path  {}\nworktree   {}\nbranch     {}\nbase       {}\ngit_sync   {}\nconflicts  {}\n\n{}",
+            "repo       {}\nrepo_path  {}\nworktree   {}\nbranch     {}\nbase       {}\npolicy     {}\ngit_sync   {}\nconflicts  {}\n\n{}",
             session.repo_name,
             session.repo_path,
             session.worktree,
             session.branch,
             session.base_branch,
+            session.integration_policy.as_str(),
             sync,
             if session.has_conflicts { "yes" } else { "no" },
             summary,
@@ -637,6 +640,15 @@ impl RuntimeApp {
                     self.clamp_composer_selection();
                 }
             }
+            KeyCode::Char('r') if key.modifiers == KeyModifiers::CONTROL => {
+                self.composer.status_lines.clear();
+                self.pending_focus = None;
+                self.composer.integration_policy =
+                    match self.composer.integration_policy {
+                        IntegrationPolicy::ManualReview => IntegrationPolicy::AutoApplySafe,
+                        IntegrationPolicy::AutoApplySafe => IntegrationPolicy::ManualReview,
+                    };
+            }
             KeyCode::Up => {
                 self.composer.selected = self.composer.selected.saturating_sub(1);
             }
@@ -670,6 +682,7 @@ impl RuntimeApp {
                             } else {
                                 None
                             },
+                            integration_policy: self.composer.integration_policy,
                         },
                     )
                     .await?;
@@ -682,6 +695,7 @@ impl RuntimeApp {
                                 format!("base branch  {}", created.base_branch),
                                 format!("new branch   {}", created.branch),
                                 format!("worktree     {}", created.worktree),
+                                format!("policy       {}", created.integration_policy.as_str()),
                             ];
                             self.pending_focus = Some((
                                 created.session_id.clone(),
@@ -729,12 +743,13 @@ impl RuntimeApp {
         let summary =
             session.git_status_summary.clone().unwrap_or_else(|| "review ready".to_string());
         self.detail_text = format!(
-            "session    {}\nrepo       {}\nbase       {}\nbranch     {}\nworktree   {}\nstatus     {}\nreview     {}\nconflicts  {}\n\nCLI actions\nagent diff {}\nagent accept {}\nagent discard {}\n\n`accept` will only apply when the repo checkout is clean and on `{}`. It performs a normal git merge and refuses to touch the upstream checkout if preflight predicts conflicts.",
+            "session    {}\nrepo       {}\nbase       {}\nbranch     {}\nworktree   {}\npolicy     {}\nstatus     {}\nreview     {}\nconflicts  {}\n\nCLI actions\nagent diff {}\nagent accept {}\nagent discard {}\n\n`accept` will only apply when the repo checkout is clean and on `{}`. It performs a normal git merge and refuses to touch the upstream checkout if preflight predicts conflicts.",
             session.session_id,
             session.repo_name,
             session.base_branch,
             session.branch,
             session.worktree,
+            session.integration_policy.as_str(),
             session.status_string(),
             summary,
             if session.has_conflicts { "yes" } else { "no" },
@@ -1092,8 +1107,13 @@ impl RuntimeApp {
                 Span::styled("agent  ", subtle_style()),
                 Span::raw(self.composer.agent_input.as_str()),
             ]),
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled("policy ", subtle_style()),
+                Span::raw(self.composer.integration_policy.as_str()),
+            ]),
             Line::from(Span::styled(
-                "Type to filter sessions or name a new session. Enter opens the selected row. Tab switches field.",
+                "Type to filter sessions or name a new session. Enter opens the selected row. Tab switches field. Ctrl-R toggles auto-apply vs review.",
                 subtle_style(),
             )),
             Line::from(""),
@@ -2014,17 +2034,21 @@ fn session_rank(session: &SessionRecord) -> u8 {
         || session.has_conflicts
     {
         1
-    } else if session.integration_state == IntegrationState::PendingReview {
+    } else if session.integration_state == IntegrationState::AutoApplying {
         2
-    } else if matches!(session.status, SessionStatus::Running | SessionStatus::Creating) {
+    } else if session.integration_state == IntegrationState::PendingReview {
         3
-    } else {
+    } else if matches!(session.status, SessionStatus::Running | SessionStatus::Creating) {
         4
+    } else {
+        5
     }
 }
 
 fn session_icon(session: &SessionRecord) -> &'static str {
-    if session.integration_state == IntegrationState::PendingReview {
+    if session.integration_state == IntegrationState::AutoApplying {
+        "↺"
+    } else if session.integration_state == IntegrationState::PendingReview {
         "⧖"
     } else {
         match session.status {
@@ -2038,7 +2062,9 @@ fn session_icon(session: &SessionRecord) -> &'static str {
 }
 
 fn session_icon_color(session: &SessionRecord) -> Color {
-    if session.integration_state == IntegrationState::PendingReview {
+    if session.integration_state == IntegrationState::AutoApplying {
+        Color::Yellow
+    } else if session.integration_state == IntegrationState::PendingReview {
         Color::Blue
     } else {
         match session.status {
@@ -2065,6 +2091,12 @@ fn session_status_text(session: &SessionRecord) -> String {
     }
     if session.has_conflicts {
         return "conflicts detected".to_string();
+    }
+    if session.integration_state == IntegrationState::AutoApplying {
+        return "auto applying".to_string();
+    }
+    if session.integration_state == IntegrationState::Applied {
+        return "applied".to_string();
     }
     if let Some(summary) = &session.git_status_summary {
         return summary.clone();
@@ -2125,7 +2157,8 @@ mod tests {
     };
     use agentd_shared::paths::AppPaths;
     use agentd_shared::session::{
-        AttentionLevel, GitSyncStatus, IntegrationState, SessionMode, SessionRecord, SessionStatus,
+        AttentionLevel, GitSyncStatus, IntegrationPolicy, IntegrationState, SessionMode,
+        SessionRecord, SessionStatus,
     };
     use camino::Utf8PathBuf;
     use chrono::{Duration, Utc};
@@ -2147,6 +2180,7 @@ mod tests {
             branch: "agent/demo".to_string(),
             worktree: "/tmp/worktree".to_string(),
             status,
+            integration_policy: IntegrationPolicy::AutoApplySafe,
             integration_state,
             git_sync: GitSyncStatus::Unknown,
             git_status_summary: None,

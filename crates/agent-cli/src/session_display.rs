@@ -28,7 +28,8 @@ fn format_elapsed_seconds(seconds: u64) -> String {
 mod tests {
     use super::{format_elapsed_seconds, session_elapsed_label_at};
     use agentd_shared::session::{
-        AttentionLevel, GitSyncStatus, IntegrationState, SessionMode, SessionRecord, SessionStatus,
+        AttentionLevel, GitSyncStatus, IntegrationPolicy, IntegrationState, SessionMode,
+        SessionRecord, SessionStatus,
     };
     use chrono::{Duration, Utc};
 
@@ -77,6 +78,7 @@ mod tests {
             branch: "agent/demo".to_string(),
             worktree: "/tmp/worktree".to_string(),
             status: SessionStatus::Running,
+            integration_policy: IntegrationPolicy::AutoApplySafe,
             integration_state: IntegrationState::Clean,
             git_sync: GitSyncStatus::Unknown,
             git_status_summary: None,

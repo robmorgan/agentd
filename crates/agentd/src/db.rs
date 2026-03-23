@@ -5,8 +5,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use agentd_shared::{
     paths::AppPaths,
     session::{
-        AttentionLevel, GitSyncStatus, IntegrationState, SessionMode, SessionRecord, SessionStatus,
-        repo_name_from_path,
+        AttentionLevel, GitSyncStatus, IntegrationPolicy, IntegrationState, SessionMode,
+        SessionRecord, SessionStatus, repo_name_from_path,
     },
 };
 
@@ -31,6 +31,7 @@ pub struct NewSession<'a> {
     pub base_branch: &'a str,
     pub branch: &'a str,
     pub worktree: &'a str,
+    pub integration_policy: IntegrationPolicy,
 }
 
 impl Database {
@@ -65,6 +66,7 @@ impl Database {
                 branch TEXT NOT NULL,
                 worktree TEXT NOT NULL,
                 status TEXT NOT NULL,
+                integration_policy TEXT NOT NULL DEFAULT 'manual_review',
                 pid INTEGER,
                 exit_code INTEGER,
                 error TEXT,
@@ -126,6 +128,11 @@ impl Database {
         )?;
         self.ensure_column(
             &conn,
+            "integration_policy",
+            "ALTER TABLE sessions ADD COLUMN integration_policy TEXT NOT NULL DEFAULT 'manual_review'",
+        )?;
+        self.ensure_column(
+            &conn,
             "integration_state",
             "ALTER TABLE sessions ADD COLUMN integration_state TEXT NOT NULL DEFAULT 'clean'",
         )?;
@@ -161,12 +168,13 @@ impl Database {
                  repo_name = COALESCE(repo_name, repo_path, workspace),
                  title = COALESCE(title, task, repo_name, workspace),
                  base_branch = COALESCE(base_branch, 'HEAD'),
+                 integration_policy = COALESCE(integration_policy, 'manual_review'),
                  integration_state = COALESCE(integration_state, 'clean'),
                  git_sync = COALESCE(git_sync, 'unknown'),
                  has_conflicts = COALESCE(has_conflicts, 0),
                  attention = COALESCE(attention, 'info'),
                  attention_summary = COALESCE(attention_summary, title, task)
-             WHERE mode IS NULL OR repo_path IS NULL OR repo_name IS NULL OR title IS NULL OR base_branch IS NULL OR integration_state IS NULL OR git_sync IS NULL OR has_conflicts IS NULL OR attention IS NULL OR attention_summary IS NULL",
+             WHERE mode IS NULL OR repo_path IS NULL OR repo_name IS NULL OR title IS NULL OR base_branch IS NULL OR integration_policy IS NULL OR integration_state IS NULL OR git_sync IS NULL OR has_conflicts IS NULL OR attention IS NULL OR attention_summary IS NULL",
             [],
         )?;
         self.backfill_repo_names(&conn)?;
@@ -221,9 +229,9 @@ impl Database {
         conn.execute(
             "INSERT INTO sessions (
                 session_id, thread_id, agent, model, mode, agent_command, agent_args_json, resume_session_id, workspace,
-                repo_path, repo_name, title, task, base_branch, branch, worktree, status, attention, attention_summary,
+                repo_path, repo_name, title, task, base_branch, branch, worktree, status, integration_policy, attention, attention_summary,
                 integration_state, git_sync, git_status_summary, has_conflicts, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?23)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?24)",
             params![
                 new_session.session_id,
                 new_session.thread_id,
@@ -241,6 +249,7 @@ impl Database {
                 new_session.branch,
                 new_session.worktree,
                 status_to_str(SessionStatus::Creating),
+                integration_policy_to_str(new_session.integration_policy),
                 attention_to_str(AttentionLevel::Info),
                 new_session.title,
                 integration_state_to_str(IntegrationState::Clean),
@@ -414,7 +423,7 @@ impl Database {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, repo_name, title, base_branch, branch,
-                    worktree, status, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
+                    worktree, status, integration_policy, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
             params![session_id],
@@ -428,7 +437,7 @@ impl Database {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, repo_name, title, base_branch, branch,
-                    worktree, status, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
+                    worktree, status, integration_policy, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
         )?;
@@ -467,36 +476,43 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
                 Box::new(err),
             )
         })?,
-        integration_state: str_to_integration_state(&row.get::<_, String>(13)?).map_err(|err| {
+        integration_policy: str_to_integration_policy(&row.get::<_, String>(13)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 13,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        git_sync: str_to_git_sync_status(&row.get::<_, String>(14)?).map_err(|err| {
+        integration_state: str_to_integration_state(&row.get::<_, String>(14)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 14,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        git_status_summary: row.get(15)?,
-        has_conflicts: row.get::<_, bool>(16)?,
-        pid: row.get::<_, Option<u32>>(17)?,
-        exit_code: row.get(18)?,
-        error: row.get(19)?,
-        attention: str_to_attention(&row.get::<_, String>(20)?).map_err(|err| {
+        git_sync: str_to_git_sync_status(&row.get::<_, String>(15)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                20,
+                15,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        attention_summary: row.get(21)?,
-        created_at: parse_time(row.get::<_, String>(22)?)?,
-        updated_at: parse_time(row.get::<_, String>(23)?)?,
-        exited_at: row.get::<_, Option<String>>(24)?.map(parse_time).transpose()?,
+        git_status_summary: row.get(16)?,
+        has_conflicts: row.get::<_, bool>(17)?,
+        pid: row.get::<_, Option<u32>>(18)?,
+        exit_code: row.get(19)?,
+        error: row.get(20)?,
+        attention: str_to_attention(&row.get::<_, String>(21)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                21,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?,
+        attention_summary: row.get(22)?,
+        created_at: parse_time(row.get::<_, String>(23)?)?,
+        updated_at: parse_time(row.get::<_, String>(24)?)?,
+        exited_at: row.get::<_, Option<String>>(25)?.map(parse_time).transpose()?,
     })
 }
 
@@ -545,6 +561,10 @@ fn git_sync_status_to_str(status: GitSyncStatus) -> &'static str {
     status.as_str()
 }
 
+fn integration_policy_to_str(policy: IntegrationPolicy) -> &'static str {
+    policy.as_str()
+}
+
 fn integration_state_to_str(state: IntegrationState) -> &'static str {
     state.as_str()
 }
@@ -556,12 +576,26 @@ fn session_mode_to_str(mode: SessionMode) -> &'static str {
 fn str_to_integration_state(value: &str) -> std::result::Result<IntegrationState, std::io::Error> {
     match value {
         "clean" => Ok(IntegrationState::Clean),
+        "auto_applying" => Ok(IntegrationState::AutoApplying),
         "pending_review" => Ok(IntegrationState::PendingReview),
         "applied" => Ok(IntegrationState::Applied),
         "discarded" => Ok(IntegrationState::Discarded),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown integration state `{value}`"),
+        )),
+    }
+}
+
+fn str_to_integration_policy(
+    value: &str,
+) -> std::result::Result<IntegrationPolicy, std::io::Error> {
+    match value {
+        "manual_review" => Ok(IntegrationPolicy::ManualReview),
+        "auto_apply_safe" => Ok(IntegrationPolicy::AutoApplySafe),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown integration policy `{value}`"),
         )),
     }
 }
@@ -605,7 +639,10 @@ fn str_to_session_mode(value: &str) -> std::result::Result<SessionMode, std::io:
 #[cfg(test)]
 mod tests {
     use super::Database;
-    use agentd_shared::{paths::AppPaths, session::{SessionMode, SessionStatus}};
+    use agentd_shared::{
+        paths::AppPaths,
+        session::{IntegrationPolicy, SessionMode, SessionStatus},
+    };
     use rusqlite::params;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -644,6 +681,7 @@ mod tests {
             base_branch: "main",
             branch: "agent/test",
             worktree: "/tmp/worktree",
+            integration_policy: IntegrationPolicy::AutoApplySafe,
         })
         .unwrap();
 
@@ -674,6 +712,7 @@ mod tests {
             base_branch: "main",
             branch: "agent/legacy",
             worktree: "/tmp/worktree",
+            integration_policy: IntegrationPolicy::AutoApplySafe,
         })
         .unwrap();
         let conn = rusqlite::Connection::open(paths.database.as_str()).unwrap();

@@ -105,8 +105,17 @@ async fn handle_connection(
                 let _ = shutdown_tx.send(true);
             }
         }
-        IncomingRequest::Standard(Request::CreateSession { workspace, title, agent, model }) => {
-            match state.create_session(workspace, title, agent, model).await {
+        IncomingRequest::Standard(Request::CreateSession {
+            workspace,
+            title,
+            agent,
+            model,
+            integration_policy,
+        }) => {
+            match state
+                .create_session(workspace, title, agent, model, integration_policy)
+                .await
+            {
                 Ok(session) => {
                     send_response(&mut writer, &Response::CreateSession { session }).await?
                 }
@@ -459,8 +468,8 @@ mod tests {
     use agentd_shared::{
         protocol::Response,
         session::{
-            AttentionLevel, GitSyncStatus, IntegrationState, SessionMode, SessionRecord,
-            SessionStatus,
+            AttentionLevel, GitSyncStatus, IntegrationPolicy, IntegrationState, SessionMode,
+            SessionRecord, SessionStatus,
         },
     };
     use chrono::Utc;
@@ -481,6 +490,7 @@ mod tests {
             branch: "agent/task".to_string(),
             worktree: "/tmp/worktree".to_string(),
             status,
+            integration_policy: IntegrationPolicy::AutoApplySafe,
             integration_state: IntegrationState::Clean,
             git_sync: GitSyncStatus::Unknown,
             git_status_summary: None,

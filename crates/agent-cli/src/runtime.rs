@@ -20,7 +20,7 @@ use agentd_shared::{
     config::Config,
     paths::AppPaths,
     protocol::{Request, Response},
-    session::{IntegrationState, SessionRecord, SessionStatus},
+    session::{GitSyncStatus, IntegrationPolicy, IntegrationState, SessionMode, SessionRecord, SessionStatus},
 };
 
 use crate::{
@@ -94,6 +94,17 @@ const SESSION_LIST_BRANCH_MIN_WIDTH: usize = 12;
 const SESSION_LIST_BRANCH_MAX_WIDTH: usize = 34;
 const SESSION_LIST_BRANCH_FLOOR_WIDTH: usize = 8;
 const SESSION_LIST_STRUCTURAL_WIDTH: usize = 12;
+
+fn default_integration_policy(paths: &AppPaths) -> IntegrationPolicy {
+    match Config::load(paths)
+        .ok()
+        .map(|config| config.git.default_integration_policy)
+        .as_deref()
+    {
+        Some("manual_review") => IntegrationPolicy::ManualReview,
+        _ => IntegrationPolicy::AutoApplySafe,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SessionListLayout {
@@ -868,6 +879,7 @@ impl SessionPicker {
                 title: (!title.is_empty()).then(|| title.to_string()),
                 agent: agent.to_string(),
                 model: if agent == "codex" { Some(CODEX_MODELS[0].to_string()) } else { None },
+                integration_policy: default_integration_policy(&self.paths),
             },
         )
         .await?;
@@ -1385,6 +1397,7 @@ impl AttachOverlay {
                         } else {
                             None
                         },
+                        integration_policy: default_integration_policy(&self.paths),
                     },
                 )
                 .await?;
@@ -1702,17 +1715,21 @@ fn session_rank(session: &SessionRecord) -> u8 {
         || session.has_conflicts
     {
         1
-    } else if session.integration_state == IntegrationState::PendingReview {
+    } else if session.integration_state == IntegrationState::AutoApplying {
         2
-    } else if matches!(session.status, SessionStatus::Running | SessionStatus::Creating) {
+    } else if session.integration_state == IntegrationState::PendingReview {
         3
-    } else {
+    } else if matches!(session.status, SessionStatus::Running | SessionStatus::Creating) {
         4
+    } else {
+        5
     }
 }
 
 fn session_icon(session: &SessionRecord) -> &'static str {
-    if session.integration_state == IntegrationState::PendingReview {
+    if session.integration_state == IntegrationState::AutoApplying {
+        "↺"
+    } else if session.integration_state == IntegrationState::PendingReview {
         "⧖"
     } else {
         match session.status {
@@ -1726,7 +1743,9 @@ fn session_icon(session: &SessionRecord) -> &'static str {
 }
 
 fn session_icon_color(session: &SessionRecord) -> Color {
-    if session.integration_state == IntegrationState::PendingReview {
+    if session.integration_state == IntegrationState::AutoApplying {
+        Color::Yellow
+    } else if session.integration_state == IntegrationState::PendingReview {
         Color::Blue
     } else {
         match session.status {
@@ -1778,6 +1797,10 @@ fn render_host_picker_legend_row(width: usize, sessions: &[SessionRecord]) -> St
         (
             demo_status_session(SessionStatus::Exited, IntegrationState::PendingReview),
             "pending review",
+        ),
+        (
+            demo_status_session(SessionStatus::Exited, IntegrationState::AutoApplying),
+            "auto applying",
         ),
         (demo_status_session(SessionStatus::Running, IntegrationState::Clean), "running"),
         (demo_status_session(SessionStatus::UnknownRecovered, IntegrationState::Clean), "recovered"),
@@ -1832,7 +1855,7 @@ fn demo_status_session(
         thread_id: None,
         agent: "codex".to_string(),
         model: None,
-        mode: agentd_shared::session::SessionMode::Execute,
+        mode: SessionMode::Execute,
         workspace: String::new(),
         repo_path: String::new(),
         repo_name: String::new(),
@@ -1841,8 +1864,9 @@ fn demo_status_session(
         branch: String::new(),
         worktree: String::new(),
         status,
+        integration_policy: IntegrationPolicy::AutoApplySafe,
         integration_state,
-        git_sync: agentd_shared::session::GitSyncStatus::Unknown,
+        git_sync: GitSyncStatus::Unknown,
         git_status_summary: None,
         has_conflicts: false,
         pid: None,
@@ -1857,8 +1881,12 @@ fn demo_status_session(
 }
 
 fn session_list_status_label(session: &SessionRecord) -> &'static str {
-    if session.integration_state == IntegrationState::PendingReview {
+    if session.integration_state == IntegrationState::AutoApplying {
+        "auto applying"
+    } else if session.integration_state == IntegrationState::PendingReview {
         "pending review"
+    } else if session.integration_state == IntegrationState::Applied {
+        "applied"
     } else {
         match session.status {
             SessionStatus::NeedsInput => "needs input",
@@ -1872,6 +1900,7 @@ fn session_list_status_label(session: &SessionRecord) -> &'static str {
 
 fn host_picker_icon_ansi_prefix(session: &SessionRecord) -> String {
     match session.integration_state {
+        IntegrationState::AutoApplying => HOST_PICKER_STATUS_YELLOW_FG.to_string(),
         IntegrationState::PendingReview => HOST_PICKER_STATUS_BLUE_FG.to_string(),
         _ => match session.status {
             SessionStatus::NeedsInput => format!("{ANSI_DIM}{HOST_PICKER_STATUS_YELLOW_FG}"),
@@ -1888,6 +1917,12 @@ fn host_picker_icon_ansi_prefix(session: &SessionRecord) -> String {
 fn session_status_text(session: &SessionRecord) -> String {
     if let Some(summary) = &session.attention_summary {
         return summary.clone();
+    }
+    if session.integration_state == IntegrationState::AutoApplying {
+        return "auto applying".to_string();
+    }
+    if session.integration_state == IntegrationState::Applied {
+        return "applied".to_string();
     }
     match session.status {
         SessionStatus::Creating => "starting".to_string(),
@@ -1931,8 +1966,8 @@ mod tests {
     use agentd_shared::{
         paths::AppPaths,
         session::{
-            AttentionLevel, GitSyncStatus, IntegrationState, SessionMode, SessionRecord,
-            SessionStatus,
+            AttentionLevel, GitSyncStatus, IntegrationPolicy, IntegrationState, SessionMode,
+            SessionRecord, SessionStatus,
         },
     };
     use camino::Utf8PathBuf;
@@ -2656,6 +2691,7 @@ mod tests {
             branch: format!("agent/{session_id}"),
             worktree: format!("/tmp/{session_id}"),
             status,
+            integration_policy: IntegrationPolicy::AutoApplySafe,
             integration_state,
             git_sync: GitSyncStatus::InSync,
             git_status_summary: None,
