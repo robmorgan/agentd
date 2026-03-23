@@ -13,12 +13,11 @@ use clap::{ArgAction, Parser, Subcommand};
 use crossterm::{
     cursor::{Hide, Show},
     event::{DisableMouseCapture, EnableMouseCapture},
-    event::{Event, EventStream, KeyCode, KeyModifiers},
+    event::{KeyCode, KeyModifiers},
     execute,
     style::{Attribute as CrosAttribute, Color as CrosColor, Stylize},
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use futures::StreamExt;
 use libc::{
     _POSIX_VDISABLE, O_NONBLOCK, TCSAFLUSH, TCSANOW, VLNEXT, VMIN, VQUIT, VTIME, cfmakeraw, fcntl,
     tcgetattr, tcsetattr, termios,
@@ -1009,9 +1008,7 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
         other => bail!("unexpected response: {:?}", other),
     };
 
-    eprintln!(
-        "attached to {session_id} ({attach_id}); detach with Ctrl-]; open overlay with Ctrl-\\"
-    );
+    eprintln!("attached to {session_id} ({attach_id}); detach with Ctrl-]");
     let _screen = AttachScreenGuard::enter()?;
     let _terminal = AttachTerminalGuard::enter()?;
     let raw_input = AttachRawInput::new()?;
@@ -1026,12 +1023,10 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
         write_session_snapshot(&initial_snapshot)?;
     }
     let mut input_parser = AttachInputParser::default();
-    let mut overlay = None::<runtime::AttachOverlay>;
-    let mut overlay_events = None::<EventStream>;
 
     loop {
         tokio::select! {
-            chunk = raw_input.read_chunk(), if overlay.is_none() => {
+            chunk = raw_input.read_chunk() => {
                 let Some(chunk) = chunk? else {
                     break;
                 };
@@ -1044,14 +1039,6 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
                             drop(write_half);
                             return Ok(AttachOutcome::Detached);
                         }
-                        AttachInputAction::OpenOverlay => {
-                            let mut active_overlay =
-                                runtime::AttachOverlay::new(paths.clone(), session_id.to_string());
-                            active_overlay.open().await?;
-                            active_overlay.draw()?;
-                            overlay_events = Some(EventStream::new());
-                            overlay = Some(active_overlay);
-                        }
                     }
                 }
             }
@@ -1061,52 +1048,6 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
                 }
                 if let Ok((cols, rows)) = crossterm::terminal::size() {
                     send_attach_resize(&mut write_half, cols, rows).await?;
-                    if let Some(overlay) = overlay.as_ref() {
-                        overlay.draw()?;
-                    }
-                }
-            }
-            event = next_overlay_event(overlay_events.as_mut()), if overlay.is_some() => {
-                let Some(event) = event? else {
-                    overlay_events = None;
-                    overlay = None;
-                    write_attach_bytes(AGENTD_ATTACH_CLEAR_SEQUENCE)?;
-                    if let Ok(snapshot) = fetch_session_snapshot(paths, session_id).await {
-                        write_attach_bytes(&snapshot)?;
-                    }
-                    continue;
-                };
-                if let Some(active_overlay) = overlay.as_mut()
-                    && let Some(outcome) = active_overlay.handle_event(event).await?
-                {
-                    match outcome {
-                        runtime::OverlayOutcome::Close => {
-                            overlay_events = None;
-                            overlay = None;
-                            write_attach_bytes(AGENTD_ATTACH_CLEAR_SEQUENCE)?;
-                            if let Ok(snapshot) = fetch_session_snapshot(paths, session_id).await {
-                                write_attach_bytes(&snapshot)?;
-                            }
-                            continue;
-                        }
-                        runtime::OverlayOutcome::ForwardInput(data) => {
-                            overlay_events = None;
-                            overlay = None;
-                            write_attach_bytes(AGENTD_ATTACH_CLEAR_SEQUENCE)?;
-                            if let Ok(snapshot) = fetch_session_snapshot(paths, session_id).await {
-                                write_attach_bytes(&snapshot)?;
-                            }
-                            write_request(&mut write_half, &Request::AttachInput { data }).await?;
-                            continue;
-                        }
-                        runtime::OverlayOutcome::SwitchSession(next_session_id) => {
-                            drop(write_half);
-                            return Ok(AttachOutcome::SwitchSession(next_session_id));
-                        }
-                    }
-                }
-                if let Some(active_overlay) = overlay.as_ref() {
-                    active_overlay.draw()?;
                 }
             }
             response = read_response(&mut reader) => {
@@ -1115,9 +1056,7 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
                 };
                 match response {
                     Response::PtyOutput { data } => {
-                        if overlay.is_none() {
-                            write_attach_bytes(&data)?;
-                        }
+                        write_attach_bytes(&data)?;
                     }
                     Response::SwitchSession { session_id } => {
                         drop(write_half);
@@ -1163,22 +1102,6 @@ async fn send_attach_resize(
     write_request(write_half, &Request::AttachResize { cols, rows }).await
 }
 
-async fn next_overlay_event(stream: Option<&mut EventStream>) -> Result<Option<Event>> {
-    let Some(stream) = stream else {
-        return Ok(None);
-    };
-    loop {
-        match stream.next().await {
-            Some(Ok(event @ Event::Key(_))) | Some(Ok(event @ Event::Paste(_))) => {
-                return Ok(Some(event));
-            }
-            Some(Ok(_)) => continue,
-            Some(Err(err)) => return Err(err).context("failed to read attach overlay input"),
-            None => return Ok(None),
-        }
-    }
-}
-
 async fn fetch_session_snapshot(paths: &AppPaths, session_id: &str) -> Result<Vec<u8>> {
     let mut stream = try_connect(paths).await?;
     write_request(
@@ -1210,20 +1133,11 @@ async fn try_connect(paths: &AppPaths) -> Result<UnixStream> {
 }
 
 fn print_sessions(sessions: &[SessionRecord]) {
-    for session in sessions {
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            session.session_id,
-            session.agent,
-            session.status_string(),
-            session.integration_string(),
-            session.attention_string(),
-            session.repo_name,
-            session.branch
-        );
-        if let Some(summary) = &session.attention_summary {
-            println!("\t{summary}");
-        }
+    let width = crossterm::terminal::size()
+        .map(|(cols, _)| cols as usize)
+        .unwrap_or_else(|_| runtime::default_session_list_width());
+    for line in runtime::render_session_list_lines(sessions, width) {
+        println!("{line}");
     }
 }
 
@@ -1412,14 +1326,11 @@ fn control_char_byte(ch: char) -> Option<u8> {
 }
 
 const ATTACH_DETACH_BYTE: u8 = 0x1d;
-const ATTACH_LEADER_BYTE: u8 = 0x1c;
-const ATTACH_ALT_LEADER_BYTE: u8 = 0x1e;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AttachInputAction {
     Data(Vec<u8>),
     Detach,
-    OpenOverlay,
 }
 
 #[derive(Default)]
@@ -1437,10 +1348,10 @@ impl AttachInputParser {
 
         while index < input.len() {
             if input[index] == 0x1b {
-                match parse_attach_csi_u_action(&input[index..]) {
-                    Some(AttachCsiUParse::Action(action, consumed)) => {
+                match parse_attach_detach_csi_u(&input[index..]) {
+                    Some(AttachCsiUParse::Action(consumed)) => {
                         flush_attach_bytes(&mut actions, &mut forwarded);
-                        actions.push(action);
+                        actions.push(AttachInputAction::Detach);
                         index += consumed;
                         continue;
                     }
@@ -1453,10 +1364,6 @@ impl AttachInputParser {
             }
 
             match input[index] {
-                ATTACH_LEADER_BYTE | ATTACH_ALT_LEADER_BYTE => {
-                    flush_attach_bytes(&mut actions, &mut forwarded);
-                    actions.push(AttachInputAction::OpenOverlay);
-                }
                 ATTACH_DETACH_BYTE => {
                     flush_attach_bytes(&mut actions, &mut forwarded);
                     actions.push(AttachInputAction::Detach);
@@ -1472,27 +1379,26 @@ impl AttachInputParser {
 }
 
 enum AttachCsiUParse {
-    Action(AttachInputAction, usize),
+    Action(usize),
     Incomplete,
 }
 
-fn parse_attach_csi_u_action(bytes: &[u8]) -> Option<AttachCsiUParse> {
+fn parse_attach_detach_csi_u(bytes: &[u8]) -> Option<AttachCsiUParse> {
     if bytes.len() < 2 || bytes[0] != 0x1b || bytes[1] != b'[' {
         return None;
     }
 
     let mut index = 2;
     let key_code = parse_csi_u_decimal(bytes, &mut index)?;
+    if key_code != 93 {
+        return None;
+    }
 
-    let mut alternates = Vec::new();
     while index < bytes.len() && bytes[index] == b':' {
         index += 1;
-        let Some(value) = parse_csi_u_decimal_optional(bytes, &mut index) else {
+        let Some(_) = parse_csi_u_decimal_optional(bytes, &mut index) else {
             return Some(AttachCsiUParse::Incomplete);
         };
-        if let Some(value) = value {
-            alternates.push(value);
-        }
     }
 
     if index >= bytes.len() {
@@ -1544,22 +1450,7 @@ fn parse_attach_csi_u_action(bytes: &[u8]) -> Option<AttachCsiUParse> {
         return None;
     }
 
-    let action = if matches_attach_overlay_key(key_code, &alternates) {
-        AttachInputAction::OpenOverlay
-    } else if key_code == 93 {
-        AttachInputAction::Detach
-    } else {
-        return None;
-    };
-
-    Some(AttachCsiUParse::Action(action, index + 1))
-}
-
-fn matches_attach_overlay_key(key_code: u32, alternates: &[u32]) -> bool {
-    key_code == 92
-        || key_code == 54
-        || key_code == 94
-        || alternates.iter().any(|value| matches!(*value, 92 | 54 | 94))
+    Some(AttachCsiUParse::Action(index + 1))
 }
 
 fn parse_csi_u_decimal(bytes: &[u8], index: &mut usize) -> Option<u32> {
@@ -1936,9 +1827,9 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENTD_ATTACH_RESTORE_SEQUENCE, ATTACH_ALT_LEADER_BYTE, ATTACH_DETACH_BYTE,
-        ATTACH_LEADER_BYTE, AttachInputAction, AttachInputParser, Cli, Command, DaemonCommand,
-        SessionEndSummary, bail_daemon_command, clear_stale_daemon_state,
+        AGENTD_ATTACH_RESTORE_SEQUENCE, ATTACH_DETACH_BYTE, AttachInputAction, AttachInputParser,
+        Cli, Command, DaemonCommand, SessionEndSummary, bail_daemon_command,
+        clear_stale_daemon_state,
         format_session_end_summary, render_diff_text, resolve_detach_session_id,
         resolve_new_session_options, should_colorize_diff_output,
     };
@@ -2133,99 +2024,35 @@ mod tests {
     }
 
     #[test]
-    fn attach_parser_opens_overlay_on_ctrl_backslash() {
-        let mut parser = AttachInputParser::default();
-        assert_eq!(
-            parser.push_bytes(&[ATTACH_LEADER_BYTE]),
-            vec![AttachInputAction::OpenOverlay]
-        );
-    }
-
-    #[test]
-    fn attach_parser_opens_overlay_on_ctrl_caret() {
-        let mut parser = AttachInputParser::default();
-        assert_eq!(
-            parser.push_bytes(&[ATTACH_ALT_LEADER_BYTE]),
-            vec![AttachInputAction::OpenOverlay]
-        );
-    }
-
-    #[test]
-    fn attach_parser_opens_overlay_twice_on_double_ctrl_backslash() {
-        let mut parser = AttachInputParser::default();
-        assert_eq!(
-            parser.push_bytes(&[ATTACH_LEADER_BYTE, ATTACH_LEADER_BYTE]),
-            vec![AttachInputAction::OpenOverlay, AttachInputAction::OpenOverlay]
-        );
-    }
-
-    #[test]
-    fn attach_parser_forwards_following_bytes_after_ctrl_backslash() {
-        let mut parser = AttachInputParser::default();
-        assert_eq!(
-            parser.push_bytes(b"\x1cs"),
-            vec![AttachInputAction::OpenOverlay, AttachInputAction::Data(b"s".to_vec())]
-        );
-    }
-
-    #[test]
-    fn attach_parser_does_not_drop_unknown_bytes_after_ctrl_backslash() {
-        let mut parser = AttachInputParser::default();
-        assert_eq!(
-            parser.push_bytes(b"\x1cq"),
-            vec![AttachInputAction::OpenOverlay, AttachInputAction::Data(b"q".to_vec())]
-        );
-    }
-
-    #[test]
-    fn attach_parser_opens_overlay_on_kitty_ctrl_backslash() {
-        let mut parser = AttachInputParser::default();
-        assert_eq!(
-            parser.push_bytes(b"\x1b[92;5u"),
-            vec![AttachInputAction::OpenOverlay]
-        );
-    }
-
-    #[test]
-    fn attach_parser_opens_overlay_on_kitty_ctrl_caret() {
-        let mut parser = AttachInputParser::default();
-        assert_eq!(
-            parser.push_bytes(b"\x1b[54:94;5u"),
-            vec![AttachInputAction::OpenOverlay]
-        );
-    }
-
-    #[test]
     fn attach_parser_detaches_on_kitty_ctrl_right_bracket() {
         let mut parser = AttachInputParser::default();
         assert_eq!(parser.push_bytes(b"\x1b[93;5u"), vec![AttachInputAction::Detach]);
     }
 
     #[test]
-    fn attach_parser_ignores_kitty_key_release_events() {
+    fn attach_parser_ignores_kitty_detach_key_release_events() {
         let mut parser = AttachInputParser::default();
         assert_eq!(
-            parser.push_bytes(b"\x1b[92;5:3u"),
-            vec![AttachInputAction::Data(b"\x1b[92;5:3u".to_vec())]
+            parser.push_bytes(b"\x1b[93;5:3u"),
+            vec![AttachInputAction::Data(b"\x1b[93;5:3u".to_vec())]
         );
     }
 
     #[test]
-    fn attach_parser_carries_incomplete_kitty_sequences_between_reads() {
+    fn attach_parser_carries_incomplete_kitty_detach_sequences_between_reads() {
         let mut parser = AttachInputParser::default();
-        assert!(parser.push_bytes(b"\x1b[92;").is_empty());
-        assert_eq!(parser.push_bytes(b"5u"), vec![AttachInputAction::OpenOverlay]);
+        assert!(parser.push_bytes(b"\x1b[93;").is_empty());
+        assert_eq!(parser.push_bytes(b"5u"), vec![AttachInputAction::Detach]);
     }
 
     #[test]
     fn attach_parser_flushes_bytes_around_control_sequences() {
         let mut parser = AttachInputParser::default();
         assert_eq!(
-            parser.push_bytes(b"ab\x1c\x1ccd\x1d"),
+            parser.push_bytes(b"ab\x1dcd\x1d"),
             vec![
                 AttachInputAction::Data(b"ab".to_vec()),
-                AttachInputAction::OpenOverlay,
-                AttachInputAction::OpenOverlay,
+                AttachInputAction::Detach,
                 AttachInputAction::Data(b"cd".to_vec()),
                 AttachInputAction::Detach,
             ]
