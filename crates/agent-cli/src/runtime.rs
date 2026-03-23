@@ -978,7 +978,7 @@ fn render_host_picker_brand() -> String {
 }
 
 fn render_host_picker_subtitle() -> String {
-    render_host_picker_gradient_text("agent multiplexer")
+    render_ansi_gradient("agent multiplexer", (162, 96, 252), (104, 250, 253))
 }
 
 fn render_host_picker_gradient_text(text: &str) -> String {
@@ -992,6 +992,30 @@ fn render_host_picker_gradient_text(text: &str) -> String {
         rendered.push_str(&format!("{}", ch.to_string().with(CrosColor::AnsiValue(value))));
     }
     rendered
+}
+
+pub fn render_ansi_gradient(text: &str, start: (u8, u8, u8), end: (u8, u8, u8)) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+
+    if len == 0 {
+        return String::new();
+    }
+
+    chars
+        .iter()
+        .enumerate()
+        .map(|(i, ch)| {
+            let t = if len == 1 { 0.0 } else { i as f32 / (len - 1) as f32 };
+
+            let r = start.0 as f32 + (end.0 as f32 - start.0 as f32) * t;
+            let g = start.1 as f32 + (end.1 as f32 - start.1 as f32) * t;
+            let b = start.2 as f32 + (end.2 as f32 - start.2 as f32) * t;
+
+            format!("\x1b[38;2;{};{};{}m{}", r as u8, g as u8, b as u8, ch)
+        })
+        .collect::<String>()
+        + "\x1b[0m"
 }
 
 fn interpolate_ansi_value(start: u8, end: u8, index: usize, last_index: usize) -> u8 {
