@@ -27,8 +27,6 @@ pub struct AgentConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitConfig {
-    #[serde(default = "default_integration_policy")]
-    pub default_integration_policy: String,
     #[serde(default = "default_auto_commit_message")]
     pub auto_commit_message: String,
 }
@@ -39,10 +37,6 @@ fn default_model_flag() -> Option<String> {
 
 fn default_agent_name() -> String {
     "codex".to_string()
-}
-
-fn default_integration_policy() -> String {
-    "auto_apply_safe".to_string()
 }
 
 fn default_auto_commit_message() -> String {
@@ -122,10 +116,7 @@ impl Default for Config {
 
 impl Default for GitConfig {
     fn default() -> Self {
-        Self {
-            default_integration_policy: default_integration_policy(),
-            auto_commit_message: default_auto_commit_message(),
-        }
+        Self { auto_commit_message: default_auto_commit_message() }
     }
 }
 

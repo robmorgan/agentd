@@ -128,6 +128,13 @@ impl Database {
             "integration_policy",
             "ALTER TABLE sessions ADD COLUMN integration_policy TEXT NOT NULL DEFAULT 'manual_review'",
         )?;
+        self.ensure_column(&conn, "pid", "ALTER TABLE sessions ADD COLUMN pid INTEGER")?;
+        self.ensure_column(
+            &conn,
+            "exit_code",
+            "ALTER TABLE sessions ADD COLUMN exit_code INTEGER",
+        )?;
+        self.ensure_column(&conn, "error", "ALTER TABLE sessions ADD COLUMN error TEXT")?;
         self.ensure_column(
             &conn,
             "integration_state",
@@ -158,6 +165,7 @@ impl Database {
             "attention_summary",
             "ALTER TABLE sessions ADD COLUMN attention_summary TEXT",
         )?;
+        self.ensure_column(&conn, "exited_at", "ALTER TABLE sessions ADD COLUMN exited_at TEXT")?;
         conn.execute(
             "UPDATE sessions
              SET mode = COALESCE(mode, 'execute'),
@@ -229,10 +237,10 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO sessions (
-                session_id, thread_id, agent, model, mode, workspace,
+                session_id, thread_id, agent, model, mode, workspace, task,
                 repo_path, repo_name, title, base_branch, branch, worktree, status, integration_policy, attention, attention_summary,
                 integration_state, git_sync, git_status_summary, has_conflicts, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22)",
             params![
                 new_session.session_id,
                 new_session.thread_id,
@@ -240,6 +248,7 @@ impl Database {
                 new_session.model,
                 session_mode_to_str(new_session.mode),
                 new_session.workspace,
+                new_session.title,
                 new_session.repo_path,
                 new_session.repo_name,
                 new_session.title,
@@ -613,7 +622,7 @@ mod tests {
     use super::Database;
     use agentd_shared::{
         paths::AppPaths,
-        session::{IntegrationPolicy, SessionMode},
+        session::{ApplyState, IntegrationPolicy, SessionMode},
     };
     use rusqlite::params;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -697,6 +706,9 @@ mod tests {
         .unwrap();
 
         let db = Database::open(&paths).unwrap();
-        assert!(db.get_session("legacy").unwrap().is_none());
+        let session = db.get_session("legacy").unwrap().unwrap();
+        assert_eq!(session.title, "legacy");
+        assert_eq!(session.repo_path, "/tmp/repo");
+        assert_eq!(session.apply_state, ApplyState::Idle);
     }
 }

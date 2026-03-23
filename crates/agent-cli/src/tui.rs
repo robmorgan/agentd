@@ -15,9 +15,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use agentd_shared::{
     paths::AppPaths,
     protocol::{Request, Response, read_response, write_request},
-    session::{
-        ApplyState, AttachmentKind, IntegrationPolicy, MergeStatus, SessionRecord, SessionStatus,
-    },
+    session::{ApplyState, AttachmentKind, MergeStatus, SessionRecord, SessionStatus},
 };
 
 use crate::{
@@ -98,7 +96,6 @@ struct InlineComposer {
     active: bool,
     query: String,
     agent_input: String,
-    integration_policy: IntegrationPolicy,
     selected: usize,
     field: ComposerField,
     status_lines: Vec<String>,
@@ -164,7 +161,6 @@ impl RuntimeApp {
                 active: initial_session_id.is_none(),
                 query: String::new(),
                 agent_input: "codex".to_string(),
-                integration_policy: IntegrationPolicy::AutoApplySafe,
                 selected: 0,
                 field: ComposerField::Query,
                 status_lines: Vec::new(),
@@ -546,13 +542,12 @@ impl RuntimeApp {
         let summary =
             session.merge_summary.clone().unwrap_or_else(|| "merge status unavailable".to_string());
         self.detail_text = format!(
-            "repo       {}\nrepo_path  {}\nworktree   {}\nbranch     {}\nbase       {}\npolicy     {}\nmerge      {}\nconflicts  {}\n\n{}",
+            "repo       {}\nrepo_path  {}\nworktree   {}\nbranch     {}\nbase       {}\nmerge      {}\nconflicts  {}\n\n{}",
             session.repo_name,
             session.repo_path,
             session.worktree,
             session.branch,
             session.base_branch,
-            session.integration_policy.as_str(),
             sync,
             if session.has_conflicts { "yes" } else { "no" },
             summary,
@@ -641,14 +636,6 @@ impl RuntimeApp {
                     self.clamp_composer_selection();
                 }
             }
-            KeyCode::Char('r') if key.modifiers == KeyModifiers::CONTROL => {
-                self.composer.status_lines.clear();
-                self.pending_focus = None;
-                self.composer.integration_policy = match self.composer.integration_policy {
-                    IntegrationPolicy::ManualReview => IntegrationPolicy::AutoApplySafe,
-                    IntegrationPolicy::AutoApplySafe => IntegrationPolicy::ManualReview,
-                };
-            }
             KeyCode::Up => {
                 self.composer.selected = self.composer.selected.saturating_sub(1);
             }
@@ -682,7 +669,7 @@ impl RuntimeApp {
                             } else {
                                 None
                             },
-                            integration_policy: self.composer.integration_policy,
+                            integration_policy: agentd_shared::session::IntegrationPolicy::ManualReview,
                         },
                     )
                     .await?;
@@ -695,7 +682,6 @@ impl RuntimeApp {
                                 format!("base branch  {}", created.base_branch),
                                 format!("new branch   {}", created.branch),
                                 format!("worktree     {}", created.worktree),
-                                format!("policy       {}", created.integration_policy.as_str()),
                             ];
                             self.pending_focus = Some((
                                 created.session_id.clone(),
@@ -742,13 +728,12 @@ impl RuntimeApp {
         };
         let summary = session.merge_summary.clone().unwrap_or_else(|| "ready to merge".to_string());
         self.detail_text = format!(
-            "session    {}\nrepo       {}\nbase       {}\nbranch     {}\nworktree   {}\npolicy     {}\nstatus     {}\nmerge      {}\nconflicts  {}\n\nCLI actions\nagent diff {}\nagent merge {}\nagent discard {}\n\n`merge` applies committed branch HEAD into `{}` when the upstream checkout is clean and preflight predicts no conflicts. Uncommitted worktree changes stay local.",
+            "session    {}\nrepo       {}\nbase       {}\nbranch     {}\nworktree   {}\nstatus     {}\nmerge      {}\nconflicts  {}\n\nCLI actions\nagent diff {}\nagent merge {}\nagent discard {}\n\n`merge` applies committed branch HEAD into `{}` when the upstream checkout is clean and preflight predicts no conflicts. Uncommitted worktree changes stay local.",
             session.session_id,
             session.repo_name,
             session.base_branch,
             session.branch,
             session.worktree,
-            session.integration_policy.as_str(),
             session.status_string(),
             summary,
             if session.has_conflicts { "yes" } else { "no" },
@@ -1106,13 +1091,8 @@ impl RuntimeApp {
                 Span::styled("agent  ", subtle_style()),
                 Span::raw(self.composer.agent_input.as_str()),
             ]),
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled("policy ", subtle_style()),
-                Span::raw(self.composer.integration_policy.as_str()),
-            ]),
             Line::from(Span::styled(
-                "Type to filter sessions or name a new session. Enter opens the selected row. Tab switches field. Ctrl-R toggles auto-apply vs review.",
+                "Type to filter sessions or name a new session. Enter opens the selected row. Tab switches field.",
                 subtle_style(),
             )),
             Line::from(""),
@@ -2018,9 +1998,9 @@ fn session_rank(session: &SessionRecord) -> u8 {
         || session.has_conflicts
     {
         1
-    } else if session.apply_state == ApplyState::AutoApplying {
+    } else if session.merge_status == MergeStatus::Conflicted {
         2
-    } else if session.merge_status == MergeStatus::Ready {
+    } else if matches!(session.merge_status, MergeStatus::Ready | MergeStatus::Blocked) {
         3
     } else if matches!(session.status, SessionStatus::Running | SessionStatus::Creating) {
         4
@@ -2030,34 +2010,32 @@ fn session_rank(session: &SessionRecord) -> u8 {
 }
 
 fn session_icon(session: &SessionRecord) -> &'static str {
-    if session.apply_state == ApplyState::AutoApplying {
-        "↺"
-    } else if session.merge_status == MergeStatus::Ready {
-        "⧖"
-    } else {
-        match session.status {
+    match session.merge_status {
+        MergeStatus::Ready => "⧖",
+        MergeStatus::Blocked => "⚠",
+        MergeStatus::Conflicted => "✖",
+        _ => match session.status {
             SessionStatus::NeedsInput => "◦",
             SessionStatus::Failed => "✖",
             SessionStatus::UnknownRecovered => "⚠",
             SessionStatus::Running | SessionStatus::Creating => "●",
             SessionStatus::Exited => "✔",
-        }
+        },
     }
 }
 
 fn session_icon_color(session: &SessionRecord) -> Color {
-    if session.apply_state == ApplyState::AutoApplying {
-        Color::Yellow
-    } else if session.merge_status == MergeStatus::Ready {
-        Color::Blue
-    } else {
-        match session.status {
+    match session.merge_status {
+        MergeStatus::Ready => Color::Blue,
+        MergeStatus::Blocked => Color::Yellow,
+        MergeStatus::Conflicted => Color::Red,
+        _ => match session.status {
             SessionStatus::NeedsInput => Color::Yellow,
             SessionStatus::Failed => Color::Red,
             SessionStatus::UnknownRecovered => Color::Yellow,
             SessionStatus::Running | SessionStatus::Creating => Color::Green,
             SessionStatus::Exited => Color::Green,
-        }
+        },
     }
 }
 
@@ -2075,9 +2053,6 @@ fn session_status_text(session: &SessionRecord) -> String {
     }
     if session.has_conflicts {
         return "conflicts detected".to_string();
-    }
-    if session.apply_state == ApplyState::AutoApplying {
-        return "auto applying".to_string();
     }
     if session.apply_state == ApplyState::Applied {
         return "applied".to_string();

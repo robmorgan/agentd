@@ -98,10 +98,8 @@ const SESSION_LIST_BRANCH_FLOOR_WIDTH: usize = 8;
 const SESSION_LIST_STRUCTURAL_WIDTH: usize = 12;
 
 fn default_integration_policy(paths: &AppPaths) -> IntegrationPolicy {
-    match Config::load(paths).ok().map(|config| config.git.default_integration_policy).as_deref() {
-        Some("manual_review") => IntegrationPolicy::ManualReview,
-        _ => IntegrationPolicy::AutoApplySafe,
-    }
+    let _ = Config::load(paths);
+    IntegrationPolicy::ManualReview
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1734,9 +1732,9 @@ fn session_rank(session: &SessionRecord) -> u8 {
         || session.has_conflicts
     {
         1
-    } else if session.apply_state == ApplyState::AutoApplying {
+    } else if session.merge_status == MergeStatus::Conflicted {
         2
-    } else if session.merge_status == MergeStatus::Ready {
+    } else if matches!(session.merge_status, MergeStatus::Ready | MergeStatus::Blocked) {
         3
     } else if matches!(session.status, SessionStatus::Running | SessionStatus::Creating) {
         4
@@ -1746,34 +1744,32 @@ fn session_rank(session: &SessionRecord) -> u8 {
 }
 
 fn session_icon(session: &SessionRecord) -> &'static str {
-    if session.apply_state == ApplyState::AutoApplying {
-        "↺"
-    } else if session.merge_status == MergeStatus::Ready {
-        "⧖"
-    } else {
-        match session.status {
+    match session.merge_status {
+        MergeStatus::Ready => "⧖",
+        MergeStatus::Blocked => "⚠",
+        MergeStatus::Conflicted => "✖",
+        _ => match session.status {
             SessionStatus::NeedsInput => "◦",
             SessionStatus::Failed => "✖",
             SessionStatus::UnknownRecovered => "⚠",
             SessionStatus::Running | SessionStatus::Creating => "●",
             SessionStatus::Exited => "✔",
-        }
+        },
     }
 }
 
 fn session_icon_color(session: &SessionRecord) -> Color {
-    if session.apply_state == ApplyState::AutoApplying {
-        Color::Yellow
-    } else if session.merge_status == MergeStatus::Ready {
-        Color::Blue
-    } else {
-        match session.status {
+    match session.merge_status {
+        MergeStatus::Ready => Color::Blue,
+        MergeStatus::Blocked => Color::Yellow,
+        MergeStatus::Conflicted => Color::Red,
+        _ => match session.status {
             SessionStatus::NeedsInput => Color::Yellow,
             SessionStatus::Failed => Color::Red,
             SessionStatus::UnknownRecovered => Color::Yellow,
             SessionStatus::Running | SessionStatus::Creating => Color::Green,
             SessionStatus::Exited => Color::Green,
-        }
+        },
     }
 }
 
@@ -1818,7 +1814,14 @@ fn render_host_picker_legend_row(width: usize, sessions: &[SessionRecord]) -> St
             },
             "ready to merge",
         ),
-        (demo_status_session(SessionStatus::Exited, ApplyState::AutoApplying), "auto applying"),
+        (
+            {
+                let mut session = demo_status_session(SessionStatus::Exited, ApplyState::Idle);
+                session.merge_status = MergeStatus::Blocked;
+                session
+            },
+            "merge blocked",
+        ),
         (demo_status_session(SessionStatus::Running, ApplyState::Idle), "running"),
         (demo_status_session(SessionStatus::UnknownRecovered, ApplyState::Idle), "recovered"),
         (demo_status_session(SessionStatus::Exited, ApplyState::Idle), "exited"),
@@ -1895,10 +1898,12 @@ fn demo_status_session(status: SessionStatus, apply_state: ApplyState) -> Sessio
 }
 
 fn session_list_status_label(session: &SessionRecord) -> &'static str {
-    if session.apply_state == ApplyState::AutoApplying {
-        "auto applying"
-    } else if session.merge_status == MergeStatus::Ready {
+    if session.merge_status == MergeStatus::Ready {
         "ready to merge"
+    } else if session.merge_status == MergeStatus::Blocked {
+        "merge blocked"
+    } else if session.merge_status == MergeStatus::Conflicted {
+        "merge conflicted"
     } else if session.apply_state == ApplyState::Applied {
         "applied"
     } else {
@@ -1913,22 +1918,16 @@ fn session_list_status_label(session: &SessionRecord) -> &'static str {
 }
 
 fn host_picker_icon_ansi_prefix(session: &SessionRecord) -> String {
-    match session.apply_state {
-        ApplyState::AutoApplying => HOST_PICKER_STATUS_YELLOW_FG.to_string(),
-        _ => match session.status {
-            SessionStatus::NeedsInput => format!("{ANSI_DIM}{HOST_PICKER_STATUS_YELLOW_FG}"),
-            SessionStatus::Failed => HOST_PICKER_STATUS_RED_FG.to_string(),
-            SessionStatus::UnknownRecovered => HOST_PICKER_STATUS_YELLOW_FG.to_string(),
-            SessionStatus::Running | SessionStatus::Creating => {
-                HOST_PICKER_STATUS_GREEN_FG.to_string()
-            }
-            SessionStatus::Exited => {
-                if session.merge_status == MergeStatus::Ready {
-                    HOST_PICKER_STATUS_BLUE_FG.to_string()
-                } else {
-                    HOST_PICKER_STATUS_GREEN_FG.to_string()
-                }
-            }
+    match session.status {
+        SessionStatus::NeedsInput => format!("{ANSI_DIM}{HOST_PICKER_STATUS_YELLOW_FG}"),
+        SessionStatus::Failed => HOST_PICKER_STATUS_RED_FG.to_string(),
+        SessionStatus::UnknownRecovered => HOST_PICKER_STATUS_YELLOW_FG.to_string(),
+        SessionStatus::Running | SessionStatus::Creating => HOST_PICKER_STATUS_GREEN_FG.to_string(),
+        SessionStatus::Exited => match session.merge_status {
+            MergeStatus::Ready => HOST_PICKER_STATUS_BLUE_FG.to_string(),
+            MergeStatus::Blocked => HOST_PICKER_STATUS_YELLOW_FG.to_string(),
+            MergeStatus::Conflicted => HOST_PICKER_STATUS_RED_FG.to_string(),
+            _ => HOST_PICKER_STATUS_GREEN_FG.to_string(),
         },
     }
 }
@@ -1936,9 +1935,6 @@ fn host_picker_icon_ansi_prefix(session: &SessionRecord) -> String {
 fn session_status_text(session: &SessionRecord) -> String {
     if let Some(summary) = &session.attention_summary {
         return summary.clone();
-    }
-    if session.apply_state == ApplyState::AutoApplying {
-        return "auto applying".to_string();
     }
     if session.apply_state == ApplyState::Applied {
         return "applied".to_string();
@@ -2000,8 +1996,9 @@ mod tests {
     #[derive(Clone, Copy)]
     enum IntegrationState {
         Clean,
-        AutoApplying,
         PendingReview,
+        Blocked,
+        Conflicted,
     }
 
     fn strip_ansi(input: &str) -> String {
@@ -2739,8 +2736,9 @@ mod tests {
     ) -> SessionRecord {
         let (apply_state, merge_status) = match integration_state {
             IntegrationState::Clean => (ApplyState::Idle, MergeStatus::Unknown),
-            IntegrationState::AutoApplying => (ApplyState::AutoApplying, MergeStatus::Unknown),
             IntegrationState::PendingReview => (ApplyState::Idle, MergeStatus::Ready),
+            IntegrationState::Blocked => (ApplyState::Idle, MergeStatus::Blocked),
+            IntegrationState::Conflicted => (ApplyState::Idle, MergeStatus::Conflicted),
         };
         let now = Utc::now();
         SessionRecord {

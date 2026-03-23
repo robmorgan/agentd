@@ -54,7 +54,7 @@ impl AppState {
         title: Option<String>,
         agent_name: String,
         model: Option<String>,
-        integration_policy: IntegrationPolicy,
+        _integration_policy: IntegrationPolicy,
     ) -> Result<CreateSessionResult> {
         let paths = self.paths.clone();
         let db = self.db.clone();
@@ -87,7 +87,7 @@ impl AppState {
                 base_branch: &base_branch,
                 branch: &branch,
                 worktree: worktree.as_str(),
-                integration_policy,
+                integration_policy: IntegrationPolicy::ManualReview,
             })?;
 
             if let Err(err) = git::create_worktree(&repo_root, &base_branch, &branch, &worktree) {
@@ -125,7 +125,7 @@ impl AppState {
                 worktree: worktree.to_string(),
                 status: SessionStatus::Running,
                 mode,
-                integration_policy,
+                integration_policy: IntegrationPolicy::ManualReview,
             })
         })
         .await?
@@ -882,27 +882,7 @@ fn finalize_session_exit(db: &Database, session_id: &str, exit_code: Option<i32>
     if exit_code == Some(0) {
         db.mark_exited(session_id, exit_code)?;
         if has_changes {
-            match session.integration_policy {
-                IntegrationPolicy::ManualReview => {
-                    db.set_apply_state(
-                        session_id,
-                        ApplyState::Idle,
-                        AttentionLevel::Notice,
-                        "changes available to merge",
-                    )?;
-                }
-                IntegrationPolicy::AutoApplySafe => {
-                    if let Err(err) = auto_apply_session_on_exit(db, &session) {
-                        let summary = format!("auto-apply stopped: {err}");
-                        db.set_apply_state(
-                            &session.session_id,
-                            ApplyState::Idle,
-                            AttentionLevel::Action,
-                            &summary,
-                        )?;
-                    }
-                }
-            }
+            finalize_mergeable_session(db, &session)?;
         }
     } else {
         let error = match exit_code {
@@ -914,14 +894,7 @@ fn finalize_session_exit(db: &Database, session_id: &str, exit_code: Option<i32>
     Ok(())
 }
 
-fn auto_apply_session_on_exit(db: &Database, session: &SessionRecord) -> Result<()> {
-    db.set_apply_state(
-        &session.session_id,
-        ApplyState::AutoApplying,
-        AttentionLevel::Notice,
-        "auto-applying changes",
-    )?;
-
+fn finalize_mergeable_session(db: &Database, session: &SessionRecord) -> Result<()> {
     let worktree = Utf8PathBuf::from(&session.worktree);
     if !worktree.exists() {
         db.set_apply_state(
@@ -937,81 +910,22 @@ fn auto_apply_session_on_exit(db: &Database, session: &SessionRecord) -> Result<
         git::commit_all(&worktree, &auto_commit_message(session))?;
     }
 
-    match git::rebase_onto_base(&worktree, &session.base_branch)? {
-        git::RebaseOutcome::RebasingClean => {}
-        git::RebaseOutcome::Conflicted => {
-            let summary = auto_apply_rebase_conflict_summary(session);
-            db.set_apply_state(
-                &session.session_id,
-                ApplyState::Idle,
-                AttentionLevel::Action,
-                &summary,
-            )?;
-            return Ok(());
-        }
-    }
+    let merge = inspect_merge_state(session)?;
+    let attention = match merge.merge_status {
+        MergeStatus::Ready => AttentionLevel::Notice,
+        MergeStatus::Blocked => AttentionLevel::Notice,
+        MergeStatus::Conflicted => AttentionLevel::Action,
+        MergeStatus::UpToDate => AttentionLevel::Info,
+        MergeStatus::Unknown => AttentionLevel::Action,
+    };
+    let summary = match merge.merge_status {
+        MergeStatus::Unknown => "could not determine merge readiness".to_string(),
+        _ => merge.summary,
+    };
+    db.set_apply_state(&session.session_id, ApplyState::Idle, attention, &summary)?;
 
-    let merge = merge_state_for_apply(session)?;
-    match merge.merge_status {
-        MergeStatus::Ready | MergeStatus::UpToDate => {}
-        MergeStatus::Blocked => {
-            db.set_apply_state(
-                &session.session_id,
-                ApplyState::Idle,
-                AttentionLevel::Notice,
-                &merge.summary,
-            )?;
-            return Ok(());
-        }
-        MergeStatus::Conflicted => {
-            db.set_apply_state(
-                &session.session_id,
-                ApplyState::Idle,
-                AttentionLevel::Action,
-                &merge.summary,
-            )?;
-            return Ok(());
-        }
-        MergeStatus::Unknown => {
-            db.set_apply_state(
-                &session.session_id,
-                ApplyState::Idle,
-                AttentionLevel::Action,
-                "auto-apply could not determine merge readiness",
-            )?;
-            return Ok(());
-        }
-    }
-
-    let repo_root = Utf8PathBuf::from(&session.repo_path);
-    match git::preview_merge(&repo_root, &session.base_branch, &session.branch)? {
-        git::MergePreview::NoChanges => {
-            db.set_apply_state(
-                &session.session_id,
-                ApplyState::Applied,
-                AttentionLevel::Info,
-                "changes already present on base branch",
-            )?;
-        }
-        git::MergePreview::HasChanges => {
-            git::apply_fast_forward(&repo_root, &session.branch)?;
-            let summary = format!("changes auto-applied into {}", session.base_branch);
-            db.set_apply_state(
-                &session.session_id,
-                ApplyState::Applied,
-                AttentionLevel::Info,
-                &summary,
-            )?;
-        }
-        git::MergePreview::Conflicted => {
-            let summary = manual_accept_conflict_summary(session);
-            db.set_apply_state(
-                &session.session_id,
-                ApplyState::Idle,
-                AttentionLevel::Action,
-                &summary,
-            )?;
-        }
+    if merge.merge_status == MergeStatus::Conflicted {
+        return Ok(());
     }
 
     Ok(())
@@ -1028,17 +942,6 @@ fn session_has_pending_changes(session: &SessionRecord) -> Result<bool> {
 
 fn auto_commit_message(session: &SessionRecord) -> String {
     format!("agentd: finalize session {}", session.session_id)
-}
-
-fn auto_apply_rebase_conflict_summary(session: &SessionRecord) -> String {
-    format!(
-        "auto-apply rebase would conflict with {}\nrun:\n  git -C {} checkout {}\n  git -C {} rebase {}",
-        session.base_branch,
-        shell_quote(&session.worktree),
-        shell_quote(&session.branch),
-        shell_quote(&session.worktree),
-        shell_quote(&session.base_branch),
-    )
 }
 
 fn normalize_session_title(
@@ -1652,20 +1555,23 @@ mod tests {
     }
 
     #[test]
-    fn finalize_session_exit_auto_applies_changed_sessions_when_safe() {
+    fn finalize_session_exit_commits_changes_and_leaves_session_mergeable() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
         let db = Database::open(&paths).unwrap();
         let repo = paths.root.join("repo");
+        let worktree = paths.root.join("worktree");
         init_git_repo(repo.as_str());
 
-        insert_session(&db, repo.as_str(), "demo", "changed");
-        fs::write(repo.join("README.md"), "updated\n").unwrap();
+        insert_session_with_worktree(&db, repo.as_str(), worktree.as_str(), "demo", "changed");
+        fs::write(worktree.join("README.md"), "updated\n").unwrap();
         finalize_session_exit(&db, "demo", Some(0)).unwrap();
 
         let session = db.get_session("demo").unwrap().unwrap();
         assert_eq!(session.status, agentd_shared::session::SessionStatus::Exited);
-        assert_eq!(session.apply_state, ApplyState::Applied);
+        assert_eq!(session.apply_state, ApplyState::Idle);
+        let review = inspect_merge_state(&session).unwrap();
+        assert_eq!(review.merge_status, MergeStatus::Ready);
     }
 
     #[test]
