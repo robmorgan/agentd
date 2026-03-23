@@ -4,6 +4,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use agentd_shared::{
+    paths::AppPaths,
+    session::{
+        AttentionLevel, GitSyncStatus, IntegrationState, SessionMode, SessionRecord, SessionStatus,
+        repo_name_from_path,
+    },
+};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use nix::{
@@ -12,16 +19,6 @@ use nix::{
     unistd::Pid,
 };
 use rusqlite::{Connection, OptionalExtension, params};
-use serde_json::Value;
-
-use agentd_shared::{
-    event::SessionEvent,
-    paths::AppPaths,
-    session::{
-        AttentionLevel, GitSyncStatus, IntegrationState, SessionMode, SessionRecord, SessionStatus,
-        repo_name_from_path,
-    },
-};
 
 pub struct LocalStore {
     path: String,
@@ -60,23 +57,6 @@ impl LocalStore {
         .map_err(Into::into)
     }
 
-    pub fn list_events_since(
-        &self,
-        session_id: &str,
-        after_id: Option<i64>,
-    ) -> Result<Vec<SessionEvent>> {
-        let conn = self.connect()?;
-        let after_id = after_id.unwrap_or(0);
-        let mut stmt = conn.prepare(
-            "SELECT id, session_id, timestamp, type, payload_json
-             FROM events
-             WHERE session_id = ?1 AND id > ?2
-             ORDER BY id ASC",
-        )?;
-        let rows = stmt.query_map(params![session_id, after_id], row_to_event)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
-    }
-
     pub fn mark_exited(&self, session_id: &str, exit_code: Option<i32>) -> Result<()> {
         let conn = self.connect()?;
         let now = Utc::now().to_rfc3339();
@@ -103,7 +83,6 @@ impl LocalStore {
 
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
         let conn = self.connect()?;
-        conn.execute("DELETE FROM events WHERE session_id = ?1", params![session_id])?;
         let _ = conn.execute("DELETE FROM threads WHERE session_id = ?1", params![session_id]);
         conn.execute("DELETE FROM sessions WHERE session_id = ?1", params![session_id])?;
         Ok(())
@@ -144,13 +123,6 @@ impl LocalStore {
                 updated_at TEXT NOT NULL,
                 exited_at TEXT
             );
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                type TEXT NOT NULL,
-                payload_json TEXT NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS threads (
                 thread_id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL UNIQUE,
@@ -161,9 +133,9 @@ impl LocalStore {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_events_session_id_id
-                ON events (session_id, id);",
+            ",
         )?;
+        conn.execute("DROP TABLE IF EXISTS events", [])?;
         ensure_column(&conn, "thread_id", "ALTER TABLE sessions ADD COLUMN thread_id TEXT")?;
         ensure_column(&conn, "model", "ALTER TABLE sessions ADD COLUMN model TEXT")?;
         ensure_column(
@@ -364,24 +336,8 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     })
 }
 
-fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
-    Ok(SessionEvent {
-        id: row.get(0)?,
-        session_id: row.get(1)?,
-        timestamp: parse_time(row.get::<_, String>(2)?)?,
-        event_type: row.get(3)?,
-        payload_json: parse_payload(row.get::<_, String>(4)?)?,
-    })
-}
-
 fn parse_time(value: String) -> rusqlite::Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(&value).map(|dt| dt.with_timezone(&Utc)).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
-    })
-}
-
-fn parse_payload(value: String) -> rusqlite::Result<Value> {
-    serde_json::from_str(&value).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
     })
 }
@@ -390,7 +346,6 @@ fn status_to_str(status: SessionStatus) -> &'static str {
     match status {
         SessionStatus::Creating => "creating",
         SessionStatus::Running => "running",
-        SessionStatus::Paused => "paused",
         SessionStatus::NeedsInput => "needs_input",
         SessionStatus::Exited => "exited",
         SessionStatus::Failed => "failed",
@@ -402,7 +357,7 @@ fn str_to_status(value: &str) -> std::result::Result<SessionStatus, std::io::Err
     match value {
         "creating" => Ok(SessionStatus::Creating),
         "running" => Ok(SessionStatus::Running),
-        "paused" => Ok(SessionStatus::Paused),
+        "paused" => Ok(SessionStatus::UnknownRecovered),
         "needs_input" => Ok(SessionStatus::NeedsInput),
         "exited" => Ok(SessionStatus::Exited),
         "failed" => Ok(SessionStatus::Failed),
@@ -531,7 +486,7 @@ fn remove_log_if_present(paths: &AppPaths, session: &SessionRecord) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::LocalStore;
-    use agentd_shared::paths::AppPaths;
+    use agentd_shared::{paths::AppPaths, session::SessionStatus};
     use rusqlite::params;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -569,13 +524,6 @@ mod tests {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 exited_at TEXT
-            );
-            CREATE TABLE events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                type TEXT NOT NULL,
-                payload_json TEXT NOT NULL
             );",
         )
         .unwrap();
@@ -600,5 +548,50 @@ mod tests {
         let session = store.get_session("demo").unwrap().unwrap();
         assert_eq!(session.repo_path, "/tmp/repo");
         assert_eq!(session.base_branch, "HEAD");
+    }
+
+    #[test]
+    fn open_maps_legacy_paused_rows_to_unknown_recovered() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let conn = rusqlite::Connection::open(paths.database.as_str()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                session_id TEXT PRIMARY KEY,
+                agent TEXT NOT NULL,
+                workspace TEXT NOT NULL,
+                task TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                worktree TEXT NOT NULL,
+                status TEXT NOT NULL,
+                pid INTEGER,
+                exit_code INTEGER,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                exited_at TEXT
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (
+                session_id, agent, workspace, task, branch, worktree, status, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            params![
+                "legacy",
+                "codex",
+                "/tmp/repo",
+                "paused",
+                "agent/legacy",
+                "/tmp/worktree",
+                "paused",
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )
+        .unwrap();
+
+        let store = LocalStore::open(&paths).unwrap();
+        let session = store.get_session("legacy").unwrap().unwrap();
+        assert_eq!(session.status, SessionStatus::UnknownRecovered);
     }
 }

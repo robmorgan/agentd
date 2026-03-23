@@ -3,7 +3,6 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use agentd_shared::{
-    event::{NewSessionEvent, SessionEvent},
     paths::AppPaths,
     session::{
         AttentionLevel, GitSyncStatus, IntegrationState, SessionMode, SessionRecord, SessionStatus,
@@ -32,24 +31,6 @@ pub struct NewSession<'a> {
     pub base_branch: &'a str,
     pub branch: &'a str,
     pub worktree: &'a str,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionLaunchInfo {
-    pub command: Option<String>,
-    pub args: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ThreadRecord {
-    pub thread_id: String,
-    pub session_id: String,
-    pub agent: String,
-    pub title: String,
-    pub initial_prompt: String,
-    pub upstream_thread_id: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
 }
 
 impl Database {
@@ -97,13 +78,6 @@ impl Database {
                 updated_at TEXT NOT NULL,
                 exited_at TEXT
             );
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                type TEXT NOT NULL,
-                payload_json TEXT NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS threads (
                 thread_id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL UNIQUE,
@@ -114,23 +88,12 @@ impl Database {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS plans (
-                session_id TEXT NOT NULL,
-                version INTEGER NOT NULL,
-                summary TEXT NOT NULL,
-                body_markdown TEXT NOT NULL,
-                source_event_id INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (session_id, version)
-            );
-            CREATE INDEX IF NOT EXISTS idx_events_session_id_id
-                ON events (session_id, id);
             CREATE INDEX IF NOT EXISTS idx_threads_session_id
                 ON threads (session_id);
-            CREATE INDEX IF NOT EXISTS idx_plans_session_id_version
-                ON plans (session_id, version DESC);
             ",
         )?;
+        conn.execute("DROP TABLE IF EXISTS events", [])?;
+        conn.execute("DROP TABLE IF EXISTS plans", [])?;
         self.ensure_column(&conn, "thread_id", "ALTER TABLE sessions ADD COLUMN thread_id TEXT")?;
         self.ensure_column(&conn, "model", "ALTER TABLE sessions ADD COLUMN model TEXT")?;
         self.ensure_column(
@@ -341,31 +304,6 @@ impl Database {
         Ok(())
     }
 
-    pub fn mark_paused(&self, session_id: &str) -> Result<()> {
-        let conn = self.connect()?;
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE sessions
-             SET status = ?2,
-                 pid = NULL,
-                 exit_code = NULL,
-                 error = NULL,
-                 attention = ?3,
-                 attention_summary = ?4,
-                 updated_at = ?5,
-                 exited_at = NULL
-             WHERE session_id = ?1",
-            params![
-                session_id,
-                status_to_str(SessionStatus::Paused),
-                attention_to_str(AttentionLevel::Notice),
-                "paused",
-                now,
-            ],
-        )?;
-        Ok(())
-    }
-
     pub fn mark_exited(&self, session_id: &str, exit_code: Option<i32>) -> Result<()> {
         let conn = self.connect()?;
         let now = Utc::now().to_rfc3339();
@@ -498,115 +436,11 @@ impl Database {
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
-    pub fn set_launch_info(&self, session_id: &str, command: &str, args_json: &str) -> Result<()> {
-        let conn = self.connect()?;
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE sessions
-             SET agent_command = ?2, agent_args_json = ?3, updated_at = ?4
-             WHERE session_id = ?1",
-            params![session_id, command, args_json, now],
-        )?;
-        Ok(())
-    }
-
-    pub fn get_launch_info(&self, session_id: &str) -> Result<Option<SessionLaunchInfo>> {
-        let conn = self.connect()?;
-        conn.query_row(
-            "SELECT agent_command, agent_args_json
-             FROM sessions
-             WHERE session_id = ?1",
-            params![session_id],
-            |row| {
-                Ok(SessionLaunchInfo {
-                    command: row.get(0)?,
-                    args: parse_agent_args_json(row.get(1)?)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(Into::into)
-    }
-
-    pub fn set_resume_session_id(&self, session_id: &str, resume_session_id: &str) -> Result<()> {
-        let conn = self.connect()?;
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE sessions
-             SET resume_session_id = ?2, updated_at = ?3
-             WHERE session_id = ?1",
-            params![session_id, resume_session_id, now],
-        )?;
-        Ok(())
-    }
-
-    pub fn get_resume_session_id(&self, session_id: &str) -> Result<Option<String>> {
-        let conn = self.connect()?;
-        let resume_session_id = conn
-            .query_row(
-                "SELECT resume_session_id FROM sessions WHERE session_id = ?1",
-                params![session_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?;
-        Ok(resume_session_id.flatten())
-    }
-
-    pub fn get_thread(&self, thread_id: &str) -> Result<Option<ThreadRecord>> {
-        let conn = self.connect()?;
-        conn.query_row(
-            "SELECT thread_id, session_id, agent, title, initial_prompt, upstream_thread_id,
-                    created_at, updated_at
-             FROM threads WHERE thread_id = ?1",
-            params![thread_id],
-            row_to_thread,
-        )
-        .optional()
-        .map_err(Into::into)
-    }
-
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
         let conn = self.connect()?;
-        conn.execute("DELETE FROM events WHERE session_id = ?1", params![session_id])?;
         conn.execute("DELETE FROM threads WHERE session_id = ?1", params![session_id])?;
-        conn.execute("DELETE FROM plans WHERE session_id = ?1", params![session_id])?;
         conn.execute("DELETE FROM sessions WHERE session_id = ?1", params![session_id])?;
         Ok(())
-    }
-
-    pub fn append_events(
-        &self,
-        session_id: &str,
-        events: &[NewSessionEvent],
-    ) -> Result<Vec<SessionEvent>> {
-        if events.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let mut inserted = Vec::with_capacity(events.len());
-
-        for event in events {
-            validate_new_event(event)?;
-            let timestamp = Utc::now();
-            let payload_json = serde_json::to_string(&event.payload_json)?;
-            tx.execute(
-                "INSERT INTO events (session_id, timestamp, type, payload_json)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![session_id, timestamp.to_rfc3339(), event.event_type, payload_json,],
-            )?;
-            inserted.push(SessionEvent {
-                id: tx.last_insert_rowid(),
-                session_id: session_id.to_string(),
-                timestamp,
-                event_type: event.event_type.clone(),
-                payload_json: event.payload_json.clone(),
-            });
-        }
-
-        tx.commit()?;
-        Ok(inserted)
     }
 }
 
@@ -666,49 +500,16 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     })
 }
 
-fn row_to_thread(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRecord> {
-    Ok(ThreadRecord {
-        thread_id: row.get(0)?,
-        session_id: row.get(1)?,
-        agent: row.get(2)?,
-        title: row.get(3)?,
-        initial_prompt: row.get(4)?,
-        upstream_thread_id: row.get(5)?,
-        created_at: parse_time(row.get::<_, String>(6)?)?,
-        updated_at: parse_time(row.get::<_, String>(7)?)?,
-    })
-}
-
 fn parse_time(value: String) -> rusqlite::Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(&value).map(|dt| dt.with_timezone(&Utc)).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
     })
 }
 
-fn parse_agent_args_json(value: Option<String>) -> rusqlite::Result<Option<Vec<String>>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    serde_json::from_str(&value).map(Some).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
-    })
-}
-
-fn validate_new_event(event: &NewSessionEvent) -> Result<()> {
-    if event.event_type.trim().is_empty() {
-        anyhow::bail!("event type must not be empty");
-    }
-    if !event.payload_json.is_object() {
-        anyhow::bail!("event payload must be a JSON object");
-    }
-    Ok(())
-}
-
 fn status_to_str(status: SessionStatus) -> &'static str {
     match status {
         SessionStatus::Creating => "creating",
         SessionStatus::Running => "running",
-        SessionStatus::Paused => "paused",
         SessionStatus::NeedsInput => "needs_input",
         SessionStatus::Exited => "exited",
         SessionStatus::Failed => "failed",
@@ -720,7 +521,7 @@ fn str_to_status(value: &str) -> std::result::Result<SessionStatus, std::io::Err
     match value {
         "creating" => Ok(SessionStatus::Creating),
         "running" => Ok(SessionStatus::Running),
-        "paused" => Ok(SessionStatus::Paused),
+        "paused" => Ok(SessionStatus::UnknownRecovered),
         "needs_input" => Ok(SessionStatus::NeedsInput),
         "exited" => Ok(SessionStatus::Exited),
         "failed" => Ok(SessionStatus::Failed),
@@ -804,8 +605,8 @@ fn str_to_session_mode(value: &str) -> std::result::Result<SessionMode, std::io:
 #[cfg(test)]
 mod tests {
     use super::Database;
-    use agentd_shared::{event::NewSessionEvent, paths::AppPaths, session::SessionMode};
-    use serde_json::json;
+    use agentd_shared::{paths::AppPaths, session::{SessionMode, SessionStatus}};
+    use rusqlite::params;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_paths() -> AppPaths {
@@ -853,12 +654,12 @@ mod tests {
     }
 
     #[test]
-    fn append_events_returns_inserted_rows_in_order() {
+    fn legacy_paused_rows_decode_as_unknown_recovered() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
         let db = Database::open(&paths).unwrap();
         db.insert_session(&super::NewSession {
-            session_id: "demo",
+            session_id: "legacy",
             thread_id: None,
             agent: "codex",
             model: None,
@@ -869,61 +670,20 @@ mod tests {
             workspace: "/tmp/repo",
             repo_path: "/tmp/repo",
             repo_name: "repo",
-            title: "test",
+            title: "legacy",
             base_branch: "main",
-            branch: "agent/test",
+            branch: "agent/legacy",
             worktree: "/tmp/worktree",
         })
         .unwrap();
-
-        let inserted = db
-            .append_events(
-                "demo",
-                &[
-                    NewSessionEvent {
-                        event_type: "SESSION_STARTED".to_string(),
-                        payload_json: json!({"source":"daemon"}),
-                    },
-                    NewSessionEvent {
-                        event_type: "COMMAND_EXECUTED".to_string(),
-                        payload_json: json!({"command":"cargo test"}),
-                    },
-                ],
-            )
-            .unwrap();
-
-        assert_eq!(inserted.len(), 2);
-        assert!(inserted[0].id < inserted[1].id);
-        assert_eq!(inserted[0].event_type, "SESSION_STARTED");
-        assert_eq!(inserted[1].event_type, "COMMAND_EXECUTED");
-    }
-
-    #[test]
-    fn resume_session_id_round_trips() {
-        let paths = test_paths();
-        paths.ensure_layout().unwrap();
-        let db = Database::open(&paths).unwrap();
-        db.insert_session(&super::NewSession {
-            session_id: "demo",
-            thread_id: None,
-            agent: "codex",
-            model: None,
-            mode: SessionMode::Execute,
-            agent_command: "codex",
-            agent_args_json: "[]",
-            resume_session_id: None,
-            workspace: "/tmp/repo",
-            repo_path: "/tmp/repo",
-            repo_name: "repo",
-            title: "test",
-            base_branch: "main",
-            branch: "agent/test",
-            worktree: "/tmp/worktree",
-        })
+        let conn = rusqlite::Connection::open(paths.database.as_str()).unwrap();
+        conn.execute(
+            "UPDATE sessions SET status = ?2, attention = ?3, attention_summary = ?4 WHERE session_id = ?1",
+            params!["legacy", "paused", "notice", "paused"],
+        )
         .unwrap();
 
-        assert!(db.get_resume_session_id("demo").unwrap().is_none());
-        db.set_resume_session_id("demo", "thread-123").unwrap();
-        assert_eq!(db.get_resume_session_id("demo").unwrap().as_deref(), Some("thread-123"));
+        let session = db.get_session("legacy").unwrap().unwrap();
+        assert_eq!(session.status, SessionStatus::UnknownRecovered);
     }
 }

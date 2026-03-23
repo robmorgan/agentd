@@ -68,7 +68,6 @@ const HOST_PICKER_STATUS_YELLOW_FG: &str = "\x1b[38;2;250;204;21m";
 const HOST_PICKER_STATUS_RED_FG: &str = "\x1b[38;2;239;68;68m";
 const HOST_PICKER_STATUS_BLUE_FG: &str = "\x1b[38;2;96;165;250m";
 const HOST_PICKER_STATUS_GREEN_FG: &str = "\x1b[38;2;34;197;94m";
-const HOST_PICKER_STATUS_GRAY_FG: &str = "\x1b[38;2;156;163;175m";
 const HOST_PICKER_DIFF_HEADER_STYLE: &str = "\x1b[38;2;153;214;255m\x1b[1m";
 const HOST_PICKER_DIFF_HUNK_STYLE: &str = "\x1b[38;2;242;201;76m\x1b[1m";
 const HOST_PICKER_DIFF_ADD_STYLE: &str = "\x1b[38;2;111;207;151m";
@@ -1707,10 +1706,8 @@ fn session_rank(session: &SessionRecord) -> u8 {
         2
     } else if matches!(session.status, SessionStatus::Running | SessionStatus::Creating) {
         3
-    } else if session.status == SessionStatus::Paused {
-        4
     } else {
-        5
+        4
     }
 }
 
@@ -1723,7 +1720,6 @@ fn session_icon(session: &SessionRecord) -> &'static str {
             SessionStatus::Failed => "✖",
             SessionStatus::UnknownRecovered => "⚠",
             SessionStatus::Running | SessionStatus::Creating => "●",
-            SessionStatus::Paused => "⏸",
             SessionStatus::Exited => "✔",
         }
     }
@@ -1738,7 +1734,6 @@ fn session_icon_color(session: &SessionRecord) -> Color {
             SessionStatus::Failed => Color::Red,
             SessionStatus::UnknownRecovered => Color::Yellow,
             SessionStatus::Running | SessionStatus::Creating => Color::Green,
-            SessionStatus::Paused => Color::DarkGray,
             SessionStatus::Exited => Color::Green,
         }
     }
@@ -1746,7 +1741,7 @@ fn session_icon_color(session: &SessionRecord) -> Color {
 
 fn session_icon_style(session: &SessionRecord) -> Style {
     let mut style = Style::default().fg(session_icon_color(session));
-    if matches!(session.status, SessionStatus::NeedsInput | SessionStatus::Paused) {
+    if session.status == SessionStatus::NeedsInput {
         style = style.add_modifier(Modifier::DIM);
     }
     style
@@ -1785,7 +1780,7 @@ fn render_host_picker_legend_row(width: usize, sessions: &[SessionRecord]) -> St
             "pending review",
         ),
         (demo_status_session(SessionStatus::Running, IntegrationState::Clean), "running"),
-        (demo_status_session(SessionStatus::Paused, IntegrationState::Clean), "paused"),
+        (demo_status_session(SessionStatus::UnknownRecovered, IntegrationState::Clean), "recovered"),
         (demo_status_session(SessionStatus::Exited, IntegrationState::Clean), "exited"),
     ];
     let max_chars = width.saturating_sub(1).max(1);
@@ -1870,7 +1865,6 @@ fn session_list_status_label(session: &SessionRecord) -> &'static str {
             SessionStatus::Failed => "failed",
             SessionStatus::UnknownRecovered => "recovered",
             SessionStatus::Running | SessionStatus::Creating => "running",
-            SessionStatus::Paused => "paused",
             SessionStatus::Exited => "exited",
         }
     }
@@ -1886,7 +1880,6 @@ fn host_picker_icon_ansi_prefix(session: &SessionRecord) -> String {
             SessionStatus::Running | SessionStatus::Creating => {
                 HOST_PICKER_STATUS_GREEN_FG.to_string()
             }
-            SessionStatus::Paused => format!("{ANSI_DIM}{HOST_PICKER_STATUS_GRAY_FG}"),
             SessionStatus::Exited => HOST_PICKER_STATUS_GREEN_FG.to_string(),
         },
     }
@@ -1899,7 +1892,6 @@ fn session_status_text(session: &SessionRecord) -> String {
     match session.status {
         SessionStatus::Creating => "starting".to_string(),
         SessionStatus::Running => "running".to_string(),
-        SessionStatus::Paused => "paused".to_string(),
         SessionStatus::NeedsInput => "needs input".to_string(),
         SessionStatus::Exited => "complete".to_string(),
         SessionStatus::Failed => session.error.clone().unwrap_or_else(|| "blocked".to_string()),
@@ -1925,7 +1917,7 @@ mod tests {
         ANSI_RESET, AttachOverlay, HOST_PICKER_CURSOR, HOST_PICKER_DIFF_ADD_STYLE,
         HOST_PICKER_DIFF_HEADER_STYLE, HOST_PICKER_DIFF_HUNK_STYLE, HOST_PICKER_DIFF_REMOVE_STYLE,
         HOST_PICKER_LEGEND_TEXT_STYLE, HOST_PICKER_PLACEHOLDER_FG, HOST_PICKER_QUERY_BG,
-        HOST_PICKER_SELECTED_STYLE, HOST_PICKER_STATUS_BLUE_FG, HOST_PICKER_STATUS_GRAY_FG,
+        HOST_PICKER_SELECTED_STYLE, HOST_PICKER_STATUS_BLUE_FG,
         HOST_PICKER_STATUS_GREEN_FG, HOST_PICKER_STATUS_RED_FG, HOST_PICKER_STATUS_YELLOW_FG,
         HOST_PICKER_TEXT_FG, OverlayMode, OverlayOutcome, PickerComposer, PickerMode, PickerRow,
         SessionAction, SessionPicker, configured_agent_names, fit_host_picker_line,
@@ -2314,10 +2306,10 @@ mod tests {
             session_icon(&demo_with(
                 "alpha",
                 "repo-a",
-                SessionStatus::Paused,
+                SessionStatus::UnknownRecovered,
                 IntegrationState::Clean
             )),
-            "⏸"
+            "⚠"
         );
         assert_eq!(
             session_icon(&demo_with(
@@ -2381,10 +2373,10 @@ mod tests {
             session_icon_color(&demo_with(
                 "alpha",
                 "repo-a",
-                SessionStatus::Paused,
+                SessionStatus::UnknownRecovered,
                 IntegrationState::Clean
             )),
-            ratatui::style::Color::DarkGray
+            ratatui::style::Color::Yellow
         );
     }
 
@@ -2429,20 +2421,19 @@ mod tests {
             &[
                 demo_with("alpha", "repo-a", SessionStatus::NeedsInput, IntegrationState::Clean),
                 demo_with("beta", "repo-b", SessionStatus::Exited, IntegrationState::PendingReview),
-                demo_with("gamma", "repo-c", SessionStatus::Paused, IntegrationState::Clean),
+                demo_with("gamma", "repo-c", SessionStatus::UnknownRecovered, IntegrationState::Clean),
             ],
         );
         assert!(rendered.contains(HOST_PICKER_STATUS_YELLOW_FG));
         assert!(rendered.contains(HOST_PICKER_STATUS_BLUE_FG));
-        assert!(rendered.contains(HOST_PICKER_STATUS_GRAY_FG));
         assert!(rendered.contains(HOST_PICKER_LEGEND_TEXT_STYLE));
         assert!(rendered.starts_with("  "));
         assert!(rendered.contains("◦"));
         assert!(rendered.contains("⧖"));
-        assert!(rendered.contains("⏸"));
+        assert!(rendered.contains("⚠"));
         assert!(rendered.contains("needs input"));
         assert!(rendered.contains("pending review"));
-        assert!(rendered.contains("paused"));
+        assert!(rendered.contains("recovered"));
         assert!(rendered.contains(" • "));
         assert!(!rendered.contains("failed"));
         assert!(!rendered.contains("running"));
@@ -2507,7 +2498,7 @@ mod tests {
         let rendered = render_session_list_lines(
             &[
                 demo_with("alpha", "repo-a", SessionStatus::NeedsInput, IntegrationState::Clean),
-                demo_with("beta", "repo-b", SessionStatus::Paused, IntegrationState::Clean),
+                demo_with("beta", "repo-b", SessionStatus::UnknownRecovered, IntegrationState::Clean),
             ],
             120,
         )

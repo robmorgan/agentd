@@ -2,7 +2,6 @@ use std::{
     collections::HashMap,
     fs,
     io::{Read, Write},
-    path::Path,
     sync::{Arc, Mutex, mpsc as std_mpsc},
     time::{Duration, Instant},
 };
@@ -21,7 +20,6 @@ use tokio::{sync::broadcast, task};
 
 use agentd_shared::{
     config::Config,
-    event::NewSessionEvent,
     paths::AppPaths,
     session::{
         AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult, GitSyncStatus,
@@ -31,7 +29,7 @@ use agentd_shared::{
 };
 
 use crate::{
-    db::{Database, NewSession, SessionLaunchInfo},
+    db::{Database, NewSession},
     git,
     ids::generate_session_id,
     terminal_state::{GhosttyTerminalState, TerminalStateEngine},
@@ -99,20 +97,6 @@ impl AppState {
                 let _ = record_session_failure(&db, &session_id, err.to_string());
                 return Err(err);
             }
-            let _ = db.append_events(
-                &session_id,
-                &[daemon_event(
-                    "WORKTREE_CREATED",
-                    serde_json::json!({
-                        "source": "daemon",
-                        "repo_path": repo_root.as_str(),
-                        "base_branch": base_branch,
-                        "branch": branch,
-                        "worktree": worktree.as_str()
-                    }),
-                )],
-            );
-
             let launch = LaunchCommand {
                 agent_name: agent_name.clone(),
                 command: agent.command,
@@ -131,9 +115,6 @@ impl AppState {
                     title: &title,
                     launch: &launch,
                     model: model.as_deref(),
-                    session_mode: mode,
-                    resume_session_id: None,
-                    mode: SessionStartMode::Create,
                 },
             ) {
                 let _ = record_session_failure(&db, &session_id, err.to_string());
@@ -181,7 +162,7 @@ impl AppState {
     pub async fn reconcile_sessions(&self) -> Result<()> {
         let sessions = self.list_sessions().await?;
         for session in sessions {
-            if session.status == SessionStatus::Running && !process_exists(session.pid) {
+            if accepts_live_io(&session) {
                 let db = self.db.clone();
                 let session_id = session.session_id.clone();
                 task::spawn_blocking(move || db.mark_unknown_recovered(&session_id)).await??;
@@ -190,89 +171,9 @@ impl AppState {
         Ok(())
     }
 
-    pub async fn resume_paused_sessions(&self) -> Result<()> {
-        let sessions = self.list_sessions().await?;
-        let config = self.config.clone();
-        for session in sessions {
-            if session.status != SessionStatus::Paused {
-                continue;
-            }
-
-            let launch = match self.resolve_launch_command(&session).await {
-                Ok(launch) => launch,
-                Err(err) => {
-                    let error = err.to_string();
-                    let db = self.db.clone();
-                    let session_id = session.session_id.clone();
-                    task::spawn_blocking(move || record_session_failure(&db, &session_id, error))
-                        .await??;
-                    continue;
-                }
-            };
-            let paths = self.paths.clone();
-            let db = self.db.clone();
-            let runtimes = self.runtimes.clone();
-            let session_id = session.session_id.clone();
-            let repo_path = session.repo_path.clone();
-            let worktree = session.worktree.clone();
-            let branch = session.branch.clone();
-            let title = session.title.clone();
-            let config = config.clone();
-
-            let result = task::spawn_blocking(move || {
-                start_session_runtime(
-                    &paths,
-                    &db,
-                    &config,
-                    &runtimes,
-                    SessionStartRequest {
-                        session_id: &session_id,
-                        repo_root: &repo_path,
-                        worktree: &worktree,
-                        branch: &branch,
-                        title: &title,
-                        launch: &launch,
-                        model: session.model.as_deref(),
-                        session_mode: session.mode,
-                        resume_session_id: None,
-                        mode: SessionStartMode::Resume,
-                    },
-                )
-            })
-            .await?;
-
-            if let Err(err) = result {
-                let error = err.to_string();
-                let db = self.db.clone();
-                let session_id = session.session_id.clone();
-                task::spawn_blocking(move || record_session_failure(&db, &session_id, error))
-                    .await??;
-            }
-        }
-
-        Ok(())
-    }
-
     pub async fn has_running_sessions(&self) -> Result<bool> {
         let sessions = self.list_sessions().await?;
-        Ok(sessions
-            .into_iter()
-            .any(|session| session.status == SessionStatus::Running && process_exists(session.pid)))
-    }
-
-    pub async fn resolve_launch_command(&self, session: &SessionRecord) -> Result<LaunchCommand> {
-        let db = self.db.clone();
-        let config = self.config.clone();
-        let paths = self.paths.clone();
-        let session_id = session.session_id.clone();
-        let agent_name = session.agent.clone();
-        task::spawn_blocking(move || {
-            let launch = db
-                .get_launch_info(&session_id)?
-                .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
-            resolve_launch_command(&config, &paths, &agent_name, launch)
-        })
-        .await?
+        Ok(sessions.into_iter().any(|session| accepts_live_io(&session)))
     }
 
     pub async fn create_worktree(&self, session_id: &str) -> Result<WorktreeRecord> {
@@ -291,19 +192,6 @@ impl AppState {
             }
 
             git::create_worktree(&repo_root, &session.base_branch, &session.branch, &worktree)?;
-            let _ = db.append_events(
-                &session_id,
-                &[daemon_event(
-                    "WORKTREE_CREATED",
-                    serde_json::json!({
-                        "source": "daemon",
-                        "repo_path": session.repo_path,
-                        "base_branch": session.base_branch,
-                        "branch": session.branch,
-                        "worktree": session.worktree
-                    }),
-                )],
-            );
 
             Ok(WorktreeRecord {
                 session_id: session.session_id,
@@ -333,18 +221,6 @@ impl AppState {
             }
 
             git::remove_worktree(&repo_root, &worktree)?;
-            let _ = db.append_events(
-                &session_id,
-                &[daemon_event(
-                    "WORKTREE_REMOVED",
-                    serde_json::json!({
-                        "source": "daemon",
-                        "repo_path": session.repo_path,
-                        "branch": session.branch,
-                        "worktree": session.worktree
-                    }),
-                )],
-            );
 
             Ok(WorktreeRecord {
                 session_id: session.session_id,
@@ -375,17 +251,6 @@ impl AppState {
 
             if was_running {
                 terminate_session_process(&session_id, session.pid)?;
-                let _ = db.append_events(
-                    &session_id,
-                    &[daemon_event(
-                        "SESSION_KILLED",
-                        serde_json::json!({
-                            "source": "daemon",
-                            "pid": session.pid,
-                            "signal": "SIGTERM"
-                        }),
-                    )],
-                );
                 let _ = db.mark_exited(&session_id, None);
             }
 
@@ -494,20 +359,6 @@ impl AppState {
                     bail!(manual_accept_conflict_summary(&session));
                 }
             }
-            db.append_events(
-                &session.session_id,
-                &[daemon_event(
-                    "SESSION_APPLIED",
-                    serde_json::json!({
-                        "source": "daemon",
-                        "repo_path": session.repo_path,
-                        "base_branch": session.base_branch,
-                        "branch": session.branch,
-                        "worktree": session.worktree,
-                    }),
-                )],
-            )?;
-
             db.get_session(&session_id)?
                 .ok_or_else(|| anyhow!("session `{session_id}` not found after apply"))
         })
@@ -543,32 +394,6 @@ impl AppState {
                 Some("changes discarded"),
                 false,
             )?;
-            db.append_events(
-                &session.session_id,
-                &[
-                    daemon_event(
-                        "WORKTREE_REMOVED",
-                        serde_json::json!({
-                            "source": "daemon",
-                            "repo_path": session.repo_path,
-                            "branch": session.branch,
-                            "worktree": session.worktree
-                        }),
-                    ),
-                    daemon_event(
-                        "SESSION_DISCARDED",
-                        serde_json::json!({
-                            "source": "daemon",
-                            "repo_path": session.repo_path,
-                            "base_branch": session.base_branch,
-                            "branch": session.branch,
-                            "worktree": session.worktree,
-                            "forced": force,
-                        }),
-                    ),
-                ],
-            )?;
-
             db.get_session(&session_id)?
                 .ok_or_else(|| anyhow!("session `{session_id}` not found after discard"))
         })
@@ -593,25 +418,8 @@ impl AppState {
             .ok_or_else(|| anyhow!("session `{session_id}` does not have a live PTY"))?;
         runtime.write_input(&data)?;
 
-        let db = self.db.clone();
-        let session_id = session_id.to_string();
-        task::spawn_blocking(move || {
-            db.append_events(
-                &session_id,
-                &[daemon_event(
-                    "SESSION_INPUT_INJECTED",
-                    serde_json::json!({
-                        "source": "daemon",
-                        "target_session_id": session_id,
-                        "source_session_id": source_session_id,
-                        "byte_count": data.len(),
-                        "preview": preview_input(&data),
-                    }),
-                )],
-            )?;
-            Ok(())
-        })
-        .await?
+        let _ = source_session_id;
+        Ok(())
     }
 
     pub async fn write_attached_input(&self, session_id: &str, data: Vec<u8>) -> Result<()> {
@@ -752,12 +560,6 @@ pub struct LaunchCommand {
     pub args: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SessionStartMode {
-    Create,
-    Resume,
-}
-
 struct SessionStartRequest<'a> {
     session_id: &'a str,
     repo_root: &'a str,
@@ -766,30 +568,6 @@ struct SessionStartRequest<'a> {
     title: &'a str,
     launch: &'a LaunchCommand,
     model: Option<&'a str>,
-    session_mode: SessionMode,
-    resume_session_id: Option<&'a str>,
-    mode: SessionStartMode,
-}
-
-pub fn is_resumable_command(command: &str) -> bool {
-    Path::new(command).file_name().and_then(|value| value.to_str()) == Some("codex")
-}
-
-fn resolve_launch_command(
-    config: &Config,
-    paths: &AppPaths,
-    agent_name: &str,
-    launch: SessionLaunchInfo,
-) -> Result<LaunchCommand> {
-    let command = match launch.command {
-        Some(command) => command,
-        None => config.require_agent(paths, agent_name)?.command.clone(),
-    };
-    let args = match launch.args {
-        Some(args) => args,
-        None => config.agents.get(agent_name).map(|agent| agent.args.clone()).unwrap_or_default(),
-    };
-    Ok(LaunchCommand { agent_name: agent_name.to_string(), command, args })
 }
 
 fn start_session_runtime(
@@ -829,25 +607,6 @@ fn start_session_runtime(
 
     let pid = child.process_id().map(|value| value as u32).unwrap_or(0);
     db.mark_running(request.session_id, pid)?;
-    let start_event = match request.mode {
-        SessionStartMode::Create => "SESSION_STARTED",
-        SessionStartMode::Resume => "SESSION_RESUMED",
-    };
-    db.append_events(
-        request.session_id,
-        &[daemon_event(
-            start_event,
-            serde_json::json!({
-                "source": "daemon",
-                "pid": pid,
-                "agent": request.launch.agent_name,
-                "session_mode": request.session_mode.as_str(),
-                "branch": request.branch,
-                "worktree": request.worktree,
-                "resume_session_id": request.resume_session_id
-            }),
-        )],
-    )?;
 
     let reader = pair.master.try_clone_reader().context("failed to clone PTY reader")?;
     let writer = pair.master.take_writer().context("failed to clone PTY writer")?;
@@ -873,14 +632,13 @@ fn start_session_runtime(
     let exit_db = db.clone();
     let exit_session_id = request.session_id.to_string();
     let exit_runtimes = runtimes.clone();
-    let start_mode = request.mode;
     std::thread::spawn(move || {
         let status = child.wait();
         let code = status.ok().map(|value| value.exit_code() as i32);
         exit_runtimes.freeze_history(&exit_session_id);
         exit_runtimes.remove(&exit_session_id);
         let _ = writer_done_rx.recv();
-        let _ = finalize_session_exit(&exit_db, &exit_session_id, code, start_mode);
+        let _ = finalize_session_exit(&exit_db, &exit_session_id, code);
     });
 
     Ok(())
@@ -1115,31 +873,11 @@ fn unique_session_id(db: &Database) -> Result<String> {
     bail!("failed to allocate a unique session id")
 }
 
-fn daemon_event(event_type: &str, payload_json: serde_json::Value) -> NewSessionEvent {
-    NewSessionEvent { event_type: event_type.to_string(), payload_json }
-}
-
 fn record_session_failure(db: &Database, session_id: &str, error: String) -> Result<()> {
-    db.mark_failed(session_id, error.clone())?;
-    db.append_events(
-        session_id,
-        &[daemon_event(
-            "SESSION_FAILED",
-            serde_json::json!({
-                "source": "daemon",
-                "error": error
-            }),
-        )],
-    )?;
-    Ok(())
+    db.mark_failed(session_id, error)
 }
 
-fn finalize_session_exit(
-    db: &Database,
-    session_id: &str,
-    exit_code: Option<i32>,
-    start_mode: SessionStartMode,
-) -> Result<()> {
+fn finalize_session_exit(db: &Database, session_id: &str, exit_code: Option<i32>) -> Result<()> {
     let Some(session) = db.get_session(session_id)? else {
         return Ok(());
     };
@@ -1148,7 +886,7 @@ fn finalize_session_exit(
     }
 
     let has_changes = session_has_pending_changes(&session)?;
-    let outcome = if exit_code == Some(0) {
+    if exit_code == Some(0) {
         db.mark_exited(session_id, exit_code)?;
         if has_changes {
             db.set_integration_state(
@@ -1157,22 +895,6 @@ fn finalize_session_exit(
                 AttentionLevel::Notice,
                 "changes ready to review",
             )?;
-            db.append_events(
-                session_id,
-                &[daemon_event(
-                    "SESSION_PENDING_REVIEW",
-                    serde_json::json!({
-                        "source": "daemon",
-                        "repo_path": session.repo_path,
-                        "base_branch": session.base_branch,
-                        "branch": session.branch,
-                        "worktree": session.worktree,
-                    }),
-                )],
-            )?;
-            "pending_review"
-        } else {
-            "complete"
         }
     } else {
         let error = match exit_code {
@@ -1180,29 +902,7 @@ fn finalize_session_exit(
             None => "agent exited unexpectedly".to_string(),
         };
         db.mark_failed(session_id, error)?;
-        "failed"
-    };
-
-    db.append_events(
-        session_id,
-        &[daemon_event(
-            "SESSION_FINISHED",
-            serde_json::json!({
-                "source": "daemon",
-                "exit_code": exit_code,
-                "integration_state": if has_changes {
-                    IntegrationState::PendingReview.as_str()
-                } else {
-                    IntegrationState::Clean.as_str()
-                },
-                "mode": match start_mode {
-                    SessionStartMode::Create => "create",
-                    SessionStartMode::Resume => "resume",
-                },
-                "outcome": outcome,
-            }),
-        )],
-    )?;
+    }
     Ok(())
 }
 
@@ -1263,13 +963,6 @@ fn configure_spawn_command(
             command.arg(flag);
             command.arg(model);
         }
-    }
-
-    if request.mode == SessionStartMode::Resume && request.resume_session_id.is_some() {
-        bail!(
-            "resume-based interactive sessions are no longer supported for `{}`",
-            request.launch.agent_name
-        );
     }
     Ok(())
 }
@@ -1371,30 +1064,23 @@ fn remove_log_if_present(paths: &AppPaths, session: &SessionRecord) -> Result<()
     Ok(())
 }
 
-fn preview_input(data: &[u8]) -> String {
-    let mut preview = String::from_utf8_lossy(data).replace('\n', "\\n").replace('\r', "\\r");
-    if preview.len() > 120 {
-        preview.truncate(120);
-        preview.push_str("...");
-    }
-    preview
-}
-
 fn ensure_session_running(session: &SessionRecord) -> Result<()> {
-    let accepts_live_io =
-        matches!(session.status, SessionStatus::Running | SessionStatus::NeedsInput)
-            && process_exists(session.pid);
-    if !accepts_live_io {
+    if !accepts_live_io(session) {
         bail!("session `{}` is not running", session.session_id);
     }
     Ok(())
 }
 
 fn ensure_session_not_running(session: &SessionRecord) -> Result<()> {
-    if session.status == SessionStatus::Running && process_exists(session.pid) {
+    if accepts_live_io(session) {
         bail!("session `{}` is still running", session.session_id);
     }
     Ok(())
+}
+
+fn accepts_live_io(session: &SessionRecord) -> bool {
+    matches!(session.status, SessionStatus::Running | SessionStatus::NeedsInput)
+        && process_exists(session.pid)
 }
 
 fn ensure_not_pending_review(session: &SessionRecord, action: &str) -> Result<()> {
@@ -1549,8 +1235,8 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachControl, SessionRuntime, SessionStartMode, finalize_session_exit,
-        inspect_review_state, manual_accept_conflict_summary, review_state_for_accept, shell_quote,
+        AttachControl, SessionRuntime, finalize_session_exit, inspect_review_state,
+        manual_accept_conflict_summary, review_state_for_accept, shell_quote,
     };
     use crate::app::SessionRuntimeRegistry;
     use crate::db::{Database, NewSession};
@@ -1721,7 +1407,7 @@ mod tests {
         init_git_repo(repo.as_str());
 
         insert_session(&db, repo.as_str(), "demo", "clean");
-        finalize_session_exit(&db, "demo", Some(0), SessionStartMode::Create).unwrap();
+        finalize_session_exit(&db, "demo", Some(0)).unwrap();
 
         let session = db.get_session("demo").unwrap().unwrap();
         assert_eq!(session.status, agentd_shared::session::SessionStatus::Exited);
@@ -1738,7 +1424,7 @@ mod tests {
 
         insert_session(&db, repo.as_str(), "demo", "changed");
         fs::write(repo.join("README.md"), "updated\n").unwrap();
-        finalize_session_exit(&db, "demo", Some(0), SessionStartMode::Create).unwrap();
+        finalize_session_exit(&db, "demo", Some(0)).unwrap();
 
         let session = db.get_session("demo").unwrap().unwrap();
         assert_eq!(session.status, agentd_shared::session::SessionStatus::Exited);

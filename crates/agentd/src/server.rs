@@ -37,7 +37,6 @@ pub async fn serve() -> Result<()> {
     let config = Config::load(&paths)?;
     let state = AppState::new(paths.clone(), db, config);
     state.reconcile_sessions().await?;
-    state.resume_paused_sessions().await?;
 
     let listener =
         UnixListener::bind(paths.socket.as_std_path()).context("failed to bind agentd socket")?;
@@ -266,17 +265,6 @@ async fn handle_connection(
                 }
             }
         }
-        IncomingRequest::Standard(Request::AppendSessionEvents { session_id, events }) => {
-            let _ = (session_id, events);
-            send_response(
-                &mut writer,
-                &Response::Error {
-                    message: "structured event ingestion is disabled in interactive mode"
-                        .to_string(),
-                },
-            )
-            .await?
-        }
         IncomingRequest::Standard(Request::GetHistory { session_id, vt }) => {
             match state.get_history(&session_id, vt).await {
                 Ok(data) => send_response(&mut writer, &Response::History { data }).await?,
@@ -285,16 +273,6 @@ async fn handle_connection(
                         .await?
                 }
             }
-        }
-        IncomingRequest::Standard(Request::StreamEvents { session_id, follow }) => {
-            let _ = (session_id, follow);
-            send_response(
-                &mut writer,
-                &Response::Error {
-                    message: "event streaming is disabled in interactive mode".to_string(),
-                },
-            )
-            .await?;
         }
     }
 
@@ -467,7 +445,7 @@ fn session_ended_response(session: &SessionRecord) -> Option<Response> {
             exit_code: session.exit_code,
             error: session.error.clone(),
         }),
-        SessionStatus::Creating | SessionStatus::Running | SessionStatus::Paused => None,
+        SessionStatus::Creating | SessionStatus::Running => None,
     }
 }
 

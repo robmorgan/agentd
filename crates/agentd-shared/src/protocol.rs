@@ -3,15 +3,12 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::{
-    event::{NewSessionEvent, SessionEvent},
-    session::{
-        AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult, GitSyncStatus,
-        IntegrationState, SessionDiff, SessionMode, SessionRecord, SessionStatus, WorktreeRecord,
-    },
+use crate::session::{
+    AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult, GitSyncStatus,
+    IntegrationState, SessionDiff, SessionMode, SessionRecord, SessionStatus, WorktreeRecord,
 };
 
-pub const PROTOCOL_VERSION: u16 = 20;
+pub const PROTOCOL_VERSION: u16 = 21;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
@@ -78,9 +75,7 @@ pub enum Request {
     GetSession { session_id: String },
     ListSessions,
     ListAttachments { session_id: String },
-    AppendSessionEvents { session_id: String, events: Vec<NewSessionEvent> },
     GetHistory { session_id: String, vt: bool },
-    StreamEvents { session_id: String, follow: bool },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,9 +119,6 @@ pub enum Response {
     Attachments {
         attachments: Vec<AttachmentRecord>,
     },
-    Event {
-        event: SessionEvent,
-    },
     History {
         data: String,
     },
@@ -165,9 +157,7 @@ enum MessageKind {
     DiffSessionRequest = 10,
     GetSessionRequest = 11,
     ListSessionsRequest = 12,
-    AppendSessionEventsRequest = 13,
     GetHistoryRequest = 14,
-    StreamEventsRequest = 15,
     DaemonInfoResponse = 101,
     CreateSessionResponse = 102,
     KillSessionResponse = 103,
@@ -179,7 +169,6 @@ enum MessageKind {
     DiffResponse = 107,
     SessionResponse = 108,
     SessionsResponse = 109,
-    EventResponse = 110,
     HistoryResponse = 111,
     PtyOutputResponse = 112,
     SwitchSessionResponse = 116,
@@ -210,9 +199,7 @@ impl MessageKind {
             10 => Self::DiffSessionRequest,
             11 => Self::GetSessionRequest,
             12 => Self::ListSessionsRequest,
-            13 => Self::AppendSessionEventsRequest,
             14 => Self::GetHistoryRequest,
-            15 => Self::StreamEventsRequest,
             101 => Self::DaemonInfoResponse,
             102 => Self::CreateSessionResponse,
             103 => Self::KillSessionResponse,
@@ -224,7 +211,6 @@ impl MessageKind {
             107 => Self::DiffResponse,
             108 => Self::SessionResponse,
             109 => Self::SessionsResponse,
-            110 => Self::EventResponse,
             111 => Self::HistoryResponse,
             112 => Self::PtyOutputResponse,
             116 => Self::SwitchSessionResponse,
@@ -488,23 +474,10 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             put_string(&mut payload, session_id)?;
             MessageKind::ListAttachmentsRequest
         }
-        Request::AppendSessionEvents { session_id, events } => {
-            put_string(&mut payload, session_id)?;
-            put_len(&mut payload, events.len())?;
-            for event in events {
-                put_new_session_event(&mut payload, event)?;
-            }
-            MessageKind::AppendSessionEventsRequest
-        }
         Request::GetHistory { session_id, vt } => {
             put_string(&mut payload, session_id)?;
             put_bool(&mut payload, *vt);
             MessageKind::GetHistoryRequest
-        }
-        Request::StreamEvents { session_id, follow } => {
-            put_string(&mut payload, session_id)?;
-            put_bool(&mut payload, *follow);
-            MessageKind::StreamEventsRequest
         }
     };
     Ok((kind, payload))
@@ -569,20 +542,8 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
         MessageKind::ListAttachmentsRequest => {
             Request::ListAttachments { session_id: cursor.take_string()? }
         }
-        MessageKind::AppendSessionEventsRequest => {
-            let session_id = cursor.take_string()?;
-            let len = cursor.take_len()?;
-            let mut events = Vec::with_capacity(len);
-            for _ in 0..len {
-                events.push(cursor.take_new_session_event()?);
-            }
-            Request::AppendSessionEvents { session_id, events }
-        }
         MessageKind::GetHistoryRequest => {
             Request::GetHistory { session_id: cursor.take_string()?, vt: cursor.take_bool()? }
-        }
-        MessageKind::StreamEventsRequest => {
-            Request::StreamEvents { session_id: cursor.take_string()?, follow: cursor.take_bool()? }
         }
         other => bail!("unexpected response message kind `{other:?}` while decoding request"),
     };
@@ -656,10 +617,6 @@ fn encode_response(response: &Response) -> Result<(MessageKind, Vec<u8>)> {
             }
             MessageKind::AttachmentsResponse
         }
-        Response::Event { event } => {
-            put_session_event(&mut payload, event)?;
-            MessageKind::EventResponse
-        }
         Response::History { data } => {
             put_string(&mut payload, data)?;
             MessageKind::HistoryResponse
@@ -730,7 +687,6 @@ fn decode_response(kind: MessageKind, payload: &[u8]) -> Result<Response> {
             }
             Response::Attachments { attachments }
         }
-        MessageKind::EventResponse => Response::Event { event: cursor.take_session_event()? },
         MessageKind::HistoryResponse => Response::History { data: cursor.take_string()? },
         MessageKind::PtyOutputResponse => Response::PtyOutput { data: cursor.take_bytes()? },
         MessageKind::SwitchSessionResponse => {
@@ -844,7 +800,6 @@ fn put_session_status(buf: &mut Vec<u8>, status: SessionStatus) {
     buf.push(match status {
         SessionStatus::Creating => 1,
         SessionStatus::Running => 2,
-        SessionStatus::Paused => 3,
         SessionStatus::NeedsInput => 4,
         SessionStatus::Exited => 5,
         SessionStatus::Failed => 6,
@@ -955,25 +910,6 @@ fn put_attachment_record(buf: &mut Vec<u8>, attachment: &AttachmentRecord) -> Re
     put_attachment_kind(buf, attachment.kind);
     put_datetime(buf, &attachment.connected_at);
     Ok(())
-}
-
-fn put_session_event(buf: &mut Vec<u8>, event: &SessionEvent) -> Result<()> {
-    buf.extend_from_slice(&event.id.to_le_bytes());
-    put_string(buf, &event.session_id)?;
-    put_datetime(buf, &event.timestamp);
-    put_string(buf, &event.event_type)?;
-    put_json_value(buf, &event.payload_json)?;
-    Ok(())
-}
-
-fn put_new_session_event(buf: &mut Vec<u8>, event: &NewSessionEvent) -> Result<()> {
-    put_string(buf, &event.event_type)?;
-    put_json_value(buf, &event.payload_json)?;
-    Ok(())
-}
-
-fn put_json_value(buf: &mut Vec<u8>, value: &serde_json::Value) -> Result<()> {
-    put_string(buf, &serde_json::to_string(value)?)
 }
 
 fn put_datetime(buf: &mut Vec<u8>, value: &DateTime<Utc>) {
@@ -1095,7 +1031,7 @@ impl<'a> Cursor<'a> {
         Ok(match self.take_u8()? {
             1 => SessionStatus::Creating,
             2 => SessionStatus::Running,
-            3 => SessionStatus::Paused,
+            3 => SessionStatus::UnknownRecovered,
             4 => SessionStatus::NeedsInput,
             5 => SessionStatus::Exited,
             6 => SessionStatus::Failed,
@@ -1157,10 +1093,6 @@ impl<'a> Cursor<'a> {
 
     fn take_optional_datetime(&mut self) -> Result<Option<DateTime<Utc>>> {
         Ok(if self.take_bool()? { Some(self.take_datetime()?) } else { None })
-    }
-
-    fn take_json_value(&mut self) -> Result<serde_json::Value> {
-        serde_json::from_str(&self.take_string()?).map_err(Into::into)
     }
 
     fn take_daemon_info(&mut self) -> Result<DaemonInfo> {
@@ -1237,23 +1169,6 @@ impl<'a> Cursor<'a> {
         })
     }
 
-    fn take_session_event(&mut self) -> Result<SessionEvent> {
-        Ok(SessionEvent {
-            id: self.take_i64()?,
-            session_id: self.take_string()?,
-            timestamp: self.take_datetime()?,
-            event_type: self.take_string()?,
-            payload_json: self.take_json_value()?,
-        })
-    }
-
-    fn take_new_session_event(&mut self) -> Result<NewSessionEvent> {
-        Ok(NewSessionEvent {
-            event_type: self.take_string()?,
-            payload_json: self.take_json_value()?,
-        })
-    }
-
     fn take_u8(&mut self) -> Result<u8> {
         Ok(self.take_exact(1)?[0])
     }
@@ -1287,20 +1202,17 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
+        Cursor,
         DAEMON_MANAGEMENT_VERSION, DaemonInfo, DaemonManagementRequest, DaemonManagementResponse,
         DaemonManagementStatus, IncomingRequest, PROTOCOL_VERSION, Request, Response,
         decode_request, decode_response, encode_request, encode_response, read_incoming_request,
         read_request, write_daemon_management_request, write_daemon_management_response,
     };
-    use crate::{
-        event::{NewSessionEvent, SessionEvent},
-        session::{
-            AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult, GitSyncStatus,
-            IntegrationState, SessionMode, SessionRecord, SessionStatus,
-        },
+    use crate::session::{
+        AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult, GitSyncStatus,
+        IntegrationState, SessionMode, SessionRecord, SessionStatus,
     };
     use chrono::Utc;
-    use serde_json::json;
     use tokio::io::AsyncWriteExt;
 
     #[test]
@@ -1379,6 +1291,12 @@ mod tests {
     }
 
     #[test]
+    fn legacy_paused_status_decodes_as_unknown_recovered() {
+        let mut cursor = Cursor::new(&[3]);
+        assert_eq!(cursor.take_session_status().unwrap(), SessionStatus::UnknownRecovered);
+    }
+
+    #[test]
     fn apply_session_round_trips() {
         let request = Request::ApplySession { session_id: "demo".to_string() };
         let (kind, payload) = encode_request(&request).unwrap();
@@ -1406,22 +1324,6 @@ mod tests {
     #[test]
     fn switch_session_response_round_trips() {
         let response = Response::SwitchSession { session_id: "target".to_string() };
-        let (kind, payload) = encode_response(&response).unwrap();
-        let decoded = decode_response(kind, &payload).unwrap();
-        assert_eq!(decoded, response);
-    }
-
-    #[test]
-    fn event_response_round_trips() {
-        let response = Response::Event {
-            event: SessionEvent {
-                id: 7,
-                session_id: "demo".to_string(),
-                timestamp: Utc::now(),
-                event_type: "COMMAND_EXECUTED".to_string(),
-                payload_json: json!({"command":"cargo test","exit_code":1}),
-            },
-        };
         let (kind, payload) = encode_response(&response).unwrap();
         let decoded = decode_response(kind, &payload).unwrap();
         assert_eq!(decoded, response);
@@ -1561,20 +1463,6 @@ mod tests {
 
         let incoming = read_incoming_request(&mut reader).await.unwrap().unwrap();
         assert_eq!(incoming, IncomingRequest::DaemonManagement(DaemonManagementRequest::Status));
-    }
-
-    #[test]
-    fn append_session_events_round_trips() {
-        let request = Request::AppendSessionEvents {
-            session_id: "demo".to_string(),
-            events: vec![NewSessionEvent {
-                event_type: "progress".to_string(),
-                payload_json: json!({"value":42}),
-            }],
-        };
-        let (kind, payload) = encode_request(&request).unwrap();
-        let decoded = decode_request(kind, &payload).unwrap();
-        assert_eq!(decoded, request);
     }
 
     #[test]

@@ -15,7 +15,7 @@ But once you run more than one, things get messy:
 * lost artifacts
 * agents needing attention
 
-`agentd` turns coding agents into **durable tasks with state, artifacts, and events.** Instead of babysitting terminal
+`agentd` turns coding agents into **durable tasks with state, artifacts, and history.** Instead of babysitting terminal
 tabs, you supervise work.
 
 ## How It Works
@@ -26,9 +26,8 @@ tabs, you supervise work.
 Each task runs inside a managed session with:
 * its own git worktree and branch
 * a dedicated PTY
-* structured logs
+* retained terminal history
 * persistent artifacts
-* a machine-readable event stream
 
 This allows developers to supervise agent work without constantly switching between terminal sessions.
 
@@ -94,12 +93,11 @@ Run the `agent` command without any arguments to open the TUI.
 
 ## Core Concepts
 
-`agentd` introduces four core primitives.
+`agentd` introduces three core primitives.
 
 - **Tasks.** A long-running unit of work. A task may spawn one or more agents and has a lifecycle (running, blocked, completed, failed).
 - **Threads.** A sequence of reasoning associated with a task. Threads capture prompts, tool calls, intermediate outputs, and final results.
 - **Artifacts.** Outputs produced by agents, such as commits, files, patches, test results, or screenshots.
-- **Events.** Structured runtime events emitted by agentd. These allow external clients to build UIs, dashboards, or automation.
 
 ## Attention model
 
@@ -123,7 +121,7 @@ Clients surface tasks based on attention instead of raw output.
 
 - durable PTY-backed agent sessions that outlive the client connection that started them
 - built-in Git worktree isolation under the resolved runtime root
-- session metadata and structured events stored in `state.db` under the resolved runtime root
+- session metadata stored in `state.db` under the resolved runtime root
 - in-memory PTY scrollback retained by the daemon until restart
 - interactive reattach with `agent attach`
 - background PTY input with `agent send`
@@ -181,9 +179,9 @@ The daemon injects:
 - `AGENTD_BRANCH`
 - `AGENTD_TASK`
 
-Instrumented agents can send structured event batches back to the daemon over the Unix socket
-named by `AGENTD_SOCKET` using the `append_session_events` request. Consumers can read them with
-`stream_events` or `agent events`.
+Instrumented agents can use the injected session environment to locate the daemon socket, but
+there is no separate structured event channel. Session status, attention, history, diff, and
+worktree state are the supported runtime surfaces.
 
 Runtime paths are resolved in this order:
 
@@ -217,6 +215,8 @@ agent daemon restart
 agent daemon upgrade
 ```
 
+`agent daemon upgrade` now refuses to run while live sessions are active; stop them first.
+
 ## Status And Limitations
 
 Current capabilities include:
@@ -228,5 +228,5 @@ Current capabilities include:
 - Git worktree isolation per session
 
 `attach` and `send` only work for sessions created under the current daemon lifetime. If
-`agentd` restarts, previously running sessions still keep their metadata and events, but their
+`agentd` restarts, previously running sessions still keep their metadata, but their
 live PTY can no longer be reattached or written to and their in-memory history is lost.

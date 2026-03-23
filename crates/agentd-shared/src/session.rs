@@ -8,7 +8,6 @@ use std::path::Path;
 pub enum SessionStatus {
     Creating,
     Running,
-    Paused,
     NeedsInput,
     Exited,
     Failed,
@@ -118,16 +117,6 @@ pub struct AttachmentRecord {
     pub session_id: String,
     pub kind: AttachmentKind,
     pub connected_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PlanRecord {
-    pub session_id: String,
-    pub version: u32,
-    pub summary: String,
-    pub body_markdown: String,
-    pub source_event_id: i64,
-    pub created_at: DateTime<Utc>,
 }
 
 pub fn branch_name_from_title(title: &str) -> String {

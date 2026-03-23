@@ -1,5 +1,4 @@
 mod app;
-mod codex;
 mod db;
 mod git;
 mod ids;
@@ -15,14 +14,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
 
-use agentd_shared::{
-    config::Config, event::NewSessionEvent, paths::AppPaths, session::SessionRecord,
-};
+use agentd_shared::{paths::AppPaths, session::SessionStatus};
 
-use crate::{
-    app::{LaunchCommand, is_resumable_command},
-    db::Database,
-};
+use crate::db::Database;
 
 #[derive(Debug, Parser)]
 #[command(name = "agentd")]
@@ -70,119 +64,29 @@ fn daemonize_self() -> Result<()> {
 async fn upgrade_daemon() -> Result<()> {
     let paths = AppPaths::discover()?;
     paths.ensure_layout()?;
-    let config = Config::load(&paths)?;
     let db = Database::open(&paths)?;
 
     let running_sessions = db
         .list_sessions()?
         .into_iter()
-        .filter(|session| session.status == agentd_shared::session::SessionStatus::Running)
+        .filter(|session| matches!(session.status, SessionStatus::Running | SessionStatus::NeedsInput))
         .filter(|session| process_exists(session.pid))
         .collect::<Vec<_>>();
 
-    let mut resolved = Vec::with_capacity(running_sessions.len());
-    let mut unsupported = Vec::new();
-    for session in &running_sessions {
-        let launch = resolve_launch_for_upgrade(&db, &config, &paths, session)?;
-        if !is_resumable_command(&launch.command) {
-            unsupported.push(format!("{} ({})", session.session_id, session.agent));
-            continue;
-        }
-        let resume_session_id = resolve_resume_session_id_for_upgrade(&db, session, &launch)?
-            .ok_or_else(|| {
-                anyhow!(
-                    "session `{}` does not have an exact Codex resume id yet",
-                    session.session_id
-                )
-            })?;
-        resolved.push((session.clone(), launch, resume_session_id));
-    }
-
-    if !unsupported.is_empty() {
-        bail!("cannot upgrade with non-resumable running sessions: {}", unsupported.join(", "));
-    }
-
-    for (session, launch, resume_session_id) in &resolved {
-        let args_json =
-            serde_json::to_string(&launch.args).context("failed to serialize agent args")?;
-        db.set_launch_info(&session.session_id, &launch.command, &args_json)?;
-        db.set_resume_session_id(&session.session_id, resume_session_id)?;
+    if !running_sessions.is_empty() {
+        let sessions = running_sessions
+            .iter()
+            .map(|session| format!("{} ({})", session.session_id, session.agent))
+            .collect::<Vec<_>>();
+        bail!("cannot upgrade agentd while sessions are running: {}", sessions.join(", "));
     }
 
     stop_existing_daemon(&paths).await?;
-
-    for (session, launch, resume_session_id) in &resolved {
-        db.mark_paused(&session.session_id)?;
-        db.append_events(
-            &session.session_id,
-            &[NewSessionEvent {
-                event_type: "SESSION_PAUSED_FOR_UPGRADE".to_string(),
-                payload_json: serde_json::json!({
-                    "source": "daemon",
-                    "agent": launch.agent_name,
-                    "resume_session_id": resume_session_id,
-                }),
-            }],
-        )?;
-        terminate_process_if_running(&session.session_id, session.pid).await?;
-    }
-
     daemonize_self()?;
     wait_for_new_daemon(&paths).await?;
 
-    println!("✓ Upgraded daemon and resumed {} session(s)", resolved.len());
+    println!("✓ Upgraded daemon");
     Ok(())
-}
-
-fn resolve_launch_for_upgrade(
-    db: &Database,
-    config: &Config,
-    paths: &AppPaths,
-    session: &SessionRecord,
-) -> Result<LaunchCommand> {
-    let launch = db
-        .get_launch_info(&session.session_id)?
-        .ok_or_else(|| anyhow!("session `{}` not found", session.session_id))?;
-    let configured = config.agents.get(&session.agent);
-    let command = match launch.command {
-        Some(command) => command,
-        None => configured.map(|agent| agent.command.clone()).ok_or_else(|| {
-            anyhow!("agent `{}` is not configured in {}", session.agent, paths.config)
-        })?,
-    };
-    let args = match launch.args {
-        Some(args) => args,
-        None => configured.map(|agent| agent.args.clone()).unwrap_or_default(),
-    };
-    Ok(LaunchCommand { agent_name: session.agent.clone(), command, args })
-}
-
-fn resolve_resume_session_id_for_upgrade(
-    db: &Database,
-    session: &SessionRecord,
-    launch: &LaunchCommand,
-) -> Result<Option<String>> {
-    if !is_resumable_command(&launch.command) {
-        return Ok(None);
-    }
-
-    if let Some(thread_id) = &session.thread_id {
-        if let Some(thread) = db.get_thread(thread_id)? {
-            if thread.upstream_thread_id.is_some() {
-                return Ok(thread.upstream_thread_id);
-            }
-        }
-    }
-
-    if let Some(resume_session_id) = db.get_resume_session_id(&session.session_id)? {
-        return Ok(Some(resume_session_id));
-    }
-
-    let discovered = codex::discover_resume_session_id(&session.worktree)?;
-    if let Some(ref resume_session_id) = discovered {
-        db.set_resume_session_id(&session.session_id, resume_session_id)?;
-    }
-    Ok(discovered)
 }
 
 async fn stop_existing_daemon(paths: &AppPaths) -> Result<()> {
@@ -231,28 +135,6 @@ async fn wait_for_exit(pid: Pid, timeout: Duration) -> bool {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-}
-
-async fn terminate_process_if_running(name: &str, pid: Option<u32>) -> Result<()> {
-    let Some(pid) = pid else {
-        return Ok(());
-    };
-    if pid == 0 || !process_exists(Some(pid)) {
-        return Ok(());
-    }
-
-    let pid = Pid::from_raw(pid as i32);
-    send_signal(pid, nix::sys::signal::Signal::SIGTERM, name)?;
-    if wait_for_exit(pid, Duration::from_secs(5)).await {
-        return Ok(());
-    }
-
-    send_signal(pid, nix::sys::signal::Signal::SIGKILL, name)?;
-    if wait_for_exit(pid, Duration::from_secs(5)).await {
-        return Ok(());
-    }
-
-    bail!("`{name}` did not exit after SIGTERM and SIGKILL");
 }
 
 async fn wait_for_new_daemon(paths: &AppPaths) -> Result<()> {

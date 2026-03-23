@@ -2018,10 +2018,8 @@ fn session_rank(session: &SessionRecord) -> u8 {
         2
     } else if matches!(session.status, SessionStatus::Running | SessionStatus::Creating) {
         3
-    } else if session.status == SessionStatus::Paused {
-        4
     } else {
-        5
+        4
     }
 }
 
@@ -2034,7 +2032,6 @@ fn session_icon(session: &SessionRecord) -> &'static str {
             SessionStatus::Failed => "✖",
             SessionStatus::UnknownRecovered => "⚠",
             SessionStatus::Running | SessionStatus::Creating => "●",
-            SessionStatus::Paused => "⏸",
             SessionStatus::Exited => "✔",
         }
     }
@@ -2049,7 +2046,6 @@ fn session_icon_color(session: &SessionRecord) -> Color {
             SessionStatus::Failed => Color::Red,
             SessionStatus::UnknownRecovered => Color::Yellow,
             SessionStatus::Running | SessionStatus::Creating => Color::Green,
-            SessionStatus::Paused => Color::DarkGray,
             SessionStatus::Exited => Color::Green,
         }
     }
@@ -2057,7 +2053,7 @@ fn session_icon_color(session: &SessionRecord) -> Color {
 
 fn session_icon_style(session: &SessionRecord) -> Style {
     let mut style = Style::default().fg(session_icon_color(session));
-    if matches!(session.status, SessionStatus::NeedsInput | SessionStatus::Paused) {
+    if session.status == SessionStatus::NeedsInput {
         style = style.add_modifier(Modifier::DIM);
     }
     style
@@ -2079,7 +2075,6 @@ fn session_status_text(session: &SessionRecord) -> String {
     match session.status {
         SessionStatus::Creating => "starting".to_string(),
         SessionStatus::Running => "working".to_string(),
-        SessionStatus::Paused => "paused".to_string(),
         SessionStatus::NeedsInput => "needs input".to_string(),
         SessionStatus::Exited => "complete".to_string(),
         SessionStatus::Failed => session.error.clone().unwrap_or_else(|| "blocked".to_string()),
@@ -2115,7 +2110,6 @@ fn status_label(status: SessionStatus) -> &'static str {
     match status {
         SessionStatus::Creating => "creating",
         SessionStatus::Running => "running",
-        SessionStatus::Paused => "paused",
         SessionStatus::NeedsInput => "needs_input",
         SessionStatus::Exited => "exited",
         SessionStatus::Failed => "failed",
@@ -2205,7 +2199,6 @@ mod tests {
             "⚠"
         );
         assert_eq!(session_icon(&demo(SessionStatus::Running, IntegrationState::Clean)), "●");
-        assert_eq!(session_icon(&demo(SessionStatus::Paused, IntegrationState::Clean)), "⏸");
         assert_eq!(session_icon(&demo(SessionStatus::Exited, IntegrationState::Clean)), "✔");
     }
 
@@ -2232,8 +2225,8 @@ mod tests {
             Color::Green
         );
         assert_eq!(
-            session_icon_color(&demo(SessionStatus::Paused, IntegrationState::Clean)),
-            Color::DarkGray
+            session_icon_color(&demo(SessionStatus::UnknownRecovered, IntegrationState::Clean)),
+            Color::Yellow
         );
     }
 

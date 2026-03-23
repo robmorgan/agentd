@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use crossterm::{
     cursor::{Hide, Show},
     event::{DisableMouseCapture, EnableMouseCapture},
@@ -129,11 +129,6 @@ enum Command {
         session_id: String,
         #[arg(long)]
         vt: bool,
-    },
-    Events {
-        session_id: String,
-        #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true", default_value_t = true)]
-        follow: bool,
     },
     #[command(visible_alias = "ls", alias = "sessions")]
     List,
@@ -350,13 +345,6 @@ async fn main() -> Result<()> {
         (Some(Command::History { .. }), ExecutionMode::Local(reason)) => {
             bail!("{reason}. `agent history` requires a compatible daemon");
         }
-        (Some(Command::Events { session_id, follow }), ExecutionMode::Daemon) => {
-            stream_events(&paths, &session_id, follow).await?;
-        }
-        (Some(Command::Events { session_id, follow }), ExecutionMode::Local(reason)) => {
-            print_degraded_notice(&reason);
-            local_events(&paths, &session_id, follow).await?;
-        }
         (Some(Command::List), ExecutionMode::Daemon) => {
             let sessions = daemon_list_sessions(&paths).await?;
             print_sessions(&sessions);
@@ -493,12 +481,7 @@ async fn resolve_execution_mode(
 }
 
 fn command_supports_local_mode(command: Option<&Command>) -> bool {
-    matches!(
-        command,
-        Some(
-            Command::Kill { .. } | Command::Events { .. } | Command::List | Command::Status { .. }
-        )
-    )
+    matches!(command, Some(Command::Kill { .. } | Command::List | Command::Status { .. }))
 }
 
 async fn degraded_mode_reason(paths: &AppPaths) -> Result<Option<String>> {
@@ -837,57 +820,6 @@ async fn print_history(paths: &AppPaths, session_id: &str, vt: bool) -> Result<(
         }
         Response::Error { message } => bail!(message),
         other => bail!("unexpected response: {:?}", other),
-    }
-}
-
-async fn stream_events(paths: &AppPaths, session_id: &str, follow: bool) -> Result<()> {
-    let mut stream = try_connect(paths).await?;
-    write_request(
-        &mut stream,
-        &Request::StreamEvents { session_id: session_id.to_string(), follow },
-    )
-    .await?;
-
-    let mut reader = BufReader::new(stream);
-    while let Some(response) = read_response(&mut reader).await? {
-        match response {
-            Response::Event { event } => {
-                println!("{}", serde_json::to_string(&event)?);
-            }
-            Response::EndOfStream => break,
-            Response::Error { message } => bail!(message),
-            other => bail!("unexpected response: {:?}", other),
-        }
-    }
-    Ok(())
-}
-
-async fn local_events(paths: &AppPaths, session_id: &str, follow: bool) -> Result<()> {
-    let store = LocalStore::open(paths)?;
-    store
-        .get_session(session_id)?
-        .ok_or_else(|| anyhow::anyhow!("session `{session_id}` not found"))?;
-    let mut after_id = None;
-
-    loop {
-        let events = store.list_events_since(session_id, after_id)?;
-        for event in &events {
-            println!("{}", serde_json::to_string(event)?);
-        }
-        if let Some(last) = events.last() {
-            after_id = Some(last.id);
-        }
-        if !follow {
-            return Ok(());
-        }
-        let session_running = store
-            .get_session(session_id)?
-            .map(|session| local::session_is_running(&session))
-            .unwrap_or(false);
-        if !session_running && events.is_empty() {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -1545,7 +1477,6 @@ fn format_session_end_summary(summary: &SessionEndSummary) -> String {
             Some(error) => format!("session {} failed: {error}", summary.session_id),
             None => format!("session {} failed", summary.session_id),
         },
-        SessionStatus::Paused => format!("session {} paused", summary.session_id),
         SessionStatus::NeedsInput => format!("session {} needs input", summary.session_id),
         SessionStatus::Exited | SessionStatus::UnknownRecovered => {
             if summary.integration_state == IntegrationState::PendingReview {
@@ -1669,7 +1600,6 @@ impl StatusString for SessionRecord {
         match self.status {
             SessionStatus::Creating => "creating",
             SessionStatus::Running => "running",
-            SessionStatus::Paused => "paused",
             SessionStatus::NeedsInput => "needs_input",
             SessionStatus::Exited => "exited",
             SessionStatus::Failed => "failed",
