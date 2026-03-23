@@ -48,7 +48,7 @@ use agentd_shared::{
     },
 };
 
-use crate::local::{LocalStore, normalize_session, print_log_file, remove_session_artifacts};
+use crate::local::{LocalStore, normalize_session, remove_session_artifacts};
 
 const AGENTD_ATTACH_RESTORE_SEQUENCE: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[?25h";
@@ -135,10 +135,10 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    Logs {
+    History {
         session_id: String,
-        #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true", default_value_t = true)]
-        follow: bool,
+        #[arg(long)]
+        vt: bool,
     },
     Events {
         session_id: String,
@@ -361,12 +361,11 @@ async fn main() -> Result<()> {
         (Some(Command::Discard { .. }), ExecutionMode::Local(reason)) => {
             bail_live_command(&reason)?;
         }
-        (Some(Command::Logs { session_id, follow }), ExecutionMode::Daemon) => {
-            stream_logs(&paths, &session_id, follow).await?;
+        (Some(Command::History { session_id, vt }), ExecutionMode::Daemon) => {
+            print_history(&paths, &session_id, vt).await?;
         }
-        (Some(Command::Logs { session_id, follow }), ExecutionMode::Local(reason)) => {
-            print_degraded_notice(&reason);
-            local_logs(&paths, &session_id, follow)?;
+        (Some(Command::History { .. }), ExecutionMode::Local(reason)) => {
+            bail!("{reason}. `agent history` requires a compatible daemon");
         }
         (Some(Command::Events { session_id, follow }), ExecutionMode::Daemon) => {
             stream_events(&paths, &session_id, follow).await?;
@@ -514,11 +513,7 @@ fn command_supports_local_mode(command: Option<&Command>) -> bool {
     matches!(
         command,
         Some(
-            Command::Kill { .. }
-                | Command::Logs { .. }
-                | Command::Events { .. }
-                | Command::List
-                | Command::Status { .. }
+            Command::Kill { .. } | Command::Events { .. } | Command::List | Command::Status { .. }
         )
     )
 }
@@ -843,23 +838,23 @@ fn print_daemon_management_status(status: &DaemonManagementStatus) {
     println!("running_sessions: {}", status.running_sessions);
 }
 
-async fn stream_logs(paths: &AppPaths, session_id: &str, follow: bool) -> Result<()> {
+async fn print_history(paths: &AppPaths, session_id: &str, vt: bool) -> Result<()> {
     let mut stream = try_connect(paths).await?;
-    write_request(&mut stream, &Request::StreamLogs { session_id: session_id.to_string(), follow })
+    write_request(&mut stream, &Request::GetHistory { session_id: session_id.to_string(), vt })
         .await?;
 
     let mut reader = BufReader::new(stream);
-    while let Some(response) = read_response(&mut reader).await? {
-        match response {
-            Response::LogChunk { data } => {
-                print!("{data}");
-            }
-            Response::EndOfStream => break,
-            Response::Error { message } => bail!(message),
-            other => bail!("unexpected response: {:?}", other),
+    let Some(response) = read_response(&mut reader).await? else {
+        bail!("agentd closed the history connection");
+    };
+    match response {
+        Response::History { data } => {
+            print!("{data}");
+            Ok(())
         }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {:?}", other),
     }
-    Ok(())
 }
 
 async fn stream_events(paths: &AppPaths, session_id: &str, follow: bool) -> Result<()> {
@@ -882,10 +877,6 @@ async fn stream_events(paths: &AppPaths, session_id: &str, follow: bool) -> Resu
         }
     }
     Ok(())
-}
-
-fn local_logs(paths: &AppPaths, session_id: &str, follow: bool) -> Result<()> {
-    print_log_file(paths, session_id, follow)
 }
 
 async fn local_events(paths: &AppPaths, session_id: &str, follow: bool) -> Result<()> {
@@ -1208,14 +1199,23 @@ fn print_diff(diff: &SessionDiff) {
     print!("{}", render_diff_text(&diff.diff, diff_color_enabled()));
 }
 
-fn resolve_focus_log_path(paths: &AppPaths, session: &SessionRecord) -> camino::Utf8PathBuf {
-    let rendered = paths.rendered_log_path(&session.session_id);
-    if rendered.exists() { rendered } else { paths.log_path(&session.session_id) }
-}
+async fn fetch_focus_history(paths: &AppPaths, session_id: &str) -> Result<String> {
+    let mut stream = try_connect(paths).await?;
+    write_request(
+        &mut stream,
+        &Request::GetHistory { session_id: session_id.to_string(), vt: false },
+    )
+    .await?;
 
-fn read_focus_log_contents(path: &camino::Utf8Path) -> Result<String> {
-    Ok(fs::read_to_string(path.as_std_path())
-        .with_context(|| format!("failed to read {}", path))?)
+    let mut reader = BufReader::new(stream);
+    let Some(response) = read_response(&mut reader).await? else {
+        bail!("agentd closed the history connection");
+    };
+    match response {
+        Response::History { data } => Ok(data),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected history response: {:?}", other),
+    }
 }
 
 fn diff_color_enabled() -> bool {
@@ -1457,17 +1457,11 @@ fn parse_csi_u_decimal(bytes: &[u8], index: &mut usize) -> Option<u32> {
     let start = *index;
     let mut value = 0_u32;
     while *index < bytes.len() && bytes[*index].is_ascii_digit() {
-        value = value
-            .checked_mul(10)?
-            .checked_add((bytes[*index] - b'0') as u32)?;
+        value = value.checked_mul(10)?.checked_add((bytes[*index] - b'0') as u32)?;
         *index += 1;
     }
 
-    if *index == start {
-        None
-    } else {
-        Some(value)
-    }
+    if *index == start { None } else { Some(value) }
 }
 
 fn parse_csi_u_decimal_optional(bytes: &[u8], index: &mut usize) -> Option<Option<u32>> {
@@ -1731,10 +1725,7 @@ fn write_attach_bytes(data: &[u8]) -> Result<()> {
         }
 
         let err = std::io::Error::last_os_error();
-        if matches!(
-            err.kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-        ) {
+        if matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) {
             std::thread::yield_now();
             continue;
         }
@@ -1829,9 +1820,8 @@ mod tests {
     use super::{
         AGENTD_ATTACH_RESTORE_SEQUENCE, ATTACH_DETACH_BYTE, AttachInputAction, AttachInputParser,
         Cli, Command, DaemonCommand, SessionEndSummary, bail_daemon_command,
-        clear_stale_daemon_state,
-        format_session_end_summary, render_diff_text, resolve_detach_session_id,
-        resolve_new_session_options, should_colorize_diff_output,
+        clear_stale_daemon_state, format_session_end_summary, render_diff_text,
+        resolve_detach_session_id, resolve_new_session_options, should_colorize_diff_output,
     };
     use agentd_shared::paths::AppPaths;
     use agentd_shared::session::{IntegrationState, SessionStatus};
@@ -1840,11 +1830,13 @@ mod tests {
         ffi::OsString,
         fs,
         path::PathBuf,
+        sync::Mutex,
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
     static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn new_command_parses_optional_title() {
@@ -1938,6 +1930,30 @@ mod tests {
     }
 
     #[test]
+    fn history_command_parses() {
+        let cli = Cli::try_parse_from(["agent", "history", "demo"]).unwrap();
+        match cli.command {
+            Some(Command::History { session_id, vt }) => {
+                assert_eq!(session_id, "demo");
+                assert!(!vt);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn history_command_parses_vt_flag() {
+        let cli = Cli::try_parse_from(["agent", "history", "demo", "--vt"]).unwrap();
+        match cli.command {
+            Some(Command::History { session_id, vt }) => {
+                assert_eq!(session_id, "demo");
+                assert!(vt);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn daemon_restart_parses_force_flag() {
         let cli = Cli::try_parse_from(["agent", "daemon", "restart", "--force"]).unwrap();
         match cli.command {
@@ -1957,6 +1973,7 @@ mod tests {
 
     #[test]
     fn resolve_detach_session_id_prefers_explicit_value() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("AGENTD_SESSION_ID", "env-session");
         }
@@ -1966,6 +1983,7 @@ mod tests {
 
     #[test]
     fn resolve_detach_session_id_uses_environment() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("AGENTD_SESSION_ID", "env-session");
         }
@@ -1975,6 +1993,7 @@ mod tests {
 
     #[test]
     fn resolve_detach_session_id_errors_without_environment() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::remove_var("AGENTD_SESSION_ID");
         }

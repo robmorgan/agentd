@@ -144,6 +144,8 @@ struct RuntimeApp {
     pending_focus: Option<(String, std::time::Instant)>,
     pty: Option<FocusedPty>,
     last_pane_size: Option<(u16, u16)>,
+    focused_history_key: Option<(String, chrono::DateTime<chrono::Utc>)>,
+    focused_history: String,
 }
 
 impl RuntimeApp {
@@ -175,6 +177,8 @@ impl RuntimeApp {
             pending_focus: None,
             pty: None,
             last_pane_size: None,
+            focused_history_key: None,
+            focused_history: String::new(),
         }
     }
 
@@ -187,6 +191,36 @@ impl RuntimeApp {
             self.focus = FocusTarget::Coordinator;
         }
         self.clamp_composer_selection();
+        self.refresh_focused_history().await?;
+        Ok(())
+    }
+
+    async fn refresh_focused_history(&mut self) -> Result<()> {
+        let target = self.focused_worker_session_id().and_then(|session_id| {
+            self.sessions
+                .iter()
+                .find(|session| session.session_id == session_id)
+                .map(|session| (session.session_id.clone(), session.updated_at, session.status))
+        });
+        let Some((session_id, updated_at, status)) = target else {
+            self.focused_history_key = None;
+            self.focused_history.clear();
+            return Ok(());
+        };
+
+        if matches!(status, SessionStatus::Running | SessionStatus::NeedsInput) {
+            self.focused_history_key = None;
+            self.focused_history.clear();
+            return Ok(());
+        }
+
+        let key = (session_id.clone(), updated_at);
+        if self.focused_history_key.as_ref() == Some(&key) {
+            return Ok(());
+        }
+
+        self.focused_history = super::fetch_focus_history(&self.paths, &session_id).await?;
+        self.focused_history_key = Some(key);
         Ok(())
     }
 
@@ -955,10 +989,10 @@ impl RuntimeApp {
                 pty_inner,
             );
         } else {
-            let path = super::resolve_focus_log_path(&self.paths, session);
-            let body = super::read_focus_log_contents(&path).unwrap_or_default();
             frame.render_widget(
-                Paragraph::new(body).wrap(Wrap { trim: false }).block(Block::default()),
+                Paragraph::new(self.focused_history.as_str())
+                    .wrap(Wrap { trim: false })
+                    .block(Block::default()),
                 pty_inner,
             );
         }

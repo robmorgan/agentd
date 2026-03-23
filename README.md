@@ -62,14 +62,20 @@ agent attach fix-tests
 Multiple clients can attach to the same running session at once, including the TUI and one or
 more `agent attach` processes.
 
-Detach the local `agent attach` client using `ctrl + ]`. Open the attach overlay with
-`ctrl + \`. Overlay actions such as switching sessions or opening session
-details now run from the overlay itself. To inspect or manage other attached clients:
+Detach the local `agent attach` client using `ctrl + ]`. To inspect or manage other attached
+clients:
 
 ```sh
 agent attachments fix-tests
 agent detach fix-tests --attach attach-1
 agent detach fix-tests --all
+```
+
+Inspect retained session scrollback from daemon memory:
+
+```sh
+agent history fix-tests
+agent history fix-tests --vt
 ```
 
 Stop a task:
@@ -118,7 +124,7 @@ Clients surface tasks based on attention instead of raw output.
 - durable PTY-backed agent sessions that outlive the client connection that started them
 - built-in Git worktree isolation under the resolved runtime root
 - session metadata and structured events stored in `state.db` under the resolved runtime root
-- raw PTY logs stored in `logs/` under the resolved runtime root
+- in-memory PTY scrollback retained by the daemon until restart
 - interactive reattach with `agent attach`
 - background PTY input with `agent send`
 - diff inspection against the base branch with `agent diff`
@@ -187,7 +193,7 @@ Runtime paths are resolved in this order:
 - `TMPDIR/agentd-<uid>`
 - `/tmp/agentd-<uid>`
 
-The selected root contains `config.toml`, `agentd.sock`, `agentd.pid`, `state.db`, `logs/`, and
+The selected root contains `config.toml`, `agentd.sock`, `agentd.pid`, `state.db`, and
 `worktrees/`.
 
 macOS typically does not set `XDG_RUNTIME_DIR`, so the default root on macOS becomes `~/.agentd`
@@ -218,9 +224,9 @@ Current capabilities include:
 - local `agentd` daemon over a Unix socket
 - PTY-backed agent processes that outlive client connections
 - SQLite-backed session metadata and event storage
-- per-session PTY log persistence
+- in-memory per-session PTY history until daemon restart
 - Git worktree isolation per session
 
 `attach` and `send` only work for sessions created under the current daemon lifetime. If
-`agentd` restarts, previously running sessions still keep their metadata, logs, and events, but
-their live PTY can no longer be reattached or written to.
+`agentd` restarts, previously running sessions still keep their metadata and events, but their
+live PTY can no longer be reattached or written to and their in-memory history is lost.

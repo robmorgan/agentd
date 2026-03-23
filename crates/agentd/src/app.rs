@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fs::{self, File, OpenOptions},
+    fs,
     io::{Read, Write},
     path::Path,
     sync::{Arc, Mutex, mpsc as std_mpsc},
@@ -113,12 +113,6 @@ impl AppState {
                 )],
             );
 
-            let log_path = paths.log_path(&session_id);
-            if let Err(err) = prepare_log_file(&log_path, SessionStartMode::Create) {
-                let err = anyhow!(err).context("failed to create session log file");
-                let _ = record_session_failure(&db, &session_id, err.to_string());
-                return Err(err);
-            }
             let launch = LaunchCommand {
                 agent_name: agent_name.clone(),
                 command: agent.command,
@@ -135,7 +129,6 @@ impl AppState {
                     worktree: worktree.as_str(),
                     branch: &branch,
                     title: &title,
-                    log_path: &log_path,
                     launch: &launch,
                     model: model.as_deref(),
                     session_mode: mode,
@@ -224,7 +217,6 @@ impl AppState {
             let worktree = session.worktree.clone();
             let branch = session.branch.clone();
             let title = session.title.clone();
-            let log_path = self.paths.log_path(&session.session_id);
             let config = config.clone();
 
             let result = task::spawn_blocking(move || {
@@ -239,7 +231,6 @@ impl AppState {
                         worktree: &worktree,
                         branch: &branch,
                         title: &title,
-                        log_path: &log_path,
                         launch: &launch,
                         model: session.model.as_deref(),
                         session_mode: session.mode,
@@ -696,6 +687,27 @@ impl AppState {
         runtime.list_attachments(session_id)
     }
 
+    pub async fn get_history(&self, session_id: &str, vt: bool) -> Result<String> {
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+
+        if let Some(runtime) = self.runtimes.get(session_id) {
+            let history = runtime.history()?;
+            return Ok(if vt { history.vt } else { history.plain });
+        }
+
+        if let Some(history) = self.runtimes.get_history(session_id) {
+            return Ok(if vt { history.vt } else { history.plain });
+        }
+
+        bail!(
+            "history for session `{}` is not available; it is only retained until the daemon restarts",
+            session.session_id
+        )
+    }
+
     pub async fn detach_session(&self, session_id: &str, all: bool) -> Result<()> {
         let session = self
             .get_session(session_id)
@@ -752,7 +764,6 @@ struct SessionStartRequest<'a> {
     worktree: &'a str,
     branch: &'a str,
     title: &'a str,
-    log_path: &'a Utf8PathBuf,
     launch: &'a LaunchCommand,
     model: Option<&'a str>,
     session_mode: SessionMode,
@@ -781,23 +792,6 @@ fn resolve_launch_command(
     Ok(LaunchCommand { agent_name: agent_name.to_string(), command, args })
 }
 
-fn prepare_log_file(log_path: &Utf8PathBuf, mode: SessionStartMode) -> Result<()> {
-    match mode {
-        SessionStartMode::Create => {
-            File::create(log_path.as_std_path())
-                .with_context(|| format!("failed to create {}", log_path))?;
-        }
-        SessionStartMode::Resume => {
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log_path.as_std_path())
-                .with_context(|| format!("failed to open {}", log_path))?;
-        }
-    }
-    Ok(())
-}
-
 fn start_session_runtime(
     paths: &AppPaths,
     db: &Database,
@@ -805,8 +799,6 @@ fn start_session_runtime(
     runtimes: &SessionRuntimeRegistry,
     request: SessionStartRequest<'_>,
 ) -> Result<()> {
-    prepare_log_file(request.log_path, request.mode)?;
-
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -868,11 +860,10 @@ fn start_session_runtime(
     );
     let writer_db = db.clone();
     let writer_session_id = request.session_id.to_string();
-    let writer_log_path = request.log_path.clone();
     let writer_runtime = runtime.clone();
     let (writer_done_tx, writer_done_rx) = std_mpsc::channel();
     std::thread::spawn(move || {
-        let result = pump_pty_to_log(reader, &writer_log_path, &writer_runtime);
+        let result = pump_pty(reader, &writer_runtime);
         if let Err(err) = result {
             let _ = record_session_failure(&writer_db, &writer_session_id, err.to_string());
         }
@@ -886,6 +877,7 @@ fn start_session_runtime(
     std::thread::spawn(move || {
         let status = child.wait();
         let code = status.ok().map(|value| value.exit_code() as i32);
+        exit_runtimes.freeze_history(&exit_session_id);
         exit_runtimes.remove(&exit_session_id);
         let _ = writer_done_rx.recv();
         let _ = finalize_session_exit(&exit_db, &exit_session_id, code, start_mode);
@@ -902,11 +894,22 @@ const MAX_SCROLLBACK_BYTES: usize = 10_000_000;
 #[derive(Clone, Default)]
 struct SessionRuntimeRegistry {
     inner: Arc<Mutex<HashMap<String, Arc<SessionRuntime>>>>,
+    history: Arc<Mutex<HashMap<String, SessionHistory>>>,
+}
+
+#[derive(Clone, Debug)]
+struct SessionHistory {
+    plain: String,
+    vt: String,
 }
 
 impl SessionRuntimeRegistry {
     fn insert(&self, session_id: String, runtime: SessionRuntime) -> Arc<SessionRuntime> {
         let runtime = Arc::new(runtime);
+        {
+            let mut history = self.history.lock().expect("session history cache poisoned");
+            history.remove(&session_id);
+        }
         let mut inner = self.inner.lock().expect("session runtime registry poisoned");
         inner.insert(session_id, runtime.clone());
         runtime
@@ -920,6 +923,25 @@ impl SessionRuntimeRegistry {
     fn remove(&self, session_id: &str) {
         let mut inner = self.inner.lock().expect("session runtime registry poisoned");
         inner.remove(session_id);
+    }
+
+    fn freeze_history(&self, session_id: &str) {
+        let runtime = {
+            let inner = self.inner.lock().expect("session runtime registry poisoned");
+            inner.get(session_id).cloned()
+        };
+        let Some(runtime) = runtime else {
+            return;
+        };
+        if let Ok(history) = runtime.history() {
+            let mut cache = self.history.lock().expect("session history cache poisoned");
+            cache.insert(session_id.to_string(), history);
+        }
+    }
+
+    fn get_history(&self, session_id: &str) -> Option<SessionHistory> {
+        let history = self.history.lock().expect("session history cache poisoned");
+        history.get(session_id).cloned()
     }
 }
 
@@ -970,6 +992,14 @@ impl SessionRuntime {
         Ok(())
     }
 
+    fn history(&self) -> Result<SessionHistory> {
+        let mut state = self.state.lock().map_err(|_| anyhow!("session runtime state poisoned"))?;
+        Ok(SessionHistory {
+            plain: state.terminal_state.format_plain()?,
+            vt: state.terminal_state.format_vt()?,
+        })
+    }
+
     fn attach(
         self: &Arc<Self>,
         session_id: &str,
@@ -985,7 +1015,7 @@ impl SessionRuntime {
         let attach_id = format!("{}-{}", kind.as_str(), state.next_attach_ordinal);
         state.next_attach_ordinal += 1;
         let connected_at = Utc::now();
-        let snapshot = state.terminal_state.snapshot()?;
+        let snapshot = state.terminal_state.vt_snapshot()?;
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         state
             .attachments
@@ -1244,29 +1274,13 @@ fn configure_spawn_command(
     Ok(())
 }
 
-fn pump_pty_to_log(
-    mut reader: Box<dyn Read + Send>,
-    log_path: &Utf8PathBuf,
-    runtime: &SessionRuntime,
-) -> Result<()> {
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path.as_std_path())
-        .with_context(|| format!("failed to open {}", log_path))?;
-    let file = Arc::new(Mutex::new(file));
+fn pump_pty(mut reader: Box<dyn Read + Send>, runtime: &SessionRuntime) -> Result<()> {
     let mut buffer = [0_u8; 8192];
 
     loop {
         let bytes_read = reader.read(&mut buffer)?;
         if bytes_read == 0 {
             break;
-        }
-
-        {
-            let mut file = file.lock().map_err(|_| anyhow!("log writer poisoned"))?;
-            file.write_all(&buffer[..bytes_read])?;
-            file.flush()?;
         }
         runtime.publish_output(&buffer[..bytes_read])?;
     }
@@ -1538,6 +1552,7 @@ mod tests {
         AttachControl, SessionRuntime, SessionStartMode, finalize_session_exit,
         inspect_review_state, manual_accept_conflict_summary, review_state_for_accept, shell_quote,
     };
+    use crate::app::SessionRuntimeRegistry;
     use crate::db::{Database, NewSession};
     use crate::terminal_state::TerminalStateEngine;
     use agentd_shared::{
@@ -1565,8 +1580,16 @@ mod tests {
             Ok(())
         }
 
-        fn snapshot(&mut self) -> Result<Vec<u8>> {
+        fn vt_snapshot(&mut self) -> Result<Vec<u8>> {
             Ok(b"snapshot".to_vec())
+        }
+
+        fn format_plain(&mut self) -> Result<String> {
+            Ok("plain".to_string())
+        }
+
+        fn format_vt(&mut self) -> Result<String> {
+            Ok("vt".to_string())
         }
     }
 
@@ -1651,6 +1674,42 @@ mod tests {
 
         assert_ne!(first.attach_id, second.attach_id);
         assert_eq!(runtime.list_attachments("demo").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn runtime_history_uses_terminal_state_formats() {
+        let runtime = SessionRuntime::new(
+            Box::new(StubMasterPty),
+            Box::new(std::io::sink()),
+            Box::new(StubTerminalState),
+            8,
+        );
+
+        let history = runtime.history().unwrap();
+
+        assert_eq!(history.plain, "plain");
+        assert_eq!(history.vt, "vt");
+    }
+
+    #[test]
+    fn freeze_history_caches_runtime_output() {
+        let registry = SessionRuntimeRegistry::default();
+        registry.insert(
+            "demo".to_string(),
+            SessionRuntime::new(
+                Box::new(StubMasterPty),
+                Box::new(std::io::sink()),
+                Box::new(StubTerminalState),
+                8,
+            ),
+        );
+
+        registry.freeze_history("demo");
+        registry.remove("demo");
+
+        let history = registry.get_history("demo").unwrap();
+        assert_eq!(history.plain, "plain");
+        assert_eq!(history.vt, "vt");
     }
 
     #[test]

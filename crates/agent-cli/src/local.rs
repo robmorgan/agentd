@@ -1,6 +1,5 @@
 use std::{
-    fs::{self, File},
-    io::{Read, Seek, SeekFrom, Write},
+    fs,
     process::Command,
     time::{Duration, Instant},
 };
@@ -292,39 +291,6 @@ pub fn remove_session_artifacts(paths: &AppPaths, session: &SessionRecord) -> Re
     remove_worktree_if_present(session)?;
     remove_log_if_present(paths, session)?;
     Ok(())
-}
-
-pub fn print_log_file(paths: &AppPaths, session_id: &str, follow: bool) -> Result<()> {
-    let rendered = paths.rendered_log_path(session_id);
-    let path = if rendered.exists() { rendered } else { paths.log_path(session_id) };
-    let mut file =
-        File::open(path.as_std_path()).with_context(|| format!("failed to open {}", path))?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
-    print!("{}", String::from_utf8_lossy(&buffer));
-    std::io::stdout().flush()?;
-
-    if !follow {
-        return Ok(());
-    }
-
-    let mut offset = buffer.len() as u64;
-    loop {
-        let metadata =
-            fs::metadata(path.as_std_path()).with_context(|| format!("failed to stat {}", path))?;
-        if metadata.len() < offset {
-            offset = 0;
-        }
-        if metadata.len() > offset {
-            file.seek(SeekFrom::Start(offset))?;
-            let mut chunk = Vec::new();
-            file.read_to_end(&mut chunk)?;
-            print!("{}", String::from_utf8_lossy(&chunk));
-            std::io::stdout().flush()?;
-            offset = metadata.len();
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
 }
 
 fn ensure_column(conn: &Connection, column: &str, ddl: &str) -> Result<()> {

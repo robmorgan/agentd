@@ -6,12 +6,15 @@ const GHOSTTY_SUCCESS: i32 = 0;
 
 pub trait TerminalStateEngine: Send {
     fn feed(&mut self, data: &[u8]) -> Result<()>;
-    fn snapshot(&mut self) -> Result<Vec<u8>>;
+    fn vt_snapshot(&mut self) -> Result<Vec<u8>>;
+    fn format_plain(&mut self) -> Result<String>;
+    fn format_vt(&mut self) -> Result<String>;
 }
 
 pub struct GhosttyTerminalState {
     terminal: GhosttyTerminal,
-    formatter: GhosttyFormatter,
+    plain_formatter: GhosttyFormatter,
+    vt_formatter: GhosttyFormatter,
 }
 
 impl GhosttyTerminalState {
@@ -26,44 +29,25 @@ impl GhosttyTerminalState {
         };
         ensure_success(result, "ghostty_terminal_new")?;
 
-        let mut formatter = ptr::null_mut();
-        let result = unsafe {
-            ghostty_formatter_terminal_new(
-                ptr::null(),
-                &mut formatter,
-                terminal,
-                GhosttyFormatterTerminalOptions {
-                    size: std::mem::size_of::<GhosttyFormatterTerminalOptions>(),
-                    emit: GhosttyFormatterFormat::Vt,
-                    unwrap: false,
-                    trim: false,
-                    extra: GhosttyFormatterTerminalExtra {
-                        size: std::mem::size_of::<GhosttyFormatterTerminalExtra>(),
-                        palette: true,
-                        modes: true,
-                        scrolling_region: true,
-                        tabstops: true,
-                        pwd: false,
-                        keyboard: true,
-                        screen: GhosttyFormatterScreenExtra {
-                            size: std::mem::size_of::<GhosttyFormatterScreenExtra>(),
-                            cursor: true,
-                            style: true,
-                            hyperlink: true,
-                            protection: true,
-                            kitty_keyboard: true,
-                            charsets: true,
-                        },
-                    },
-                },
-            )
+        let plain_formatter = match new_formatter(terminal, GhosttyFormatterFormat::Plain) {
+            Ok(formatter) => formatter,
+            Err(err) => {
+                unsafe { ghostty_terminal_free(terminal) };
+                return Err(err);
+            }
         };
-        if let Err(err) = ensure_success(result, "ghostty_formatter_terminal_new") {
-            unsafe { ghostty_terminal_free(terminal) };
-            return Err(err);
-        }
+        let vt_formatter = match new_formatter(terminal, GhosttyFormatterFormat::Vt) {
+            Ok(formatter) => formatter,
+            Err(err) => {
+                unsafe {
+                    ghostty_formatter_free(plain_formatter);
+                    ghostty_terminal_free(terminal);
+                }
+                return Err(err);
+            }
+        };
 
-        Ok(Self { terminal, formatter })
+        Ok(Self { terminal, plain_formatter, vt_formatter })
     }
 }
 
@@ -73,30 +57,82 @@ impl TerminalStateEngine for GhosttyTerminalState {
         Ok(())
     }
 
-    fn snapshot(&mut self) -> Result<Vec<u8>> {
-        let mut ptr = ptr::null_mut();
-        let mut len = 0usize;
-        let result = unsafe {
-            ghostty_formatter_format_alloc(self.formatter, ptr::null(), &mut ptr, &mut len)
-        };
-        ensure_success(result, "ghostty_formatter_format_alloc")?;
-        if ptr.is_null() && len != 0 {
-            bail!("ghostty formatter returned a null buffer for a non-empty snapshot");
-        }
+    fn vt_snapshot(&mut self) -> Result<Vec<u8>> {
+        format_terminal(self.vt_formatter)
+    }
 
-        let bytes = unsafe { slice::from_raw_parts(ptr, len) }.to_vec();
-        unsafe { libc_free(ptr.cast()) };
-        Ok(bytes)
+    fn format_plain(&mut self) -> Result<String> {
+        Ok(String::from_utf8_lossy(&format_terminal(self.plain_formatter)?).into_owned())
+    }
+
+    fn format_vt(&mut self) -> Result<String> {
+        Ok(String::from_utf8_lossy(&format_terminal(self.vt_formatter)?).into_owned())
     }
 }
 
 impl Drop for GhosttyTerminalState {
     fn drop(&mut self) {
         unsafe {
-            ghostty_formatter_free(self.formatter);
+            ghostty_formatter_free(self.plain_formatter);
+            ghostty_formatter_free(self.vt_formatter);
             ghostty_terminal_free(self.terminal);
         }
     }
+}
+
+fn new_formatter(
+    terminal: GhosttyTerminal,
+    emit: GhosttyFormatterFormat,
+) -> Result<GhosttyFormatter> {
+    let mut formatter = ptr::null_mut();
+    let result = unsafe {
+        ghostty_formatter_terminal_new(
+            ptr::null(),
+            &mut formatter,
+            terminal,
+            GhosttyFormatterTerminalOptions {
+                size: std::mem::size_of::<GhosttyFormatterTerminalOptions>(),
+                emit,
+                unwrap: false,
+                trim: false,
+                extra: GhosttyFormatterTerminalExtra {
+                    size: std::mem::size_of::<GhosttyFormatterTerminalExtra>(),
+                    palette: true,
+                    modes: true,
+                    scrolling_region: true,
+                    tabstops: true,
+                    pwd: false,
+                    keyboard: true,
+                    screen: GhosttyFormatterScreenExtra {
+                        size: std::mem::size_of::<GhosttyFormatterScreenExtra>(),
+                        cursor: true,
+                        style: true,
+                        hyperlink: true,
+                        protection: true,
+                        kitty_keyboard: true,
+                        charsets: true,
+                    },
+                },
+            },
+        )
+    };
+    ensure_success(result, "ghostty_formatter_terminal_new")?;
+    Ok(formatter)
+}
+
+fn format_terminal(formatter: GhosttyFormatter) -> Result<Vec<u8>> {
+    let mut ptr = ptr::null_mut();
+    let mut len = 0usize;
+    let result =
+        unsafe { ghostty_formatter_format_alloc(formatter, ptr::null(), &mut ptr, &mut len) };
+    ensure_success(result, "ghostty_formatter_format_alloc")?;
+    if ptr.is_null() && len != 0 {
+        bail!("ghostty formatter returned a null buffer for a non-empty snapshot");
+    }
+
+    let bytes = unsafe { slice::from_raw_parts(ptr, len) }.to_vec();
+    unsafe { libc_free(ptr.cast()) };
+    Ok(bytes)
 }
 
 unsafe impl Send for GhosttyTerminalState {}

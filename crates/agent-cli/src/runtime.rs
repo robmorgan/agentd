@@ -1053,17 +1053,9 @@ fn session_list_layout(width: usize) -> SessionListLayout {
 
     let mut deficit = min_total - visible_width;
     shrink_session_list_column(&mut layout.repo, SESSION_LIST_REPO_FLOOR_WIDTH, &mut deficit);
-    shrink_session_list_column(
-        &mut layout.session,
-        SESSION_LIST_SESSION_FLOOR_WIDTH,
-        &mut deficit,
-    );
+    shrink_session_list_column(&mut layout.session, SESSION_LIST_SESSION_FLOOR_WIDTH, &mut deficit);
     shrink_session_list_column(&mut layout.title, SESSION_LIST_TITLE_FLOOR_WIDTH, &mut deficit);
-    shrink_session_list_column(
-        &mut layout.branch,
-        SESSION_LIST_BRANCH_FLOOR_WIDTH,
-        &mut deficit,
-    );
+    shrink_session_list_column(&mut layout.branch, SESSION_LIST_BRANCH_FLOOR_WIDTH, &mut deficit);
     layout
 }
 
@@ -1930,17 +1922,17 @@ fn matches_query<T: AsRef<str>>(haystack: T, query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANSI_RESET, HOST_PICKER_CURSOR, HOST_PICKER_DIFF_ADD_STYLE, HOST_PICKER_DIFF_HEADER_STYLE,
-        HOST_PICKER_DIFF_HUNK_STYLE, HOST_PICKER_DIFF_REMOVE_STYLE, HOST_PICKER_LEGEND_TEXT_STYLE,
-        AttachOverlay, HOST_PICKER_PLACEHOLDER_FG, HOST_PICKER_QUERY_BG,
+        ANSI_RESET, AttachOverlay, HOST_PICKER_CURSOR, HOST_PICKER_DIFF_ADD_STYLE,
+        HOST_PICKER_DIFF_HEADER_STYLE, HOST_PICKER_DIFF_HUNK_STYLE, HOST_PICKER_DIFF_REMOVE_STYLE,
+        HOST_PICKER_LEGEND_TEXT_STYLE, HOST_PICKER_PLACEHOLDER_FG, HOST_PICKER_QUERY_BG,
         HOST_PICKER_SELECTED_STYLE, HOST_PICKER_STATUS_BLUE_FG, HOST_PICKER_STATUS_GRAY_FG,
         HOST_PICKER_STATUS_GREEN_FG, HOST_PICKER_STATUS_RED_FG, HOST_PICKER_STATUS_YELLOW_FG,
         HOST_PICKER_TEXT_FG, OverlayMode, OverlayOutcome, PickerComposer, PickerMode, PickerRow,
-        SessionAction, SessionPicker, render_session_list_header_content,
-        render_session_list_header_row, render_session_list_lines,
-        configured_agent_names, fit_host_picker_line, render_host_picker_brand,
-        render_host_picker_legend_row, render_host_picker_session_row, render_host_picker_subtitle,
-        render_host_picker_title_line, session_icon, session_icon_color, session_list_layout,
+        SessionAction, SessionPicker, configured_agent_names, fit_host_picker_line,
+        render_host_picker_brand, render_host_picker_legend_row, render_host_picker_session_row,
+        render_host_picker_subtitle, render_host_picker_title_line,
+        render_session_list_header_content, render_session_list_header_row,
+        render_session_list_lines, session_icon, session_icon_color, session_list_layout,
         style_host_picker_background_row, style_host_picker_diff_line,
         style_host_picker_query_line,
     };
@@ -2012,11 +2004,9 @@ mod tests {
         let mut overlay = AttachOverlay::new(test_paths(), "alpha".to_string());
         overlay.mode = OverlayMode::Palette;
 
-        let outcome = block_on(overlay.handle_key(KeyEvent::new(
-            KeyCode::Char('b'),
-            KeyModifiers::CONTROL,
-        )))
-        .unwrap();
+        let outcome =
+            block_on(overlay.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)))
+                .unwrap();
 
         assert_eq!(outcome, Some(OverlayOutcome::ForwardInput(vec![0x02])));
     }
@@ -2486,8 +2476,8 @@ mod tests {
     #[test]
     fn session_list_uses_single_row_and_dynamic_widths() {
         let mut session = demo("alpha", "repository-with-a-long-name");
-        session.title = "a very long title that should be truncated in the fixed width column"
-            .to_string();
+        session.title =
+            "a very long title that should be truncated in the fixed width column".to_string();
         session.branch =
             "agent/this-is-a-very-long-branch-name-that-should-be-truncated".to_string();
         session.attention_summary =

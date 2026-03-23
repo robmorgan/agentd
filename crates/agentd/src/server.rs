@@ -1,6 +1,6 @@
-use std::{io, path::Path, time::Duration};
+use std::{io, path::Path};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result};
 use tokio::{
     io::BufReader,
     net::{UnixListener, UnixStream, unix::OwnedWriteHalf},
@@ -289,11 +289,13 @@ async fn handle_connection(
             )
             .await?
         }
-        IncomingRequest::Standard(Request::StreamLogs { session_id, follow }) => {
-            if let Err(err) = stream_logs(&state, &session_id, follow, &mut writer).await {
-                send_response(&mut writer, &Response::Error { message: err.to_string() }).await?;
-            } else {
-                send_response(&mut writer, &Response::EndOfStream).await?;
+        IncomingRequest::Standard(Request::GetHistory { session_id, vt }) => {
+            match state.get_history(&session_id, vt).await {
+                Ok(data) => send_response(&mut writer, &Response::History { data }).await?,
+                Err(err) => {
+                    send_response(&mut writer, &Response::Error { message: err.to_string() })
+                        .await?
+                }
             }
         }
         IncomingRequest::Standard(Request::StreamEvents { session_id, follow }) => {
@@ -483,59 +485,6 @@ fn session_ended_response(session: &SessionRecord) -> Option<Response> {
 
 async fn send_response(writer: &mut OwnedWriteHalf, response: &Response) -> Result<()> {
     write_response(writer, response).await
-}
-
-async fn stream_logs(
-    state: &AppState,
-    session_id: &str,
-    follow: bool,
-    writer: &mut OwnedWriteHalf,
-) -> Result<()> {
-    let session = state
-        .get_session(session_id)
-        .await?
-        .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
-    let rendered_log_path = state.paths.rendered_log_path(session_id);
-    let log_path = if session.agent == "codex" && rendered_log_path.exists() {
-        rendered_log_path
-    } else {
-        state.paths.log_path(session_id)
-    };
-    if !log_path.exists() {
-        bail!("no log file exists for session `{session_id}`");
-    }
-
-    let mut position = 0_u64;
-    loop {
-        let (chunk, next_position) = read_from_offset(&log_path, position)?;
-        if !chunk.is_empty() {
-            send_response(writer, &Response::LogChunk { data: chunk }).await?;
-            position = next_position;
-        }
-
-        let session = state.get_session(session_id).await?;
-        let is_running =
-            matches!(session.as_ref().map(|item| item.status), Some(SessionStatus::Running));
-        if !follow || !is_running {
-            let (remainder, _) = read_from_offset(&log_path, position)?;
-            if !remainder.is_empty() {
-                send_response(writer, &Response::LogChunk { data: remainder }).await?;
-            }
-            break;
-        }
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-
-    Ok(())
-}
-
-fn read_from_offset(log_path: &camino::Utf8PathBuf, position: u64) -> Result<(String, u64)> {
-    let bytes = std::fs::read(log_path.as_std_path())
-        .with_context(|| format!("failed to read {}", log_path))?;
-    let start = position.min(bytes.len() as u64) as usize;
-    let chunk = String::from_utf8_lossy(&bytes[start..]).to_string();
-    Ok((chunk, bytes.len() as u64))
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ use crate::{
     },
 };
 
-pub const PROTOCOL_VERSION: u16 = 19;
+pub const PROTOCOL_VERSION: u16 = 20;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
@@ -80,7 +80,7 @@ pub enum Request {
     ListSessions,
     ListAttachments { session_id: String },
     AppendSessionEvents { session_id: String, events: Vec<NewSessionEvent> },
-    StreamLogs { session_id: String, follow: bool },
+    GetHistory { session_id: String, vt: bool },
     StreamEvents { session_id: String, follow: bool },
 }
 
@@ -128,7 +128,7 @@ pub enum Response {
     Event {
         event: SessionEvent,
     },
-    LogChunk {
+    History {
         data: String,
     },
     PtyOutput {
@@ -168,7 +168,7 @@ enum MessageKind {
     GetSessionRequest = 11,
     ListSessionsRequest = 12,
     AppendSessionEventsRequest = 13,
-    StreamLogsRequest = 14,
+    GetHistoryRequest = 14,
     StreamEventsRequest = 15,
     DaemonInfoResponse = 101,
     CreateSessionResponse = 102,
@@ -182,7 +182,7 @@ enum MessageKind {
     SessionResponse = 108,
     SessionsResponse = 109,
     EventResponse = 110,
-    LogChunkResponse = 111,
+    HistoryResponse = 111,
     PtyOutputResponse = 112,
     SwitchSessionResponse = 116,
     EndOfStreamResponse = 113,
@@ -214,7 +214,7 @@ impl MessageKind {
             11 => Self::GetSessionRequest,
             12 => Self::ListSessionsRequest,
             13 => Self::AppendSessionEventsRequest,
-            14 => Self::StreamLogsRequest,
+            14 => Self::GetHistoryRequest,
             15 => Self::StreamEventsRequest,
             101 => Self::DaemonInfoResponse,
             102 => Self::CreateSessionResponse,
@@ -228,7 +228,7 @@ impl MessageKind {
             108 => Self::SessionResponse,
             109 => Self::SessionsResponse,
             110 => Self::EventResponse,
-            111 => Self::LogChunkResponse,
+            111 => Self::HistoryResponse,
             112 => Self::PtyOutputResponse,
             116 => Self::SwitchSessionResponse,
             113 => Self::EndOfStreamResponse,
@@ -504,10 +504,10 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             }
             MessageKind::AppendSessionEventsRequest
         }
-        Request::StreamLogs { session_id, follow } => {
+        Request::GetHistory { session_id, vt } => {
             put_string(&mut payload, session_id)?;
-            put_bool(&mut payload, *follow);
-            MessageKind::StreamLogsRequest
+            put_bool(&mut payload, *vt);
+            MessageKind::GetHistoryRequest
         }
         Request::StreamEvents { session_id, follow } => {
             put_string(&mut payload, session_id)?;
@@ -590,8 +590,8 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
             }
             Request::AppendSessionEvents { session_id, events }
         }
-        MessageKind::StreamLogsRequest => {
-            Request::StreamLogs { session_id: cursor.take_string()?, follow: cursor.take_bool()? }
+        MessageKind::GetHistoryRequest => {
+            Request::GetHistory { session_id: cursor.take_string()?, vt: cursor.take_bool()? }
         }
         MessageKind::StreamEventsRequest => {
             Request::StreamEvents { session_id: cursor.take_string()?, follow: cursor.take_bool()? }
@@ -672,9 +672,9 @@ fn encode_response(response: &Response) -> Result<(MessageKind, Vec<u8>)> {
             put_session_event(&mut payload, event)?;
             MessageKind::EventResponse
         }
-        Response::LogChunk { data } => {
+        Response::History { data } => {
             put_string(&mut payload, data)?;
-            MessageKind::LogChunkResponse
+            MessageKind::HistoryResponse
         }
         Response::PtyOutput { data } => {
             put_bytes(&mut payload, data)?;
@@ -743,7 +743,7 @@ fn decode_response(kind: MessageKind, payload: &[u8]) -> Result<Response> {
             Response::Attachments { attachments }
         }
         MessageKind::EventResponse => Response::Event { event: cursor.take_session_event()? },
-        MessageKind::LogChunkResponse => Response::LogChunk { data: cursor.take_string()? },
+        MessageKind::HistoryResponse => Response::History { data: cursor.take_string()? },
         MessageKind::PtyOutputResponse => Response::PtyOutput { data: cursor.take_bytes()? },
         MessageKind::SwitchSessionResponse => {
             Response::SwitchSession { session_id: cursor.take_string()? }
@@ -1394,6 +1394,14 @@ mod tests {
     }
 
     #[test]
+    fn get_history_round_trips() {
+        let request = Request::GetHistory { session_id: "demo".to_string(), vt: true };
+        let (kind, payload) = encode_request(&request).unwrap();
+        let decoded = decode_request(kind, &payload).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
     fn apply_session_round_trips() {
         let request = Request::ApplySession { session_id: "demo".to_string() };
         let (kind, payload) = encode_request(&request).unwrap();
@@ -1437,6 +1445,14 @@ mod tests {
                 payload_json: json!({"command":"cargo test","exit_code":1}),
             },
         };
+        let (kind, payload) = encode_response(&response).unwrap();
+        let decoded = decode_response(kind, &payload).unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn history_response_round_trips() {
+        let response = Response::History { data: "\u{1b}[31mhello\u{1b}[0m".to_string() };
         let (kind, payload) = encode_response(&response).unwrap();
         let decoded = decode_response(kind, &payload).unwrap();
         assert_eq!(decoded, response);
