@@ -447,7 +447,8 @@ fn session_ended_response(session: &SessionRecord) -> Option<Response> {
         | SessionStatus::UnknownRecovered => Some(Response::SessionEnded {
             session_id: session.session_id.clone(),
             status: session.status,
-            integration_state: session.integration_state,
+            apply_state: session.apply_state,
+            merge_status: session.merge_status,
             branch: session.branch.clone(),
             worktree: session.worktree.clone(),
             exit_code: session.exit_code,
@@ -467,8 +468,8 @@ mod tests {
     use agentd_shared::{
         protocol::Response,
         session::{
-            AttentionLevel, GitSyncStatus, IntegrationPolicy, IntegrationState, SessionMode,
-            SessionRecord, SessionStatus,
+            ApplyState, AttentionLevel, IntegrationPolicy, MergeStatus, SessionMode, SessionRecord,
+            SessionStatus,
         },
     };
     use chrono::Utc;
@@ -490,9 +491,9 @@ mod tests {
             worktree: "/tmp/worktree".to_string(),
             status,
             integration_policy: IntegrationPolicy::AutoApplySafe,
-            integration_state: IntegrationState::Clean,
-            git_sync: GitSyncStatus::Unknown,
-            git_status_summary: None,
+            apply_state: ApplyState::Idle,
+            merge_status: MergeStatus::Unknown,
+            merge_summary: None,
             has_conflicts: false,
             pid: Some(123),
             exit_code: Some(0),
@@ -513,7 +514,8 @@ mod tests {
             Response::SessionEnded {
                 session_id: "demo".to_string(),
                 status: SessionStatus::Exited,
-                integration_state: IntegrationState::Clean,
+                apply_state: ApplyState::Idle,
+                merge_status: MergeStatus::Unknown,
                 branch: "agent/task".to_string(),
                 worktree: "/tmp/worktree".to_string(),
                 exit_code: Some(0),

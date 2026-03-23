@@ -46,8 +46,8 @@ use agentd_shared::{
         write_daemon_management_request, write_request,
     },
     session::{
-        AttachmentKind, AttachmentRecord, AttentionLevel, IntegrationPolicy, IntegrationState,
-        SessionDiff, SessionRecord, SessionStatus, WorktreeRecord,
+        ApplyState, AttachmentKind, AttachmentRecord, AttentionLevel, IntegrationPolicy,
+        MergeStatus, SessionDiff, SessionRecord, SessionStatus, WorktreeRecord,
     },
 };
 
@@ -99,7 +99,7 @@ fn cli_styles() -> Styles {
     name = "agent",
     version,
     about = "Run, inspect, and review local coding sessions",
-    before_help = "agent\nA local multi-session coding workflow for daemon-backed agents.\n\nCore flows:\n  Start a session      agent new \"fix flaky tests\"\n  Inspect sessions     agent list\n  Reconnect live PTY   agent attach <session_id>\n  Review changes       agent diff <session_id> | agent accept <session_id>",
+    before_help = "agent\nA local multi-session coding workflow for daemon-backed agents.\n\nCore flows:\n  Start a session      agent new \"fix flaky tests\"\n  Inspect sessions     agent list\n  Reconnect live PTY   agent attach <session_id>\n  Review changes       agent diff <session_id> | agent merge <session_id>",
     after_help = "Examples:\n  agent new \"add health checks\"\n  agent create --workspace . --agent codex --title \"refactor retries\"\n  agent list\n  agent status <session_id>\n  agent daemon info\n\nUse `agent <command> --help` for command-specific details.",
     help_template = ROOT_HELP_TEMPLATE,
     styles = cli_styles(),
@@ -166,15 +166,17 @@ enum Command {
         )]
         data: Vec<String>,
     },
-    #[command(about = "Apply a reviewed session back to the base branch", display_order = 7)]
+    #[command(about = "Merge a session branch back to the base branch", display_order = 7)]
+    Merge { session_id: Option<String> },
+    #[command(about = "Compatibility alias for `agent merge`", display_order = 8, hide = true)]
     Accept { session_id: String },
-    #[command(about = "Discard a session's worktree and changes", display_order = 8)]
+    #[command(about = "Discard a session's worktree and changes", display_order = 9)]
     Discard {
         session_id: String,
         #[arg(long)]
         force: bool,
     },
-    #[command(about = "Print captured session history", display_order = 9)]
+    #[command(about = "Print captured session history", display_order = 10)]
     History {
         session_id: String,
         #[arg(long)]
@@ -184,21 +186,21 @@ enum Command {
         visible_alias = "ls",
         alias = "sessions",
         about = "List known sessions",
-        display_order = 10
+        display_order = 11
     )]
     List,
-    #[command(about = "Show currently attached clients for a session", display_order = 11)]
+    #[command(about = "Show currently attached clients for a session", display_order = 12)]
     Attachments { session_id: String },
-    #[command(about = "Show detailed session status", display_order = 12)]
+    #[command(about = "Show detailed session status", display_order = 13)]
     Status { session_id: String },
-    #[command(about = "Show the session diff against its base branch", display_order = 13)]
+    #[command(about = "Show the session diff against its base branch", display_order = 14)]
     Diff { session_id: String },
-    #[command(about = "Create or clean up session worktrees", display_order = 14)]
+    #[command(about = "Create or clean up session worktrees", display_order = 15)]
     Worktree {
         #[command(subcommand)]
         command: WorktreeCommand,
     },
-    #[command(about = "Inspect or control the local agent daemon", display_order = 15)]
+    #[command(about = "Inspect or control the local agent daemon", display_order = 16)]
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -394,6 +396,20 @@ async fn main() -> Result<()> {
         }
         (Some(Command::SendInput { .. }), ExecutionMode::Local(reason)) => {
             bail_live_command(&reason)?;
+        }
+        (Some(Command::Merge { session_id }), ExecutionMode::Daemon) => {
+            let session_id = resolve_merge_session_id(session_id)?;
+            let response =
+                send_request(&paths, &Request::ApplySession { session_id: session_id.clone() })
+                    .await?;
+            match response {
+                Response::Session { session } => print_session(&session),
+                Response::Error { message } => bail!(message),
+                other => bail!("unexpected response: {:?}", other),
+            }
+        }
+        (Some(Command::Merge { .. }), ExecutionMode::Local(reason)) => {
+            bail_daemon_command(&reason, "agent merge")?;
         }
         (Some(Command::Accept { session_id }), ExecutionMode::Daemon) => {
             let response = send_request(&paths, &Request::ApplySession { session_id }).await?;
@@ -635,6 +651,14 @@ fn resolve_detach_session_id(session_id: Option<String>) -> Result<String> {
         Some(session_id) => Ok(session_id),
         None => std::env::var("AGENTD_SESSION_ID")
             .context("`agent detach` without a session id only works inside a managed session"),
+    }
+}
+
+fn resolve_merge_session_id(session_id: Option<String>) -> Result<String> {
+    match session_id {
+        Some(session_id) => Ok(session_id),
+        None => std::env::var("AGENTD_SESSION_ID")
+            .context("`agent merge` without a session id only works inside a managed session"),
     }
 }
 
@@ -941,9 +965,12 @@ fn local_kill(paths: &AppPaths, session_id: &str, remove: bool) -> Result<()> {
     }
 
     if remove {
-        if session.integration_state == IntegrationState::PendingReview {
+        if matches!(
+            session.merge_status,
+            MergeStatus::Ready | MergeStatus::Blocked | MergeStatus::Conflicted
+        ) {
             bail!(
-                "session `{session_id}` has unapplied changes; use `agent diff {session_id}` and `agent accept {session_id}` before removing it, or reconnect to the daemon and run `agent discard {session_id}`"
+                "session `{session_id}` has mergeable changes; use `agent diff {session_id}` and `agent merge {session_id}` before removing it, or reconnect to the daemon and run `agent discard {session_id}`"
             );
         }
         remove_session_artifacts(paths, &session)?;
@@ -1016,7 +1043,8 @@ pub(crate) async fn connect_attached_session(
         Response::SessionEnded {
             session_id,
             status,
-            integration_state,
+            apply_state,
+            merge_status,
             branch,
             worktree,
             exit_code,
@@ -1024,7 +1052,8 @@ pub(crate) async fn connect_attached_session(
         } => Ok(AttachHandshake::SessionEnded(SessionEndSummary {
             session_id,
             status,
-            integration_state,
+            apply_state,
+            merge_status,
             branch,
             worktree,
             exit_code,
@@ -1097,7 +1126,8 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
                     Response::SessionEnded {
                         session_id,
                         status,
-                        integration_state,
+                        apply_state,
+                        merge_status,
                         branch,
                         worktree,
                         exit_code,
@@ -1107,7 +1137,8 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
                         return Ok(AttachOutcome::SessionEnded(SessionEndSummary {
                             session_id,
                             status,
-                            integration_state,
+                            apply_state,
+                            merge_status,
                             branch,
                             worktree,
                             exit_code,
@@ -1177,7 +1208,8 @@ fn print_session(session: &SessionRecord) {
     }
     println!("status: {}", session.status_string());
     println!("integration_policy: {}", session.integration_policy.as_str());
-    println!("integration_state: {}", session.integration_string());
+    println!("apply_state: {}", session.apply_state_string());
+    println!("merge_status: {}", session.merge_status.as_str());
     println!("attention: {}", session.attention_string());
     if let Some(summary) = &session.attention_summary {
         println!("attention_summary: {summary}");
@@ -1189,10 +1221,9 @@ fn print_session(session: &SessionRecord) {
     println!("base_branch: {}", session.base_branch);
     println!("branch: {}", session.branch);
     println!("worktree: {}", session.worktree);
-    println!("git_sync: {}", session.git_sync.as_str());
     println!("has_conflicts: {}", session.has_conflicts);
-    if let Some(summary) = &session.git_status_summary {
-        println!("git_status_summary: {summary}");
+    if let Some(summary) = &session.merge_summary {
+        println!("merge_summary: {summary}");
     }
     if let Some(pid) = session.pid {
         println!("pid: {pid}");
@@ -1568,7 +1599,8 @@ enum AttachOutcome {
 struct SessionEndSummary {
     session_id: String,
     status: SessionStatus,
-    integration_state: IntegrationState,
+    apply_state: ApplyState,
+    merge_status: MergeStatus,
     branch: String,
     worktree: String,
     exit_code: Option<i32>,
@@ -1587,15 +1619,15 @@ fn format_session_end_summary(summary: &SessionEndSummary) -> String {
         },
         SessionStatus::NeedsInput => format!("session {} needs input", summary.session_id),
         SessionStatus::Exited | SessionStatus::UnknownRecovered => {
-            if summary.integration_state == IntegrationState::Applied {
+            if summary.apply_state == ApplyState::Applied {
                 return format!(
                     "session {} finished and auto-applied from {} ({})",
                     summary.session_id, summary.branch, summary.worktree
                 );
             }
-            if summary.integration_state == IntegrationState::PendingReview {
+            if summary.merge_status == MergeStatus::Ready {
                 return format!(
-                    "session {} finished with changes on {} ({})\nrun: agent diff {} | agent accept {} | agent discard {}",
+                    "session {} finished with changes on {} ({})\nrun: agent diff {} | agent merge {} | agent discard {}",
                     summary.session_id,
                     summary.branch,
                     summary.worktree,
@@ -1705,7 +1737,7 @@ impl Drop for AttachScreenGuard {
 
 trait StatusString {
     fn status_string(&self) -> &'static str;
-    fn integration_string(&self) -> &'static str;
+    fn apply_state_string(&self) -> &'static str;
     fn attention_string(&self) -> &'static str;
 }
 
@@ -1721,13 +1753,12 @@ impl StatusString for SessionRecord {
         }
     }
 
-    fn integration_string(&self) -> &'static str {
-        match self.integration_state {
-            IntegrationState::Clean => "clean",
-            IntegrationState::AutoApplying => "auto_applying",
-            IntegrationState::PendingReview => "pending_review",
-            IntegrationState::Applied => "applied",
-            IntegrationState::Discarded => "discarded",
+    fn apply_state_string(&self) -> &'static str {
+        match self.apply_state {
+            ApplyState::Idle => "idle",
+            ApplyState::AutoApplying => "auto_applying",
+            ApplyState::Applied => "applied",
+            ApplyState::Discarded => "discarded",
         }
     }
 
@@ -1836,10 +1867,11 @@ mod tests {
         AGENTD_ATTACH_RESTORE_SEQUENCE, ATTACH_DETACH_BYTE, AttachInputAction, AttachInputParser,
         Cli, Command, DaemonCommand, SessionEndSummary, bail_daemon_command,
         clear_stale_daemon_state, format_session_end_summary, render_diff_text,
-        resolve_detach_session_id, resolve_new_session_options, should_colorize_diff_output,
+        resolve_detach_session_id, resolve_merge_session_id, resolve_new_session_options,
+        should_colorize_diff_output,
     };
     use agentd_shared::paths::AppPaths;
-    use agentd_shared::session::{IntegrationPolicy, IntegrationState, SessionStatus};
+    use agentd_shared::session::{ApplyState, IntegrationPolicy, MergeStatus, SessionStatus};
     use clap::Parser;
     use std::{
         ffi::OsString,
@@ -2025,11 +2057,21 @@ mod tests {
     }
 
     #[test]
+    fn resolve_merge_session_id_uses_environment() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("AGENTD_SESSION_ID", "env-session");
+        }
+        let session_id = resolve_merge_session_id(None).unwrap();
+        assert_eq!(session_id, "env-session");
+    }
+
+    #[test]
     fn daemon_command_error_for_accept_does_not_mention_pty() {
-        let err = bail_daemon_command("agentd is unavailable", "agent accept").unwrap_err();
+        let err = bail_daemon_command("agentd is unavailable", "agent merge").unwrap_err();
         assert_eq!(
             err.to_string(),
-            "agentd is unavailable. `agent accept` requires a compatible daemon"
+            "agentd is unavailable. `agent merge` requires a compatible daemon"
         );
     }
 
@@ -2114,7 +2156,8 @@ mod tests {
         let summary = SessionEndSummary {
             session_id: "demo".to_string(),
             status: SessionStatus::Exited,
-            integration_state: IntegrationState::Clean,
+            apply_state: ApplyState::Idle,
+            merge_status: MergeStatus::Unknown,
             branch: "agent/demo".to_string(),
             worktree: "/tmp/worktree".to_string(),
             exit_code: Some(0),
@@ -2128,7 +2171,8 @@ mod tests {
         let summary = SessionEndSummary {
             session_id: "demo".to_string(),
             status: SessionStatus::Failed,
-            integration_state: IntegrationState::Clean,
+            apply_state: ApplyState::Idle,
+            merge_status: MergeStatus::Unknown,
             branch: "agent/demo".to_string(),
             worktree: "/tmp/worktree".to_string(),
             exit_code: Some(1),
@@ -2142,13 +2186,14 @@ mod tests {
         let summary = SessionEndSummary {
             session_id: "demo".to_string(),
             status: SessionStatus::Exited,
-            integration_state: IntegrationState::PendingReview,
+            apply_state: ApplyState::Idle,
+            merge_status: MergeStatus::Ready,
             branch: "agent/demo".to_string(),
             worktree: "/tmp/worktree".to_string(),
             exit_code: Some(0),
             error: None,
         };
-        assert!(format_session_end_summary(&summary).contains("agent accept demo"));
+        assert!(format_session_end_summary(&summary).contains("agent merge demo"));
     }
 
     #[test]
@@ -2156,7 +2201,8 @@ mod tests {
         let summary = SessionEndSummary {
             session_id: "demo".to_string(),
             status: SessionStatus::Exited,
-            integration_state: IntegrationState::Applied,
+            apply_state: ApplyState::Applied,
+            merge_status: MergeStatus::UpToDate,
             branch: "agent/demo".to_string(),
             worktree: "/tmp/worktree".to_string(),
             exit_code: Some(0),

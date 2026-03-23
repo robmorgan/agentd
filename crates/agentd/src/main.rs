@@ -69,7 +69,9 @@ async fn upgrade_daemon() -> Result<()> {
     let running_sessions = db
         .list_sessions()?
         .into_iter()
-        .filter(|session| matches!(session.status, SessionStatus::Running | SessionStatus::NeedsInput))
+        .filter(|session| {
+            matches!(session.status, SessionStatus::Running | SessionStatus::NeedsInput)
+        })
         .filter(|session| process_exists(session.pid))
         .collect::<Vec<_>>();
 

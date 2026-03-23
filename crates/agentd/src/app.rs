@@ -22,9 +22,9 @@ use agentd_shared::{
     config::Config,
     paths::AppPaths,
     session::{
-        AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult, GitSyncStatus,
-        IntegrationPolicy, IntegrationState, SessionDiff, SessionMode, SessionRecord,
-        SessionStatus, WorktreeRecord, branch_name_from_title, repo_name_from_path,
+        ApplyState, AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult,
+        IntegrationPolicy, MergeStatus, SessionDiff, SessionMode, SessionRecord, SessionStatus,
+        WorktreeRecord, branch_name_from_title, repo_name_from_path,
     },
 };
 
@@ -142,7 +142,7 @@ impl AppState {
         task::spawn_blocking(move || {
             let session = db.get_session(&session_id)?;
             if let Some(session) = session {
-                Ok(Some(refresh_review_state(&db, session)?))
+                Ok(Some(refresh_merge_state(&db, session)?))
             } else {
                 Ok(None)
             }
@@ -156,7 +156,7 @@ impl AppState {
             let sessions = db.list_sessions()?;
             sessions
                 .into_iter()
-                .map(|session| refresh_review_state(&db, session))
+                .map(|session| refresh_merge_state(&db, session))
                 .collect::<Result<Vec<_>>>()
         })
         .await?
@@ -215,7 +215,8 @@ impl AppState {
                 .get_session(&session_id)?
                 .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
             ensure_session_not_running(&session)?;
-            ensure_not_pending_review(&session, "cleanup")?;
+            let session = refresh_merge_state(&db, session)?;
+            ensure_not_mergeable(&session, "cleanup")?;
 
             let repo_root = Utf8PathBuf::from(session.repo_path.clone());
             let worktree = Utf8PathBuf::from(session.worktree.clone());
@@ -258,7 +259,8 @@ impl AppState {
             }
 
             if remove {
-                ensure_not_pending_review(&session, "remove")?;
+                let session = refresh_merge_state(&db, session)?;
+                ensure_not_mergeable(&session, "remove")?;
                 remove_session_artifacts(&paths, &session)?;
                 db.delete_session(&session_id)?;
             }
@@ -275,7 +277,7 @@ impl AppState {
             let session = db
                 .get_session(&session_id)?
                 .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
-            let session = refresh_review_state(&db, session)?;
+            let session = refresh_merge_state(&db, session)?;
             let worktree = Utf8PathBuf::from(session.worktree.clone());
             if !worktree.exists() {
                 bail!("worktree `{worktree}` does not exist");
@@ -300,69 +302,41 @@ impl AppState {
             let session = db
                 .get_session(&session_id)?
                 .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
-            ensure_session_not_running(&session)?;
-            ensure_pending_review(&session, "accept")?;
+            let session = refresh_merge_state(&db, session)?;
+            let review = merge_state_for_apply(&session)?;
 
-            let session = refresh_review_state(&db, session)?;
-            let review = review_state_for_accept(&session)?;
-            db.set_git_review_state(
-                &session.session_id,
-                review.git_sync,
-                Some(&review.summary),
-                review.has_conflicts,
-            )?;
-
-            match review.git_sync {
-                GitSyncStatus::NeedsSync => bail!(review.summary),
-                GitSyncStatus::Conflicted => bail!(review.summary),
-                GitSyncStatus::Unknown => {
-                    bail!("session `{}` is not ready to apply", session.session_id)
+            match review.merge_status {
+                MergeStatus::Ready | MergeStatus::UpToDate => {}
+                MergeStatus::Blocked | MergeStatus::Conflicted => bail!(review.summary),
+                MergeStatus::Unknown => {
+                    bail!("session `{}` is not ready to merge", session.session_id)
                 }
-                GitSyncStatus::InSync => {}
             }
 
             let repo_root = Utf8PathBuf::from(session.repo_path.clone());
             match git::preview_merge(&repo_root, &session.base_branch, &session.branch)? {
                 git::MergePreview::NoChanges => {
-                    db.set_integration_state(
+                    db.set_apply_state(
                         &session.session_id,
-                        IntegrationState::Applied,
+                        ApplyState::Applied,
                         AttentionLevel::Info,
                         "changes already present on base branch",
-                    )?;
-                    db.set_git_review_state(
-                        &session.session_id,
-                        GitSyncStatus::InSync,
-                        Some("changes already present on base branch"),
-                        false,
                     )?;
                 }
                 git::MergePreview::HasChanges => {
                     git::apply_merge(&repo_root, &session.branch)?;
-                    db.set_integration_state(
+                    db.set_apply_state(
                         &session.session_id,
-                        IntegrationState::Applied,
+                        ApplyState::Applied,
                         AttentionLevel::Info,
                         &format!("changes merged into {}", session.base_branch),
                     )?;
-                    db.set_git_review_state(
-                        &session.session_id,
-                        GitSyncStatus::InSync,
-                        Some(&format!("changes merged into {}", session.base_branch)),
-                        false,
-                    )?;
                 }
-                git::MergePreview::Conflicted => {
-                    db.set_git_review_state(
-                        &session.session_id,
-                        GitSyncStatus::Conflicted,
-                        Some(&manual_accept_conflict_summary(&session)),
-                        true,
-                    )?;
-                    bail!(manual_accept_conflict_summary(&session));
-                }
+                git::MergePreview::Conflicted => bail!(manual_accept_conflict_summary(&session)),
             }
             db.get_session(&session_id)?
+                .map(|session| refresh_merge_state(&db, session))
+                .transpose()?
                 .ok_or_else(|| anyhow!("session `{session_id}` not found after apply"))
         })
         .await?
@@ -378,26 +352,21 @@ impl AppState {
             if !force {
                 ensure_session_not_running(&session)?;
             }
-            ensure_pending_review(&session, "discard")?;
 
             let repo_root = Utf8PathBuf::from(session.repo_path.clone());
             let worktree = Utf8PathBuf::from(session.worktree.clone());
             if worktree.exists() {
                 git::remove_worktree(&repo_root, &worktree)?;
             }
-            db.set_integration_state(
+            db.set_apply_state(
                 &session.session_id,
-                IntegrationState::Discarded,
+                ApplyState::Discarded,
                 AttentionLevel::Info,
                 "changes discarded",
             )?;
-            db.set_git_review_state(
-                &session.session_id,
-                GitSyncStatus::Unknown,
-                Some("changes discarded"),
-                false,
-            )?;
             db.get_session(&session_id)?
+                .map(|session| refresh_merge_state(&db, session))
+                .transpose()?
                 .ok_or_else(|| anyhow!("session `{session_id}` not found after discard"))
         })
         .await?
@@ -920,23 +889,21 @@ fn finalize_session_exit(db: &Database, session_id: &str, exit_code: Option<i32>
         if has_changes {
             match session.integration_policy {
                 IntegrationPolicy::ManualReview => {
-                    db.set_integration_state(
+                    db.set_apply_state(
                         session_id,
-                        IntegrationState::PendingReview,
+                        ApplyState::Idle,
                         AttentionLevel::Notice,
-                        "changes ready to review",
+                        "changes available to merge",
                     )?;
                 }
                 IntegrationPolicy::AutoApplySafe => {
                     if let Err(err) = auto_apply_session_on_exit(db, &session) {
                         let summary = format!("auto-apply stopped: {err}");
-                        set_pending_review_state(
-                            db,
-                            &session,
-                            GitSyncStatus::NeedsSync,
-                            &summary,
-                            false,
+                        db.set_apply_state(
+                            &session.session_id,
+                            ApplyState::Idle,
                             AttentionLevel::Action,
+                            &summary,
                         )?;
                     }
                 }
@@ -953,22 +920,20 @@ fn finalize_session_exit(db: &Database, session_id: &str, exit_code: Option<i32>
 }
 
 fn auto_apply_session_on_exit(db: &Database, session: &SessionRecord) -> Result<()> {
-    db.set_integration_state(
+    db.set_apply_state(
         &session.session_id,
-        IntegrationState::AutoApplying,
+        ApplyState::AutoApplying,
         AttentionLevel::Notice,
         "auto-applying changes",
     )?;
 
     let worktree = Utf8PathBuf::from(&session.worktree);
     if !worktree.exists() {
-        set_pending_review_state(
-            db,
-            session,
-            GitSyncStatus::NeedsSync,
-            &format!("worktree {} is missing; recreate or discard it", session.worktree),
-            false,
+        db.set_apply_state(
+            &session.session_id,
+            ApplyState::Idle,
             AttentionLevel::Action,
+            &format!("worktree {} is missing; recreate or discard it", session.worktree),
         )?;
         return Ok(());
     }
@@ -981,51 +946,43 @@ fn auto_apply_session_on_exit(db: &Database, session: &SessionRecord) -> Result<
         git::RebaseOutcome::RebasingClean => {}
         git::RebaseOutcome::Conflicted => {
             let summary = auto_apply_rebase_conflict_summary(session);
-            set_pending_review_state(
-                db,
-                session,
-                GitSyncStatus::Conflicted,
-                &summary,
-                true,
+            db.set_apply_state(
+                &session.session_id,
+                ApplyState::Idle,
                 AttentionLevel::Action,
+                &summary,
             )?;
             return Ok(());
         }
     }
 
-    let review = review_state_for_accept(session)?;
-    match review.git_sync {
-        GitSyncStatus::InSync => {}
-        GitSyncStatus::NeedsSync => {
-            set_pending_review_state(
-                db,
-                session,
-                review.git_sync,
-                &review.summary,
-                review.has_conflicts,
+    let merge = merge_state_for_apply(session)?;
+    match merge.merge_status {
+        MergeStatus::Ready | MergeStatus::UpToDate => {}
+        MergeStatus::Blocked => {
+            db.set_apply_state(
+                &session.session_id,
+                ApplyState::Idle,
                 AttentionLevel::Notice,
+                &merge.summary,
             )?;
             return Ok(());
         }
-        GitSyncStatus::Conflicted => {
-            set_pending_review_state(
-                db,
-                session,
-                review.git_sync,
-                &review.summary,
-                review.has_conflicts,
+        MergeStatus::Conflicted => {
+            db.set_apply_state(
+                &session.session_id,
+                ApplyState::Idle,
                 AttentionLevel::Action,
+                &merge.summary,
             )?;
             return Ok(());
         }
-        GitSyncStatus::Unknown => {
-            set_pending_review_state(
-                db,
-                session,
-                review.git_sync,
-                "auto-apply could not determine integration readiness",
-                review.has_conflicts,
+        MergeStatus::Unknown => {
+            db.set_apply_state(
+                &session.session_id,
+                ApplyState::Idle,
                 AttentionLevel::Action,
+                "auto-apply could not determine merge readiness",
             )?;
             return Ok(());
         }
@@ -1034,66 +991,35 @@ fn auto_apply_session_on_exit(db: &Database, session: &SessionRecord) -> Result<
     let repo_root = Utf8PathBuf::from(&session.repo_path);
     match git::preview_merge(&repo_root, &session.base_branch, &session.branch)? {
         git::MergePreview::NoChanges => {
-            db.set_integration_state(
+            db.set_apply_state(
                 &session.session_id,
-                IntegrationState::Applied,
+                ApplyState::Applied,
                 AttentionLevel::Info,
                 "changes already present on base branch",
-            )?;
-            db.set_git_review_state(
-                &session.session_id,
-                GitSyncStatus::InSync,
-                Some("changes already present on base branch"),
-                false,
             )?;
         }
         git::MergePreview::HasChanges => {
             git::apply_fast_forward(&repo_root, &session.branch)?;
             let summary = format!("changes auto-applied into {}", session.base_branch);
-            db.set_integration_state(
+            db.set_apply_state(
                 &session.session_id,
-                IntegrationState::Applied,
+                ApplyState::Applied,
                 AttentionLevel::Info,
                 &summary,
-            )?;
-            db.set_git_review_state(
-                &session.session_id,
-                GitSyncStatus::InSync,
-                Some(&summary),
-                false,
             )?;
         }
         git::MergePreview::Conflicted => {
             let summary = manual_accept_conflict_summary(session);
-            set_pending_review_state(
-                db,
-                session,
-                GitSyncStatus::Conflicted,
-                &summary,
-                true,
+            db.set_apply_state(
+                &session.session_id,
+                ApplyState::Idle,
                 AttentionLevel::Action,
+                &summary,
             )?;
         }
     }
 
     Ok(())
-}
-
-fn set_pending_review_state(
-    db: &Database,
-    session: &SessionRecord,
-    git_sync: GitSyncStatus,
-    summary: &str,
-    has_conflicts: bool,
-    attention: AttentionLevel,
-) -> Result<()> {
-    db.set_integration_state(
-        &session.session_id,
-        IntegrationState::PendingReview,
-        attention,
-        summary,
-    )?;
-    db.set_git_review_state(&session.session_id, git_sync, Some(summary), has_conflicts)
 }
 
 fn session_has_pending_changes(session: &SessionRecord) -> Result<bool> {
@@ -1288,88 +1214,47 @@ fn accepts_live_io(session: &SessionRecord) -> bool {
         && process_exists(session.pid)
 }
 
-fn ensure_not_pending_review(session: &SessionRecord, action: &str) -> Result<()> {
-    if session.integration_state == IntegrationState::PendingReview {
-        bail!(
-            "session `{}` has unapplied changes; use `agent diff {}` and `agent accept {}` before {action}, or `agent discard {}` to drop them",
-            session.session_id,
-            session.session_id,
-            session.session_id,
-            session.session_id
-        );
-    }
-    Ok(())
-}
-
-fn ensure_pending_review(session: &SessionRecord, action: &str) -> Result<()> {
-    if session.integration_state != IntegrationState::PendingReview {
-        bail!("session `{}` is not waiting for review; cannot {action}", session.session_id);
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone)]
-struct ReviewState {
-    git_sync: GitSyncStatus,
+struct MergeState {
+    merge_status: MergeStatus,
     summary: String,
     has_conflicts: bool,
 }
 
-fn refresh_review_state(db: &Database, session: SessionRecord) -> Result<SessionRecord> {
-    if session.integration_state == IntegrationState::PendingReview {
-        let review = inspect_review_state(&session)?;
-        if session.git_sync != review.git_sync
-            || session.git_status_summary.as_deref() != Some(review.summary.as_str())
-            || session.has_conflicts != review.has_conflicts
-        {
-            db.set_git_review_state(
-                &session.session_id,
-                review.git_sync,
-                Some(&review.summary),
-                review.has_conflicts,
-            )?;
-            return db
-                .get_session(&session.session_id)?
-                .ok_or_else(|| anyhow!("session `{}` disappeared", session.session_id));
+fn ensure_not_mergeable(session: &SessionRecord, action: &str) -> Result<()> {
+    match session.merge_status {
+        MergeStatus::Ready | MergeStatus::Blocked | MergeStatus::Conflicted => {
+            let summary = session
+                .merge_summary
+                .clone()
+                .unwrap_or_else(|| "session has mergeable committed work".to_string());
+            bail!(
+                "session `{}` has mergeable committed work; use `agent diff {}` and `agent merge {}` before {action}, or `agent discard {}` to drop it\n{}",
+                session.session_id,
+                session.session_id,
+                session.session_id,
+                session.session_id,
+                summary
+            );
         }
-        return Ok(session);
+        MergeStatus::Unknown | MergeStatus::UpToDate => Ok(()),
     }
+}
 
-    if matches!(
-        session.integration_state,
-        IntegrationState::AutoApplying | IntegrationState::Applied
-    ) {
-        return Ok(session);
-    }
-
-    if session.git_sync != GitSyncStatus::Unknown
-        || session.git_status_summary.is_some()
-        || session.has_conflicts
-    {
-        db.set_git_review_state(&session.session_id, GitSyncStatus::Unknown, None, false)?;
-        return db
-            .get_session(&session.session_id)?
-            .ok_or_else(|| anyhow!("session `{}` disappeared", session.session_id));
-    }
-
+fn refresh_merge_state(_db: &Database, mut session: SessionRecord) -> Result<SessionRecord> {
+    let merge = inspect_merge_state(&session)?;
+    session.merge_status = merge.merge_status;
+    session.merge_summary = Some(merge.summary);
+    session.has_conflicts = merge.has_conflicts;
     Ok(session)
 }
 
-fn inspect_review_state(session: &SessionRecord) -> Result<ReviewState> {
+fn inspect_merge_state(session: &SessionRecord) -> Result<MergeState> {
     let worktree = Utf8PathBuf::from(session.worktree.clone());
     if !worktree.exists() {
-        return Ok(ReviewState {
-            git_sync: GitSyncStatus::NeedsSync,
+        return Ok(MergeState {
+            merge_status: MergeStatus::Blocked,
             summary: format!("worktree {} is missing; recreate or discard it", session.worktree),
-            has_conflicts: false,
-        });
-    }
-    if git::has_worktree_changes(&worktree)? {
-        return Ok(ReviewState {
-            git_sync: GitSyncStatus::NeedsSync,
-            summary:
-                "session worktree has uncommitted changes; commit or discard them before accept"
-                    .to_string(),
             has_conflicts: false,
         });
     }
@@ -1379,54 +1264,71 @@ fn inspect_review_state(session: &SessionRecord) -> Result<ReviewState> {
     if git::has_worktree_changes(&repo_root)? {
         let summary = if current_branch == session.base_branch {
             format!(
-                "upstream checkout {} on {} has uncommitted changes; clean it before accept",
+                "upstream checkout {} on {} has uncommitted changes; clean it before merge",
                 session.repo_path, session.base_branch
             )
         } else {
             format!(
-                "repo {} has local changes on {}; clean it before accept",
+                "repo {} has local changes on {}; clean it before merge",
                 session.repo_path, current_branch
             )
         };
-        return Ok(ReviewState {
-            git_sync: GitSyncStatus::NeedsSync,
+        return Ok(MergeState {
+            merge_status: MergeStatus::Blocked,
             summary,
             has_conflicts: false,
         });
     }
 
     if current_branch != session.base_branch {
-        return Ok(ReviewState {
-            git_sync: GitSyncStatus::NeedsSync,
+        return Ok(MergeState {
+            merge_status: MergeStatus::Blocked,
             summary: format!(
-                "repo is on {}; switch to {} before accept",
+                "repo is on {}; switch to {} before merge",
                 current_branch, session.base_branch
             ),
             has_conflicts: false,
         });
     }
 
+    let has_worktree_changes = git::has_worktree_changes(&worktree)?;
+    if !has_worktree_changes
+        && !git::has_committed_diff_against_base(&worktree, &session.base_branch)?
+    {
+        return Ok(MergeState {
+            merge_status: MergeStatus::UpToDate,
+            summary: "branch is already up to date with base".to_string(),
+            has_conflicts: false,
+        });
+    }
+
+    let dirty_suffix = if has_worktree_changes {
+        " Uncommitted worktree changes are excluded from merge."
+    } else {
+        ""
+    };
+
     match git::preview_merge(&repo_root, &session.base_branch, &session.branch)? {
-        git::MergePreview::NoChanges => Ok(ReviewState {
-            git_sync: GitSyncStatus::InSync,
-            summary: "changes already present on base branch".to_string(),
+        git::MergePreview::NoChanges => Ok(MergeState {
+            merge_status: MergeStatus::UpToDate,
+            summary: format!("changes already present on base branch{dirty_suffix}"),
             has_conflicts: false,
         }),
-        git::MergePreview::HasChanges => Ok(ReviewState {
-            git_sync: GitSyncStatus::InSync,
-            summary: format!("review ready: merge into {}", session.base_branch),
+        git::MergePreview::HasChanges => Ok(MergeState {
+            merge_status: MergeStatus::Ready,
+            summary: format!("ready to merge into {}.{dirty_suffix}", session.base_branch),
             has_conflicts: false,
         }),
-        git::MergePreview::Conflicted => Ok(ReviewState {
-            git_sync: GitSyncStatus::Conflicted,
-            summary: manual_accept_conflict_summary(session),
+        git::MergePreview::Conflicted => Ok(MergeState {
+            merge_status: MergeStatus::Conflicted,
+            summary: format!("{}{}", manual_accept_conflict_summary(session), dirty_suffix),
             has_conflicts: true,
         }),
     }
 }
 
-fn review_state_for_accept(session: &SessionRecord) -> Result<ReviewState> {
-    inspect_review_state(session)
+fn merge_state_for_apply(session: &SessionRecord) -> Result<MergeState> {
+    inspect_merge_state(session)
 }
 
 fn manual_accept_conflict_summary(session: &SessionRecord) -> String {
@@ -1447,8 +1349,8 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachControl, SessionRuntime, finalize_session_exit, inspect_review_state,
-        manual_accept_conflict_summary, review_state_for_accept, shell_quote,
+        AttachControl, SessionRuntime, finalize_session_exit, inspect_merge_state,
+        manual_accept_conflict_summary, merge_state_for_apply, shell_quote,
     };
     use crate::app::SessionRuntimeRegistry;
     use crate::db::{Database, NewSession};
@@ -1456,7 +1358,7 @@ mod tests {
     use agentd_shared::{
         paths::AppPaths,
         session::{
-            AttachmentKind, GitSyncStatus, IntegrationPolicy, SessionMode, SessionRecord,
+            ApplyState, AttachmentKind, IntegrationPolicy, MergeStatus, SessionMode, SessionRecord,
             SessionStatus,
         },
     };
@@ -1751,7 +1653,7 @@ mod tests {
 
         let session = db.get_session("demo").unwrap().unwrap();
         assert_eq!(session.status, agentd_shared::session::SessionStatus::Exited);
-        assert_eq!(session.integration_state, agentd_shared::session::IntegrationState::Clean);
+        assert_eq!(session.apply_state, ApplyState::Idle);
     }
 
     #[test]
@@ -1768,45 +1670,49 @@ mod tests {
 
         let session = db.get_session("demo").unwrap().unwrap();
         assert_eq!(session.status, agentd_shared::session::SessionStatus::Exited);
-        assert_eq!(session.integration_state, agentd_shared::session::IntegrationState::Applied);
+        assert_eq!(session.apply_state, ApplyState::Applied);
     }
 
     #[test]
-    fn inspect_review_state_blocks_dirty_session_worktree() {
+    fn inspect_merge_state_allows_dirty_session_worktree_but_excludes_it() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
         let db = Database::open(&paths).unwrap();
         let repo = paths.root.join("repo");
+        let worktree = paths.root.join("worktree");
         init_git_repo(repo.as_str());
 
-        insert_session(&db, repo.as_str(), "demo", "changed");
-        fs::write(repo.join("README.md"), "repo dirty\n").unwrap();
+        insert_session_with_worktree(&db, repo.as_str(), worktree.as_str(), "demo", "changed");
+        fs::write(worktree.join("README.md"), "committed change\n").unwrap();
+        commit_all(worktree.as_str(), "session change");
+        fs::write(worktree.join("README.md"), "repo dirty\n").unwrap();
 
         let session = db.get_session("demo").unwrap().unwrap();
-        let review = inspect_review_state(&session).unwrap();
-        assert_eq!(review.git_sync, GitSyncStatus::NeedsSync);
-        assert!(review.summary.contains("session worktree has uncommitted changes"));
+        let review = inspect_merge_state(&session).unwrap();
+        assert_eq!(review.merge_status, MergeStatus::Ready);
+        assert!(review.summary.contains("excluded from merge"));
     }
 
     #[test]
-    fn review_state_for_accept_detects_conflicts() {
+    fn merge_state_for_apply_detects_conflicts() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
         let db = Database::open(&paths).unwrap();
         let repo = paths.root.join("repo");
+        let worktree = paths.root.join("worktree");
         init_git_repo(repo.as_str());
 
-        insert_session(&db, repo.as_str(), "demo", "changed");
+        insert_session_with_worktree(&db, repo.as_str(), worktree.as_str(), "demo", "changed");
         assert!(
             Command::new("git")
-                .args(["-C", repo.as_str(), "checkout", "agent/demo"])
+                .args(["-C", worktree.as_str(), "checkout", "agent/demo"])
                 .output()
                 .unwrap()
                 .status
                 .success()
         );
-        fs::write(repo.join("README.md"), "agent version\n").unwrap();
-        commit_all(repo.as_str(), "session change");
+        fs::write(worktree.join("README.md"), "agent version\n").unwrap();
+        commit_all(worktree.as_str(), "session change");
         assert!(
             Command::new("git")
                 .args(["-C", repo.as_str(), "checkout", "main"])
@@ -1819,8 +1725,8 @@ mod tests {
         commit_all(repo.as_str(), "base change");
 
         let session = db.get_session("demo").unwrap().unwrap();
-        let review = review_state_for_accept(&session).unwrap();
-        assert_eq!(review.git_sync, GitSyncStatus::Conflicted);
+        let review = merge_state_for_apply(&session).unwrap();
+        assert_eq!(review.merge_status, MergeStatus::Conflicted);
         assert!(review.has_conflicts);
         assert!(review.summary.contains("git -C"));
         assert!(review.summary.contains("checkout 'main'"));
@@ -1828,7 +1734,7 @@ mod tests {
     }
 
     #[test]
-    fn inspect_review_state_blocks_dirty_upstream_checkout() {
+    fn inspect_merge_state_blocks_dirty_upstream_checkout() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
         let db = Database::open(&paths).unwrap();
@@ -1840,8 +1746,8 @@ mod tests {
         fs::write(repo.join("README.md"), "repo dirty\n").unwrap();
 
         let session = db.get_session("demo").unwrap().unwrap();
-        let review = inspect_review_state(&session).unwrap();
-        assert_eq!(review.git_sync, GitSyncStatus::NeedsSync);
+        let review = inspect_merge_state(&session).unwrap();
+        assert_eq!(review.merge_status, MergeStatus::Blocked);
         assert!(review.summary.contains("upstream checkout"));
         assert!(review.summary.contains("main"));
     }
@@ -1863,9 +1769,9 @@ mod tests {
             worktree: "/tmp/worktree".to_string(),
             status: SessionStatus::Exited,
             integration_policy: IntegrationPolicy::AutoApplySafe,
-            integration_state: agentd_shared::session::IntegrationState::PendingReview,
-            git_sync: GitSyncStatus::InSync,
-            git_status_summary: None,
+            apply_state: ApplyState::Idle,
+            merge_status: MergeStatus::Conflicted,
+            merge_summary: None,
             has_conflicts: true,
             pid: None,
             exit_code: Some(0),
@@ -1883,24 +1789,25 @@ mod tests {
     }
 
     #[test]
-    fn inspect_review_state_marks_noop_merge_as_already_present() {
+    fn inspect_merge_state_marks_noop_merge_as_already_present() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
         let db = Database::open(&paths).unwrap();
         let repo = paths.root.join("repo");
+        let worktree = paths.root.join("worktree");
         init_git_repo(repo.as_str());
 
-        insert_session(&db, repo.as_str(), "demo", "changed");
+        insert_session_with_worktree(&db, repo.as_str(), worktree.as_str(), "demo", "changed");
         assert!(
             Command::new("git")
-                .args(["-C", repo.as_str(), "checkout", "agent/demo"])
+                .args(["-C", worktree.as_str(), "checkout", "agent/demo"])
                 .output()
                 .unwrap()
                 .status
                 .success()
         );
-        fs::write(repo.join("README.md"), "branch copy\n").unwrap();
-        commit_all(repo.as_str(), "session change");
+        fs::write(worktree.join("README.md"), "branch copy\n").unwrap();
+        commit_all(worktree.as_str(), "session change");
         assert!(
             Command::new("git")
                 .args(["-C", repo.as_str(), "checkout", "main"])
@@ -1913,8 +1820,8 @@ mod tests {
         commit_all(repo.as_str(), "same change on main");
 
         let session = db.get_session("demo").unwrap().unwrap();
-        let review = inspect_review_state(&session).unwrap();
-        assert_eq!(review.git_sync, GitSyncStatus::InSync);
+        let review = inspect_merge_state(&session).unwrap();
+        assert_eq!(review.merge_status, MergeStatus::UpToDate);
         assert_eq!(review.summary, "changes already present on base branch");
         assert!(!review.has_conflicts);
     }

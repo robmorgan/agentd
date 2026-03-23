@@ -7,8 +7,8 @@ use std::{
 use agentd_shared::{
     paths::AppPaths,
     session::{
-        AttentionLevel, GitSyncStatus, IntegrationPolicy, IntegrationState, SessionMode,
-        SessionRecord, SessionStatus, repo_name_from_path,
+        ApplyState, AttentionLevel, IntegrationPolicy, MergeStatus, SessionMode, SessionRecord,
+        SessionStatus, repo_name_from_path,
     },
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -114,7 +114,7 @@ impl LocalStore {
                 pid INTEGER,
                 exit_code INTEGER,
                 error TEXT,
-                integration_state TEXT NOT NULL DEFAULT 'clean',
+                integration_state TEXT NOT NULL DEFAULT 'idle',
                 git_sync TEXT NOT NULL DEFAULT 'unknown',
                 git_status_summary TEXT,
                 has_conflicts INTEGER NOT NULL DEFAULT 0,
@@ -156,7 +156,7 @@ impl LocalStore {
         ensure_column(
             &conn,
             "integration_state",
-            "ALTER TABLE sessions ADD COLUMN integration_state TEXT NOT NULL DEFAULT 'clean'",
+            "ALTER TABLE sessions ADD COLUMN integration_state TEXT NOT NULL DEFAULT 'idle'",
         )?;
         ensure_column(
             &conn,
@@ -191,7 +191,11 @@ impl LocalStore {
                  title = COALESCE(title, task, repo_name, workspace),
                  base_branch = COALESCE(base_branch, 'HEAD'),
                  integration_policy = COALESCE(integration_policy, 'manual_review'),
-                 integration_state = COALESCE(integration_state, 'clean'),
+                 integration_state = CASE
+                     WHEN integration_state IS NULL THEN 'idle'
+                     WHEN integration_state IN ('clean', 'pending_review') THEN 'idle'
+                     ELSE integration_state
+                 END,
                  git_sync = COALESCE(git_sync, 'unknown'),
                  has_conflicts = COALESCE(has_conflicts, 0),
                  attention = COALESCE(attention, 'info'),
@@ -310,28 +314,30 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
                 Box::new(err),
             )
         })?,
-        integration_policy: str_to_integration_policy(&row.get::<_, String>(13)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(
-                13,
-                rusqlite::types::Type::Text,
-                Box::new(err),
-            )
-        })?,
-        integration_state: str_to_integration_state(&row.get::<_, String>(14)?).map_err(|err| {
+        integration_policy: str_to_integration_policy(&row.get::<_, String>(13)?).map_err(
+            |err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    13,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            },
+        )?,
+        apply_state: str_to_apply_state(&row.get::<_, String>(14)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 14,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        git_sync: str_to_git_sync_status(&row.get::<_, String>(15)?).map_err(|err| {
+        merge_status: str_to_merge_status(&row.get::<_, String>(15)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 15,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        git_status_summary: row.get(16)?,
+        merge_summary: row.get(16)?,
         has_conflicts: row.get::<_, bool>(17)?,
         pid: row.get::<_, Option<u32>>(18)?,
         exit_code: row.get(19)?,
@@ -383,16 +389,15 @@ fn str_to_status(value: &str) -> std::result::Result<SessionStatus, std::io::Err
     }
 }
 
-fn str_to_integration_state(value: &str) -> std::result::Result<IntegrationState, std::io::Error> {
+fn str_to_apply_state(value: &str) -> std::result::Result<ApplyState, std::io::Error> {
     match value {
-        "clean" => Ok(IntegrationState::Clean),
-        "auto_applying" => Ok(IntegrationState::AutoApplying),
-        "pending_review" => Ok(IntegrationState::PendingReview),
-        "applied" => Ok(IntegrationState::Applied),
-        "discarded" => Ok(IntegrationState::Discarded),
+        "idle" | "clean" | "pending_review" => Ok(ApplyState::Idle),
+        "auto_applying" => Ok(ApplyState::AutoApplying),
+        "applied" => Ok(ApplyState::Applied),
+        "discarded" => Ok(ApplyState::Discarded),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("unknown integration state `{value}`"),
+            format!("unknown apply state `{value}`"),
         )),
     }
 }
@@ -410,15 +415,16 @@ fn str_to_integration_policy(
     }
 }
 
-fn str_to_git_sync_status(value: &str) -> std::result::Result<GitSyncStatus, std::io::Error> {
+fn str_to_merge_status(value: &str) -> std::result::Result<MergeStatus, std::io::Error> {
     match value {
-        "unknown" => Ok(GitSyncStatus::Unknown),
-        "in_sync" => Ok(GitSyncStatus::InSync),
-        "needs_sync" => Ok(GitSyncStatus::NeedsSync),
-        "conflicted" => Ok(GitSyncStatus::Conflicted),
+        "unknown" => Ok(MergeStatus::Unknown),
+        "up_to_date" => Ok(MergeStatus::UpToDate),
+        "ready" | "in_sync" => Ok(MergeStatus::Ready),
+        "blocked" | "needs_sync" => Ok(MergeStatus::Blocked),
+        "conflicted" => Ok(MergeStatus::Conflicted),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("unknown git sync status `{value}`"),
+            format!("unknown merge status `{value}`"),
         )),
     }
 }

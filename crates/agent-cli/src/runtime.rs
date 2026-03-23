@@ -20,7 +20,9 @@ use agentd_shared::{
     config::Config,
     paths::AppPaths,
     protocol::{Request, Response},
-    session::{GitSyncStatus, IntegrationPolicy, IntegrationState, SessionMode, SessionRecord, SessionStatus},
+    session::{
+        ApplyState, IntegrationPolicy, MergeStatus, SessionMode, SessionRecord, SessionStatus,
+    },
 };
 
 use crate::{
@@ -96,11 +98,7 @@ const SESSION_LIST_BRANCH_FLOOR_WIDTH: usize = 8;
 const SESSION_LIST_STRUCTURAL_WIDTH: usize = 12;
 
 fn default_integration_policy(paths: &AppPaths) -> IntegrationPolicy {
-    match Config::load(paths)
-        .ok()
-        .map(|config| config.git.default_integration_policy)
-        .as_deref()
-    {
+    match Config::load(paths).ok().map(|config| config.git.default_integration_policy).as_deref() {
         Some("manual_review") => IntegrationPolicy::ManualReview,
         _ => IntegrationPolicy::AutoApplySafe,
     }
@@ -815,7 +813,7 @@ impl SessionPicker {
             actions.push(SessionAction::Attach);
         }
         actions.push(SessionAction::Diff);
-        if session.integration_state == IntegrationState::PendingReview {
+        if session.merge_status == MergeStatus::Ready {
             actions.push(SessionAction::Merge);
         }
         actions.push(SessionAction::Delete);
@@ -1462,12 +1460,13 @@ impl AttachOverlay {
             }
             Command::GitStatus => {
                 let session = daemon_get_session(&self.paths, &self.session_id).await?;
-                let sync = session.git_sync.as_str();
-                let summary = session.git_status_summary.clone().unwrap_or_else(|| {
-                    "TODO: live git status sync not implemented yet".to_string()
-                });
+                let sync = session.merge_status.as_str();
+                let summary = session
+                    .merge_summary
+                    .clone()
+                    .unwrap_or_else(|| "merge status unavailable".to_string());
                 self.detail_text = format!(
-                    "repo      {}\nrepo_path  {}\nworktree   {}\nbranch     {}\nbase       {}\ngit_sync   {}\nconflicts  {}\nstatus     {}\n\n{}",
+                    "repo      {}\nrepo_path  {}\nworktree   {}\nbranch     {}\nbase       {}\nmerge     {}\nconflicts  {}\nstatus     {}\n\n{}",
                     session.repo_name,
                     session.repo_path,
                     session.worktree,
@@ -1703,7 +1702,7 @@ fn session_search_text(session: &SessionRecord) -> String {
         session.repo_name,
         session.branch,
         session.status_string(),
-        session.integration_string(),
+        session.apply_state.as_str(),
         session.attention_string()
     )
 }
@@ -1715,9 +1714,9 @@ fn session_rank(session: &SessionRecord) -> u8 {
         || session.has_conflicts
     {
         1
-    } else if session.integration_state == IntegrationState::AutoApplying {
+    } else if session.apply_state == ApplyState::AutoApplying {
         2
-    } else if session.integration_state == IntegrationState::PendingReview {
+    } else if session.merge_status == MergeStatus::Ready {
         3
     } else if matches!(session.status, SessionStatus::Running | SessionStatus::Creating) {
         4
@@ -1727,9 +1726,9 @@ fn session_rank(session: &SessionRecord) -> u8 {
 }
 
 fn session_icon(session: &SessionRecord) -> &'static str {
-    if session.integration_state == IntegrationState::AutoApplying {
+    if session.apply_state == ApplyState::AutoApplying {
         "↺"
-    } else if session.integration_state == IntegrationState::PendingReview {
+    } else if session.merge_status == MergeStatus::Ready {
         "⧖"
     } else {
         match session.status {
@@ -1743,9 +1742,9 @@ fn session_icon(session: &SessionRecord) -> &'static str {
 }
 
 fn session_icon_color(session: &SessionRecord) -> Color {
-    if session.integration_state == IntegrationState::AutoApplying {
+    if session.apply_state == ApplyState::AutoApplying {
         Color::Yellow
-    } else if session.integration_state == IntegrationState::PendingReview {
+    } else if session.merge_status == MergeStatus::Ready {
         Color::Blue
     } else {
         match session.status {
@@ -1788,23 +1787,21 @@ fn render_host_picker_session_row(session: &SessionRecord, width: usize, selecte
 
 fn render_host_picker_legend_row(width: usize, sessions: &[SessionRecord]) -> String {
     let entries = [
-        (demo_status_session(SessionStatus::NeedsInput, IntegrationState::Clean), "needs input"),
-        (demo_status_session(SessionStatus::Failed, IntegrationState::Clean), "failed"),
+        (demo_status_session(SessionStatus::NeedsInput, ApplyState::Idle), "needs input"),
+        (demo_status_session(SessionStatus::Failed, ApplyState::Idle), "failed"),
+        (demo_status_session(SessionStatus::UnknownRecovered, ApplyState::Idle), "recovered"),
         (
-            demo_status_session(SessionStatus::UnknownRecovered, IntegrationState::Clean),
-            "recovered",
+            {
+                let mut session = demo_status_session(SessionStatus::Exited, ApplyState::Idle);
+                session.merge_status = MergeStatus::Ready;
+                session
+            },
+            "ready to merge",
         ),
-        (
-            demo_status_session(SessionStatus::Exited, IntegrationState::PendingReview),
-            "pending review",
-        ),
-        (
-            demo_status_session(SessionStatus::Exited, IntegrationState::AutoApplying),
-            "auto applying",
-        ),
-        (demo_status_session(SessionStatus::Running, IntegrationState::Clean), "running"),
-        (demo_status_session(SessionStatus::UnknownRecovered, IntegrationState::Clean), "recovered"),
-        (demo_status_session(SessionStatus::Exited, IntegrationState::Clean), "exited"),
+        (demo_status_session(SessionStatus::Exited, ApplyState::AutoApplying), "auto applying"),
+        (demo_status_session(SessionStatus::Running, ApplyState::Idle), "running"),
+        (demo_status_session(SessionStatus::UnknownRecovered, ApplyState::Idle), "recovered"),
+        (demo_status_session(SessionStatus::Exited, ApplyState::Idle), "exited"),
     ];
     let max_chars = width.saturating_sub(1).max(1);
     let mut line = "  ".to_string();
@@ -1846,10 +1843,7 @@ fn render_host_picker_legend_row(width: usize, sessions: &[SessionRecord]) -> St
     line
 }
 
-fn demo_status_session(
-    status: SessionStatus,
-    integration_state: IntegrationState,
-) -> SessionRecord {
+fn demo_status_session(status: SessionStatus, apply_state: ApplyState) -> SessionRecord {
     SessionRecord {
         session_id: String::new(),
         thread_id: None,
@@ -1865,9 +1859,9 @@ fn demo_status_session(
         worktree: String::new(),
         status,
         integration_policy: IntegrationPolicy::AutoApplySafe,
-        integration_state,
-        git_sync: GitSyncStatus::Unknown,
-        git_status_summary: None,
+        apply_state,
+        merge_status: MergeStatus::Unknown,
+        merge_summary: None,
         has_conflicts: false,
         pid: None,
         exit_code: None,
@@ -1881,11 +1875,11 @@ fn demo_status_session(
 }
 
 fn session_list_status_label(session: &SessionRecord) -> &'static str {
-    if session.integration_state == IntegrationState::AutoApplying {
+    if session.apply_state == ApplyState::AutoApplying {
         "auto applying"
-    } else if session.integration_state == IntegrationState::PendingReview {
-        "pending review"
-    } else if session.integration_state == IntegrationState::Applied {
+    } else if session.merge_status == MergeStatus::Ready {
+        "ready to merge"
+    } else if session.apply_state == ApplyState::Applied {
         "applied"
     } else {
         match session.status {
@@ -1899,9 +1893,8 @@ fn session_list_status_label(session: &SessionRecord) -> &'static str {
 }
 
 fn host_picker_icon_ansi_prefix(session: &SessionRecord) -> String {
-    match session.integration_state {
-        IntegrationState::AutoApplying => HOST_PICKER_STATUS_YELLOW_FG.to_string(),
-        IntegrationState::PendingReview => HOST_PICKER_STATUS_BLUE_FG.to_string(),
+    match session.apply_state {
+        ApplyState::AutoApplying => HOST_PICKER_STATUS_YELLOW_FG.to_string(),
         _ => match session.status {
             SessionStatus::NeedsInput => format!("{ANSI_DIM}{HOST_PICKER_STATUS_YELLOW_FG}"),
             SessionStatus::Failed => HOST_PICKER_STATUS_RED_FG.to_string(),
@@ -1909,7 +1902,13 @@ fn host_picker_icon_ansi_prefix(session: &SessionRecord) -> String {
             SessionStatus::Running | SessionStatus::Creating => {
                 HOST_PICKER_STATUS_GREEN_FG.to_string()
             }
-            SessionStatus::Exited => HOST_PICKER_STATUS_GREEN_FG.to_string(),
+            SessionStatus::Exited => {
+                if session.merge_status == MergeStatus::Ready {
+                    HOST_PICKER_STATUS_BLUE_FG.to_string()
+                } else {
+                    HOST_PICKER_STATUS_GREEN_FG.to_string()
+                }
+            }
         },
     }
 }
@@ -1918,11 +1917,14 @@ fn session_status_text(session: &SessionRecord) -> String {
     if let Some(summary) = &session.attention_summary {
         return summary.clone();
     }
-    if session.integration_state == IntegrationState::AutoApplying {
+    if session.apply_state == ApplyState::AutoApplying {
         return "auto applying".to_string();
     }
-    if session.integration_state == IntegrationState::Applied {
+    if session.apply_state == ApplyState::Applied {
         return "applied".to_string();
+    }
+    if let Some(summary) = &session.merge_summary {
+        return summary.clone();
     }
     match session.status {
         SessionStatus::Creating => "starting".to_string(),
@@ -1952,28 +1954,34 @@ mod tests {
         ANSI_RESET, AttachOverlay, HOST_PICKER_CURSOR, HOST_PICKER_DIFF_ADD_STYLE,
         HOST_PICKER_DIFF_HEADER_STYLE, HOST_PICKER_DIFF_HUNK_STYLE, HOST_PICKER_DIFF_REMOVE_STYLE,
         HOST_PICKER_LEGEND_TEXT_STYLE, HOST_PICKER_PLACEHOLDER_FG, HOST_PICKER_QUERY_BG,
-        HOST_PICKER_SELECTED_STYLE, HOST_PICKER_STATUS_BLUE_FG,
-        HOST_PICKER_STATUS_GREEN_FG, HOST_PICKER_STATUS_RED_FG, HOST_PICKER_STATUS_YELLOW_FG,
-        HOST_PICKER_TEXT_FG, OverlayMode, OverlayOutcome, PickerComposer, PickerMode, PickerRow,
-        SessionAction, SessionPicker, configured_agent_names, fit_host_picker_line,
-        render_host_picker_brand, render_host_picker_legend_row, render_host_picker_session_row,
-        render_host_picker_subtitle, render_host_picker_title_line,
-        render_session_list_header_content, render_session_list_header_row,
-        render_session_list_lines, session_icon, session_icon_color, session_list_layout,
-        style_host_picker_background_row, style_host_picker_diff_line,
-        style_host_picker_query_line,
+        HOST_PICKER_SELECTED_STYLE, HOST_PICKER_STATUS_BLUE_FG, HOST_PICKER_STATUS_GREEN_FG,
+        HOST_PICKER_STATUS_RED_FG, HOST_PICKER_STATUS_YELLOW_FG, HOST_PICKER_TEXT_FG, OverlayMode,
+        OverlayOutcome, PickerComposer, PickerMode, PickerRow, SessionAction, SessionPicker,
+        configured_agent_names, fit_host_picker_line, render_host_picker_brand,
+        render_host_picker_legend_row, render_host_picker_session_row, render_host_picker_subtitle,
+        render_host_picker_title_line, render_session_list_header_content,
+        render_session_list_header_row, render_session_list_lines, session_icon,
+        session_icon_color, session_list_layout, style_host_picker_background_row,
+        style_host_picker_diff_line, style_host_picker_query_line,
     };
     use agentd_shared::{
         paths::AppPaths,
         session::{
-            AttentionLevel, GitSyncStatus, IntegrationPolicy, IntegrationState, SessionMode,
-            SessionRecord, SessionStatus,
+            ApplyState, AttentionLevel, IntegrationPolicy, MergeStatus, SessionMode, SessionRecord,
+            SessionStatus,
         },
     };
     use camino::Utf8PathBuf;
     use chrono::{Duration, Utc};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use futures::executor::block_on;
+
+    #[derive(Clone, Copy)]
+    enum IntegrationState {
+        Clean,
+        AutoApplying,
+        PendingReview,
+    }
 
     fn strip_ansi(input: &str) -> String {
         let mut output = String::new();
@@ -2094,7 +2102,7 @@ mod tests {
     #[test]
     fn action_menu_shows_merge_for_pending_review() {
         let mut session = demo("alpha", "repo-a");
-        session.integration_state = IntegrationState::PendingReview;
+        session.merge_status = MergeStatus::Ready;
         session.status = SessionStatus::Exited;
         let picker = SessionPicker {
             paths: test_paths(),
@@ -2116,7 +2124,7 @@ mod tests {
     #[test]
     fn action_menu_shows_attach_and_merge_when_both_apply() {
         let mut session = demo("alpha", "repo-a");
-        session.integration_state = IntegrationState::PendingReview;
+        session.merge_status = MergeStatus::Ready;
         let picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![session],
@@ -2456,7 +2464,12 @@ mod tests {
             &[
                 demo_with("alpha", "repo-a", SessionStatus::NeedsInput, IntegrationState::Clean),
                 demo_with("beta", "repo-b", SessionStatus::Exited, IntegrationState::PendingReview),
-                demo_with("gamma", "repo-c", SessionStatus::UnknownRecovered, IntegrationState::Clean),
+                demo_with(
+                    "gamma",
+                    "repo-c",
+                    SessionStatus::UnknownRecovered,
+                    IntegrationState::Clean,
+                ),
             ],
         );
         assert!(rendered.contains(HOST_PICKER_STATUS_YELLOW_FG));
@@ -2467,7 +2480,7 @@ mod tests {
         assert!(rendered.contains("⧖"));
         assert!(rendered.contains("⚠"));
         assert!(rendered.contains("needs input"));
-        assert!(rendered.contains("pending review"));
+        assert!(rendered.contains("ready to merge"));
         assert!(rendered.contains("recovered"));
         assert!(rendered.contains(" • "));
         assert!(!rendered.contains("failed"));
@@ -2533,7 +2546,12 @@ mod tests {
         let rendered = render_session_list_lines(
             &[
                 demo_with("alpha", "repo-a", SessionStatus::NeedsInput, IntegrationState::Clean),
-                demo_with("beta", "repo-b", SessionStatus::UnknownRecovered, IntegrationState::Clean),
+                demo_with(
+                    "beta",
+                    "repo-b",
+                    SessionStatus::UnknownRecovered,
+                    IntegrationState::Clean,
+                ),
             ],
             120,
         )
@@ -2676,6 +2694,11 @@ mod tests {
         status: SessionStatus,
         integration_state: IntegrationState,
     ) -> SessionRecord {
+        let (apply_state, merge_status) = match integration_state {
+            IntegrationState::Clean => (ApplyState::Idle, MergeStatus::Unknown),
+            IntegrationState::AutoApplying => (ApplyState::AutoApplying, MergeStatus::Unknown),
+            IntegrationState::PendingReview => (ApplyState::Idle, MergeStatus::Ready),
+        };
         let now = Utc::now();
         SessionRecord {
             session_id: session_id.to_string(),
@@ -2692,9 +2715,9 @@ mod tests {
             worktree: format!("/tmp/{session_id}"),
             status,
             integration_policy: IntegrationPolicy::AutoApplySafe,
-            integration_state,
-            git_sync: GitSyncStatus::InSync,
-            git_status_summary: None,
+            apply_state,
+            merge_status,
+            merge_summary: None,
             has_conflicts: false,
             pid: Some(123),
             exit_code: None,

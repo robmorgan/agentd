@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::session::{
-    AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult, GitSyncStatus,
-    IntegrationPolicy, IntegrationState, SessionDiff, SessionMode, SessionRecord, SessionStatus,
+    ApplyState, AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult,
+    IntegrationPolicy, MergeStatus, SessionDiff, SessionMode, SessionRecord, SessionStatus,
     WorktreeRecord,
 };
 
@@ -148,7 +148,8 @@ pub enum Response {
     SessionEnded {
         session_id: String,
         status: SessionStatus,
-        integration_state: IntegrationState,
+        apply_state: ApplyState,
+        merge_status: MergeStatus,
         branch: String,
         worktree: String,
         exit_code: Option<i32>,
@@ -632,7 +633,8 @@ fn encode_response(response: &Response) -> Result<(MessageKind, Vec<u8>)> {
         Response::SessionEnded {
             session_id,
             status,
-            integration_state,
+            apply_state,
+            merge_status,
             branch,
             worktree,
             exit_code,
@@ -640,7 +642,8 @@ fn encode_response(response: &Response) -> Result<(MessageKind, Vec<u8>)> {
         } => {
             put_string(&mut payload, session_id)?;
             put_session_status(&mut payload, *status);
-            put_integration_state(&mut payload, *integration_state);
+            put_apply_state(&mut payload, *apply_state);
+            put_merge_status(&mut payload, *merge_status);
             put_string(&mut payload, branch)?;
             put_string(&mut payload, worktree)?;
             put_optional_i32(&mut payload, *exit_code);
@@ -714,7 +717,8 @@ fn decode_response(kind: MessageKind, payload: &[u8]) -> Result<Response> {
         MessageKind::SessionEndedResponse => Response::SessionEnded {
             session_id: cursor.take_string()?,
             status: cursor.take_session_status()?,
-            integration_state: cursor.take_integration_state()?,
+            apply_state: cursor.take_apply_state()?,
+            merge_status: cursor.take_merge_status()?,
             branch: cursor.take_string()?,
             worktree: cursor.take_string()?,
             exit_code: cursor.take_optional_i32()?,
@@ -879,13 +883,12 @@ fn put_attention_level(buf: &mut Vec<u8>, attention: AttentionLevel) {
     });
 }
 
-fn put_integration_state(buf: &mut Vec<u8>, state: IntegrationState) {
+fn put_apply_state(buf: &mut Vec<u8>, state: ApplyState) {
     buf.push(match state {
-        IntegrationState::Clean => 1,
-        IntegrationState::AutoApplying => 2,
-        IntegrationState::PendingReview => 3,
-        IntegrationState::Applied => 4,
-        IntegrationState::Discarded => 5,
+        ApplyState::Idle => 1,
+        ApplyState::AutoApplying => 2,
+        ApplyState::Applied => 4,
+        ApplyState::Discarded => 5,
     });
 }
 
@@ -896,12 +899,13 @@ fn put_integration_policy(buf: &mut Vec<u8>, policy: IntegrationPolicy) {
     });
 }
 
-fn put_git_sync_status(buf: &mut Vec<u8>, status: GitSyncStatus) {
+fn put_merge_status(buf: &mut Vec<u8>, status: MergeStatus) {
     buf.push(match status {
-        GitSyncStatus::Unknown => 1,
-        GitSyncStatus::InSync => 2,
-        GitSyncStatus::NeedsSync => 3,
-        GitSyncStatus::Conflicted => 4,
+        MergeStatus::Unknown => 1,
+        MergeStatus::UpToDate => 2,
+        MergeStatus::Ready => 3,
+        MergeStatus::Blocked => 4,
+        MergeStatus::Conflicted => 5,
     });
 }
 
@@ -956,9 +960,9 @@ fn put_session_record(buf: &mut Vec<u8>, session: &SessionRecord) -> Result<()> 
     put_string(buf, &session.worktree)?;
     put_session_status(buf, session.status);
     put_integration_policy(buf, session.integration_policy);
-    put_integration_state(buf, session.integration_state);
-    put_git_sync_status(buf, session.git_sync);
-    put_optional_string(buf, session.git_status_summary.as_deref())?;
+    put_apply_state(buf, session.apply_state);
+    put_merge_status(buf, session.merge_status);
+    put_optional_string(buf, session.merge_summary.as_deref())?;
     put_bool(buf, session.has_conflicts);
     put_optional_u32(buf, session.pid);
     put_optional_i32(buf, session.exit_code);
@@ -1124,14 +1128,14 @@ impl<'a> Cursor<'a> {
         })
     }
 
-    fn take_integration_state(&mut self) -> Result<IntegrationState> {
+    fn take_apply_state(&mut self) -> Result<ApplyState> {
         Ok(match self.take_u8()? {
-            1 => IntegrationState::Clean,
-            2 => IntegrationState::AutoApplying,
-            3 => IntegrationState::PendingReview,
-            4 => IntegrationState::Applied,
-            5 => IntegrationState::Discarded,
-            other => bail!("invalid integration state `{other}`"),
+            1 => ApplyState::Idle,
+            2 => ApplyState::AutoApplying,
+            3 => ApplyState::Idle,
+            4 => ApplyState::Applied,
+            5 => ApplyState::Discarded,
+            other => bail!("invalid apply state `{other}`"),
         })
     }
 
@@ -1143,13 +1147,14 @@ impl<'a> Cursor<'a> {
         })
     }
 
-    fn take_git_sync_status(&mut self) -> Result<GitSyncStatus> {
+    fn take_merge_status(&mut self) -> Result<MergeStatus> {
         Ok(match self.take_u8()? {
-            1 => GitSyncStatus::Unknown,
-            2 => GitSyncStatus::InSync,
-            3 => GitSyncStatus::NeedsSync,
-            4 => GitSyncStatus::Conflicted,
-            other => bail!("invalid git sync status `{other}`"),
+            1 => MergeStatus::Unknown,
+            2 => MergeStatus::UpToDate,
+            3 => MergeStatus::Ready,
+            4 => MergeStatus::Blocked,
+            5 => MergeStatus::Conflicted,
+            other => bail!("invalid merge status `{other}`"),
         })
     }
 
@@ -1223,9 +1228,9 @@ impl<'a> Cursor<'a> {
             worktree: self.take_string()?,
             status: self.take_session_status()?,
             integration_policy: self.take_integration_policy()?,
-            integration_state: self.take_integration_state()?,
-            git_sync: self.take_git_sync_status()?,
-            git_status_summary: self.take_optional_string()?,
+            apply_state: self.take_apply_state()?,
+            merge_status: self.take_merge_status()?,
+            merge_summary: self.take_optional_string()?,
             has_conflicts: self.take_bool()?,
             pid: self.take_optional_u32()?,
             exit_code: self.take_optional_i32()?,
@@ -1287,8 +1292,8 @@ mod tests {
         write_daemon_management_response,
     };
     use crate::session::{
-        AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult, GitSyncStatus,
-        IntegrationPolicy, IntegrationState, SessionMode, SessionRecord, SessionStatus,
+        ApplyState, AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult,
+        IntegrationPolicy, MergeStatus, SessionMode, SessionRecord, SessionStatus,
     };
     use chrono::Utc;
     use tokio::io::AsyncWriteExt;
@@ -1438,9 +1443,9 @@ mod tests {
                 worktree: "/tmp/worktree".to_string(),
                 status: SessionStatus::Running,
                 integration_policy: IntegrationPolicy::AutoApplySafe,
-                integration_state: IntegrationState::Clean,
-                git_sync: GitSyncStatus::Unknown,
-                git_status_summary: None,
+                apply_state: ApplyState::Idle,
+                merge_status: MergeStatus::Unknown,
+                merge_summary: None,
                 has_conflicts: false,
                 pid: Some(123),
                 exit_code: None,
@@ -1491,7 +1496,8 @@ mod tests {
         let response = Response::SessionEnded {
             session_id: "demo".to_string(),
             status: SessionStatus::Exited,
-            integration_state: IntegrationState::PendingReview,
+            apply_state: ApplyState::Idle,
+            merge_status: MergeStatus::Ready,
             branch: "agent/demo".to_string(),
             worktree: "/tmp/worktree".to_string(),
             exit_code: Some(0),
