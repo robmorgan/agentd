@@ -9,7 +9,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{
+    Parser, Subcommand,
+    builder::styling::{AnsiColor, Effects, Styles},
+};
 use crossterm::{
     cursor::{Hide, Show},
     event::{DisableMouseCapture, EnableMouseCapture},
@@ -62,8 +65,48 @@ const CODEX_MODELS: &[&str] = &[
     "gpt-5-codex",
 ];
 
+const ROOT_HELP_TEMPLATE: &str = "\
+{before-help}{name} {version}
+
+{about-with-newline}{usage-heading} {usage}
+
+{subcommands}
+{options}
+{after-help}";
+
+const GROUP_HELP_TEMPLATE: &str = "\
+{before-help}{name}
+
+{about-with-newline}{usage-heading} {usage}
+
+{subcommands}
+{options}
+{after-help}";
+
+fn cli_styles() -> Styles {
+    Styles::styled()
+        .header(AnsiColor::Cyan.on_default() | Effects::BOLD)
+        .usage(AnsiColor::Yellow.on_default() | Effects::BOLD)
+        .literal(AnsiColor::Green.on_default() | Effects::BOLD)
+        .placeholder(AnsiColor::BrightBlack.on_default())
+        .valid(AnsiColor::Green.on_default())
+        .invalid(AnsiColor::Red.on_default() | Effects::BOLD)
+        .error(AnsiColor::Red.on_default() | Effects::BOLD)
+}
+
 #[derive(Debug, Parser)]
-#[command(name = "agent")]
+#[command(
+    name = "agent",
+    version,
+    about = "Run, inspect, and review local coding sessions",
+    before_help = "agent\nA local multi-session coding workflow for daemon-backed agents.\n\nCore flows:\n  Start a session      agent new \"fix flaky tests\"\n  Inspect sessions     agent list\n  Reconnect live PTY   agent attach <session_id>\n  Review changes       agent diff <session_id> | agent accept <session_id>",
+    after_help = "Examples:\n  agent new \"add health checks\"\n  agent create --workspace . --agent codex --title \"refactor retries\"\n  agent list\n  agent status <session_id>\n  agent daemon info\n\nUse `agent <command> --help` for command-specific details.",
+    help_template = ROOT_HELP_TEMPLATE,
+    styles = cli_styles(),
+    disable_help_subcommand = true,
+    propagate_version = true,
+    next_display_order = 1
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -75,6 +118,7 @@ enum Command {
     Runtime {
         session_id: Option<String>,
     },
+    #[command(about = "Start and attach to a new session", display_order = 1)]
     New {
         title: Option<String>,
         #[arg(long)]
@@ -82,6 +126,7 @@ enum Command {
         #[arg(long)]
         agent: Option<String>,
     },
+    #[command(about = "Create a session without attaching", display_order = 2)]
     Create {
         #[arg(long)]
         workspace: PathBuf,
@@ -90,14 +135,17 @@ enum Command {
         #[arg(long)]
         agent: String,
     },
+    #[command(about = "Stop a running session or remove its record", display_order = 3)]
     Kill {
         #[arg(long)]
         rm: bool,
         session_id: String,
     },
+    #[command(about = "Attach to a live session PTY", display_order = 4)]
     Attach {
         session_id: String,
     },
+    #[command(about = "Detach one or more attached clients", display_order = 5)]
     Detach {
         session_id: Option<String>,
         #[arg(long)]
@@ -105,6 +153,7 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    #[command(about = "Send background input to a live session", display_order = 6)]
     SendInput {
         session_id: String,
         #[arg(long)]
@@ -117,34 +166,47 @@ enum Command {
         )]
         data: Vec<String>,
     },
+    #[command(about = "Apply a reviewed session back to the base branch", display_order = 7)]
     Accept {
         session_id: String,
     },
+    #[command(about = "Discard a session's worktree and changes", display_order = 8)]
     Discard {
         session_id: String,
         #[arg(long)]
         force: bool,
     },
+    #[command(about = "Print captured session history", display_order = 9)]
     History {
         session_id: String,
         #[arg(long)]
         vt: bool,
     },
-    #[command(visible_alias = "ls", alias = "sessions")]
+    #[command(
+        visible_alias = "ls",
+        alias = "sessions",
+        about = "List known sessions",
+        display_order = 10
+    )]
     List,
+    #[command(about = "Show currently attached clients for a session", display_order = 11)]
     Attachments {
         session_id: String,
     },
+    #[command(about = "Show detailed session status", display_order = 12)]
     Status {
         session_id: String,
     },
+    #[command(about = "Show the session diff against its base branch", display_order = 13)]
     Diff {
         session_id: String,
     },
+    #[command(about = "Create or clean up session worktrees", display_order = 14)]
     Worktree {
         #[command(subcommand)]
         command: WorktreeCommand,
     },
+    #[command(about = "Inspect or control the local agent daemon", display_order = 15)]
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -152,18 +214,39 @@ enum Command {
 }
 
 #[derive(Debug, Subcommand)]
+#[command(
+    name = "agent worktree",
+    help_template = GROUP_HELP_TEMPLATE,
+    before_help = "agent worktree\nManage the git worktree attached to a session.\n\nTypical flow:\n  agent worktree create <session_id>\n  agent worktree cleanup <session_id>",
+    after_help = "Use `agent status <session_id>` first if you are unsure whether a session is still live.",
+    styles = cli_styles(),
+    next_display_order = 1
+)]
 enum WorktreeCommand {
+    #[command(about = "Create the session worktree on disk", display_order = 1)]
     Create { session_id: String },
+    #[command(about = "Remove the session worktree from disk", display_order = 2)]
     Cleanup { session_id: String },
 }
 
 #[derive(Debug, Subcommand)]
+#[command(
+    name = "agent daemon",
+    help_template = GROUP_HELP_TEMPLATE,
+    before_help = "agent daemon\nInspect, restart, or upgrade the local daemon process.",
+    after_help = "Notes:\n  `restart` keeps metadata but does not preserve live PTY connectivity.\n  `upgrade` refuses to run while sessions are still live.",
+    styles = cli_styles(),
+    next_display_order = 1
+)]
 enum DaemonCommand {
+    #[command(about = "Show daemon version, socket, pid, and compatibility", display_order = 1)]
     Info,
+    #[command(about = "Restart the daemon", display_order = 2)]
     Restart {
         #[arg(long)]
         force: bool,
     },
+    #[command(about = "Upgrade the daemon binary when no sessions are live", display_order = 3)]
     Upgrade,
 }
 
