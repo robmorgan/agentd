@@ -49,6 +49,7 @@ dependencies = [
  "dirs",
  "indexmap",
  "nix 0.30.1",
+ "rusqlite",
  "serde",
  "serde_json",
  "slug",

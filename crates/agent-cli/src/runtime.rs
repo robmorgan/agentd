@@ -20,7 +20,10 @@ use agentd_shared::{
     config::Config,
     paths::AppPaths,
     protocol::{Request, Response},
-    session::{GitSyncStatus, IntegrationPolicy, IntegrationState, SessionMode, SessionRecord, SessionStatus},
+    session::{
+        GitSyncStatus, IntegrationPolicy, IntegrationState, SessionMode, SessionRecord,
+        SessionStatus,
+    },
 };
 
 use crate::{
@@ -96,11 +99,7 @@ const SESSION_LIST_BRANCH_FLOOR_WIDTH: usize = 8;
 const SESSION_LIST_STRUCTURAL_WIDTH: usize = 12;
 
 fn default_integration_policy(paths: &AppPaths) -> IntegrationPolicy {
-    match Config::load(paths)
-        .ok()
-        .map(|config| config.git.default_integration_policy)
-        .as_deref()
-    {
+    match Config::load(paths).ok().map(|config| config.git.default_integration_policy).as_deref() {
         Some("manual_review") => IntegrationPolicy::ManualReview,
         _ => IntegrationPolicy::AutoApplySafe,
     }
@@ -1823,7 +1822,10 @@ fn render_host_picker_legend_row(width: usize, sessions: &[SessionRecord]) -> St
             "auto applying",
         ),
         (demo_status_session(SessionStatus::Running, IntegrationState::Clean), "running"),
-        (demo_status_session(SessionStatus::UnknownRecovered, IntegrationState::Clean), "recovered"),
+        (
+            demo_status_session(SessionStatus::UnknownRecovered, IntegrationState::Clean),
+            "recovered",
+        ),
         (demo_status_session(SessionStatus::Exited, IntegrationState::Clean), "exited"),
     ];
     let max_chars = width.saturating_sub(1).max(1);
@@ -1972,11 +1974,10 @@ mod tests {
         ANSI_RESET, AttachOverlay, HOST_PICKER_CURSOR, HOST_PICKER_DIFF_ADD_STYLE,
         HOST_PICKER_DIFF_HEADER_STYLE, HOST_PICKER_DIFF_HUNK_STYLE, HOST_PICKER_DIFF_REMOVE_STYLE,
         HOST_PICKER_LEGEND_TEXT_STYLE, HOST_PICKER_PLACEHOLDER_FG, HOST_PICKER_QUERY_BG,
-        HOST_PICKER_SELECTED_STYLE, HOST_PICKER_STATUS_BLUE_FG,
-        HOST_PICKER_STATUS_GREEN_FG, HOST_PICKER_STATUS_RED_FG, HOST_PICKER_STATUS_YELLOW_FG,
-        HOST_PICKER_TEXT_FG, OverlayMode, OverlayOutcome, PickerComposer, PickerMode, PickerRow,
-        SessionAction, SessionPicker, configured_agent_names, fit_host_picker_line,
-        interpolate_ansi_value,
+        HOST_PICKER_SELECTED_STYLE, HOST_PICKER_STATUS_BLUE_FG, HOST_PICKER_STATUS_GREEN_FG,
+        HOST_PICKER_STATUS_RED_FG, HOST_PICKER_STATUS_YELLOW_FG, HOST_PICKER_TEXT_FG, OverlayMode,
+        OverlayOutcome, PickerComposer, PickerMode, PickerRow, SessionAction, SessionPicker,
+        configured_agent_names, fit_host_picker_line, interpolate_ansi_value,
         render_host_picker_brand, render_host_picker_gradient_text, render_host_picker_legend_row,
         render_host_picker_session_row, render_host_picker_subtitle, render_host_picker_title_line,
         render_session_list_header_content, render_session_list_header_row,
@@ -2477,7 +2478,12 @@ mod tests {
             &[
                 demo_with("alpha", "repo-a", SessionStatus::NeedsInput, IntegrationState::Clean),
                 demo_with("beta", "repo-b", SessionStatus::Exited, IntegrationState::PendingReview),
-                demo_with("gamma", "repo-c", SessionStatus::UnknownRecovered, IntegrationState::Clean),
+                demo_with(
+                    "gamma",
+                    "repo-c",
+                    SessionStatus::UnknownRecovered,
+                    IntegrationState::Clean,
+                ),
             ],
         );
         assert!(rendered.contains(HOST_PICKER_STATUS_YELLOW_FG));
@@ -2576,7 +2582,12 @@ mod tests {
         let rendered = render_session_list_lines(
             &[
                 demo_with("alpha", "repo-a", SessionStatus::NeedsInput, IntegrationState::Clean),
-                demo_with("beta", "repo-b", SessionStatus::UnknownRecovered, IntegrationState::Clean),
+                demo_with(
+                    "beta",
+                    "repo-b",
+                    SessionStatus::UnknownRecovered,
+                    IntegrationState::Clean,
+                ),
             ],
             120,
         )

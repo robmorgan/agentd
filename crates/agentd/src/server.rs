@@ -112,10 +112,7 @@ async fn handle_connection(
             model,
             integration_policy,
         }) => {
-            match state
-                .create_session(workspace, title, agent, model, integration_policy)
-                .await
-            {
+            match state.create_session(workspace, title, agent, model, integration_policy).await {
                 Ok(session) => {
                     send_response(&mut writer, &Response::CreateSession { session }).await?
                 }

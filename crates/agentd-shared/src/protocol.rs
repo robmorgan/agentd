@@ -66,23 +66,65 @@ pub enum Request {
         model: Option<String>,
         integration_policy: IntegrationPolicy,
     },
-    CreateWorktree { session_id: String },
-    CleanupWorktree { session_id: String },
-    KillSession { session_id: String, remove: bool },
-    AttachSession { session_id: String, kind: AttachmentKind },
-    AttachResize { cols: u16, rows: u16 },
-    DetachSession { session_id: String, all: bool },
-    DetachAttachment { session_id: String, attach_id: String },
-    AttachInput { data: Vec<u8> },
-    SendInput { session_id: String, data: Vec<u8>, source_session_id: Option<String> },
-    ApplySession { session_id: String },
-    DiscardSession { session_id: String, force: bool },
-    SwitchAttachedSession { source_session_id: String, target_session_id: String },
-    DiffSession { session_id: String },
-    GetSession { session_id: String },
+    CreateWorktree {
+        session_id: String,
+    },
+    CleanupWorktree {
+        session_id: String,
+    },
+    KillSession {
+        session_id: String,
+        remove: bool,
+    },
+    AttachSession {
+        session_id: String,
+        kind: AttachmentKind,
+    },
+    AttachResize {
+        cols: u16,
+        rows: u16,
+    },
+    DetachSession {
+        session_id: String,
+        all: bool,
+    },
+    DetachAttachment {
+        session_id: String,
+        attach_id: String,
+    },
+    AttachInput {
+        data: Vec<u8>,
+    },
+    SendInput {
+        session_id: String,
+        data: Vec<u8>,
+        source_session_id: Option<String>,
+    },
+    ApplySession {
+        session_id: String,
+    },
+    DiscardSession {
+        session_id: String,
+        force: bool,
+    },
+    SwitchAttachedSession {
+        source_session_id: String,
+        target_session_id: String,
+    },
+    DiffSession {
+        session_id: String,
+    },
+    GetSession {
+        session_id: String,
+    },
     ListSessions,
-    ListAttachments { session_id: String },
-    GetHistory { session_id: String, vt: bool },
+    ListAttachments {
+        session_id: String,
+    },
+    GetHistory {
+        session_id: String,
+        vt: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1232,11 +1274,11 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cursor,
-        DAEMON_MANAGEMENT_VERSION, DaemonInfo, DaemonManagementRequest, DaemonManagementResponse,
-        DaemonManagementStatus, IncomingRequest, PROTOCOL_VERSION, Request, Response,
-        decode_request, decode_response, encode_request, encode_response, read_incoming_request,
-        read_request, write_daemon_management_request, write_daemon_management_response,
+        Cursor, DAEMON_MANAGEMENT_VERSION, DaemonInfo, DaemonManagementRequest,
+        DaemonManagementResponse, DaemonManagementStatus, IncomingRequest, PROTOCOL_VERSION,
+        Request, Response, decode_request, decode_response, encode_request, encode_response,
+        read_incoming_request, read_request, write_daemon_management_request,
+        write_daemon_management_response,
     };
     use crate::session::{
         AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult, GitSyncStatus,

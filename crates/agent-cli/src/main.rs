@@ -115,9 +115,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     #[command(hide = true)]
-    Runtime {
-        session_id: Option<String>,
-    },
+    Runtime { session_id: Option<String> },
     #[command(about = "Start and attach to a new session", display_order = 1)]
     New {
         title: Option<String>,
@@ -146,9 +144,7 @@ enum Command {
         session_id: String,
     },
     #[command(about = "Attach to a live session PTY", display_order = 4)]
-    Attach {
-        session_id: String,
-    },
+    Attach { session_id: String },
     #[command(about = "Detach one or more attached clients", display_order = 5)]
     Detach {
         session_id: Option<String>,
@@ -171,9 +167,7 @@ enum Command {
         data: Vec<String>,
     },
     #[command(about = "Apply a reviewed session back to the base branch", display_order = 7)]
-    Accept {
-        session_id: String,
-    },
+    Accept { session_id: String },
     #[command(about = "Discard a session's worktree and changes", display_order = 8)]
     Discard {
         session_id: String,
@@ -194,17 +188,11 @@ enum Command {
     )]
     List,
     #[command(about = "Show currently attached clients for a session", display_order = 11)]
-    Attachments {
-        session_id: String,
-    },
+    Attachments { session_id: String },
     #[command(about = "Show detailed session status", display_order = 12)]
-    Status {
-        session_id: String,
-    },
+    Status { session_id: String },
     #[command(about = "Show the session diff against its base branch", display_order = 13)]
-    Diff {
-        session_id: String,
-    },
+    Diff { session_id: String },
     #[command(about = "Create or clean up session worktrees", display_order = 14)]
     Worktree {
         #[command(subcommand)]
@@ -642,10 +630,7 @@ fn resolve_integration_policy(paths: &AppPaths, review: bool) -> Result<Integrat
     match config.git.default_integration_policy.as_str() {
         "manual_review" => Ok(IntegrationPolicy::ManualReview),
         "auto_apply_safe" => Ok(IntegrationPolicy::AutoApplySafe),
-        other => bail!(
-            "invalid git.default_integration_policy `{other}` in {}",
-            paths.config
-        ),
+        other => bail!("invalid git.default_integration_policy `{other}` in {}", paths.config),
     }
 }
 

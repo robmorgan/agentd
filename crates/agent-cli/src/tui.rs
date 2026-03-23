@@ -643,11 +643,10 @@ impl RuntimeApp {
             KeyCode::Char('r') if key.modifiers == KeyModifiers::CONTROL => {
                 self.composer.status_lines.clear();
                 self.pending_focus = None;
-                self.composer.integration_policy =
-                    match self.composer.integration_policy {
-                        IntegrationPolicy::ManualReview => IntegrationPolicy::AutoApplySafe,
-                        IntegrationPolicy::AutoApplySafe => IntegrationPolicy::ManualReview,
-                    };
+                self.composer.integration_policy = match self.composer.integration_policy {
+                    IntegrationPolicy::ManualReview => IntegrationPolicy::AutoApplySafe,
+                    IntegrationPolicy::AutoApplySafe => IntegrationPolicy::ManualReview,
+                };
             }
             KeyCode::Up => {
                 self.composer.selected = self.composer.selected.saturating_sub(1);
