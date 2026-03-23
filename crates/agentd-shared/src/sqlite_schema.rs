@@ -1,7 +1,35 @@
-use anyhow::Result;
+use anyhow::{Result, bail, ensure};
 use rusqlite::Connection;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 1;
+pub const CURRENT_SCHEMA_VERSION: i32 = 2;
+const EXPECTED_SESSIONS_COLUMNS: &[&str] = &[
+    "session_id",
+    "thread_id",
+    "agent",
+    "model",
+    "mode",
+    "workspace",
+    "repo_path",
+    "repo_name",
+    "title",
+    "base_branch",
+    "branch",
+    "worktree",
+    "status",
+    "integration_policy",
+    "pid",
+    "exit_code",
+    "error",
+    "integration_state",
+    "git_sync",
+    "git_status_summary",
+    "has_conflicts",
+    "attention",
+    "attention_summary",
+    "created_at",
+    "updated_at",
+    "exited_at",
+];
 
 pub fn init_state_db(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction()?;
@@ -19,25 +47,36 @@ pub fn init_state_db(conn: &mut Connection) -> Result<()> {
 
     if !has_objects {
         create_schema(&tx)?;
-    } else if schema_version != CURRENT_SCHEMA_VERSION {
-        reset_schema(&tx)?;
-        create_schema(&tx)?;
+    } else {
+        ensure_supported_schema(&tx, schema_version)?;
     }
 
     tx.commit()?;
     Ok(())
 }
 
-fn reset_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "
-        DROP TABLE IF EXISTS plans;
-        DROP TABLE IF EXISTS events;
-        DROP TABLE IF EXISTS threads;
-        DROP TABLE IF EXISTS sessions;
-        PRAGMA user_version = 0;
-        ",
-    )?;
+fn ensure_supported_schema(conn: &Connection, schema_version: i32) -> Result<()> {
+    ensure!(
+        schema_version == CURRENT_SCHEMA_VERSION,
+        "unsupported state database schema version {schema_version}; expected {CURRENT_SCHEMA_VERSION}. Remove or migrate the runtime root."
+    );
+
+    let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    if columns.is_empty() {
+        bail!(
+            "unsupported state database schema: missing `sessions` table. Remove or migrate the runtime root."
+        );
+    }
+    if columns.iter().map(String::as_str).collect::<Vec<_>>() != EXPECTED_SESSIONS_COLUMNS {
+        bail!(
+            "unsupported state database schema: `sessions` does not match the current layout. Remove or migrate the runtime root."
+        );
+    }
+
     Ok(())
 }
 
@@ -62,8 +101,8 @@ fn create_schema(conn: &Connection) -> Result<()> {
             pid INTEGER,
             exit_code INTEGER,
             error TEXT,
-            integration_state TEXT NOT NULL CHECK (integration_state IN ('clean', 'auto_applying', 'pending_review', 'applied', 'discarded')),
-            git_sync TEXT NOT NULL CHECK (git_sync IN ('unknown', 'in_sync', 'needs_sync', 'conflicted')),
+            integration_state TEXT NOT NULL CHECK (integration_state IN ('idle', 'auto_applying', 'applied', 'discarded')),
+            git_sync TEXT NOT NULL CHECK (git_sync IN ('unknown', 'up_to_date', 'ready', 'blocked', 'conflicted')),
             git_status_summary TEXT,
             has_conflicts INTEGER NOT NULL DEFAULT 0 CHECK (has_conflicts IN (0, 1)),
             attention TEXT NOT NULL CHECK (attention IN ('info', 'notice', 'action')),
@@ -72,7 +111,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
             updated_at TEXT NOT NULL,
             exited_at TEXT
         );
-        PRAGMA user_version = 1;
+        PRAGMA user_version = 2;
         ",
     )?;
     Ok(())
@@ -112,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    fn init_resets_legacy_schema() {
+    fn init_rejects_legacy_schema() {
         let path = temp_db_path();
         let mut conn = Connection::open(&path).unwrap();
         conn.execute_batch(
@@ -148,21 +187,7 @@ mod tests {
         )
         .unwrap();
 
-        init_state_db(&mut conn).unwrap();
-
-        let row_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0)).unwrap();
-        let has_threads_table: bool = conn
-            .query_row(
-                "SELECT EXISTS(
-                SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'threads'
-            )",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-
-        assert_eq!(row_count, 0);
-        assert!(!has_threads_table);
+        let err = init_state_db(&mut conn).unwrap_err().to_string();
+        assert!(err.contains("unsupported state database schema version 0"));
     }
 }

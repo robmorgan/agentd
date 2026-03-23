@@ -21,6 +21,7 @@ use nix::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
+#[derive(Debug)]
 pub struct LocalStore {
     path: String,
 }
@@ -95,6 +96,7 @@ impl LocalStore {
     fn init(&self) -> Result<()> {
         let mut conn = self.connect()?;
         init_state_db(&mut conn)
+            .with_context(|| format!("unsupported state database schema in {}", self.path))
     }
 }
 
@@ -395,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn open_resets_legacy_rows() {
+    fn open_rejects_legacy_rows() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
         let conn = rusqlite::Connection::open(paths.database.as_str()).unwrap();
@@ -434,12 +436,12 @@ mod tests {
         )
         .unwrap();
 
-        let store = LocalStore::open(&paths).unwrap();
-        assert!(store.get_session("demo").unwrap().is_none());
+        let err = LocalStore::open(&paths).unwrap_err().to_string();
+        assert!(err.contains("unsupported state database schema"));
     }
 
     #[test]
-    fn open_drops_legacy_threads_table() {
+    fn open_rejects_legacy_threads_table() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
         let conn = rusqlite::Connection::open(paths.database.as_str()).unwrap();
@@ -462,18 +464,7 @@ mod tests {
         )
         .unwrap();
 
-        let _store = LocalStore::open(&paths).unwrap();
-        let conn = rusqlite::Connection::open(paths.database.as_str()).unwrap();
-        let has_threads_table: bool = conn
-            .query_row(
-                "SELECT EXISTS(
-                SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'threads'
-            )",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-
-        assert!(!has_threads_table);
+        let err = LocalStore::open(&paths).unwrap_err().to_string();
+        assert!(err.contains("unsupported state database schema"));
     }
 }

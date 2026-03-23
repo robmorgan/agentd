@@ -6,11 +6,12 @@ use agentd_shared::{
     paths::AppPaths,
     session::{
         ApplyState, AttentionLevel, IntegrationPolicy, MergeStatus, SessionMode, SessionRecord,
-        SessionStatus, repo_name_from_path,
+        SessionStatus,
     },
+    sqlite_schema::init_state_db,
 };
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Database {
     path: String,
 }
@@ -43,41 +44,11 @@ impl Database {
     }
 
     fn init(&self) -> Result<()> {
-        let conn = self.connect()?;
+        let mut conn = self.connect()?;
+        init_state_db(&mut conn)
+            .with_context(|| format!("unsupported state database schema in {}", self.path))?;
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sessions (
-                session_id TEXT PRIMARY KEY,
-                thread_id TEXT,
-                agent TEXT NOT NULL,
-                model TEXT,
-                mode TEXT NOT NULL DEFAULT 'execute',
-                agent_command TEXT,
-                agent_args_json TEXT,
-                resume_session_id TEXT,
-                workspace TEXT NOT NULL,
-                repo_path TEXT,
-                repo_name TEXT,
-                title TEXT,
-                task TEXT NOT NULL,
-                base_branch TEXT,
-                branch TEXT NOT NULL,
-                worktree TEXT NOT NULL,
-                status TEXT NOT NULL,
-                integration_policy TEXT NOT NULL DEFAULT 'manual_review',
-                pid INTEGER,
-                exit_code INTEGER,
-                error TEXT,
-                integration_state TEXT NOT NULL DEFAULT 'idle',
-                git_sync TEXT NOT NULL DEFAULT 'unknown',
-                git_status_summary TEXT,
-                has_conflicts INTEGER NOT NULL DEFAULT 0,
-                attention TEXT NOT NULL DEFAULT 'info',
-                attention_summary TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                exited_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS threads (
+            "CREATE TABLE IF NOT EXISTS threads (
                 thread_id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL UNIQUE,
                 agent TEXT NOT NULL,
@@ -88,147 +59,8 @@ impl Database {
                 updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_threads_session_id
-                ON threads (session_id);
-            ",
+                ON threads (session_id);",
         )?;
-        conn.execute("DROP TABLE IF EXISTS events", [])?;
-        conn.execute("DROP TABLE IF EXISTS plans", [])?;
-        self.ensure_column(&conn, "thread_id", "ALTER TABLE sessions ADD COLUMN thread_id TEXT")?;
-        self.ensure_column(&conn, "model", "ALTER TABLE sessions ADD COLUMN model TEXT")?;
-        self.ensure_column(
-            &conn,
-            "mode",
-            "ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'execute'",
-        )?;
-        self.ensure_column(&conn, "repo_path", "ALTER TABLE sessions ADD COLUMN repo_path TEXT")?;
-        self.ensure_column(&conn, "repo_name", "ALTER TABLE sessions ADD COLUMN repo_name TEXT")?;
-        self.ensure_column(&conn, "title", "ALTER TABLE sessions ADD COLUMN title TEXT")?;
-        self.ensure_column(
-            &conn,
-            "agent_command",
-            "ALTER TABLE sessions ADD COLUMN agent_command TEXT",
-        )?;
-        self.ensure_column(
-            &conn,
-            "agent_args_json",
-            "ALTER TABLE sessions ADD COLUMN agent_args_json TEXT",
-        )?;
-        self.ensure_column(
-            &conn,
-            "resume_session_id",
-            "ALTER TABLE sessions ADD COLUMN resume_session_id TEXT",
-        )?;
-        self.ensure_column(
-            &conn,
-            "base_branch",
-            "ALTER TABLE sessions ADD COLUMN base_branch TEXT",
-        )?;
-        self.ensure_column(
-            &conn,
-            "integration_policy",
-            "ALTER TABLE sessions ADD COLUMN integration_policy TEXT NOT NULL DEFAULT 'manual_review'",
-        )?;
-        self.ensure_column(&conn, "pid", "ALTER TABLE sessions ADD COLUMN pid INTEGER")?;
-        self.ensure_column(
-            &conn,
-            "exit_code",
-            "ALTER TABLE sessions ADD COLUMN exit_code INTEGER",
-        )?;
-        self.ensure_column(&conn, "error", "ALTER TABLE sessions ADD COLUMN error TEXT")?;
-        self.ensure_column(
-            &conn,
-            "integration_state",
-            "ALTER TABLE sessions ADD COLUMN integration_state TEXT NOT NULL DEFAULT 'idle'",
-        )?;
-        self.ensure_column(
-            &conn,
-            "git_sync",
-            "ALTER TABLE sessions ADD COLUMN git_sync TEXT NOT NULL DEFAULT 'unknown'",
-        )?;
-        self.ensure_column(
-            &conn,
-            "git_status_summary",
-            "ALTER TABLE sessions ADD COLUMN git_status_summary TEXT",
-        )?;
-        self.ensure_column(
-            &conn,
-            "has_conflicts",
-            "ALTER TABLE sessions ADD COLUMN has_conflicts INTEGER NOT NULL DEFAULT 0",
-        )?;
-        self.ensure_column(
-            &conn,
-            "attention",
-            "ALTER TABLE sessions ADD COLUMN attention TEXT NOT NULL DEFAULT 'info'",
-        )?;
-        self.ensure_column(
-            &conn,
-            "attention_summary",
-            "ALTER TABLE sessions ADD COLUMN attention_summary TEXT",
-        )?;
-        self.ensure_column(&conn, "exited_at", "ALTER TABLE sessions ADD COLUMN exited_at TEXT")?;
-        conn.execute(
-            "UPDATE sessions
-             SET mode = COALESCE(mode, 'execute'),
-                 repo_path = COALESCE(repo_path, workspace),
-                 repo_name = COALESCE(repo_name, repo_path, workspace),
-                 title = COALESCE(title, task, repo_name, workspace),
-                 base_branch = COALESCE(base_branch, 'HEAD'),
-                 integration_policy = COALESCE(integration_policy, 'manual_review'),
-                 integration_state = CASE
-                     WHEN integration_state IS NULL THEN 'idle'
-                     WHEN integration_state IN ('clean', 'pending_review') THEN 'idle'
-                     ELSE integration_state
-                 END,
-                 git_sync = COALESCE(git_sync, 'unknown'),
-                 has_conflicts = COALESCE(has_conflicts, 0),
-                 attention = COALESCE(attention, 'info'),
-                 attention_summary = COALESCE(attention_summary, title, task)
-             WHERE mode IS NULL OR repo_path IS NULL OR repo_name IS NULL OR title IS NULL OR base_branch IS NULL OR integration_policy IS NULL OR integration_state IS NULL OR git_sync IS NULL OR has_conflicts IS NULL OR attention IS NULL OR attention_summary IS NULL",
-            [],
-        )?;
-        self.backfill_repo_names(&conn)?;
-        Ok(())
-    }
-
-    fn ensure_column(&self, conn: &Connection, column: &str, ddl: &str) -> Result<()> {
-        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let existing: String = row.get(1)?;
-            if existing == column {
-                return Ok(());
-            }
-        }
-        conn.execute(ddl, [])?;
-        Ok(())
-    }
-
-    fn backfill_repo_names(&self, conn: &Connection) -> Result<()> {
-        let mut stmt = conn.prepare(
-            "SELECT session_id, repo_path, workspace, repo_name
-             FROM sessions",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        })?;
-
-        for row in rows {
-            let (session_id, repo_path, workspace, repo_name) = row?;
-            let current = repo_name.unwrap_or_default();
-            let desired = repo_name_from_path(repo_path.as_deref().unwrap_or(&workspace));
-            if current != desired {
-                conn.execute(
-                    "UPDATE sessions SET repo_name = ?2 WHERE session_id = ?1",
-                    params![session_id, desired],
-                )?;
-            }
-        }
-
         Ok(())
     }
 
@@ -237,10 +69,10 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO sessions (
-                session_id, thread_id, agent, model, mode, workspace, task,
+                session_id, thread_id, agent, model, mode, workspace,
                 repo_path, repo_name, title, base_branch, branch, worktree, status, integration_policy, attention, attention_summary,
                 integration_state, git_sync, git_status_summary, has_conflicts, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21)",
             params![
                 new_session.session_id,
                 new_session.thread_id,
@@ -248,7 +80,6 @@ impl Database {
                 new_session.model,
                 session_mode_to_str(new_session.mode),
                 new_session.workspace,
-                new_session.title,
                 new_session.repo_path,
                 new_session.repo_name,
                 new_session.title,
@@ -622,7 +453,7 @@ mod tests {
     use super::Database;
     use agentd_shared::{
         paths::AppPaths,
-        session::{ApplyState, IntegrationPolicy, SessionMode},
+        session::{IntegrationPolicy, SessionMode},
     };
     use rusqlite::params;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -670,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn open_resets_legacy_schema() {
+    fn open_rejects_legacy_schema() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
         let conn = rusqlite::Connection::open(paths.database.as_str()).unwrap();
@@ -705,10 +536,7 @@ mod tests {
         )
         .unwrap();
 
-        let db = Database::open(&paths).unwrap();
-        let session = db.get_session("legacy").unwrap().unwrap();
-        assert_eq!(session.title, "legacy");
-        assert_eq!(session.repo_path, "/tmp/repo");
-        assert_eq!(session.apply_state, ApplyState::Idle);
+        let err = Database::open(&paths).unwrap_err().to_string();
+        assert!(err.contains("unsupported state database schema"));
     }
 }
