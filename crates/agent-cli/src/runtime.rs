@@ -79,6 +79,33 @@ const ANSI_DIM: &str = "\x1b[2m";
 const HOST_PICKER_CURSOR: &str = "█";
 const HOST_PICKER_CURSOR_BLINK_MS: u128 = 500;
 const ANSI_RESET: &str = "\x1b[0m";
+const SESSION_LIST_DEFAULT_WIDTH: usize = 120;
+const SESSION_LIST_STATUS_WIDTH: usize = 16;
+const SESSION_LIST_AGE_WIDTH: usize = 6;
+const SESSION_LIST_SESSION_MIN_WIDTH: usize = 8;
+const SESSION_LIST_SESSION_MAX_WIDTH: usize = 14;
+const SESSION_LIST_SESSION_FLOOR_WIDTH: usize = 6;
+const SESSION_LIST_TITLE_MIN_WIDTH: usize = 12;
+const SESSION_LIST_TITLE_MAX_WIDTH: usize = 30;
+const SESSION_LIST_TITLE_FLOOR_WIDTH: usize = 8;
+const SESSION_LIST_REPO_MIN_WIDTH: usize = 8;
+const SESSION_LIST_REPO_MAX_WIDTH: usize = 18;
+const SESSION_LIST_REPO_FLOOR_WIDTH: usize = 6;
+const SESSION_LIST_BRANCH_MIN_WIDTH: usize = 12;
+const SESSION_LIST_BRANCH_MAX_WIDTH: usize = 34;
+const SESSION_LIST_BRANCH_FLOOR_WIDTH: usize = 8;
+const SESSION_LIST_STRUCTURAL_WIDTH: usize = 12;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SessionListLayout {
+    visible_width: usize,
+    status: usize,
+    age: usize,
+    session: usize,
+    title: usize,
+    repo: usize,
+    branch: usize,
+}
 
 struct PickerScreenGuard;
 
@@ -174,6 +201,26 @@ fn clear_host_picker(previous_lines: usize) -> Result<()> {
     execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))
         .context("failed to clear session picker")?;
     stdout.flush().context("failed to flush session picker clear")
+}
+
+pub(crate) fn default_session_list_width() -> usize {
+    SESSION_LIST_DEFAULT_WIDTH
+}
+
+pub(crate) fn render_session_list_lines(sessions: &[SessionRecord], width: usize) -> Vec<String> {
+    let layout = session_list_layout(width);
+    let mut lines = vec![render_session_list_header_row(layout)];
+
+    if sessions.is_empty() {
+        lines.push(truncate_session_list_cell("  No sessions.", layout.visible_width));
+        return lines;
+    }
+
+    for session in sessions {
+        lines.push(render_session_list_row(session, layout));
+    }
+
+    lines
 }
 
 struct SessionPicker {
@@ -940,6 +987,130 @@ fn render_host_picker_option_line(content: &str, width: usize, selected: bool) -
     fit_host_picker_line(label, width)
 }
 
+fn render_session_list_header_row(layout: SessionListLayout) -> String {
+    style_host_picker_content_row(&render_session_list_header_content(layout), layout.visible_width)
+}
+
+fn render_session_list_row(session: &SessionRecord, layout: SessionListLayout) -> String {
+    let status = render_session_list_status_cell(session, layout.status);
+    let age = format_session_list_cell(&session_elapsed_label(session), layout.age);
+    let session_id = format_session_list_cell(&session.session_id, layout.session);
+    let title = format_session_list_cell(&session.title, layout.title);
+    let repo = format_session_list_cell(&session.repo_name, layout.repo);
+    let branch = format_session_list_cell(&session.branch, layout.branch);
+    format!("  {status}  {age}  {session_id}  {title}  {repo}  {branch}")
+}
+
+fn render_session_list_header_content(layout: SessionListLayout) -> String {
+    format!(
+        "  {}  {}  {}  {}  {}  {}",
+        format_session_list_cell("STATUS", layout.status),
+        format_session_list_cell("AGE", layout.age),
+        format_session_list_cell("SESSION", layout.session),
+        format_session_list_cell("TITLE", layout.title),
+        format_session_list_cell("REPO", layout.repo),
+        format_session_list_cell("BRANCH", layout.branch),
+    )
+}
+
+fn render_session_list_status_cell(session: &SessionRecord, width: usize) -> String {
+    let icon = session_icon(session);
+    let label = session_list_status_label(session);
+    let plain = format!("{icon} {label}");
+    let padding = " ".repeat(width.saturating_sub(plain.chars().count()));
+    format!("{}{icon}{ANSI_RESET} {label}{padding}", host_picker_icon_ansi_prefix(session))
+}
+
+fn style_host_picker_content_row(content: &str, visible_width: usize) -> String {
+    let visible = content.chars().take(visible_width).collect::<String>();
+    format!("{HOST_PICKER_QUERY_BG}{HOST_PICKER_TEXT_FG}{visible}{ANSI_RESET}")
+}
+
+fn session_list_layout(width: usize) -> SessionListLayout {
+    let visible_width = session_list_visible_width(width);
+    let mut layout = SessionListLayout {
+        visible_width,
+        status: SESSION_LIST_STATUS_WIDTH,
+        age: SESSION_LIST_AGE_WIDTH,
+        session: SESSION_LIST_SESSION_MIN_WIDTH,
+        title: SESSION_LIST_TITLE_MIN_WIDTH,
+        repo: SESSION_LIST_REPO_MIN_WIDTH,
+        branch: SESSION_LIST_BRANCH_MIN_WIDTH,
+    };
+    let min_total = session_list_total_width(layout);
+    if visible_width >= min_total {
+        let mut remaining = visible_width - min_total;
+        grow_session_list_column(&mut layout.branch, SESSION_LIST_BRANCH_MAX_WIDTH, &mut remaining);
+        grow_session_list_column(&mut layout.title, SESSION_LIST_TITLE_MAX_WIDTH, &mut remaining);
+        grow_session_list_column(
+            &mut layout.session,
+            SESSION_LIST_SESSION_MAX_WIDTH,
+            &mut remaining,
+        );
+        grow_session_list_column(&mut layout.repo, SESSION_LIST_REPO_MAX_WIDTH, &mut remaining);
+        return layout;
+    }
+
+    let mut deficit = min_total - visible_width;
+    shrink_session_list_column(&mut layout.repo, SESSION_LIST_REPO_FLOOR_WIDTH, &mut deficit);
+    shrink_session_list_column(
+        &mut layout.session,
+        SESSION_LIST_SESSION_FLOOR_WIDTH,
+        &mut deficit,
+    );
+    shrink_session_list_column(&mut layout.title, SESSION_LIST_TITLE_FLOOR_WIDTH, &mut deficit);
+    shrink_session_list_column(
+        &mut layout.branch,
+        SESSION_LIST_BRANCH_FLOOR_WIDTH,
+        &mut deficit,
+    );
+    layout
+}
+
+fn session_list_visible_width(width: usize) -> usize {
+    width.max(1).min(SESSION_LIST_DEFAULT_WIDTH)
+}
+
+fn session_list_total_width(layout: SessionListLayout) -> usize {
+    SESSION_LIST_STRUCTURAL_WIDTH
+        + layout.status
+        + layout.age
+        + layout.session
+        + layout.title
+        + layout.repo
+        + layout.branch
+}
+
+fn grow_session_list_column(width: &mut usize, max_width: usize, remaining: &mut usize) {
+    let add = (*remaining).min(max_width.saturating_sub(*width));
+    *width += add;
+    *remaining -= add;
+}
+
+fn shrink_session_list_column(width: &mut usize, floor_width: usize, deficit: &mut usize) {
+    let remove = (*deficit).min(width.saturating_sub(floor_width));
+    *width -= remove;
+    *deficit -= remove;
+}
+
+fn format_session_list_cell(content: &str, width: usize) -> String {
+    let truncated = truncate_session_list_cell(content, width);
+    format!("{truncated:<width$}")
+}
+
+fn truncate_session_list_cell(content: &str, width: usize) -> String {
+    let char_count = content.chars().count();
+    if char_count <= width {
+        return content.to_string();
+    }
+    if width <= 3 {
+        return content.chars().take(width).collect();
+    }
+    let mut truncated = content.chars().take(width - 3).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
 fn style_host_picker_menu_line(content: &str, width: usize, selected: bool) -> String {
     let max_chars = width.saturating_sub(1).max(1);
     let prefix = if selected { "› " } else { "  " };
@@ -1698,6 +1869,21 @@ fn demo_status_session(
     }
 }
 
+fn session_list_status_label(session: &SessionRecord) -> &'static str {
+    if session.integration_state == IntegrationState::PendingReview {
+        "pending review"
+    } else {
+        match session.status {
+            SessionStatus::NeedsInput => "needs input",
+            SessionStatus::Failed => "failed",
+            SessionStatus::UnknownRecovered => "recovered",
+            SessionStatus::Running | SessionStatus::Creating => "running",
+            SessionStatus::Paused => "paused",
+            SessionStatus::Exited => "exited",
+        }
+    }
+}
+
 fn host_picker_icon_ansi_prefix(session: &SessionRecord) -> String {
     match session.integration_state {
         IntegrationState::PendingReview => HOST_PICKER_STATUS_BLUE_FG.to_string(),
@@ -1750,10 +1936,11 @@ mod tests {
         HOST_PICKER_SELECTED_STYLE, HOST_PICKER_STATUS_BLUE_FG, HOST_PICKER_STATUS_GRAY_FG,
         HOST_PICKER_STATUS_GREEN_FG, HOST_PICKER_STATUS_RED_FG, HOST_PICKER_STATUS_YELLOW_FG,
         HOST_PICKER_TEXT_FG, OverlayMode, OverlayOutcome, PickerComposer, PickerMode, PickerRow,
-        SessionAction, SessionPicker,
+        SessionAction, SessionPicker, render_session_list_header_content,
+        render_session_list_header_row, render_session_list_lines,
         configured_agent_names, fit_host_picker_line, render_host_picker_brand,
         render_host_picker_legend_row, render_host_picker_session_row, render_host_picker_subtitle,
-        render_host_picker_title_line, session_icon, session_icon_color,
+        render_host_picker_title_line, session_icon, session_icon_color, session_list_layout,
         style_host_picker_background_row, style_host_picker_diff_line,
         style_host_picker_query_line,
     };
@@ -1768,6 +1955,26 @@ mod tests {
     use chrono::{Duration, Utc};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use futures::executor::block_on;
+
+    fn strip_ansi(input: &str) -> String {
+        let mut output = String::new();
+        let mut chars = input.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' {
+                if matches!(chars.peek(), Some('[')) {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            output.push(ch);
+        }
+        output
+    }
 
     #[test]
     fn picker_rows_include_create_and_matching_sessions() {
@@ -2261,6 +2468,76 @@ mod tests {
         assert!(subtitle.contains('a'));
         assert!(subtitle.contains('r'));
         assert!(title.contains("agentd - "));
+    }
+
+    #[test]
+    fn session_list_renders_title_header_and_rows_without_selector() {
+        let session = demo("alpha", "repo-a");
+        let rendered = render_session_list_lines(&[session], 120).join("\n");
+
+        assert!(!rendered.contains("agentd - "));
+        assert!(rendered.contains("STATUS"));
+        assert!(rendered.contains("SESSION"));
+        assert!(rendered.contains("TITLE"));
+        assert!(rendered.contains("running"));
+        assert!(!rendered.contains("› "));
+    }
+
+    #[test]
+    fn session_list_uses_single_row_and_dynamic_widths() {
+        let mut session = demo("alpha", "repository-with-a-long-name");
+        session.title = "a very long title that should be truncated in the fixed width column"
+            .to_string();
+        session.branch =
+            "agent/this-is-a-very-long-branch-name-that-should-be-truncated".to_string();
+        session.attention_summary =
+            Some("needs manual review because a long follow-up summary is present".to_string());
+
+        let wide = render_session_list_lines(&[session.clone()], 120).join("\n");
+        let narrow = render_session_list_lines(&[session], 80).join("\n");
+
+        assert_eq!(wide.lines().count(), 2);
+        assert!(!wide.contains("needs manual review because a long follow-up summary is present"));
+        assert!(wide.contains("a very long title that shou..."));
+        assert!(wide.contains("agent/this-is-a-very-long-branc..."));
+        assert!(narrow.contains("a very lo..."));
+        assert!(narrow.contains("agent/this-is-a..."));
+    }
+
+    #[test]
+    fn session_list_shows_empty_state() {
+        let rendered = render_session_list_lines(&[], 120).join("\n");
+
+        assert!(rendered.contains("No sessions."));
+        assert!(rendered.contains("STATUS"));
+    }
+
+    #[test]
+    fn session_list_does_not_render_legend() {
+        let rendered = render_session_list_lines(
+            &[
+                demo_with("alpha", "repo-a", SessionStatus::NeedsInput, IntegrationState::Clean),
+                demo_with("beta", "repo-b", SessionStatus::Paused, IntegrationState::Clean),
+            ],
+            120,
+        )
+        .join("\n");
+
+        assert!(!rendered.contains(" • "));
+        assert!(!rendered.contains("pending review"));
+    }
+
+    #[test]
+    fn session_list_header_only_wraps_its_content() {
+        let wide_layout = session_list_layout(200);
+        let narrow_layout = session_list_layout(80);
+        let wide = strip_ansi(&render_session_list_header_row(wide_layout));
+        let narrow = strip_ansi(&render_session_list_header_row(narrow_layout));
+
+        assert_eq!(wide, render_session_list_header_content(wide_layout));
+        assert_eq!(wide.chars().count(), 120);
+        assert_eq!(narrow, render_session_list_header_content(narrow_layout));
+        assert_eq!(narrow.chars().count(), 80);
     }
 
     #[test]
