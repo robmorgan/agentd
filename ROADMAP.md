@@ -74,17 +74,18 @@ Done when:
 
 ### 5. Improve event structure
 
-Events exist, but they are generic JSON records without stronger product semantics.
+Session state exists, but it does not yet expose stronger product semantics beyond the current
+status, attention, and review fields.
 
 Work:
 
-- Define daemon event types formally.
-- Add structured fields for level, source, category, and summary.
-- Document which events are emitted automatically by the daemon.
+- Define clearer lifecycle state transitions and summaries.
+- Add structured fields where needed directly on session/task state.
+- Document which state changes are driven automatically by the daemon.
 
 Done when:
 
-- Event consumers can build consistent UIs without guessing at payload shapes.
+- Clients can build consistent UIs without inferring state from low-level details.
 
 ### 6. Strengthen lifecycle recovery behavior
 
@@ -190,7 +191,7 @@ The README describes `info`, `notice`, and `action`, but the code has no attenti
 Work:
 
 - Define attention levels and transitions.
-- Allow daemon events and agent-appended events to raise attention.
+- Allow daemon-managed session state to raise attention.
 - Add APIs to list sessions/tasks ordered by attention.
 - Add CLI affordances for “needs attention now”.
 
@@ -200,7 +201,7 @@ Done when:
 
 ### 13. Add summaries for supervision
 
-Events are too low-level on their own.
+Current session state is still too low-level on its own.
 
 Work:
 
@@ -221,7 +222,7 @@ Work:
 
 - Decide whether spawned agents are child sessions, sibling sessions, or thread-level entities.
 - Add parent/child relationships and provenance metadata.
-- Ensure cleanup, logs, events, and worktrees remain understandable for grouped work.
+- Ensure cleanup, history, and worktrees remain understandable for grouped work.
 
 Done when:
 
@@ -232,7 +233,7 @@ Done when:
 Work:
 
 - Support session-to-session input or handoff workflows beyond raw `source_session_id`.
-- Add structured cross-session events for delegation and completion.
+- Add explicit cross-session coordination state for delegation and completion.
 - Define how shared artifacts are attached back to the parent task.
 
 Done when:

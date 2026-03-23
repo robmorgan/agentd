@@ -57,19 +57,14 @@ When you create a session, the daemon:
 
 For each running session, the daemon keeps three kinds of state:
 
-- durable metadata in SQLite for status, branch/worktree info, exit state, and structured events
-- an append-only PTY log file in `<runtime-root>/logs/<session_id>.log`
+- durable metadata in SQLite for status, branch/worktree info, and exit state
+- in-memory PTY scrollback retained until daemon restart
 - an in-memory PTY runtime with the live writer handle and output fan-out used by `attach` and `send`
 
-PTY output is copied into the log file and also broadcast to attached clients. PTY input can come
+PTY output is retained in memory and also broadcast to attached clients. PTY input can come
 from either an interactive `attach` session or a background `send-input` request. Multiple
 interactive attach clients may connect to the same session concurrently. PTY input is shared
 across attached clients, and PTY resize follows last-writer-wins semantics.
-
-Structured events are separate from raw PTY logs. The daemon records lifecycle events such as
-session start, finish, worktree creation or removal, and injected background input. Instrumented
-agents can also append their own events, which makes `agent events` useful for machine-readable
-progress while `agent logs` remains the raw terminal transcript.
 
 ## Socket Files
 
