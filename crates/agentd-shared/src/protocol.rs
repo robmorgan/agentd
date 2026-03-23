@@ -9,7 +9,7 @@ use crate::session::{
     WorktreeRecord,
 };
 
-pub const PROTOCOL_VERSION: u16 = 22;
+pub const PROTOCOL_VERSION: u16 = 23;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
@@ -66,23 +66,67 @@ pub enum Request {
         model: Option<String>,
         integration_policy: IntegrationPolicy,
     },
-    CreateWorktree { session_id: String },
-    CleanupWorktree { session_id: String },
-    KillSession { session_id: String, remove: bool },
-    AttachSession { session_id: String, kind: AttachmentKind },
-    AttachResize { cols: u16, rows: u16 },
-    DetachSession { session_id: String, all: bool },
-    DetachAttachment { session_id: String, attach_id: String },
-    AttachInput { data: Vec<u8> },
-    SendInput { session_id: String, data: Vec<u8>, source_session_id: Option<String> },
-    ApplySession { session_id: String },
-    DiscardSession { session_id: String, force: bool },
-    SwitchAttachedSession { source_session_id: String, target_session_id: String },
-    DiffSession { session_id: String },
-    GetSession { session_id: String },
+    CreateWorktree {
+        session_id: String,
+    },
+    CleanupWorktree {
+        session_id: String,
+    },
+    KillSession {
+        session_id: String,
+        remove: bool,
+    },
+    AttachSession {
+        session_id: String,
+        kind: AttachmentKind,
+        cols: u16,
+        rows: u16,
+    },
+    AttachResize {
+        cols: u16,
+        rows: u16,
+    },
+    DetachSession {
+        session_id: String,
+        all: bool,
+    },
+    DetachAttachment {
+        session_id: String,
+        attach_id: String,
+    },
+    AttachInput {
+        data: Vec<u8>,
+    },
+    SendInput {
+        session_id: String,
+        data: Vec<u8>,
+        source_session_id: Option<String>,
+    },
+    ApplySession {
+        session_id: String,
+    },
+    DiscardSession {
+        session_id: String,
+        force: bool,
+    },
+    SwitchAttachedSession {
+        source_session_id: String,
+        target_session_id: String,
+    },
+    DiffSession {
+        session_id: String,
+    },
+    GetSession {
+        session_id: String,
+    },
     ListSessions,
-    ListAttachments { session_id: String },
-    GetHistory { session_id: String, vt: bool },
+    ListAttachments {
+        session_id: String,
+    },
+    GetHistory {
+        session_id: String,
+        vt: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -425,9 +469,11 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             put_bool(&mut payload, *remove);
             MessageKind::KillSessionRequest
         }
-        Request::AttachSession { session_id, kind } => {
+        Request::AttachSession { session_id, kind, cols, rows } => {
             put_string(&mut payload, session_id)?;
             put_attachment_kind(&mut payload, *kind);
+            payload.extend_from_slice(&cols.to_le_bytes());
+            payload.extend_from_slice(&rows.to_le_bytes());
             MessageKind::AttachSessionRequest
         }
         Request::AttachResize { cols, rows } => {
@@ -515,6 +561,8 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
         MessageKind::AttachSessionRequest => Request::AttachSession {
             session_id: cursor.take_string()?,
             kind: cursor.take_attachment_kind()?,
+            cols: cursor.take_u16()?,
+            rows: cursor.take_u16()?,
         },
         MessageKind::AttachResizeRequest => {
             Request::AttachResize { cols: cursor.take_u16()?, rows: cursor.take_u16()? }
@@ -1232,11 +1280,11 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cursor,
-        DAEMON_MANAGEMENT_VERSION, DaemonInfo, DaemonManagementRequest, DaemonManagementResponse,
-        DaemonManagementStatus, IncomingRequest, PROTOCOL_VERSION, Request, Response,
-        decode_request, decode_response, encode_request, encode_response, read_incoming_request,
-        read_request, write_daemon_management_request, write_daemon_management_response,
+        Cursor, DAEMON_MANAGEMENT_VERSION, DaemonInfo, DaemonManagementRequest,
+        DaemonManagementResponse, DaemonManagementStatus, IncomingRequest, PROTOCOL_VERSION,
+        Request, Response, decode_request, decode_response, encode_request, encode_response,
+        read_incoming_request, read_request, write_daemon_management_request,
+        write_daemon_management_response,
     };
     use crate::session::{
         AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult, GitSyncStatus,
@@ -1286,8 +1334,12 @@ mod tests {
 
     #[test]
     fn attach_session_round_trips_kind() {
-        let request =
-            Request::AttachSession { session_id: "demo".to_string(), kind: AttachmentKind::Tui };
+        let request = Request::AttachSession {
+            session_id: "demo".to_string(),
+            kind: AttachmentKind::Tui,
+            cols: 120,
+            rows: 48,
+        };
         let (kind, payload) = encode_request(&request).unwrap();
         let decoded = decode_request(kind, &payload).unwrap();
         assert_eq!(decoded, request);

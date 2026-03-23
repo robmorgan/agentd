@@ -10,11 +10,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear as WidgetClear, Paragraph, Wrap},
 };
-use tokio::{
-    io::BufReader,
-    net::UnixStream,
-    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
-};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use agentd_shared::{
     paths::AppPaths,
@@ -23,9 +19,9 @@ use agentd_shared::{
 };
 
 use crate::{
-    CODEX_MODELS, RawModeGuard, StatusString, TerminalScreenGuard, centered_rect,
-    daemon_get_session, daemon_list_sessions, encode_attach_key, kill_session, send_request,
-    session_display::session_elapsed_label,
+    AttachHandshake, CODEX_MODELS, RawModeGuard, StatusString, TerminalScreenGuard, centered_rect,
+    connect_attached_session, daemon_get_session, daemon_list_sessions, encode_attach_key,
+    kill_session, send_request, session_display::session_elapsed_label,
 };
 
 const LEADER_KEY: (KeyCode, KeyModifiers) = (KeyCode::Char('b'), KeyModifiers::CONTROL);
@@ -257,7 +253,12 @@ impl RuntimeApp {
                         live_status,
                         Some(SessionStatus::Running | SessionStatus::NeedsInput)
                     ) {
-                        self.pty = Some(FocusedPty::spawn(self.paths.clone(), session_id.clone()));
+                        let initial_size = self.last_pane_size.unwrap_or((80, 24));
+                        self.pty = Some(FocusedPty::spawn(
+                            self.paths.clone(),
+                            session_id.clone(),
+                            initial_size,
+                        ));
                     }
                 }
 
@@ -643,11 +644,10 @@ impl RuntimeApp {
             KeyCode::Char('r') if key.modifiers == KeyModifiers::CONTROL => {
                 self.composer.status_lines.clear();
                 self.pending_focus = None;
-                self.composer.integration_policy =
-                    match self.composer.integration_policy {
-                        IntegrationPolicy::ManualReview => IntegrationPolicy::AutoApplySafe,
-                        IntegrationPolicy::AutoApplySafe => IntegrationPolicy::ManualReview,
-                    };
+                self.composer.integration_policy = match self.composer.integration_policy {
+                    IntegrationPolicy::ManualReview => IntegrationPolicy::AutoApplySafe,
+                    IntegrationPolicy::AutoApplySafe => IntegrationPolicy::ManualReview,
+                };
             }
             KeyCode::Up => {
                 self.composer.selected = self.composer.selected.saturating_sub(1);
@@ -1212,15 +1212,21 @@ struct FocusedPty {
 }
 
 impl FocusedPty {
-    fn spawn(paths: AppPaths, session_id: String) -> Self {
+    fn spawn(paths: AppPaths, session_id: String, initial_size: (u16, u16)) -> Self {
         let (command_tx, command_rx) = unbounded_channel();
         let (message_tx, message_rx) = unbounded_channel();
-        tokio::spawn(run_pty_session(paths, session_id.clone(), command_rx, message_tx));
+        tokio::spawn(run_pty_session(
+            paths,
+            session_id.clone(),
+            initial_size,
+            command_rx,
+            message_tx,
+        ));
         Self {
             session_id,
             commands: command_tx,
             messages: message_rx,
-            terminal: TerminalSurface::new(80, 24),
+            terminal: TerminalSurface::new(initial_size.0, initial_size.1),
             connected: true,
             last_error: None,
         }
@@ -1268,42 +1274,21 @@ enum PtyEvent {
 async fn run_pty_session(
     paths: AppPaths,
     session_id: String,
+    initial_size: (u16, u16),
     mut commands: UnboundedReceiver<PtyCommand>,
     messages: UnboundedSender<PtyEvent>,
 ) {
     let result = async {
-        let mut stream = UnixStream::connect(paths.socket.as_std_path())
-            .await
-            .with_context(|| format!("failed to connect to {}", paths.socket))?;
-        write_request(
-            &mut stream,
-            &Request::AttachSession {
-                session_id: session_id.clone(),
-                kind: AttachmentKind::Tui,
-            },
-        )
-        .await?;
-
-        let (read_half, mut write_half) = stream.into_split();
-        let mut reader = BufReader::new(read_half);
-        let Some(initial) = read_response(&mut reader).await? else {
-            bail!("agentd closed the connection");
-        };
-
-        match initial {
-            Response::Attached { snapshot, .. } => {
-                let _ = messages.send(PtyEvent::Snapshot(snapshot));
-            }
-            Response::SessionEnded { status, .. } => {
-                let _ = messages.send(PtyEvent::Ended(format!("session ended: {}", status_label(status))));
+        let (cols, rows) = initial_size;
+        let attached = connect_attached_session(&paths, &session_id, AttachmentKind::Tui, cols, rows).await?;
+        let (mut reader, mut write_half, snapshot) = match attached {
+            AttachHandshake::Attached(attached) => (attached.reader, attached.write_half, attached.snapshot),
+            AttachHandshake::SessionEnded(summary) => {
+                let _ = messages.send(PtyEvent::Ended(format!("session ended: {}", status_label(summary.status))));
                 return Ok::<(), anyhow::Error>(());
             }
-            Response::Error { message } => {
-                let _ = messages.send(PtyEvent::Error(message));
-                return Ok(());
-            }
-            other => bail!("unexpected response: {:?}", other),
-        }
+        };
+        let _ = messages.send(PtyEvent::Snapshot(snapshot));
 
         loop {
             tokio::select! {

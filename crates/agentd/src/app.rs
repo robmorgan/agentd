@@ -462,6 +462,8 @@ impl AppState {
         &self,
         session_id: &str,
         kind: AttachmentKind,
+        cols: u16,
+        rows: u16,
     ) -> Result<(
         AttachmentHandle,
         AttachmentRecord,
@@ -480,7 +482,7 @@ impl AppState {
             .get(session_id)
             .ok_or_else(|| anyhow!("session `{session_id}` does not have a live PTY"))?;
         let (handle, attachment, snapshot, receiver, control_rx) =
-            runtime.attach(session_id, kind)?;
+            runtime.attach(session_id, kind, cols, rows)?;
         Ok((handle, attachment, snapshot, receiver, control_rx))
     }
 
@@ -726,6 +728,7 @@ impl SessionRuntime {
             writer: Mutex::new(writer),
             state: Mutex::new(SessionRuntimeState {
                 terminal_state,
+                has_client_dimensions: false,
                 next_attach_ordinal: 1,
                 attachments: HashMap::new(),
             }),
@@ -743,6 +746,10 @@ impl SessionRuntime {
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         let master = self.master.lock().map_err(|_| anyhow!("PTY master poisoned"))?;
         master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
+        drop(master);
+        let mut state = self.state.lock().map_err(|_| anyhow!("session runtime state poisoned"))?;
+        state.terminal_state.resize(cols, rows)?;
+        state.has_client_dimensions = true;
         Ok(())
     }
 
@@ -765,6 +772,8 @@ impl SessionRuntime {
         self: &Arc<Self>,
         session_id: &str,
         kind: AttachmentKind,
+        cols: u16,
+        rows: u16,
     ) -> Result<(
         AttachmentHandle,
         AttachmentRecord,
@@ -775,8 +784,24 @@ impl SessionRuntime {
         let mut state = self.state.lock().map_err(|_| anyhow!("session runtime state poisoned"))?;
         let attach_id = format!("{}-{}", kind.as_str(), state.next_attach_ordinal);
         state.next_attach_ordinal += 1;
+        let had_client_dimensions = state.has_client_dimensions;
         let connected_at = Utc::now();
-        let snapshot = state.terminal_state.vt_snapshot()?;
+        drop(state);
+        let snapshot = if had_client_dimensions {
+            let snapshot = {
+                let mut state =
+                    self.state.lock().map_err(|_| anyhow!("session runtime state poisoned"))?;
+                state.terminal_state.vt_snapshot()?
+            };
+            self.resize(cols, rows)?;
+            snapshot
+        } else {
+            self.resize(cols, rows)?;
+            let mut state =
+                self.state.lock().map_err(|_| anyhow!("session runtime state poisoned"))?;
+            state.terminal_state.vt_snapshot()?
+        };
+        let mut state = self.state.lock().map_err(|_| anyhow!("session runtime state poisoned"))?;
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         state
             .attachments
@@ -840,6 +865,7 @@ impl SessionRuntime {
 
 struct SessionRuntimeState {
     terminal_state: Box<dyn TerminalStateEngine>,
+    has_client_dimensions: bool,
     next_attach_ordinal: u64,
     attachments: HashMap<String, RuntimeAttachment>,
 }
@@ -1441,8 +1467,8 @@ mod tests {
         fs,
         io::{Read, Write},
         process::Command,
-        sync::Arc,
         sync::atomic::{AtomicU64, Ordering},
+        sync::{Arc, Mutex},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1452,6 +1478,10 @@ mod tests {
 
     impl TerminalStateEngine for StubTerminalState {
         fn feed(&mut self, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _cols: u16, _rows: u16) -> Result<()> {
             Ok(())
         }
 
@@ -1504,6 +1534,78 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct RecordedOps {
+        events: Mutex<Vec<String>>,
+    }
+
+    struct RecordingTerminalState {
+        ops: Arc<RecordedOps>,
+    }
+
+    impl TerminalStateEngine for RecordingTerminalState {
+        fn feed(&mut self, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+            self.ops.events.lock().unwrap().push(format!("terminal_resize:{cols}x{rows}"));
+            Ok(())
+        }
+
+        fn vt_snapshot(&mut self) -> Result<Vec<u8>> {
+            self.ops.events.lock().unwrap().push("snapshot".to_string());
+            Ok(b"snapshot".to_vec())
+        }
+
+        fn format_plain(&mut self) -> Result<String> {
+            Ok("plain".to_string())
+        }
+
+        fn format_vt(&mut self) -> Result<String> {
+            Ok("vt".to_string())
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingMasterPty {
+        ops: Arc<RecordedOps>,
+    }
+
+    impl MasterPty for RecordingMasterPty {
+        fn resize(&self, size: PtySize) -> std::result::Result<(), Error> {
+            self.ops.events.lock().unwrap().push(format!("pty_resize:{}x{}", size.cols, size.rows));
+            Ok(())
+        }
+
+        fn get_size(&self) -> std::result::Result<PtySize, Error> {
+            Ok(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        }
+
+        fn try_clone_reader(&self) -> std::result::Result<Box<dyn Read + Send>, Error> {
+            Ok(Box::new(std::io::empty()))
+        }
+
+        fn take_writer(&self) -> std::result::Result<Box<dyn Write + Send>, Error> {
+            Ok(Box::new(std::io::sink()))
+        }
+
+        #[cfg(unix)]
+        fn process_group_leader(&self) -> Option<libc::pid_t> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn tty_name(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+
     #[test]
     fn request_detach_requires_active_attacher() {
         let runtime = SessionRuntime::new(
@@ -1525,7 +1627,7 @@ mod tests {
             8,
         ));
         let (_handle, attachment, snapshot, _output_rx, mut control_rx) =
-            runtime.attach("demo", AttachmentKind::Attach).unwrap();
+            runtime.attach("demo", AttachmentKind::Attach, 120, 48).unwrap();
         assert_eq!(snapshot, b"snapshot".to_vec());
 
         runtime.request_detach(&attachment.attach_id).unwrap();
@@ -1543,12 +1645,61 @@ mod tests {
             8,
         ));
         let (_first_handle, first, _snapshot, _first_output, _first_control) =
-            runtime.attach("demo", AttachmentKind::Attach).unwrap();
+            runtime.attach("demo", AttachmentKind::Attach, 120, 48).unwrap();
         let (_second_handle, second, _snapshot, _second_output, _second_control) =
-            runtime.attach("demo", AttachmentKind::Tui).unwrap();
+            runtime.attach("demo", AttachmentKind::Tui, 120, 48).unwrap();
 
         assert_ne!(first.attach_id, second.attach_id);
         assert_eq!(runtime.list_attachments("demo").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn first_attach_resizes_before_snapshot() {
+        let ops = Arc::new(RecordedOps::default());
+        let runtime = Arc::new(SessionRuntime::new(
+            Box::new(RecordingMasterPty { ops: ops.clone() }),
+            Box::new(std::io::sink()),
+            Box::new(RecordingTerminalState { ops: ops.clone() }),
+            8,
+        ));
+
+        let _ = runtime.attach("demo", AttachmentKind::Attach, 120, 48).unwrap();
+
+        let events = ops.events.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                "pty_resize:120x48".to_string(),
+                "terminal_resize:120x48".to_string(),
+                "snapshot".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn reattach_snapshots_before_resize() {
+        let ops = Arc::new(RecordedOps::default());
+        let runtime = Arc::new(SessionRuntime::new(
+            Box::new(RecordingMasterPty { ops: ops.clone() }),
+            Box::new(std::io::sink()),
+            Box::new(RecordingTerminalState { ops: ops.clone() }),
+            8,
+        ));
+
+        let _ = runtime.attach("demo", AttachmentKind::Attach, 120, 48).unwrap();
+        ops.events.lock().unwrap().clear();
+
+        let _ = runtime.attach("demo", AttachmentKind::Attach, 160, 50).unwrap();
+
+        let events = ops.events.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                "snapshot".to_string(),
+                "pty_resize:160x50".to_string(),
+                "terminal_resize:160x50".to_string(),
+            ]
+        );
     }
 
     #[test]

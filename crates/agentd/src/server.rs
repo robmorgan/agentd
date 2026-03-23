@@ -112,10 +112,7 @@ async fn handle_connection(
             model,
             integration_policy,
         }) => {
-            match state
-                .create_session(workspace, title, agent, model, integration_policy)
-                .await
-            {
+            match state.create_session(workspace, title, agent, model, integration_policy).await {
                 Ok(session) => {
                     send_response(&mut writer, &Response::CreateSession { session }).await?
                 }
@@ -159,8 +156,8 @@ async fn handle_connection(
                 }
             }
         }
-        IncomingRequest::Standard(Request::AttachSession { session_id, kind }) => {
-            attach_session(&state, &session_id, kind, &mut reader, &mut writer).await?;
+        IncomingRequest::Standard(Request::AttachSession { session_id, kind, cols, rows }) => {
+            attach_session(&state, &session_id, kind, cols, rows, &mut reader, &mut writer).await?;
         }
         IncomingRequest::Standard(Request::DetachSession { session_id, all }) => {
             match state.detach_session(&session_id, all).await {
@@ -341,11 +338,13 @@ async fn attach_session(
     state: &AppState,
     session_id: &str,
     kind: AttachmentKind,
+    cols: u16,
+    rows: u16,
     reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: &mut OwnedWriteHalf,
 ) -> Result<()> {
     let (_handle, attachment, snapshot, mut output_rx, mut control_rx) =
-        match state.attach_session(session_id, kind).await {
+        match state.attach_session(session_id, kind, cols, rows).await {
             Ok(attached) => attached,
             Err(err) => {
                 let response = match ended_session_response(state, session_id).await? {

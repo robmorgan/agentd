@@ -115,9 +115,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     #[command(hide = true)]
-    Runtime {
-        session_id: Option<String>,
-    },
+    Runtime { session_id: Option<String> },
     #[command(about = "Start and attach to a new session", display_order = 1)]
     New {
         title: Option<String>,
@@ -146,9 +144,7 @@ enum Command {
         session_id: String,
     },
     #[command(about = "Attach to a live session PTY", display_order = 4)]
-    Attach {
-        session_id: String,
-    },
+    Attach { session_id: String },
     #[command(about = "Detach one or more attached clients", display_order = 5)]
     Detach {
         session_id: Option<String>,
@@ -171,9 +167,7 @@ enum Command {
         data: Vec<String>,
     },
     #[command(about = "Apply a reviewed session back to the base branch", display_order = 7)]
-    Accept {
-        session_id: String,
-    },
+    Accept { session_id: String },
     #[command(about = "Discard a session's worktree and changes", display_order = 8)]
     Discard {
         session_id: String,
@@ -194,17 +188,11 @@ enum Command {
     )]
     List,
     #[command(about = "Show currently attached clients for a session", display_order = 11)]
-    Attachments {
-        session_id: String,
-    },
+    Attachments { session_id: String },
     #[command(about = "Show detailed session status", display_order = 12)]
-    Status {
-        session_id: String,
-    },
+    Status { session_id: String },
     #[command(about = "Show the session diff against its base branch", display_order = 13)]
-    Diff {
-        session_id: String,
-    },
+    Diff { session_id: String },
     #[command(about = "Create or clean up session worktrees", display_order = 14)]
     Worktree {
         #[command(subcommand)]
@@ -638,10 +626,7 @@ fn resolve_integration_policy(paths: &AppPaths, review: bool) -> Result<Integrat
     match config.git.default_integration_policy.as_str() {
         "manual_review" => Ok(IntegrationPolicy::ManualReview),
         "auto_apply_safe" => Ok(IntegrationPolicy::AutoApplySafe),
-        other => bail!(
-            "invalid git.default_integration_policy `{other}` in {}",
-            paths.config
-        ),
+        other => bail!("invalid git.default_integration_policy `{other}` in {}", paths.config),
     }
 }
 
@@ -983,25 +968,51 @@ async fn attach_session(paths: &AppPaths, session_id: &str) -> Result<()> {
     }
 }
 
-async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<AttachOutcome> {
+pub(crate) struct AttachedSessionStream {
+    pub(crate) attach_id: String,
+    pub(crate) snapshot: Vec<u8>,
+    pub(crate) reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    pub(crate) write_half: tokio::net::unix::OwnedWriteHalf,
+}
+
+pub(crate) enum AttachHandshake {
+    Attached(AttachedSessionStream),
+    SessionEnded(SessionEndSummary),
+}
+
+pub(crate) fn current_terminal_size() -> (u16, u16) {
+    crossterm::terminal::size().unwrap_or((80, 24))
+}
+
+pub(crate) async fn connect_attached_session(
+    paths: &AppPaths,
+    session_id: &str,
+    kind: AttachmentKind,
+    cols: u16,
+    rows: u16,
+) -> Result<AttachHandshake> {
     let mut stream = try_connect(paths).await?;
     write_request(
         &mut stream,
-        &Request::AttachSession {
-            session_id: session_id.to_string(),
-            kind: AttachmentKind::Attach,
-        },
+        &Request::AttachSession { session_id: session_id.to_string(), kind, cols, rows },
     )
     .await?;
 
-    let (read_half, mut write_half) = stream.into_split();
+    let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let Some(response) = read_response(&mut reader).await? else {
         bail!("agentd closed the connection");
     };
 
-    let (attach_id, initial_snapshot) = match response {
-        Response::Attached { attach_id, snapshot } => (attach_id, snapshot),
+    match response {
+        Response::Attached { attach_id, snapshot } => {
+            Ok(AttachHandshake::Attached(AttachedSessionStream {
+                attach_id,
+                snapshot,
+                reader,
+                write_half,
+            }))
+        }
         Response::SessionEnded {
             session_id,
             status,
@@ -1010,20 +1021,32 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
             worktree,
             exit_code,
             error,
-        } => {
-            return Ok(AttachOutcome::SessionEnded(SessionEndSummary {
-                session_id,
-                status,
-                integration_state,
-                branch,
-                worktree,
-                exit_code,
-                error,
-            }));
-        }
+        } => Ok(AttachHandshake::SessionEnded(SessionEndSummary {
+            session_id,
+            status,
+            integration_state,
+            branch,
+            worktree,
+            exit_code,
+            error,
+        })),
         Response::Error { message } => bail!(message),
-        other => bail!("unexpected response: {:?}", other),
-    };
+        other => bail!("unexpected attach response: {other:?}"),
+    }
+}
+
+async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<AttachOutcome> {
+    let (cols, rows) = current_terminal_size();
+    let attached =
+        match connect_attached_session(paths, session_id, AttachmentKind::Attach, cols, rows)
+            .await?
+        {
+            AttachHandshake::Attached(attached) => attached,
+            AttachHandshake::SessionEnded(summary) => {
+                return Ok(AttachOutcome::SessionEnded(summary));
+            }
+        };
+    let AttachedSessionStream { attach_id, snapshot, mut reader, mut write_half } = attached;
 
     eprintln!("attached to {session_id} ({attach_id}); detach with Ctrl-]");
     let _screen = AttachScreenGuard::enter()?;
@@ -1031,14 +1054,7 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
     let raw_input = AttachRawInput::new()?;
     let mut resize_signal =
         signal(SignalKind::window_change()).context("failed to watch terminal resize")?;
-    if let Ok((cols, rows)) = crossterm::terminal::size() {
-        send_attach_resize(&mut write_half, cols, rows).await?;
-    }
-    if let Ok(snapshot) = fetch_session_snapshot(paths, session_id).await {
-        write_session_snapshot(&snapshot)?;
-    } else {
-        write_session_snapshot(&initial_snapshot)?;
-    }
+    write_session_snapshot(&snapshot)?;
     let mut input_parser = AttachInputParser::default();
 
     loop {
@@ -1063,9 +1079,8 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
                 if resize.is_none() {
                     break;
                 }
-                if let Ok((cols, rows)) = crossterm::terminal::size() {
-                    send_attach_resize(&mut write_half, cols, rows).await?;
-                }
+                let (cols, rows) = current_terminal_size();
+                send_attach_resize(&mut write_half, cols, rows).await?;
             }
             response = read_response(&mut reader) => {
                 let Some(response) = response? else {
@@ -1117,25 +1132,6 @@ async fn send_attach_resize(
     rows: u16,
 ) -> Result<()> {
     write_request(write_half, &Request::AttachResize { cols, rows }).await
-}
-
-async fn fetch_session_snapshot(paths: &AppPaths, session_id: &str) -> Result<Vec<u8>> {
-    let mut stream = try_connect(paths).await?;
-    write_request(
-        &mut stream,
-        &Request::AttachSession { session_id: session_id.to_string(), kind: AttachmentKind::Tui },
-    )
-    .await?;
-    let (read_half, _write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    let Some(response) = read_response(&mut reader).await? else {
-        bail!("agentd closed the snapshot connection");
-    };
-    match response {
-        Response::Attached { snapshot, .. } => Ok(snapshot),
-        Response::Error { message } => bail!(message),
-        other => bail!("unexpected snapshot response: {:?}", other),
-    }
 }
 
 fn write_session_snapshot(snapshot: &[u8]) -> Result<()> {

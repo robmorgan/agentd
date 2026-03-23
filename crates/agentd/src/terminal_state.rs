@@ -6,6 +6,7 @@ const GHOSTTY_SUCCESS: i32 = 0;
 
 pub trait TerminalStateEngine: Send {
     fn feed(&mut self, data: &[u8]) -> Result<()>;
+    fn resize(&mut self, cols: u16, rows: u16) -> Result<()>;
     fn vt_snapshot(&mut self) -> Result<Vec<u8>>;
     fn format_plain(&mut self) -> Result<String>;
     fn format_vt(&mut self) -> Result<String>;
@@ -57,6 +58,11 @@ impl TerminalStateEngine for GhosttyTerminalState {
         Ok(())
     }
 
+    fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        let result = unsafe { ghostty_terminal_resize(self.terminal, cols, rows) };
+        ensure_success(result, "ghostty_terminal_resize")
+    }
+
     fn vt_snapshot(&mut self) -> Result<Vec<u8>> {
         format_terminal(self.vt_formatter)
     }
@@ -100,7 +106,7 @@ fn new_formatter(
                     palette: true,
                     modes: true,
                     scrolling_region: true,
-                    tabstops: true,
+                    tabstops: false,
                     pwd: false,
                     keyboard: true,
                     screen: GhosttyFormatterScreenExtra {
@@ -210,6 +216,7 @@ unsafe extern "C" {
     ) -> i32;
     fn ghostty_terminal_free(terminal: GhosttyTerminal);
     fn ghostty_terminal_vt_write(terminal: GhosttyTerminal, data: *const u8, len: usize);
+    fn ghostty_terminal_resize(terminal: GhosttyTerminal, cols: u16, rows: u16) -> i32;
 
     fn ghostty_formatter_terminal_new(
         allocator: *const GhosttyAllocator,
