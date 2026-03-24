@@ -2,7 +2,7 @@ use std::{io::Write, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use crossterm::{
-    cursor::MoveTo,
+    cursor::{MoveToColumn, MoveUp},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     style::{Color as CrosColor, Stylize},
@@ -80,8 +80,8 @@ const ANSI_DIM: &str = "\x1b[2m";
 const HOST_PICKER_CURSOR: &str = "█";
 const HOST_PICKER_CURSOR_BLINK_MS: u128 = 500;
 const ANSI_RESET: &str = "\x1b[0m";
-const HOST_PICKER_ENTER_SEQUENCE: &[u8] = b"\x1b[H\x1b[2J\x1b[?25l";
-const HOST_PICKER_EXIT_SEQUENCE: &[u8] = b"\x1b[H\x1b[2J\x1b[?25h";
+const HOST_PICKER_ENTER_SEQUENCE: &[u8] = b"\x1b[?25l";
+const HOST_PICKER_EXIT_SEQUENCE: &[u8] = b"\x1b[?25h";
 const SESSION_LIST_DEFAULT_WIDTH: usize = 120;
 const SESSION_LIST_STATUS_WIDTH: usize = 16;
 const SESSION_LIST_AGE_WIDTH: usize = 6;
@@ -192,6 +192,9 @@ pub async fn pick_session(paths: &AppPaths) -> Result<Option<String>> {
 fn draw_host_picker(lines: &[String], previous_lines: usize) -> Result<usize> {
     clear_host_picker(previous_lines)?;
     let mut stdout = std::io::stdout();
+    if previous_lines == 0 {
+        write!(stdout, "\r\n").context("failed to start session picker below prompt")?;
+    }
     for (index, line) in lines.iter().enumerate() {
         if index > 0 {
             write!(stdout, "\r\n").context("failed to write session picker newline")?;
@@ -207,7 +210,12 @@ fn clear_host_picker(previous_lines: usize) -> Result<()> {
         return Ok(());
     }
     let mut stdout = std::io::stdout();
-    execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))
+    execute!(
+        stdout,
+        MoveToColumn(0),
+        MoveUp(previous_lines.saturating_sub(1) as u16),
+        Clear(ClearType::FromCursorDown)
+    )
         .context("failed to clear session picker")?;
     stdout.flush().context("failed to flush session picker clear")
 }
