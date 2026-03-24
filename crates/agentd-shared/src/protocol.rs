@@ -8,7 +8,7 @@ use crate::session::{
     IntegrationPolicy, SessionDiff, SessionMode, SessionRecord, SessionStatus, WorktreeRecord,
 };
 
-pub const PROTOCOL_VERSION: u16 = 24;
+pub const PROTOCOL_VERSION: u16 = 25;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
@@ -60,7 +60,7 @@ pub enum Request {
     ShutdownDaemon,
     CreateSession {
         workspace: String,
-        title: Option<String>,
+        name: Option<String>,
         agent: String,
         model: Option<String>,
         integration_policy: IntegrationPolicy,
@@ -448,9 +448,9 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
     let kind = match request {
         Request::GetDaemonInfo => MessageKind::GetDaemonInfoRequest,
         Request::ShutdownDaemon => MessageKind::ShutdownDaemonRequest,
-        Request::CreateSession { workspace, title, agent, model, integration_policy } => {
+        Request::CreateSession { workspace, name, agent, model, integration_policy } => {
             put_string(&mut payload, workspace)?;
-            put_optional_string(&mut payload, title.as_deref())?;
+            put_optional_string(&mut payload, name.as_deref())?;
             put_string(&mut payload, agent)?;
             put_optional_string(&mut payload, model.as_deref())?;
             put_integration_policy(&mut payload, *integration_policy);
@@ -544,7 +544,7 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
         MessageKind::ShutdownDaemonRequest => Request::ShutdownDaemon,
         MessageKind::CreateSessionRequest => Request::CreateSession {
             workspace: cursor.take_string()?,
-            title: cursor.take_optional_string()?,
+            name: cursor.take_optional_string()?,
             agent: cursor.take_string()?,
             model: cursor.take_optional_string()?,
             integration_policy: cursor.take_integration_policy()?,
@@ -943,7 +943,6 @@ fn put_session_record(buf: &mut Vec<u8>, session: &SessionRecord) -> Result<()> 
     put_string(buf, &session.workspace)?;
     put_string(buf, &session.repo_path)?;
     put_string(buf, &session.repo_name)?;
-    put_string(buf, &session.title)?;
     put_string(buf, &session.base_branch)?;
     put_string(buf, &session.branch)?;
     put_string(buf, &session.worktree)?;
@@ -1198,7 +1197,6 @@ impl<'a> Cursor<'a> {
             workspace: self.take_string()?,
             repo_path: self.take_string()?,
             repo_name: self.take_string()?,
-            title: self.take_string()?,
             base_branch: self.take_string()?,
             branch: self.take_string()?,
             worktree: self.take_string()?,
@@ -1411,7 +1409,6 @@ mod tests {
                 workspace: "/tmp/demo".to_string(),
                 repo_path: "/tmp/demo".to_string(),
                 repo_name: "demo".to_string(),
-                title: "fix".to_string(),
                 base_branch: "main".to_string(),
                 branch: "agent/fix".to_string(),
                 worktree: "/tmp/worktree".to_string(),

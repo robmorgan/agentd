@@ -72,7 +72,6 @@ mod tests {
             workspace: "/tmp/repo".to_string(),
             repo_path: "/tmp/repo".to_string(),
             repo_name: "repo".to_string(),
-            title: "demo".to_string(),
             base_branch: "main".to_string(),
             branch: "agent/demo".to_string(),
             worktree: "/tmp/worktree".to_string(),

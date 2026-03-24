@@ -20,7 +20,10 @@ use agentd_shared::{
     header::agentd_header,
     paths::AppPaths,
     protocol::{Request, Response},
-    session::{ApplyState, IntegrationPolicy, SessionMode, SessionRecord, SessionStatus},
+    session::{
+        ApplyState, IntegrationPolicy, SESSION_NAME_RULES, SessionMode, SessionRecord,
+        SessionStatus, validate_session_name,
+    },
 };
 
 use crate::{
@@ -84,18 +87,15 @@ const SESSION_LIST_DEFAULT_WIDTH: usize = 120;
 const SESSION_LIST_STATUS_WIDTH: usize = 16;
 const SESSION_LIST_AGE_WIDTH: usize = 6;
 const SESSION_LIST_SESSION_MIN_WIDTH: usize = 8;
-const SESSION_LIST_SESSION_MAX_WIDTH: usize = 14;
+const SESSION_LIST_SESSION_MAX_WIDTH: usize = 24;
 const SESSION_LIST_SESSION_FLOOR_WIDTH: usize = 6;
-const SESSION_LIST_TITLE_MIN_WIDTH: usize = 12;
-const SESSION_LIST_TITLE_MAX_WIDTH: usize = 30;
-const SESSION_LIST_TITLE_FLOOR_WIDTH: usize = 8;
 const SESSION_LIST_REPO_MIN_WIDTH: usize = 8;
 const SESSION_LIST_REPO_MAX_WIDTH: usize = 18;
 const SESSION_LIST_REPO_FLOOR_WIDTH: usize = 6;
 const SESSION_LIST_BRANCH_MIN_WIDTH: usize = 12;
 const SESSION_LIST_BRANCH_MAX_WIDTH: usize = 34;
 const SESSION_LIST_BRANCH_FLOOR_WIDTH: usize = 8;
-const SESSION_LIST_STRUCTURAL_WIDTH: usize = 12;
+const SESSION_LIST_STRUCTURAL_WIDTH: usize = 10;
 
 fn default_integration_policy(paths: &AppPaths) -> IntegrationPolicy {
     let _ = Config::load(paths);
@@ -108,7 +108,6 @@ struct SessionListLayout {
     status: usize,
     age: usize,
     session: usize,
-    title: usize,
     repo: usize,
     branch: usize,
 }
@@ -360,6 +359,12 @@ impl SessionPicker {
                     return Ok(None);
                 }
                 Some(PickerRow::Create) | None => {
+                    if !self.composer.query.trim().is_empty()
+                        && self.composer_requested_name().is_none()
+                    {
+                        self.toast = Some(format!("invalid session name: {SESSION_NAME_RULES}"));
+                        return Ok(None);
+                    }
                     self.open_create_agent_menu();
                 }
             },
@@ -605,11 +610,15 @@ impl SessionPicker {
         selected: usize,
     ) -> Vec<String> {
         let mut lines = vec![style_host_picker_background_row(width)];
-        let title = self
+        let heading = self
             .session_by_id(session_id)
-            .map(|session| format!("{}  {}", session.title, session.branch))
+            .map(|session| format!("{}  {}", session.session_id, session.branch))
             .unwrap_or_else(|| session_id.to_string());
-        lines.push(style_host_picker_menu_line(&fit_host_picker_line(title, width), width, false));
+        lines.push(style_host_picker_menu_line(
+            &fit_host_picker_line(heading, width),
+            width,
+            false,
+        ));
         if let Some(session) = self.session_by_id(session_id) {
             lines.push(style_host_picker_menu_line(
                 &fit_host_picker_line(session.worktree.clone(), width),
@@ -629,18 +638,30 @@ impl SessionPicker {
 
     fn render_create_agent_lines(&self, width: usize, selected: usize) -> Vec<String> {
         let mut lines = vec![style_host_picker_background_row(width)];
-        let title = if self.composer.query.trim().is_empty() {
+        let heading = if self.composer.query.trim().is_empty() {
             "Choose coding agent".to_string()
-        } else {
+        } else if self.composer_requested_name().is_some() {
             format!("Create: {}", self.composer.query.trim())
+        } else {
+            "Invalid session name".to_string()
         };
-        lines.push(style_host_picker_menu_line(&fit_host_picker_line(title, width), width, false));
+        lines.push(style_host_picker_menu_line(
+            &fit_host_picker_line(heading, width),
+            width,
+            false,
+        ));
         for (index, agent) in self.create_agents.iter().enumerate() {
             let label = format!("{}. {}", index + 1, agent);
             lines.push(style_host_picker_menu_line(&label, width, index == selected));
         }
         lines.push(style_host_picker_background_row(width));
-        lines.push(fit_host_picker_line("Enter selects. Esc goes back.".to_string(), width));
+        let help =
+            if self.composer.query.trim().is_empty() || self.composer_requested_name().is_some() {
+                "Enter selects. Esc goes back.".to_string()
+            } else {
+                format!("Use lowercase letters, numbers, and hyphens. {}", SESSION_NAME_RULES)
+            };
+        lines.push(fit_host_picker_line(help, width));
         lines.push(String::new());
         lines
     }
@@ -786,6 +807,15 @@ impl SessionPicker {
         self.sessions.iter().find(|session| session.session_id == session_id)
     }
 
+    fn composer_requested_name(&self) -> Option<String> {
+        let trimmed = self.composer.query.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        validate_session_name(trimmed).ok()?;
+        Some(trimmed.to_string())
+    }
+
     fn refresh_agent_names(&mut self) -> Result<()> {
         self.create_agents = configured_agent_names(&self.paths)?;
         if self.create_agents.is_empty() {
@@ -880,13 +910,17 @@ impl SessionPicker {
     }
 
     async fn create_session_with_agent(&mut self, agent: &str) -> Result<Option<Option<String>>> {
-        let title = self.composer.query.trim();
+        let name = self.composer_requested_name();
+        if !self.composer.query.trim().is_empty() && name.is_none() {
+            self.toast = Some(format!("invalid session name: {SESSION_NAME_RULES}"));
+            return Ok(None);
+        }
         let workspace = std::env::current_dir().context("failed to determine current directory")?;
         let response = send_request(
             &self.paths,
             &Request::CreateSession {
                 workspace: workspace.to_string_lossy().to_string(),
-                title: (!title.is_empty()).then(|| title.to_string()),
+                name,
                 agent: agent.to_string(),
                 model: if agent == "codex" { Some(CODEX_MODELS[0].to_string()) } else { None },
                 integration_policy: default_integration_policy(&self.paths),
@@ -997,19 +1031,17 @@ fn render_session_list_row(session: &SessionRecord, layout: SessionListLayout) -
     let status = render_session_list_status_cell(session, layout.status);
     let age = format_session_list_cell(&session_elapsed_label(session), layout.age);
     let session_id = format_session_list_cell(&session.session_id, layout.session);
-    let title = format_session_list_cell(&session.title, layout.title);
     let repo = format_session_list_cell(&session.repo_name, layout.repo);
     let branch = format_session_list_cell(&session.branch, layout.branch);
-    format!("  {status}  {age}  {session_id}  {title}  {repo}  {branch}")
+    format!("  {status}  {age}  {session_id}  {repo}  {branch}")
 }
 
 fn render_session_list_header_content(layout: SessionListLayout) -> String {
     format!(
-        "  {}  {}  {}  {}  {}  {}",
+        "  {}  {}  {}  {}  {}",
         format_session_list_cell("STATUS", layout.status),
         format_session_list_cell("AGE", layout.age),
-        format_session_list_cell("SESSION", layout.session),
-        format_session_list_cell("TITLE", layout.title),
+        format_session_list_cell("NAME", layout.session),
         format_session_list_cell("REPO", layout.repo),
         format_session_list_cell("BRANCH", layout.branch),
     )
@@ -1035,7 +1067,6 @@ fn session_list_layout(width: usize) -> SessionListLayout {
         status: SESSION_LIST_STATUS_WIDTH,
         age: SESSION_LIST_AGE_WIDTH,
         session: SESSION_LIST_SESSION_MIN_WIDTH,
-        title: SESSION_LIST_TITLE_MIN_WIDTH,
         repo: SESSION_LIST_REPO_MIN_WIDTH,
         branch: SESSION_LIST_BRANCH_MIN_WIDTH,
     };
@@ -1043,7 +1074,6 @@ fn session_list_layout(width: usize) -> SessionListLayout {
     if visible_width >= min_total {
         let mut remaining = visible_width - min_total;
         grow_session_list_column(&mut layout.branch, SESSION_LIST_BRANCH_MAX_WIDTH, &mut remaining);
-        grow_session_list_column(&mut layout.title, SESSION_LIST_TITLE_MAX_WIDTH, &mut remaining);
         grow_session_list_column(
             &mut layout.session,
             SESSION_LIST_SESSION_MAX_WIDTH,
@@ -1056,7 +1086,6 @@ fn session_list_layout(width: usize) -> SessionListLayout {
     let mut deficit = min_total - visible_width;
     shrink_session_list_column(&mut layout.repo, SESSION_LIST_REPO_FLOOR_WIDTH, &mut deficit);
     shrink_session_list_column(&mut layout.session, SESSION_LIST_SESSION_FLOOR_WIDTH, &mut deficit);
-    shrink_session_list_column(&mut layout.title, SESSION_LIST_TITLE_FLOOR_WIDTH, &mut deficit);
     shrink_session_list_column(&mut layout.branch, SESSION_LIST_BRANCH_FLOOR_WIDTH, &mut deficit);
     layout
 }
@@ -1070,7 +1099,6 @@ fn session_list_total_width(layout: SessionListLayout) -> usize {
         + layout.status
         + layout.age
         + layout.session
-        + layout.title
         + layout.repo
         + layout.branch
 }
@@ -1186,7 +1214,7 @@ pub struct AttachOverlay {
     palette_selected: usize,
     switcher_query: String,
     switcher_selected: usize,
-    title_input: String,
+    name_input: String,
     agent_input: String,
     detail_text: String,
     detail_scroll: u16,
@@ -1204,7 +1232,7 @@ impl AttachOverlay {
             palette_selected: 0,
             switcher_query: String::new(),
             switcher_selected: 0,
-            title_input: String::new(),
+            name_input: String::new(),
             agent_input: "codex".to_string(),
             detail_text: String::new(),
             detail_scroll: 0,
@@ -1276,7 +1304,7 @@ impl AttachOverlay {
             if edit_agent {
                 self.agent_input.push_str(data);
             } else {
-                self.title_input.push_str(data);
+                self.name_input.push_str(data);
             }
         } else if matches!(self.mode, OverlayMode::Palette) {
             self.palette_query.push_str(data);
@@ -1365,14 +1393,18 @@ impl AttachOverlay {
                 if edit_agent {
                     self.agent_input.pop();
                 } else {
-                    self.title_input.pop();
+                    self.name_input.pop();
                 }
             }
             KeyCode::Enter => {
-                let title = self.title_input.trim();
+                let name = self.name_input.trim();
                 let agent = self.agent_input.trim();
                 if agent.is_empty() {
                     self.toast = Some("agent cannot be empty".to_string());
+                    return Ok(None);
+                }
+                if !name.is_empty() && validate_session_name(name).is_err() {
+                    self.toast = Some(format!("invalid session name: {SESSION_NAME_RULES}"));
                     return Ok(None);
                 }
                 let workspace =
@@ -1381,7 +1413,7 @@ impl AttachOverlay {
                     &self.paths,
                     &Request::CreateSession {
                         workspace: workspace.to_string_lossy().to_string(),
-                        title: (!title.is_empty()).then(|| title.to_string()),
+                        name: (!name.is_empty()).then(|| name.to_string()),
                         agent: agent.to_string(),
                         model: if agent == "codex" {
                             Some(CODEX_MODELS[0].to_string())
@@ -1406,7 +1438,7 @@ impl AttachOverlay {
                 if edit_agent {
                     self.agent_input.push(ch);
                 } else {
-                    self.title_input.push(ch);
+                    self.name_input.push(ch);
                 }
             }
             _ => {}
@@ -1448,7 +1480,7 @@ impl AttachOverlay {
             }
             Command::NewSession => {
                 self.mode = OverlayMode::NewSession { edit_agent: false };
-                self.title_input.clear();
+                self.name_input.clear();
                 self.agent_input = "codex".to_string();
             }
             Command::GitStatus => {
@@ -1568,7 +1600,7 @@ impl AttachOverlay {
                 Line::from(vec![
                     Span::styled(session_icon(session), session_icon_style(session)),
                     Span::raw("  "),
-                    Span::styled(session.title.as_str(), style),
+                    Span::styled(session.session_id.as_str(), style),
                     Span::raw("  "),
                     Span::styled(session.repo_name.as_str(), subtle_style()),
                     Span::raw("  "),
@@ -1603,14 +1635,14 @@ impl AttachOverlay {
                 ratatui::layout::Constraint::Length(1),
             ])
             .split(area);
-        let title_style =
+        let name_style =
             if edit_agent { Style::default() } else { Style::default().fg(Color::Cyan) };
         let agent_style =
             if edit_agent { Style::default().fg(Color::Cyan) } else { Style::default() };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("title  ", subtle_style()),
-                Span::styled(self.title_input.as_str(), title_style),
+                Span::styled("name   ", subtle_style()),
+                Span::styled(self.name_input.as_str(), name_style),
             ]))
             .block(Block::default().borders(Borders::ALL)),
             chunks[0],
@@ -1624,7 +1656,7 @@ impl AttachOverlay {
             chunks[1],
         );
         frame.render_widget(
-            Paragraph::new("Tab switches field. Enter creates a new worker."),
+            Paragraph::new("Blank auto-generates. Use lowercase letters, numbers, and hyphens."),
             chunks[2],
         );
         if let Some(toast) = &self.toast {
@@ -1684,7 +1716,7 @@ fn palette_items() -> Vec<PaletteItem> {
 fn session_search_text(session: &SessionRecord) -> String {
     format!(
         "{} {} {} {} {} {}",
-        session.title,
+        session.session_id,
         session.repo_name,
         session.branch,
         session.status_string(),
@@ -1748,10 +1780,8 @@ fn render_host_picker_session_row(session: &SessionRecord, width: usize, selecte
     let leader = if selected { "› ".to_string() } else { "  ".to_string() };
     let separator = "  ";
     let elapsed = session_elapsed_label(session);
-    let tail = format!(
-        "{}  {}  {}  {}  {}",
-        elapsed, session.session_id, session.title, session.repo_name, session.branch
-    );
+    let tail =
+        format!("{}  {}  {}  {}", elapsed, session.session_id, session.repo_name, session.branch);
     let used = leader.chars().count() + session_icon(session).chars().count() + separator.len();
     let remaining = max_chars.saturating_sub(used);
     let visible_tail = tail.chars().take(remaining).collect::<String>();
@@ -1830,7 +1860,6 @@ fn demo_status_session(status: SessionStatus, apply_state: ApplyState) -> Sessio
         workspace: String::new(),
         repo_path: String::new(),
         repo_name: String::new(),
-        title: String::new(),
         base_branch: String::new(),
         branch: String::new(),
         worktree: String::new(),
@@ -2166,7 +2195,7 @@ mod tests {
         let lines = picker.render_lines(120, true);
         let rendered = lines.join("\n");
 
-        assert!(!rendered.contains("title-beta"));
+        assert!(!rendered.contains("beta  repo-b"));
         assert!(rendered.contains("› 1. attach"));
         assert!(rendered.contains("  2. diff"));
         assert!(rendered.contains("/tmp/alpha"));
@@ -2253,7 +2282,7 @@ mod tests {
         assert_eq!(picker.mode, PickerMode::CreateAgentSelect { selected: 1 });
         assert!(rendered.contains("1. codex"));
         assert!(rendered.contains("› 2. claude"));
-        assert!(!rendered.contains("title-alpha"));
+        assert!(!rendered.contains("alpha  repo-a"));
     }
 
     #[test]
@@ -2410,7 +2439,7 @@ mod tests {
         assert!(running.contains(HOST_PICKER_SELECTED_STYLE));
         assert!(running.contains("› "));
         assert!(running.contains("●"));
-        assert!(running.contains("23m  alpha  title-alpha"));
+        assert!(running.contains("23m  alpha  repo-a  agent/alpha"));
         assert!(review.contains("⧖"));
         assert!(failed.contains("✖"));
         let needs_input = render_host_picker_session_row(
@@ -2470,8 +2499,7 @@ mod tests {
 
         assert!(!rendered.contains("agentd - "));
         assert!(rendered.contains("STATUS"));
-        assert!(rendered.contains("SESSION"));
-        assert!(rendered.contains("TITLE"));
+        assert!(rendered.contains("NAME"));
         assert!(rendered.contains("running"));
         assert!(!rendered.contains("› "));
     }
@@ -2479,8 +2507,9 @@ mod tests {
     #[test]
     fn session_list_uses_single_row_and_dynamic_widths() {
         let mut session = demo("alpha", "repository-with-a-long-name");
-        session.title =
-            "a very long title that should be truncated in the fixed width column".to_string();
+        session.session_id =
+            "a-very-long-session-name-that-should-be-truncated-in-the-fixed-width-column"
+                .to_string();
         session.branch =
             "agent/this-is-a-very-long-branch-name-that-should-be-truncated".to_string();
         session.attention_summary =
@@ -2491,10 +2520,10 @@ mod tests {
 
         assert_eq!(wide.lines().count(), 2);
         assert!(!wide.contains("needs manual review because a long follow-up summary is present"));
-        assert!(wide.contains("a very long title that shou..."));
+        assert!(wide.contains("a-very-long-session-n..."));
         assert!(wide.contains("agent/this-is-a-very-long-branc..."));
-        assert!(narrow.contains("a very lo..."));
-        assert!(narrow.contains("agent/this-is-a..."));
+        assert!(narrow.contains("a-ver..."));
+        assert!(narrow.contains("agent/this-is-a-very-long"));
     }
 
     #[test]
@@ -2533,9 +2562,15 @@ mod tests {
         let narrow = strip_ansi(&render_session_list_header_row(narrow_layout));
 
         assert_eq!(wide, render_session_list_header_content(wide_layout));
-        assert_eq!(wide.chars().count(), 120);
+        assert_eq!(
+            wide.chars().count(),
+            render_session_list_header_content(wide_layout).chars().count()
+        );
         assert_eq!(narrow, render_session_list_header_content(narrow_layout));
-        assert_eq!(narrow.chars().count(), 80);
+        assert_eq!(
+            narrow.chars().count(),
+            render_session_list_header_content(narrow_layout).chars().count()
+        );
     }
 
     #[test]
@@ -2680,7 +2715,6 @@ mod tests {
             workspace: "/tmp/repo".to_string(),
             repo_path: "/tmp/repo".to_string(),
             repo_name: repo_name.to_string(),
-            title: format!("title-{session_id}"),
             base_branch: "main".to_string(),
             branch: format!("agent/{session_id}"),
             worktree: format!("/tmp/{session_id}"),

@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{
     Parser, Subcommand,
     builder::styling::{AnsiColor, Color, Effects, RgbColor, Styles},
@@ -43,7 +43,8 @@ use agentd_shared::{
     },
     session::{
         ApplyState, AttachmentKind, AttachmentRecord, AttentionLevel, IntegrationPolicy,
-        SessionDiff, SessionRecord, SessionStatus, WorktreeRecord,
+        SESSION_NAME_RULES, SessionDiff, SessionRecord, SessionStatus, WorktreeRecord,
+        validate_session_name,
     },
 };
 
@@ -99,8 +100,8 @@ fn cli_styles() -> Styles {
     name = "agent",
     version,
     about = "Run, inspect, and review local coding sessions",
-    before_help = "agent\nA local multi-session coding workflow for daemon-backed agents.\n\nCore flows:\n  Start a session      agent new \"fix flaky tests\"\n  Inspect sessions     agent list\n  Reconnect live PTY   agent attach <session_id>\n  Review changes       agent diff <session_id> | agent merge <session_id>",
-    after_help = "Examples:\n  agent new \"add health checks\"\n  agent create --workspace . --agent codex --title \"refactor retries\"\n  agent list\n  agent status <session_id>\n  agent daemon info\n\nUse `agent <command> --help` for command-specific details.",
+    before_help = "agent\nA local multi-session coding workflow for daemon-backed agents.\n\nCore flows:\n  Start a session      agent new fix-flaky-tests\n  Inspect sessions     agent list\n  Reconnect live PTY   agent attach <name>\n  Review changes       agent diff <name> | agent merge <name>",
+    after_help = "Examples:\n  agent new add-health-checks\n  agent create --workspace . --agent codex refactor-retries\n  agent list\n  agent status <name>\n  agent daemon info\n\nUse `agent <command> --help` for command-specific details.",
     help_template = ROOT_HELP_TEMPLATE,
     styles = cli_styles(),
     disable_help_subcommand = true,
@@ -118,7 +119,7 @@ enum Command {
     Runtime { session_id: Option<String> },
     #[command(about = "Start and attach to a new session", display_order = 1)]
     New {
-        title: Option<String>,
+        name: Option<String>,
         #[arg(long)]
         workspace: Option<PathBuf>,
         #[arg(long)]
@@ -129,9 +130,8 @@ enum Command {
         #[arg(long)]
         workspace: PathBuf,
         #[arg(long)]
-        title: Option<String>,
-        #[arg(long)]
         agent: String,
+        name: Option<String>,
     },
     #[command(about = "Stop a running session or remove its record", display_order = 3)]
     Kill {
@@ -207,8 +207,8 @@ enum Command {
 #[command(
     name = "agent worktree",
     help_template = GROUP_HELP_TEMPLATE,
-    before_help = "agent worktree\nManage the git worktree attached to a session.\n\nTypical flow:\n  agent worktree create <session_id>\n  agent worktree cleanup <session_id>",
-    after_help = "Use `agent status <session_id>` first if you are unsure whether a session is still live.",
+    before_help = "agent worktree\nManage the git worktree attached to a session.\n\nTypical flow:\n  agent worktree create <name>\n  agent worktree cleanup <name>",
+    after_help = "Use `agent status <name>` first if you are unsure whether a session is still live.",
     styles = cli_styles(),
     next_display_order = 1
 )]
@@ -261,13 +261,13 @@ async fn main() -> Result<()> {
         (Some(Command::Runtime { .. }), ExecutionMode::Local(reason)) => {
             bail!("{reason}. `agent runtime` requires a compatible daemon");
         }
-        (Some(Command::New { title, workspace, agent }), ExecutionMode::Daemon) => {
-            let options = resolve_new_session_options(&paths, workspace, title, agent)?;
+        (Some(Command::New { name, workspace, agent }), ExecutionMode::Daemon) => {
+            let options = resolve_new_session_options(&paths, workspace, name, agent)?;
             let response = send_request(
                 &paths,
                 &Request::CreateSession {
                     workspace: options.workspace.to_string_lossy().to_string(),
-                    title: options.title,
+                    name: options.name,
                     agent: options.agent,
                     model: None,
                     integration_policy: IntegrationPolicy::ManualReview,
@@ -286,12 +286,13 @@ async fn main() -> Result<()> {
         (Some(Command::New { .. }), ExecutionMode::Local(reason)) => {
             bail_live_command(&reason)?;
         }
-        (Some(Command::Create { workspace, title, agent }), ExecutionMode::Daemon) => {
+        (Some(Command::Create { workspace, agent, name }), ExecutionMode::Daemon) => {
+            let name = normalize_requested_name(name)?;
             let response = send_request(
                 &paths,
                 &Request::CreateSession {
                     workspace: workspace.to_string_lossy().to_string(),
-                    title,
+                    name,
                     agent,
                     model: None,
                     integration_policy: IntegrationPolicy::ManualReview,
@@ -301,7 +302,7 @@ async fn main() -> Result<()> {
 
             match response {
                 Response::CreateSession { session } => {
-                    println!("session_id: {}", session.session_id);
+                    println!("name: {}", session.session_id);
                     println!("base_branch: {}", session.base_branch);
                     println!("branch: {}", session.branch);
                     println!("worktree: {}", session.worktree);
@@ -546,9 +547,10 @@ enum ExecutionMode {
     Local(String),
 }
 
+#[derive(Debug)]
 struct NewSessionOptions {
     workspace: PathBuf,
-    title: Option<String>,
+    name: Option<String>,
     agent: String,
 }
 
@@ -620,7 +622,7 @@ fn bail_daemon_command(reason: &str, command: &str) -> Result<()> {
 fn resolve_new_session_options(
     paths: &AppPaths,
     workspace: Option<PathBuf>,
-    title: Option<String>,
+    name: Option<String>,
     agent: Option<String>,
 ) -> Result<NewSessionOptions> {
     let config = Config::load(paths)?;
@@ -629,12 +631,22 @@ fn resolve_new_session_options(
             Some(workspace) => workspace,
             None => std::env::current_dir().context("failed to resolve current directory")?,
         },
-        title: title.filter(|value| !value.trim().is_empty()),
+        name: normalize_requested_name(name)?,
         agent: match agent {
             Some(agent) => agent,
             None => config.default_agent_name(paths)?.to_string(),
         },
     })
+}
+
+fn normalize_requested_name(name: Option<String>) -> Result<Option<String>> {
+    let trimmed = name.as_deref().map(str::trim).unwrap_or_default();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    validate_session_name(trimmed)
+        .map_err(|_| anyhow!("invalid session name `{trimmed}`: {SESSION_NAME_RULES}"))?;
+    Ok(Some(trimmed.to_string()))
 }
 
 fn resolve_detach_session_id(session_id: Option<String>) -> Result<String> {
@@ -1191,7 +1203,7 @@ fn print_attachments(attachments: &[AttachmentRecord]) {
 }
 
 fn print_session(session: &SessionRecord) {
-    println!("session_id: {}", session.session_id);
+    println!("name: {}", session.session_id);
     if let Some(thread_id) = &session.thread_id {
         println!("thread_id: {thread_id}");
     }
@@ -1209,7 +1221,6 @@ fn print_session(session: &SessionRecord) {
     println!("repo_name: {}", session.repo_name);
     println!("repo_path: {}", session.repo_path);
     println!("workspace: {}", session.workspace);
-    println!("title: {}", session.title);
     println!("base_branch: {}", session.base_branch);
     println!("branch: {}", session.branch);
     println!("worktree: {}", session.worktree);
@@ -1225,7 +1236,7 @@ fn print_session(session: &SessionRecord) {
 }
 
 fn print_worktree(worktree: &WorktreeRecord) {
-    println!("session_id: {}", worktree.session_id);
+    println!("name: {}", worktree.session_id);
     println!("repo_path: {}", worktree.repo_path);
     println!("base_branch: {}", worktree.base_branch);
     println!("branch: {}", worktree.branch);
@@ -1233,7 +1244,7 @@ fn print_worktree(worktree: &WorktreeRecord) {
 }
 
 fn print_diff(diff: &SessionDiff) {
-    println!("session_id: {}", diff.session_id);
+    println!("name: {}", diff.session_id);
     println!("base_branch: {}", diff.base_branch);
     println!("branch: {}", diff.branch);
     println!("worktree: {}", diff.worktree);
@@ -1778,11 +1789,11 @@ mod tests {
     }
 
     #[test]
-    fn new_command_parses_optional_title() {
-        let cli = Cli::try_parse_from(["agent", "new", "fix failing tests"]).unwrap();
+    fn new_command_parses_optional_name() {
+        let cli = Cli::try_parse_from(["agent", "new", "fix-failing-tests"]).unwrap();
         match cli.command {
-            Some(Command::New { title, workspace, agent }) => {
-                assert_eq!(title.as_deref(), Some("fix failing tests"));
+            Some(Command::New { name, workspace, agent }) => {
+                assert_eq!(name.as_deref(), Some("fix-failing-tests"));
                 assert!(workspace.is_none());
                 assert!(agent.is_none());
             }
@@ -1803,8 +1814,8 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Some(Command::New { title, workspace, agent }) => {
-                assert_eq!(title.as_deref(), Some("fix"));
+            Some(Command::New { name, workspace, agent }) => {
+                assert_eq!(name.as_deref(), Some("fix"));
                 assert_eq!(workspace, Some(PathBuf::from("/tmp/repo")));
                 assert_eq!(agent.as_deref(), Some("claude"));
             }
@@ -1817,7 +1828,7 @@ mod tests {
         let paths = test_paths();
         let options = resolve_new_session_options(&paths, None, None, None).unwrap();
         assert_eq!(options.workspace, std::env::current_dir().unwrap());
-        assert!(options.title.is_none());
+        assert!(options.name.is_none());
         assert_eq!(options.agent, "codex");
     }
 
@@ -1849,13 +1860,26 @@ command = "claude"
         let options = resolve_new_session_options(
             &paths,
             Some(PathBuf::from("/tmp/repo")),
-            Some("fix tests".to_string()),
+            Some("fix-tests".to_string()),
             Some("claude".to_string()),
         )
         .unwrap();
         assert_eq!(options.workspace, PathBuf::from("/tmp/repo"));
-        assert_eq!(options.title.as_deref(), Some("fix tests"));
+        assert_eq!(options.name.as_deref(), Some("fix-tests"));
         assert_eq!(options.agent, "claude");
+    }
+
+    #[test]
+    fn resolve_new_session_options_rejects_invalid_name() {
+        let paths = test_paths();
+        let err = resolve_new_session_options(
+            &paths,
+            Some(PathBuf::from("/tmp/repo")),
+            Some("fix tests".to_string()),
+            Some("claude".to_string()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid session name"));
     }
 
     #[test]

@@ -91,7 +91,7 @@ We use `libghostty-vt` to restore the previous state of the terminal when a clie
 
 How it works:
 
-* user creates or re-attaches to a session with `agent attach <session_id>` or by focusing it in the TUI
+* user creates or re-attaches to a session with `agent attach <name>` or by focusing it in the TUI
 * user interacts with terminal stdin
 * stdin gets sent to pty via daemon
 * daemon sends pty output to client and `ghostty-vt`

@@ -1,7 +1,7 @@
 use anyhow::{Result, bail, ensure};
 use rusqlite::Connection;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 3;
+pub const CURRENT_SCHEMA_VERSION: i32 = 4;
 const EXPECTED_SESSIONS_COLUMNS: &[&str] = &[
     "session_id",
     "thread_id",
@@ -11,7 +11,6 @@ const EXPECTED_SESSIONS_COLUMNS: &[&str] = &[
     "workspace",
     "repo_path",
     "repo_name",
-    "title",
     "base_branch",
     "branch",
     "worktree",
@@ -45,7 +44,8 @@ pub fn init_state_db(conn: &mut Connection) -> Result<()> {
     if !has_objects {
         create_schema(&tx)?;
     } else {
-        ensure_supported_schema(&tx, schema_version)?;
+        migrate_schema(&tx, schema_version)?;
+        ensure_supported_schema(&tx, CURRENT_SCHEMA_VERSION)?;
     }
 
     tx.commit()?;
@@ -76,9 +76,20 @@ fn ensure_supported_schema(conn: &Connection, schema_version: i32) -> Result<()>
     Ok(())
 }
 
-fn create_schema(conn: &Connection) -> Result<()> {
+fn migrate_schema(conn: &Connection, schema_version: i32) -> Result<()> {
+    match schema_version {
+        CURRENT_SCHEMA_VERSION => Ok(()),
+        3 => migrate_v3_to_v4(conn),
+        other => bail!(
+            "unsupported state database schema version {other}; expected {CURRENT_SCHEMA_VERSION}. Remove or migrate the runtime root."
+        ),
+    }
+}
+
+fn migrate_v3_to_v4(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
+        ALTER TABLE sessions RENAME TO sessions_v3;
         CREATE TABLE sessions (
             session_id TEXT PRIMARY KEY,
             thread_id TEXT,
@@ -88,7 +99,6 @@ fn create_schema(conn: &Connection) -> Result<()> {
             workspace TEXT NOT NULL,
             repo_path TEXT NOT NULL,
             repo_name TEXT NOT NULL,
-            title TEXT NOT NULL,
             base_branch TEXT NOT NULL,
             branch TEXT NOT NULL,
             worktree TEXT NOT NULL,
@@ -104,7 +114,51 @@ fn create_schema(conn: &Connection) -> Result<()> {
             updated_at TEXT NOT NULL,
             exited_at TEXT
         );
-        PRAGMA user_version = 3;
+        INSERT INTO sessions (
+            session_id, thread_id, agent, model, mode, workspace, repo_path, repo_name,
+            base_branch, branch, worktree, status, integration_policy, pid, exit_code, error,
+            integration_state, attention, attention_summary, created_at, updated_at, exited_at
+        )
+        SELECT
+            session_id, thread_id, agent, model, mode, workspace, repo_path, repo_name,
+            base_branch, branch, worktree, status, integration_policy, pid, exit_code, error,
+            integration_state, attention, attention_summary, created_at, updated_at, exited_at
+        FROM sessions_v3;
+        DROP TABLE sessions_v3;
+        PRAGMA user_version = 4;
+        ",
+    )?;
+    Ok(())
+}
+
+fn create_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE sessions (
+            session_id TEXT PRIMARY KEY,
+            thread_id TEXT,
+            agent TEXT NOT NULL,
+            model TEXT,
+            mode TEXT NOT NULL CHECK (mode IN ('execute', 'plan')),
+            workspace TEXT NOT NULL,
+            repo_path TEXT NOT NULL,
+            repo_name TEXT NOT NULL,
+            base_branch TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            worktree TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('creating', 'running', 'needs_input', 'exited', 'failed', 'unknown_recovered')),
+            integration_policy TEXT NOT NULL CHECK (integration_policy IN ('manual_review', 'auto_apply_safe')),
+            pid INTEGER,
+            exit_code INTEGER,
+            error TEXT,
+            integration_state TEXT NOT NULL CHECK (integration_state IN ('idle', 'auto_applying', 'applied', 'discarded')),
+            attention TEXT NOT NULL CHECK (attention IN ('info', 'notice', 'action')),
+            attention_summary TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            exited_at TEXT
+        );
+        PRAGMA user_version = 4;
         ",
     )?;
     Ok(())

@@ -23,8 +23,9 @@ use agentd_shared::{
     paths::AppPaths,
     session::{
         ApplyState, AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult,
-        IntegrationPolicy, SessionDiff, SessionMode, SessionRecord, SessionStatus, WorktreeRecord,
-        branch_name_from_title, repo_name_from_path,
+        IntegrationPolicy, SESSION_NAME_RULES, SessionDiff, SessionMode, SessionRecord,
+        SessionStatus, WorktreeRecord, branch_name_from_session_id, repo_name_from_path,
+        validate_session_name,
     },
 };
 
@@ -51,7 +52,7 @@ impl AppState {
     pub async fn create_session(
         &self,
         workspace: String,
-        title: Option<String>,
+        name: Option<String>,
         agent_name: String,
         model: Option<String>,
         _integration_policy: IntegrationPolicy,
@@ -69,10 +70,10 @@ impl AppState {
             let repo_name = repo_name_from_path(repo_root.as_str());
             let mode = SessionMode::Execute;
 
-            let session_id = unique_session_id(&db)?;
+            let requested_session_id = normalize_session_name(name)?;
+            let session_id = unique_session_id(&db, &repo_root, requested_session_id.as_deref())?;
             let worktree = paths.worktree_path(&session_id);
-            let title = normalize_session_title(title, &agent_name, &repo_name, &session_id);
-            let branch = unique_branch_name(&repo_root, &title, &session_id)?;
+            let branch = unique_branch_name(&repo_root, &session_id)?;
 
             db.insert_session(&NewSession {
                 session_id: &session_id,
@@ -83,7 +84,6 @@ impl AppState {
                 workspace: repo_root.as_str(),
                 repo_path: repo_root.as_str(),
                 repo_name: &repo_name,
-                title: &title,
                 base_branch: &base_branch,
                 branch: &branch,
                 worktree: worktree.as_str(),
@@ -109,7 +109,6 @@ impl AppState {
                     repo_root: repo_root.as_str(),
                     worktree: worktree.as_str(),
                     branch: &branch,
-                    title: &title,
                     launch: &launch,
                     model: model.as_deref(),
                 },
@@ -526,7 +525,6 @@ struct SessionStartRequest<'a> {
     repo_root: &'a str,
     worktree: &'a str,
     branch: &'a str,
-    title: &'a str,
     launch: &'a LaunchCommand,
     model: Option<&'a str>,
 }
@@ -555,11 +553,11 @@ fn start_session_runtime(
         command.env(&key, &value);
     }
     command.env("AGENTD_SESSION_ID", request.session_id);
+    command.env("AGENTD_SESSION_NAME", request.session_id);
     command.env("AGENTD_SOCKET", paths.socket.as_str());
     command.env("AGENTD_WORKSPACE", request.repo_root);
     command.env("AGENTD_WORKTREE", request.worktree);
     command.env("AGENTD_BRANCH", request.branch);
-    command.env("AGENTD_TITLE", request.title);
 
     let mut child = pair
         .slave
@@ -848,14 +846,28 @@ impl Drop for AttachmentHandle {
     }
 }
 
-fn unique_session_id(db: &Database) -> Result<String> {
+fn unique_session_id(
+    db: &Database,
+    repo_root: &camino::Utf8Path,
+    requested_session_id: Option<&str>,
+) -> Result<String> {
+    if let Some(session_id) = requested_session_id {
+        ensure_session_id_available(db, repo_root, session_id)?;
+        return Ok(session_id.to_string());
+    }
+
     for _ in 0..16 {
         let candidate = generate_session_id();
-        if db.get_session(&candidate)?.is_none() {
-            return Ok(candidate);
+        if db.get_session(&candidate)?.is_some() {
+            continue;
         }
+        let branch = branch_name_from_session_id(&candidate);
+        if git::branch_exists(repo_root, &branch)? {
+            continue;
+        }
+        return Ok(candidate);
     }
-    bail!("failed to allocate a unique session id")
+    bail!("failed to allocate a unique session name")
 }
 
 fn record_session_failure(db: &Database, session_id: &str, error: String) -> Result<()> {
@@ -929,33 +941,34 @@ fn auto_commit_message(session: &SessionRecord) -> String {
     format!("agentd: finalize session {}", session.session_id)
 }
 
-fn normalize_session_title(
-    title: Option<String>,
-    agent_name: &str,
-    repo_name: &str,
-    session_id: &str,
-) -> String {
-    let trimmed = title.as_deref().map(str::trim).unwrap_or_default();
-    if !trimmed.is_empty() {
-        return trimmed.to_string();
+fn normalize_session_name(name: Option<String>) -> Result<Option<String>> {
+    let trimmed = name.as_deref().map(str::trim).unwrap_or_default();
+    if trimmed.is_empty() {
+        return Ok(None);
     }
-
-    let short_id = session_id.split('-').next_back().unwrap_or(session_id);
-    format!("{agent_name} @ {repo_name} ({short_id})")
+    validate_session_name(trimmed)
+        .map_err(|_| anyhow!("invalid session name `{trimmed}`: {SESSION_NAME_RULES}"))?;
+    Ok(Some(trimmed.to_string()))
 }
 
-fn unique_branch_name(
+fn ensure_session_id_available(
+    db: &Database,
     repo_root: &camino::Utf8Path,
-    title: &str,
     session_id: &str,
-) -> Result<String> {
-    let base = branch_name_from_title(title);
-    if !git::branch_exists(repo_root, &base)? {
-        return Ok(base);
+) -> Result<()> {
+    if db.get_session(session_id)?.is_some() {
+        bail!("session `{session_id}` already exists");
     }
 
-    let suffix = session_id.split('-').next_back().unwrap_or(session_id);
-    let branch = format!("{base}-{suffix}");
+    let branch = branch_name_from_session_id(session_id);
+    if git::branch_exists(repo_root, &branch)? {
+        bail!("branch `{branch}` already exists")
+    }
+    Ok(())
+}
+
+fn unique_branch_name(repo_root: &camino::Utf8Path, session_id: &str) -> Result<String> {
+    let branch = branch_name_from_session_id(session_id);
     if git::branch_exists(repo_root, &branch)? {
         bail!("branch `{branch}` already exists")
     }
@@ -1473,7 +1486,7 @@ mod tests {
         let repo = paths.root.join("repo");
         init_git_repo(repo.as_str());
 
-        insert_session(&db, repo.as_str(), "demo", "clean");
+        insert_session(&db, repo.as_str(), "demo");
         finalize_session_exit(&db, "demo", Some(0)).unwrap();
 
         let session = db.get_session("demo").unwrap().unwrap();
@@ -1490,7 +1503,7 @@ mod tests {
         let worktree = paths.root.join("worktree");
         init_git_repo(repo.as_str());
 
-        insert_session_with_worktree(&db, repo.as_str(), worktree.as_str(), "demo", "changed");
+        insert_session_with_worktree(&db, repo.as_str(), worktree.as_str(), "demo");
         fs::write(worktree.join("README.md"), "updated\n").unwrap();
         finalize_session_exit(&db, "demo", Some(0)).unwrap();
 
@@ -1509,7 +1522,7 @@ mod tests {
         let worktree = paths.root.join("worktree");
         init_git_repo(repo.as_str());
 
-        insert_session_with_worktree(&db, repo.as_str(), worktree.as_str(), "demo", "changed");
+        insert_session_with_worktree(&db, repo.as_str(), worktree.as_str(), "demo");
         fs::write(worktree.join("README.md"), "committed change\n").unwrap();
         commit_all(worktree.as_str(), "session change");
         fs::write(worktree.join("README.md"), "repo dirty\n").unwrap();
@@ -1527,7 +1540,7 @@ mod tests {
         let worktree = paths.root.join("worktree");
         init_git_repo(repo.as_str());
 
-        insert_session_with_worktree(&db, repo.as_str(), worktree.as_str(), "demo", "changed");
+        insert_session_with_worktree(&db, repo.as_str(), worktree.as_str(), "demo");
         assert!(
             Command::new("git")
                 .args(["-C", worktree.as_str(), "checkout", "agent/demo"])
@@ -1565,7 +1578,7 @@ mod tests {
         let worktree = paths.root.join("worktree");
         init_git_repo(repo.as_str());
 
-        insert_session_with_worktree(&db, repo.as_str(), worktree.as_str(), "demo", "changed");
+        insert_session_with_worktree(&db, repo.as_str(), worktree.as_str(), "demo");
         fs::write(repo.join("README.md"), "repo dirty\n").unwrap();
 
         let session = db.get_session("demo").unwrap().unwrap();
@@ -1585,7 +1598,6 @@ mod tests {
             workspace: "/tmp/work".to_string(),
             repo_path: "/tmp/repo path/it's".to_string(),
             repo_name: "repo".to_string(),
-            title: "ship it's".to_string(),
             base_branch: "main".to_string(),
             branch: "agent/demo".to_string(),
             worktree: "/tmp/worktree".to_string(),
@@ -1617,7 +1629,7 @@ mod tests {
         let worktree = paths.root.join("worktree");
         init_git_repo(repo.as_str());
 
-        insert_session_with_worktree(&db, repo.as_str(), worktree.as_str(), "demo", "changed");
+        insert_session_with_worktree(&db, repo.as_str(), worktree.as_str(), "demo");
         assert!(
             Command::new("git")
                 .args(["-C", worktree.as_str(), "checkout", "agent/demo"])
@@ -1636,8 +1648,14 @@ mod tests {
                 .status
                 .success()
         );
-        fs::write(repo.join("README.md"), "branch copy\n").unwrap();
-        commit_all(repo.as_str(), "same change on main");
+        assert!(
+            Command::new("git")
+                .args(["-C", repo.as_str(), "merge", "--ff-only", "agent/demo"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
 
         let session = refresh_commit_state(&db, db.get_session("demo").unwrap().unwrap()).unwrap();
         assert!(!session.has_commits);
@@ -1722,17 +1740,11 @@ mod tests {
         );
     }
 
-    fn insert_session(db: &Database, repo: &str, session_id: &str, title: &str) {
-        insert_session_with_worktree(db, repo, repo, session_id, title);
+    fn insert_session(db: &Database, repo: &str, session_id: &str) {
+        insert_session_with_worktree(db, repo, repo, session_id);
     }
 
-    fn insert_session_with_worktree(
-        db: &Database,
-        repo: &str,
-        worktree: &str,
-        session_id: &str,
-        title: &str,
-    ) {
+    fn insert_session_with_worktree(db: &Database, repo: &str, worktree: &str, session_id: &str) {
         if worktree != repo {
             assert!(
                 Command::new("git")
@@ -1762,7 +1774,6 @@ mod tests {
             workspace: repo,
             repo_path: repo,
             repo_name: "repo",
-            title,
             base_branch: "main",
             branch: "agent/demo",
             worktree,

@@ -24,7 +24,6 @@ pub struct NewSession<'a> {
     pub workspace: &'a str,
     pub repo_path: &'a str,
     pub repo_name: &'a str,
-    pub title: &'a str,
     pub base_branch: &'a str,
     pub branch: &'a str,
     pub worktree: &'a str,
@@ -69,9 +68,9 @@ impl Database {
         conn.execute(
             "INSERT INTO sessions (
                 session_id, thread_id, agent, model, mode, workspace,
-                repo_path, repo_name, title, base_branch, branch, worktree, status, integration_policy, attention, attention_summary,
+                repo_path, repo_name, base_branch, branch, worktree, status, integration_policy, attention, attention_summary,
                 integration_state, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?18)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
             params![
                 new_session.session_id,
                 new_session.thread_id,
@@ -81,14 +80,13 @@ impl Database {
                 new_session.workspace,
                 new_session.repo_path,
                 new_session.repo_name,
-                new_session.title,
                 new_session.base_branch,
                 new_session.branch,
                 new_session.worktree,
                 status_to_str(SessionStatus::Creating),
                 integration_policy_to_str(new_session.integration_policy),
                 attention_to_str(AttentionLevel::Info),
-                new_session.title,
+                new_session.session_id,
                 apply_state_to_str(ApplyState::Idle),
                 now,
             ],
@@ -229,7 +227,7 @@ impl Database {
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, repo_name, title, base_branch, branch,
+            "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, repo_name, base_branch, branch,
                     worktree, status, integration_policy, integration_state, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
@@ -243,7 +241,7 @@ impl Database {
     pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, repo_name, title, base_branch, branch,
+            "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, repo_name, base_branch, branch,
                     worktree, status, integration_policy, integration_state, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
@@ -271,48 +269,47 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         workspace: row.get(5)?,
         repo_path: row.get(6)?,
         repo_name: row.get(7)?,
-        title: row.get(8)?,
-        base_branch: row.get(9)?,
-        branch: row.get(10)?,
-        worktree: row.get(11)?,
-        status: str_to_status(&row.get::<_, String>(12)?).map_err(|err| {
+        base_branch: row.get(8)?,
+        branch: row.get(9)?,
+        worktree: row.get(10)?,
+        status: str_to_status(&row.get::<_, String>(11)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                12,
+                11,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        integration_policy: str_to_integration_policy(&row.get::<_, String>(13)?).map_err(
+        integration_policy: str_to_integration_policy(&row.get::<_, String>(12)?).map_err(
             |err| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    13,
+                    12,
                     rusqlite::types::Type::Text,
                     Box::new(err),
                 )
             },
         )?,
-        apply_state: str_to_apply_state(&row.get::<_, String>(14)?).map_err(|err| {
+        apply_state: str_to_apply_state(&row.get::<_, String>(13)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                14,
+                13,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
         has_commits: false,
-        pid: row.get::<_, Option<u32>>(15)?,
-        exit_code: row.get(16)?,
-        error: row.get(17)?,
-        attention: str_to_attention(&row.get::<_, String>(18)?).map_err(|err| {
+        pid: row.get::<_, Option<u32>>(14)?,
+        exit_code: row.get(15)?,
+        error: row.get(16)?,
+        attention: str_to_attention(&row.get::<_, String>(17)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                18,
+                17,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        attention_summary: row.get(19)?,
-        created_at: parse_time(row.get::<_, String>(20)?)?,
-        updated_at: parse_time(row.get::<_, String>(21)?)?,
-        exited_at: row.get::<_, Option<String>>(22)?.map(parse_time).transpose()?,
+        attention_summary: row.get(18)?,
+        created_at: parse_time(row.get::<_, String>(19)?)?,
+        updated_at: parse_time(row.get::<_, String>(20)?)?,
+        exited_at: row.get::<_, Option<String>>(21)?.map(parse_time).transpose()?,
     })
 }
 
@@ -456,7 +453,6 @@ mod tests {
             workspace: "/tmp/repo",
             repo_path: "/tmp/repo",
             repo_name: "repo",
-            title: "test",
             base_branch: "main",
             branch: "agent/test",
             worktree: "/tmp/worktree",
@@ -465,7 +461,6 @@ mod tests {
         .unwrap();
 
         let session = db.get_session("demo").unwrap().unwrap();
-        assert_eq!(session.title, "test");
         assert_eq!(session.repo_name, "repo");
         assert_eq!(session.branch, "agent/test");
     }

@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use slug::slugify;
 use std::path::Path;
+
+pub const SESSION_NAME_RULES: &str = "use 1-64 lowercase letters, numbers, and single hyphens";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -62,7 +63,6 @@ pub struct SessionRecord {
     pub workspace: String,
     pub repo_path: String,
     pub repo_name: String,
-    pub title: String,
     pub base_branch: String,
     pub branch: String,
     pub worktree: String,
@@ -117,11 +117,33 @@ pub struct AttachmentRecord {
     pub connected_at: DateTime<Utc>,
 }
 
-pub fn branch_name_from_title(title: &str) -> String {
-    let slug = slugify(title);
-    let trimmed = slug.trim_matches('-');
-    let branch = if trimmed.is_empty() { "session".to_string() } else { trimmed.to_string() };
-    format!("agent/{branch}")
+pub fn branch_name_from_session_id(session_id: &str) -> String {
+    format!("agent/{session_id}")
+}
+
+pub fn validate_session_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(SESSION_NAME_RULES.to_string());
+    }
+    if name.len() > 64 {
+        return Err(SESSION_NAME_RULES.to_string());
+    }
+
+    let bytes = name.as_bytes();
+    if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
+        return Err(SESSION_NAME_RULES.to_string());
+    }
+
+    let mut last_was_hyphen = false;
+    for byte in bytes {
+        match byte {
+            b'a'..=b'z' | b'0'..=b'9' => last_was_hyphen = false,
+            b'-' if !last_was_hyphen => last_was_hyphen = true,
+            _ => return Err(SESSION_NAME_RULES.to_string()),
+        }
+    }
+
+    Ok(())
 }
 
 pub fn repo_name_from_path(path: &str) -> String {
@@ -183,16 +205,26 @@ impl AttachmentKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{branch_name_from_title, repo_name_from_path};
+    use super::{
+        SESSION_NAME_RULES, branch_name_from_session_id, repo_name_from_path, validate_session_name,
+    };
 
     #[test]
-    fn branch_names_are_slugified() {
-        assert_eq!(branch_name_from_title("fix failing tests"), "agent/fix-failing-tests");
+    fn branch_names_follow_session_id() {
+        assert_eq!(branch_name_from_session_id("fix-failing-tests"), "agent/fix-failing-tests");
     }
 
     #[test]
-    fn empty_titles_fall_back_to_session() {
-        assert_eq!(branch_name_from_title("!!!"), "agent/session");
+    fn valid_session_names_pass_validation() {
+        assert!(validate_session_name("fix-failing-tests").is_ok());
+        assert!(validate_session_name("demo2").is_ok());
+    }
+
+    #[test]
+    fn invalid_session_names_fail_validation() {
+        for invalid in ["", "Fix", "fix tests", "fix_tests", "-fix", "fix-", "fix--tests"] {
+            assert_eq!(validate_session_name(invalid), Err(SESSION_NAME_RULES.to_string()));
+        }
     }
 
     #[test]

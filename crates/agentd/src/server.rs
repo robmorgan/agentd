@@ -107,21 +107,16 @@ async fn handle_connection(
         }
         IncomingRequest::Standard(Request::CreateSession {
             workspace,
-            title,
+            name,
             agent,
             model,
             integration_policy,
-        }) => {
-            match state.create_session(workspace, title, agent, model, integration_policy).await {
-                Ok(session) => {
-                    send_response(&mut writer, &Response::CreateSession { session }).await?
-                }
-                Err(err) => {
-                    send_response(&mut writer, &Response::Error { message: err.to_string() })
-                        .await?
-                }
+        }) => match state.create_session(workspace, name, agent, model, integration_policy).await {
+            Ok(session) => send_response(&mut writer, &Response::CreateSession { session }).await?,
+            Err(err) => {
+                send_response(&mut writer, &Response::Error { message: err.to_string() }).await?
             }
-        }
+        },
         IncomingRequest::Standard(Request::CreateWorktree { session_id }) => {
             match state.create_worktree(&session_id).await {
                 Ok(worktree) => {
@@ -485,7 +480,6 @@ mod tests {
             workspace: "/tmp/workspace".to_string(),
             repo_path: "/tmp/workspace".to_string(),
             repo_name: "workspace".to_string(),
-            title: "task".to_string(),
             base_branch: "main".to_string(),
             branch: "agent/task".to_string(),
             worktree: "/tmp/worktree".to_string(),
