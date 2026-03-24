@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{
     Parser, Subcommand,
-    builder::styling::{AnsiColor, Effects, Styles},
+    builder::styling::{AnsiColor, Color, Effects, RgbColor, Styles},
 };
 use crossterm::{
     style::{Attribute as CrosAttribute, Color as CrosColor, Stylize},
@@ -34,6 +34,7 @@ mod session_display;
 
 use agentd_shared::{
     config::Config,
+    header::AGENTD_PRIMARY_BLUE_RGB,
     paths::AppPaths,
     protocol::{
         DaemonInfo, DaemonManagementRequest, DaemonManagementResponse, DaemonManagementStatus,
@@ -78,13 +79,17 @@ const GROUP_HELP_TEMPLATE: &str = "\
 {options}
 {after-help}";
 
+fn help_accent_style() -> clap::builder::styling::Style {
+    Color::Rgb(RgbColor::from(AGENTD_PRIMARY_BLUE_RGB)).on_default()
+}
+
 fn cli_styles() -> Styles {
     Styles::styled()
         .header(AnsiColor::Cyan.on_default() | Effects::BOLD)
         .usage(AnsiColor::Yellow.on_default() | Effects::BOLD)
-        .literal(AnsiColor::Green.on_default() | Effects::BOLD)
+        .literal(help_accent_style() | Effects::BOLD)
         .placeholder(AnsiColor::BrightBlack.on_default())
-        .valid(AnsiColor::Green.on_default())
+        .valid(help_accent_style())
         .invalid(AnsiColor::Red.on_default() | Effects::BOLD)
         .error(AnsiColor::Red.on_default() | Effects::BOLD)
 }
@@ -1740,13 +1745,16 @@ mod tests {
     use super::{
         AGENTD_ATTACH_RESTORE_SEQUENCE, ATTACH_DETACH_BYTE, AttachInputAction, AttachInputParser,
         Cli, Command, DaemonCommand, SessionEndSummary, attach_startup_bytes, bail_daemon_command,
-        clear_stale_daemon_state, format_session_end_summary, render_diff_text,
+        clear_stale_daemon_state, cli_styles, format_session_end_summary, render_diff_text,
         resolve_detach_session_id, resolve_merge_session_id, resolve_new_session_options,
         should_colorize_diff_output,
     };
-    use agentd_shared::paths::AppPaths;
     use agentd_shared::session::{ApplyState, SessionStatus};
-    use clap::Parser;
+    use agentd_shared::{header::AGENTD_PRIMARY_BLUE_RGB, paths::AppPaths};
+    use clap::{
+        Parser,
+        builder::styling::{Color, Effects, RgbColor},
+    };
     use std::{
         ffi::OsString,
         fs,
@@ -1758,6 +1766,16 @@ mod tests {
 
     static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn cli_help_uses_agentd_blue_for_literals_and_valid_values() {
+        let accent = Color::Rgb(RgbColor::from(AGENTD_PRIMARY_BLUE_RGB));
+        let styles = cli_styles();
+
+        assert_eq!(styles.get_literal().get_fg_color(), Some(accent));
+        assert!(styles.get_literal().get_effects().contains(Effects::BOLD));
+        assert_eq!(styles.get_valid().get_fg_color(), Some(accent));
+    }
 
     #[test]
     fn new_command_parses_optional_title() {

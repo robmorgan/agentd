@@ -39,6 +39,8 @@ const HEADER_SUFFIX_FADE_GAMMA: f64 = 1.35;
 
 static HEADER_COLORS: OnceLock<HeaderColors> = OnceLock::new();
 
+pub const AGENTD_PRIMARY_BLUE_RGB: (u8, u8, u8) = (DEFAULT_CYAN.0, DEFAULT_CYAN.1, DEFAULT_CYAN.2);
+
 /// Whether the terminal is Warp, which does not respond to OSC color queries
 /// and renders alternate screen content flush against block edges.
 #[must_use]
@@ -544,13 +546,19 @@ mod tests {
     use std::io::{BufReader, Cursor};
 
     use super::{
-        HEADER_FALLBACK, Rgb, agentd_header, gradient_eased, parse_osc4_rgb, parse_osc10_rgb,
-        parse_rgb_triplet, query_terminal_colors, read_until_either, to_8bit,
+        AGENTD_PRIMARY_BLUE_RGB, HEADER_FALLBACK, Rgb, agentd_header, gradient_eased,
+        parse_osc4_rgb, parse_osc10_rgb, parse_rgb_triplet, query_terminal_colors,
+        read_until_either, to_8bit,
     };
 
     #[test]
     fn agentd_header_falls_back_without_tty_color() {
         assert_eq!(agentd_header(), HEADER_FALLBACK);
+    }
+
+    #[test]
+    fn agentd_primary_blue_rgb_matches_default_header_blue() {
+        assert_eq!(AGENTD_PRIMARY_BLUE_RGB, (95, 251, 255));
     }
 
     #[test]
