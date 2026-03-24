@@ -5,7 +5,7 @@ use crossterm::{
     cursor::{MoveToColumn, MoveUp},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{self, Clear, ClearType},
+    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     Frame, Terminal,
@@ -136,6 +136,25 @@ fn write_screen_bytes(bytes: &[u8]) -> Result<()> {
     stdout.flush().context("failed to flush screen bytes")
 }
 
+struct AlternateScreenGuard;
+
+impl AlternateScreenGuard {
+    fn enter() -> Result<Self> {
+        let mut stdout = std::io::stdout();
+        execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
+        stdout.flush().context("failed to flush alternate screen enter")?;
+        Ok(Self)
+    }
+}
+
+impl Drop for AlternateScreenGuard {
+    fn drop(&mut self) {
+        let mut stdout = std::io::stdout();
+        let _ = execute!(stdout, LeaveAlternateScreen);
+        let _ = stdout.flush();
+    }
+}
+
 fn configured_agent_names(paths: &AppPaths) -> Result<Vec<String>> {
     let mut names = Config::load(paths)?.agents.into_keys().collect::<Vec<_>>();
     if names.is_empty() {
@@ -156,16 +175,30 @@ pub async fn pick_session(paths: &AppPaths) -> Result<Option<String>> {
     picker.refresh_sessions().await?;
     let mut rendered_lines = 0;
     let mut last_lines = Vec::new();
+    let mut diff_screen: Option<AlternateScreenGuard> = None;
     let blink_start = std::time::Instant::now();
 
     loop {
-        let width = terminal::size().map(|(cols, _)| cols as usize).unwrap_or(80);
-        let cursor_visible =
-            (blink_start.elapsed().as_millis() / HOST_PICKER_CURSOR_BLINK_MS).is_multiple_of(2);
-        let lines = picker.render_lines(width, cursor_visible);
-        if lines != last_lines {
-            rendered_lines = draw_host_picker(&lines, rendered_lines)?;
-            last_lines = lines;
+        if picker.is_diff_view() {
+            if diff_screen.is_none() {
+                clear_host_picker(rendered_lines)?;
+                rendered_lines = 0;
+                last_lines.clear();
+                diff_screen = Some(AlternateScreenGuard::enter()?);
+            }
+            picker.draw_diff_view()?;
+        } else {
+            if diff_screen.take().is_some() {
+                last_lines.clear();
+            }
+            let width = terminal::size().map(|(cols, _)| cols as usize).unwrap_or(80);
+            let cursor_visible =
+                (blink_start.elapsed().as_millis() / HOST_PICKER_CURSOR_BLINK_MS).is_multiple_of(2);
+            let lines = picker.render_lines(width, cursor_visible);
+            if lines != last_lines {
+                rendered_lines = draw_host_picker(&lines, rendered_lines)?;
+                last_lines = lines;
+            }
         }
 
         if !event::poll(Duration::from_millis(200)).context("failed to poll picker input")? {
@@ -529,6 +562,10 @@ impl SessionPicker {
         Ok(None)
     }
 
+    fn is_diff_view(&self) -> bool {
+        matches!(self.mode, PickerMode::DiffView { .. })
+    }
+
     fn render_lines(&self, width: usize, cursor_visible: bool) -> Vec<String> {
         let mut lines = vec![render_host_picker_title_line(width), String::new()];
         lines.extend(self.render_header_lines(width, cursor_visible));
@@ -734,6 +771,40 @@ impl SessionPicker {
         lines.push(fit_host_picker_line("Up/Down scroll. Esc goes back.".to_string(), width));
         lines.push(String::new());
         lines
+    }
+
+    fn draw_diff_view(&self) -> Result<()> {
+        let (title, subtitle) = self.diff_view_metadata();
+        let backend = CrosstermBackend::new(std::io::stdout());
+        let mut terminal = Terminal::new(backend).context("failed to initialize diff viewer")?;
+        terminal.draw(|frame| {
+            render_fullscreen_diff_view(
+                frame,
+                frame.area(),
+                &title,
+                &subtitle,
+                &self.detail_text,
+                self.detail_scroll as u16,
+            );
+        })?;
+        Ok(())
+    }
+
+    fn diff_view_metadata(&self) -> (String, String) {
+        let session_id = match &self.mode {
+            PickerMode::DiffView { session_id } => Some(session_id.as_str()),
+            _ => None,
+        };
+        let title = session_id
+            .and_then(|id| self.session_by_id(id))
+            .map(|session| format!("Diff: {}  {}", session.session_id, session.branch))
+            .or_else(|| session_id.map(|id| format!("Diff: {id}")))
+            .unwrap_or_else(|| "Diff".to_string());
+        let subtitle = session_id
+            .and_then(|id| self.session_by_id(id))
+            .map(|session| session.worktree.clone())
+            .unwrap_or_default();
+        (title, subtitle)
     }
 
     fn filtered_sessions(&self) -> Vec<&SessionRecord> {
@@ -1234,6 +1305,7 @@ pub struct AttachOverlay {
     agent_input: String,
     detail_text: String,
     detail_scroll: u16,
+    diff_screen_active: bool,
     toast: Option<String>,
 }
 
@@ -1252,6 +1324,7 @@ impl AttachOverlay {
             agent_input: "codex".to_string(),
             detail_text: String::new(),
             detail_scroll: 0,
+            diff_screen_active: false,
             toast: None,
         }
     }
@@ -1278,7 +1351,8 @@ impl AttachOverlay {
         }
     }
 
-    pub fn draw(&self) -> Result<()> {
+    pub fn draw(&mut self) -> Result<()> {
+        self.sync_diff_screen()?;
         let backend = CrosstermBackend::new(std::io::stdout());
         let mut terminal = Terminal::new(backend).context("failed to initialize overlay")?;
         terminal.draw(|frame| self.render(frame))?;
@@ -1539,6 +1613,24 @@ impl AttachOverlay {
     }
 
     fn render(&self, frame: &mut Frame) {
+        if matches!(self.mode, OverlayMode::Diff) {
+            let session =
+                self.sessions.iter().find(|session| session.session_id == self.session_id);
+            let title = session
+                .map(|session| format!("Diff: {}  {}", session.session_id, session.branch))
+                .unwrap_or_else(|| format!("Diff: {}", self.session_id));
+            let subtitle = session.map(|session| session.worktree.clone()).unwrap_or_default();
+            render_fullscreen_diff_view(
+                frame,
+                frame.area(),
+                &title,
+                &subtitle,
+                &self.detail_text,
+                self.detail_scroll,
+            );
+            return;
+        }
+
         let area = centered_rect(80, 80, frame.area());
         frame.render_widget(WidgetClear, area);
         let title = match self.mode {
@@ -1562,6 +1654,21 @@ impl AttachOverlay {
             OverlayMode::GitStatus | OverlayMode::Diff => self.render_detail(frame, inner),
             OverlayMode::StopConfirm => self.render_stop_confirm(frame, inner),
         }
+    }
+
+    fn sync_diff_screen(&mut self) -> Result<()> {
+        let wants_diff_screen = matches!(self.mode, OverlayMode::Diff);
+        if wants_diff_screen && !self.diff_screen_active {
+            let _guard = AlternateScreenGuard::enter()?;
+            std::mem::forget(_guard);
+            self.diff_screen_active = true;
+        } else if !wants_diff_screen && self.diff_screen_active {
+            let mut stdout = std::io::stdout();
+            execute!(stdout, LeaveAlternateScreen).context("failed to leave alternate screen")?;
+            stdout.flush().context("failed to flush alternate screen leave")?;
+            self.diff_screen_active = false;
+        }
+        Ok(())
     }
 
     fn render_palette(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
@@ -1714,6 +1821,71 @@ impl AttachOverlay {
                 .then_with(|| right.updated_at.cmp(&left.updated_at))
         });
         sessions
+    }
+}
+
+impl Drop for AttachOverlay {
+    fn drop(&mut self) {
+        if self.diff_screen_active {
+            let mut stdout = std::io::stdout();
+            let _ = execute!(stdout, LeaveAlternateScreen);
+            let _ = stdout.flush();
+        }
+    }
+}
+
+fn render_fullscreen_diff_view(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    title: &str,
+    subtitle: &str,
+    detail_text: &str,
+    detail_scroll: u16,
+) {
+    let block = Block::default().borders(Borders::ALL).title("Diff");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = ratatui::layout::Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            ratatui::layout::Constraint::Length(1),
+            ratatui::layout::Constraint::Length(1),
+            ratatui::layout::Constraint::Min(1),
+            ratatui::layout::Constraint::Length(1),
+        ])
+        .split(inner);
+
+    frame.render_widget(Paragraph::new(title), chunks[0]);
+    frame.render_widget(Paragraph::new(subtitle).style(subtle_style()), chunks[1]);
+
+    let body = if detail_text.is_empty() {
+        vec![Line::from("No diff available.")]
+    } else {
+        detail_text.lines().map(diff_text_line).collect::<Vec<_>>()
+    };
+    frame.render_widget(Paragraph::new(body).scroll((detail_scroll, 0)), chunks[2]);
+    frame.render_widget(
+        Paragraph::new("Up/Down/PageUp/PageDown scroll. Esc goes back.").style(subtle_style()),
+        chunks[3],
+    );
+}
+
+fn diff_text_line(line: &str) -> Line<'static> {
+    Line::from(Span::styled(line.to_string(), diff_line_style(line)))
+}
+
+fn diff_line_style(line: &str) -> Style {
+    if line.starts_with("diff --git") || line.starts_with("--- ") || line.starts_with("+++ ") {
+        Style::default().fg(Color::Rgb(153, 214, 255)).add_modifier(Modifier::BOLD)
+    } else if line.starts_with("@@") {
+        Style::default().fg(Color::Rgb(242, 201, 76)).add_modifier(Modifier::BOLD)
+    } else if line.starts_with('+') && !line.starts_with("+++") {
+        Style::default().fg(Color::Rgb(111, 207, 151))
+    } else if line.starts_with('-') && !line.starts_with("---") {
+        Style::default().fg(Color::Rgb(255, 107, 107))
+    } else {
+        Style::default()
     }
 }
 
