@@ -10,8 +10,11 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{
-    Parser, Subcommand,
-    builder::styling::{AnsiColor, Color, Effects, RgbColor, Styles},
+    CommandFactory, FromArgMatches, Parser, Subcommand,
+    builder::{
+        StyledStr,
+        styling::{AnsiColor, Color, Effects, RgbColor, Styles},
+    },
 };
 use crossterm::{
     style::{Attribute as CrosAttribute, Color as CrosColor, Stylize},
@@ -34,7 +37,7 @@ mod session_display;
 
 use agentd_shared::{
     config::Config,
-    header::AGENTD_PRIMARY_BLUE_RGB,
+    header::{AGENTD_PRIMARY_BLUE_RGB, agentd_header},
     paths::AppPaths,
     protocol::{
         DaemonInfo, DaemonManagementRequest, DaemonManagementResponse, DaemonManagementStatus,
@@ -80,8 +83,29 @@ const GROUP_HELP_TEMPLATE: &str = "\
 {options}
 {after-help}";
 
+const ROOT_HELP_INTRO: &str = "\
+A local multi-session coding workflow for daemon-backed agents.
+
+Core flows:
+  Start a session      agent new fix-flaky-tests
+  Inspect sessions     agent list
+  Reconnect live PTY   agent attach <name>
+  Review changes       agent diff <name> | agent merge <name>";
+
 fn help_accent_style() -> clap::builder::styling::Style {
     Color::Rgb(RgbColor::from(AGENTD_PRIMARY_BLUE_RGB)).on_default()
+}
+
+fn root_before_help() -> StyledStr {
+    let mut styled = StyledStr::new();
+    styled.push_str(&agentd_header());
+    styled.push_str("\n");
+    styled.push_str(ROOT_HELP_INTRO);
+    styled
+}
+
+fn cli_command() -> clap::Command {
+    Cli::command().before_help(root_before_help())
 }
 
 fn cli_styles() -> Styles {
@@ -242,7 +266,11 @@ enum DaemonCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let matches = cli_command().get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(err) => err.exit(),
+    };
     let paths = AppPaths::discover()?;
     paths.ensure_layout()?;
     ensure_config(&paths)?;
@@ -1756,9 +1784,9 @@ mod tests {
     use super::{
         AGENTD_ATTACH_RESTORE_SEQUENCE, ATTACH_DETACH_BYTE, AttachInputAction, AttachInputParser,
         Cli, Command, DaemonCommand, SessionEndSummary, attach_startup_bytes, bail_daemon_command,
-        clear_stale_daemon_state, cli_styles, format_session_end_summary, render_diff_text,
-        resolve_detach_session_id, resolve_merge_session_id, resolve_new_session_options,
-        should_colorize_diff_output,
+        clear_stale_daemon_state, cli_command, cli_styles, format_session_end_summary,
+        render_diff_text, resolve_detach_session_id, resolve_merge_session_id,
+        resolve_new_session_options, should_colorize_diff_output,
     };
     use agentd_shared::session::{ApplyState, SessionStatus};
     use agentd_shared::{header::AGENTD_PRIMARY_BLUE_RGB, paths::AppPaths};
@@ -1778,6 +1806,26 @@ mod tests {
     static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    fn strip_ansi(input: &str) -> String {
+        let mut output = String::new();
+        let mut chars = input.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' {
+                if matches!(chars.peek(), Some('[')) {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            output.push(ch);
+        }
+        output
+    }
+
     #[test]
     fn cli_help_uses_agentd_blue_for_literals_and_valid_values() {
         let accent = Color::Rgb(RgbColor::from(AGENTD_PRIMARY_BLUE_RGB));
@@ -1786,6 +1834,29 @@ mod tests {
         assert_eq!(styles.get_literal().get_fg_color(), Some(accent));
         assert!(styles.get_literal().get_effects().contains(Effects::BOLD));
         assert_eq!(styles.get_valid().get_fg_color(), Some(accent));
+    }
+
+    #[test]
+    fn root_help_uses_shared_agentd_header_without_plain_leadin() {
+        let mut command = cli_command();
+        let help = strip_ansi(&command.render_help().to_string());
+
+        assert!(help.contains("agentd - agent multiplexer"));
+        assert!(help.contains("agent 0.1.0"));
+        assert!(
+            !help
+                .contains("agent\nA local multi-session coding workflow for daemon-backed agents.")
+        );
+    }
+
+    #[test]
+    fn daemon_help_does_not_include_root_agentd_header() {
+        let mut command = cli_command();
+        let daemon = command.find_subcommand_mut("daemon").expect("daemon subcommand");
+        let help = strip_ansi(&daemon.render_help().to_string());
+
+        assert!(!help.contains("agentd - agent multiplexer"));
+        assert!(help.contains("agent daemon"));
     }
 
     #[test]
