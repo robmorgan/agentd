@@ -593,9 +593,9 @@ impl SessionPicker {
                 match row {
                     PickerRow::Create => {
                         let label = if self.composer.query.trim().is_empty() {
-                            "Create new session".to_string()
+                            " Create new session".to_string()
                         } else {
-                            format!("Create new session: {}", self.composer.query.trim())
+                            format!(" Create new session: {}", self.composer.query.trim())
                         };
                         lines.push(render_host_picker_option_line(
                             &format!("+  {label}"),
