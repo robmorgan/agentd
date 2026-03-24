@@ -2,11 +2,11 @@ use std::{io::Write, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use crossterm::{
-    cursor::{Hide, MoveTo, Show},
+    cursor::MoveTo,
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     style::{Color as CrosColor, Stylize},
-    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{self, Clear, ClearType},
 };
 use ratatui::{
     Frame, Terminal,
@@ -80,6 +80,8 @@ const ANSI_DIM: &str = "\x1b[2m";
 const HOST_PICKER_CURSOR: &str = "█";
 const HOST_PICKER_CURSOR_BLINK_MS: u128 = 500;
 const ANSI_RESET: &str = "\x1b[0m";
+const HOST_PICKER_ENTER_SEQUENCE: &[u8] = b"\x1b[H\x1b[2J\x1b[?25l";
+const HOST_PICKER_EXIT_SEQUENCE: &[u8] = b"\x1b[H\x1b[2J\x1b[?25h";
 const SESSION_LIST_DEFAULT_WIDTH: usize = 120;
 const SESSION_LIST_STATUS_WIDTH: usize = 16;
 const SESSION_LIST_AGE_WIDTH: usize = 6;
@@ -117,22 +119,21 @@ struct PickerScreenGuard;
 
 impl PickerScreenGuard {
     fn enter() -> Result<Self> {
-        execute!(
-            std::io::stdout(),
-            EnterAlternateScreen,
-            MoveTo(0, 0),
-            Clear(ClearType::All),
-            Hide
-        )
-        .context("failed to prepare session picker")?;
+        write_screen_bytes(HOST_PICKER_ENTER_SEQUENCE).context("failed to prepare session picker")?;
         Ok(Self)
     }
 }
 
 impl Drop for PickerScreenGuard {
     fn drop(&mut self) {
-        let _ = execute!(std::io::stdout(), Show, LeaveAlternateScreen);
+        let _ = write_screen_bytes(HOST_PICKER_EXIT_SEQUENCE);
     }
+}
+
+fn write_screen_bytes(bytes: &[u8]) -> Result<()> {
+    let mut stdout = std::io::stdout();
+    stdout.write_all(bytes).context("failed to write screen bytes")?;
+    stdout.flush().context("failed to flush screen bytes")
 }
 
 fn configured_agent_names(paths: &AppPaths) -> Result<Vec<String>> {
@@ -1993,10 +1994,11 @@ mod tests {
     use super::{
         ANSI_RESET, AttachOverlay, HOST_PICKER_CURSOR, HOST_PICKER_DIFF_ADD_STYLE,
         HOST_PICKER_DIFF_HEADER_STYLE, HOST_PICKER_DIFF_HUNK_STYLE, HOST_PICKER_DIFF_REMOVE_STYLE,
-        HOST_PICKER_LEGEND_TEXT_STYLE, HOST_PICKER_PLACEHOLDER_FG, HOST_PICKER_QUERY_BG,
-        HOST_PICKER_SELECTED_STYLE, HOST_PICKER_STATUS_BLUE_FG, HOST_PICKER_STATUS_GREEN_FG,
-        HOST_PICKER_STATUS_RED_FG, HOST_PICKER_STATUS_YELLOW_FG, HOST_PICKER_TEXT_FG, OverlayMode,
-        OverlayOutcome, PickerComposer, PickerMode, PickerRow, SessionAction, SessionPicker,
+        HOST_PICKER_ENTER_SEQUENCE, HOST_PICKER_EXIT_SEQUENCE, HOST_PICKER_LEGEND_TEXT_STYLE,
+        HOST_PICKER_PLACEHOLDER_FG, HOST_PICKER_QUERY_BG, HOST_PICKER_SELECTED_STYLE,
+        HOST_PICKER_STATUS_BLUE_FG, HOST_PICKER_STATUS_GREEN_FG, HOST_PICKER_STATUS_RED_FG,
+        HOST_PICKER_STATUS_YELLOW_FG, HOST_PICKER_TEXT_FG, OverlayMode, OverlayOutcome,
+        PickerComposer, PickerMode, PickerRow, SessionAction, SessionPicker,
         configured_agent_names, fit_host_picker_line, interpolate_ansi_value,
         render_host_picker_brand, render_host_picker_gradient_text, render_host_picker_legend_row,
         render_host_picker_session_row, render_host_picker_subtitle, render_host_picker_title_line,
@@ -2746,6 +2748,12 @@ mod tests {
         let rendered = style_host_picker_background_row(20);
         assert!(rendered.starts_with(HOST_PICKER_QUERY_BG));
         assert!(rendered.ends_with(ANSI_RESET));
+    }
+
+    #[test]
+    fn host_picker_sequences_do_not_enter_alternate_screen() {
+        assert!(!HOST_PICKER_ENTER_SEQUENCE.windows(6).any(|window| window == b"\x1b[?1049"));
+        assert!(!HOST_PICKER_EXIT_SEQUENCE.windows(6).any(|window| window == b"\x1b[?1049"));
     }
 
     fn demo(session_id: &str, repo_name: &str) -> SessionRecord {

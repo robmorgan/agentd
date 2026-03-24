@@ -206,6 +206,8 @@ Interactive PTY attach is available with `agent attach <session_id>`. Detach wit
 `agent detach <session_id> --attach <attach_id>` for a specific client, or
 `agent detach <session_id> --all` to disconnect every attached client on the session.
 Use `agent attachments <session_id>` to inspect the current attachment ids.
+Attach clears the visible screen and repaints from the daemon's retained terminal state; if the
+restored session was using the alternate screen, replay restores that state naturally.
 Multiple interactive attachers are allowed per session, and the TUI uses the same shared attach
 path when a worker is focused. Background PTY writes are still available with
 `agent send-input <session_id> -- <text>`.

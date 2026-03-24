@@ -14,12 +14,8 @@ use clap::{
     builder::styling::{AnsiColor, Effects, Styles},
 };
 use crossterm::{
-    cursor::{Hide, Show},
-    event::{DisableMouseCapture, EnableMouseCapture},
-    event::{KeyCode, KeyModifiers},
-    execute,
     style::{Attribute as CrosAttribute, Color as CrosColor, Stylize},
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode},
 };
 use libc::{
     _POSIX_VDISABLE, O_NONBLOCK, TCSAFLUSH, TCSANOW, VLNEXT, VMIN, VQUIT, VTIME, cfmakeraw, fcntl,
@@ -35,7 +31,6 @@ use tokio::{
 mod local;
 mod runtime;
 mod session_display;
-mod tui;
 
 use agentd_shared::{
     config::Config,
@@ -250,15 +245,13 @@ async fn main() -> Result<()> {
 
     match (cli.command, execution) {
         (None, ExecutionMode::Daemon) => {
-            if let Some(session_id) = runtime::pick_session(&paths).await? {
-                attach_session(&paths, &session_id).await?;
-            }
+            run_runtime(&paths, None).await?;
         }
         (None, ExecutionMode::Local(reason)) => {
             bail!("{reason}. `agent` requires a compatible daemon");
         }
         (Some(Command::Runtime { session_id }), ExecutionMode::Daemon) => {
-            tui::run_runtime_ui(&paths, session_id.as_deref()).await?;
+            run_runtime(&paths, session_id.as_deref()).await?;
         }
         (Some(Command::Runtime { .. }), ExecutionMode::Local(reason)) => {
             bail!("{reason}. `agent runtime` requires a compatible daemon");
@@ -529,6 +522,17 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn run_runtime(paths: &AppPaths, initial_session_id: Option<&str>) -> Result<()> {
+    let session_id = match initial_session_id {
+        Some(session_id) => Some(session_id.to_string()),
+        None => runtime::pick_session(paths).await?,
+    };
+    if let Some(session_id) = session_id {
+        attach_session(paths, &session_id).await?;
+    }
     Ok(())
 }
 
@@ -1060,7 +1064,6 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
     let AttachedSessionStream { attach_id, snapshot, mut reader, mut write_half } = attached;
 
     eprintln!("attached to {session_id} ({attach_id}); detach with Ctrl-]");
-    let _screen = AttachScreenGuard::enter()?;
     let _terminal = AttachTerminalGuard::enter()?;
     let raw_input = AttachRawInput::new()?;
     let mut resize_signal =
@@ -1148,8 +1151,14 @@ async fn send_attach_resize(
 }
 
 fn write_session_snapshot(snapshot: &[u8]) -> Result<()> {
-    write_attach_bytes(AGENTD_ATTACH_CLEAR_SEQUENCE)?;
-    write_attach_bytes(snapshot)
+    write_attach_bytes(&attach_startup_bytes(snapshot))
+}
+
+fn attach_startup_bytes(snapshot: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(AGENTD_ATTACH_CLEAR_SEQUENCE.len() + snapshot.len());
+    bytes.extend_from_slice(AGENTD_ATTACH_CLEAR_SEQUENCE);
+    bytes.extend_from_slice(snapshot);
+    bytes
 }
 
 async fn try_connect(paths: &AppPaths) -> Result<UnixStream> {
@@ -1234,25 +1243,6 @@ fn print_diff(diff: &SessionDiff) {
     print!("{}", render_diff_text(&diff.diff, diff_color_enabled()));
 }
 
-async fn fetch_focus_history(paths: &AppPaths, session_id: &str) -> Result<String> {
-    let mut stream = try_connect(paths).await?;
-    write_request(
-        &mut stream,
-        &Request::GetHistory { session_id: session_id.to_string(), vt: false },
-    )
-    .await?;
-
-    let mut reader = BufReader::new(stream);
-    let Some(response) = read_response(&mut reader).await? else {
-        bail!("agentd closed the history connection");
-    };
-    match response {
-        Response::History { data } => Ok(data),
-        Response::Error { message } => bail!(message),
-        other => bail!("unexpected history response: {:?}", other),
-    }
-}
-
 fn diff_color_enabled() -> bool {
     should_colorize_diff_output(std::io::stdout().is_terminal(), std::env::var_os("NO_COLOR"))
 }
@@ -1299,64 +1289,6 @@ fn print_kill_result(session_id: &str, was_running: bool, removed: bool) {
     }
     if removed {
         println!("removed session {session_id}");
-    }
-}
-
-fn encode_attach_key(key: crossterm::event::KeyEvent) -> Option<Vec<u8>> {
-    let mut bytes = match key.code {
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Enter => vec![b'\r'],
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::Tab => {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                b"\x1b[Z".to_vec()
-            } else {
-                vec![b'\t']
-            }
-        }
-        KeyCode::BackTab => b"\x1b[Z".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::Insert => b"\x1b[2~".to_vec(),
-        KeyCode::Esc => vec![0x1b],
-        KeyCode::Char(ch) => encode_attach_char(ch, key.modifiers)?,
-        _ => return None,
-    };
-
-    if key.modifiers.contains(KeyModifiers::ALT) {
-        bytes.insert(0, 0x1b);
-    }
-
-    Some(bytes)
-}
-
-fn encode_attach_char(ch: char, modifiers: KeyModifiers) -> Option<Vec<u8>> {
-    if modifiers.contains(KeyModifiers::CONTROL) {
-        return control_char_byte(ch).map(|byte| vec![byte]);
-    }
-
-    let mut bytes = [0_u8; 4];
-    Some(ch.encode_utf8(&mut bytes).as_bytes().to_vec())
-}
-
-fn control_char_byte(ch: char) -> Option<u8> {
-    match ch {
-        '@' | ' ' => Some(0),
-        'a'..='z' => Some((ch as u8) - b'a' + 1),
-        'A'..='Z' => Some((ch as u8) - b'A' + 1),
-        '[' => Some(27),
-        '\\' => Some(28),
-        ']' => Some(29),
-        '^' => Some(30),
-        '_' => Some(31),
-        '?' => Some(127),
-        _ => None,
     }
 }
 
@@ -1684,38 +1616,6 @@ impl Drop for AttachTerminalGuard {
     }
 }
 
-struct TerminalScreenGuard;
-
-impl TerminalScreenGuard {
-    fn enter() -> Result<Self> {
-        execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)
-            .context("failed to enter alternate screen")?;
-        Ok(Self)
-    }
-}
-
-impl Drop for TerminalScreenGuard {
-    fn drop(&mut self) {
-        let _ = execute!(std::io::stdout(), Show, DisableMouseCapture, LeaveAlternateScreen);
-    }
-}
-
-struct AttachScreenGuard;
-
-impl AttachScreenGuard {
-    fn enter() -> Result<Self> {
-        execute!(std::io::stdout(), EnterAlternateScreen, Hide)
-            .context("failed to enter attach screen")?;
-        Ok(Self)
-    }
-}
-
-impl Drop for AttachScreenGuard {
-    fn drop(&mut self) {
-        let _ = execute!(std::io::stdout(), Show, LeaveAlternateScreen);
-    }
-}
-
 trait StatusString {
     fn status_string(&self) -> &'static str;
     fn apply_state_string(&self) -> &'static str;
@@ -1846,10 +1746,10 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 mod tests {
     use super::{
         AGENTD_ATTACH_RESTORE_SEQUENCE, ATTACH_DETACH_BYTE, AttachInputAction, AttachInputParser,
-        Cli, Command, DaemonCommand, SessionEndSummary, bail_daemon_command,
-        clear_stale_daemon_state, format_session_end_summary, render_diff_text,
-        resolve_detach_session_id, resolve_merge_session_id, resolve_new_session_options,
-        should_colorize_diff_output,
+        Cli, Command, DaemonCommand, SessionEndSummary, attach_startup_bytes,
+        bail_daemon_command, clear_stale_daemon_state, format_session_end_summary,
+        render_diff_text, resolve_detach_session_id, resolve_merge_session_id,
+        resolve_new_session_options, should_colorize_diff_output,
     };
     use agentd_shared::paths::AppPaths;
     use agentd_shared::session::{ApplyState, MergeStatus, SessionStatus};
@@ -2147,6 +2047,20 @@ command = "claude"
             AGENTD_ATTACH_RESTORE_SEQUENCE,
             b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[?25h"
         );
+    }
+
+    #[test]
+    fn attach_startup_sequence_clears_then_replays_snapshot() {
+        assert_eq!(
+            attach_startup_bytes(b"\x1b[?25lhello"),
+            b"\x1b[2J\x1b[H\x1b[?25lhello".to_vec()
+        );
+    }
+
+    #[test]
+    fn attach_startup_sequence_does_not_force_alternate_screen() {
+        let startup = attach_startup_bytes(b"snapshot");
+        assert!(!startup.windows(6).any(|window| window == b"\x1b[?1049"));
     }
 
     #[test]
