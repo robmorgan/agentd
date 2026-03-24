@@ -358,7 +358,9 @@ async fn main() -> Result<()> {
             }
         }
         (Some(Command::Kill { rm, session_id }), ExecutionMode::Local(reason)) => {
-            print_degraded_notice(&reason);
+            if should_print_degraded_notice(DegradedNoticeCommand::Kill, &reason) {
+                print_degraded_notice(&reason);
+            }
             local_kill(&paths, &session_id, rm)?;
         }
         (Some(Command::Attach { session_id }), ExecutionMode::Daemon) => {
@@ -466,7 +468,9 @@ async fn main() -> Result<()> {
             print_sessions(&sessions);
         }
         (Some(Command::List), ExecutionMode::Local(reason)) => {
-            print_degraded_notice(&reason);
+            if should_print_degraded_notice(DegradedNoticeCommand::List, &reason) {
+                print_degraded_notice(&reason);
+            }
             let store = LocalStore::open(&paths)?;
             let sessions =
                 store.list_sessions()?.into_iter().map(normalize_session).collect::<Vec<_>>();
@@ -501,7 +505,9 @@ async fn main() -> Result<()> {
             }
         }
         (Some(Command::Status { session_id }), ExecutionMode::Local(reason)) => {
-            print_degraded_notice(&reason);
+            if should_print_degraded_notice(DegradedNoticeCommand::Status, &reason) {
+                print_degraded_notice(&reason);
+            }
             let store = LocalStore::open(&paths)?;
             let session = store
                 .get_session(&session_id)?
@@ -635,6 +641,18 @@ fn print_degraded_notice(reason: &str) {
     eprintln!(
         "agent: {reason}; using local degraded mode for metadata/log/session cleanup commands"
     );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DegradedNoticeCommand {
+    Kill,
+    List,
+    Status,
+}
+
+fn should_print_degraded_notice(command: DegradedNoticeCommand, reason: &str) -> bool {
+    !matches!(command, DegradedNoticeCommand::Kill)
+        || !reason.starts_with("agentd could not be queried:")
 }
 
 fn bail_live_command(reason: &str) -> Result<()> {
@@ -1783,10 +1801,11 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 mod tests {
     use super::{
         AGENTD_ATTACH_RESTORE_SEQUENCE, ATTACH_DETACH_BYTE, AttachInputAction, AttachInputParser,
-        Cli, Command, DaemonCommand, SessionEndSummary, attach_startup_bytes, bail_daemon_command,
-        clear_stale_daemon_state, cli_command, cli_styles, format_session_end_summary,
-        render_diff_text, resolve_detach_session_id, resolve_merge_session_id,
-        resolve_new_session_options, should_colorize_diff_output,
+        Cli, Command, DaemonCommand, DegradedNoticeCommand, SessionEndSummary,
+        attach_startup_bytes, bail_daemon_command, clear_stale_daemon_state, cli_command,
+        cli_styles, format_session_end_summary, render_diff_text, resolve_detach_session_id,
+        resolve_merge_session_id, resolve_new_session_options, should_colorize_diff_output,
+        should_print_degraded_notice,
     };
     use agentd_shared::session::{ApplyState, SessionStatus};
     use agentd_shared::{header::AGENTD_PRIMARY_BLUE_RGB, paths::AppPaths};
@@ -1857,6 +1876,46 @@ mod tests {
 
         assert!(!help.contains("agentd - agent multiplexer"));
         assert!(help.contains("agent daemon"));
+    }
+
+    #[test]
+    fn kill_suppresses_query_failure_degraded_notice() {
+        assert!(!should_print_degraded_notice(
+            DegradedNoticeCommand::Kill,
+            "agentd could not be queried: broken pipe"
+        ));
+    }
+
+    #[test]
+    fn kill_keeps_unavailable_degraded_notice() {
+        assert!(should_print_degraded_notice(
+            DegradedNoticeCommand::Kill,
+            "agentd is unavailable"
+        ));
+    }
+
+    #[test]
+    fn kill_keeps_protocol_mismatch_degraded_notice() {
+        assert!(should_print_degraded_notice(
+            DegradedNoticeCommand::Kill,
+            "agentd protocol version 1 is incompatible with agent protocol version 2"
+        ));
+    }
+
+    #[test]
+    fn list_keeps_query_failure_degraded_notice() {
+        assert!(should_print_degraded_notice(
+            DegradedNoticeCommand::List,
+            "agentd could not be queried: broken pipe"
+        ));
+    }
+
+    #[test]
+    fn status_keeps_query_failure_degraded_notice() {
+        assert!(should_print_degraded_notice(
+            DegradedNoticeCommand::Status,
+            "agentd could not be queried: broken pipe"
+        ));
     }
 
     #[test]
