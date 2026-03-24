@@ -742,11 +742,7 @@ impl SessionPicker {
             .iter()
             .filter(|session| matches_query(session_search_text(session), &self.composer.query))
             .collect::<Vec<_>>();
-        sessions.sort_by(|left, right| {
-            session_rank(left)
-                .cmp(&session_rank(right))
-                .then_with(|| right.updated_at.cmp(&left.updated_at))
-        });
+        sessions.sort_by(|left, right| compare_session_switcher_order(left, right));
         sessions
     }
 
@@ -1708,11 +1704,7 @@ impl AttachOverlay {
             .iter()
             .filter(|session| matches_query(session_search_text(session), &self.switcher_query))
             .collect::<Vec<_>>();
-        sessions.sort_by(|left, right| {
-            session_rank(left)
-                .cmp(&session_rank(right))
-                .then_with(|| right.updated_at.cmp(&left.updated_at))
-        });
+        sessions.sort_by(|left, right| compare_session_switcher_order(left, right));
         sessions
     }
 }
@@ -1722,6 +1714,19 @@ fn filtered_palette_items(query: &str) -> Vec<PaletteItem> {
         .into_iter()
         .filter(|item| matches_query(format!("{} {}", item.key_hint, item.title), query))
         .collect()
+}
+
+pub(crate) fn compare_session_switcher_order(
+    left: &SessionRecord,
+    right: &SessionRecord,
+) -> std::cmp::Ordering {
+    session_rank(left)
+        .cmp(&session_rank(right))
+        .then_with(|| right.updated_at.cmp(&left.updated_at))
+}
+
+pub(crate) fn session_accepts_attach(session: &SessionRecord) -> bool {
+    matches!(session.status, SessionStatus::Running | SessionStatus::NeedsInput)
 }
 
 fn palette_items() -> Vec<PaletteItem> {
