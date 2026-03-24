@@ -296,6 +296,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
             )
         })?,
         has_commits: false,
+        has_pending_changes: false,
         pid: row.get::<_, Option<u32>>(14)?,
         exit_code: row.get(15)?,
         error: row.get(16)?,

@@ -1129,6 +1129,9 @@ fn refresh_commit_state(_db: &Database, mut session: SessionRecord) -> Result<Se
         &session.base_branch,
         &session.branch,
     )?;
+    session.has_pending_changes = session.has_commits
+        || (Utf8PathBuf::from(&session.worktree).exists()
+            && git::has_worktree_changes(&Utf8PathBuf::from(&session.worktree))?);
     Ok(session)
 }
 
@@ -1605,6 +1608,7 @@ mod tests {
             integration_policy: IntegrationPolicy::AutoApplySafe,
             apply_state: ApplyState::Idle,
             has_commits: true,
+            has_pending_changes: true,
             pid: None,
             exit_code: Some(0),
             error: None,

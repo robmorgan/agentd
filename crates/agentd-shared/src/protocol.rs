@@ -8,7 +8,7 @@ use crate::session::{
     IntegrationPolicy, SessionDiff, SessionMode, SessionRecord, SessionStatus, WorktreeRecord,
 };
 
-pub const PROTOCOL_VERSION: u16 = 25;
+pub const PROTOCOL_VERSION: u16 = 26;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
@@ -950,6 +950,7 @@ fn put_session_record(buf: &mut Vec<u8>, session: &SessionRecord) -> Result<()> 
     put_integration_policy(buf, session.integration_policy);
     put_apply_state(buf, session.apply_state);
     put_bool(buf, session.has_commits);
+    put_bool(buf, session.has_pending_changes);
     put_optional_u32(buf, session.pid);
     put_optional_i32(buf, session.exit_code);
     put_optional_string(buf, session.error.as_deref())?;
@@ -1204,6 +1205,7 @@ impl<'a> Cursor<'a> {
             integration_policy: self.take_integration_policy()?,
             apply_state: self.take_apply_state()?,
             has_commits: self.take_bool()?,
+            has_pending_changes: self.take_bool()?,
             pid: self.take_optional_u32()?,
             exit_code: self.take_optional_i32()?,
             error: self.take_optional_string()?,
@@ -1416,6 +1418,7 @@ mod tests {
                 integration_policy: IntegrationPolicy::AutoApplySafe,
                 apply_state: ApplyState::Idle,
                 has_commits: false,
+                has_pending_changes: false,
                 pid: Some(123),
                 exit_code: None,
                 error: None,

@@ -190,6 +190,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
             )
         })?,
         has_commits: false,
+        has_pending_changes: false,
         pid: row.get::<_, Option<u32>>(14)?,
         exit_code: row.get(15)?,
         error: row.get(16)?,
@@ -210,7 +211,24 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
 fn refresh_commit_state(mut session: SessionRecord) -> Result<SessionRecord> {
     session.has_commits =
         branch_has_committed_diff(&session.repo_path, &session.base_branch, &session.branch)?;
+    session.has_pending_changes = session.has_commits
+        || (std::path::Path::new(&session.worktree).exists()
+            && has_worktree_changes(&session.worktree)?);
     Ok(session)
+}
+
+fn has_worktree_changes(worktree: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["status", "--porcelain"])
+        .output()
+        .with_context(|| format!("failed to inspect worktree state for {worktree}"))?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+
+    Ok(!String::from_utf8(output.stdout)?.trim().is_empty())
 }
 
 fn branch_has_committed_diff(repo_path: &str, base_branch: &str, branch: &str) -> Result<bool> {
@@ -387,10 +405,21 @@ fn remove_log_if_present(paths: &AppPaths, session: &SessionRecord) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::LocalStore;
-    use agentd_shared::paths::AppPaths;
+    use super::{LocalStore, refresh_commit_state};
+    use agentd_shared::{
+        paths::AppPaths,
+        session::{
+            ApplyState, AttentionLevel, IntegrationPolicy, SessionMode, SessionRecord,
+            SessionStatus,
+        },
+    };
+    use chrono::Utc;
     use rusqlite::params;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        fs,
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn test_paths() -> AppPaths {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
@@ -476,5 +505,103 @@ mod tests {
 
         let err = LocalStore::open(&paths).unwrap_err().to_string();
         assert!(err.contains("unsupported state database schema"));
+    }
+
+    #[test]
+    fn refresh_commit_state_marks_dirty_worktree_as_pending() {
+        let repo = init_git_repo("dirty");
+        fs::write(repo.join("README.md"), "dirty\n").unwrap();
+
+        let session = refresh_commit_state(demo_session(
+            repo.as_str(),
+            repo.as_str(),
+            "agent/demo",
+            false,
+            false,
+        ))
+        .unwrap();
+
+        assert!(!session.has_commits);
+        assert!(session.has_pending_changes);
+    }
+
+    #[test]
+    fn refresh_commit_state_marks_committed_branch_as_pending() {
+        let repo = init_git_repo("committed");
+        run_git(repo.as_str(), &["checkout", "-b", "agent/demo"]);
+        fs::write(repo.join("README.md"), "committed\n").unwrap();
+        run_git(repo.as_str(), &["add", "README.md"]);
+        run_git(repo.as_str(), &["commit", "-m", "session change"]);
+
+        let session = refresh_commit_state(demo_session(
+            repo.as_str(),
+            repo.as_str(),
+            "agent/demo",
+            false,
+            false,
+        ))
+        .unwrap();
+
+        assert!(session.has_commits);
+        assert!(session.has_pending_changes);
+    }
+
+    fn init_git_repo(name: &str) -> camino::Utf8PathBuf {
+        let root = test_paths().root.join(name);
+        fs::create_dir_all(root.as_str()).unwrap();
+        run_git(root.as_str(), &["init", "-b", "main"]);
+        run_git(root.as_str(), &["config", "user.name", "Test User"]);
+        run_git(root.as_str(), &["config", "user.email", "test@example.com"]);
+        fs::write(root.join("README.md"), "base\n").unwrap();
+        run_git(root.as_str(), &["add", "README.md"]);
+        run_git(root.as_str(), &["commit", "-m", "initial"]);
+        root
+    }
+
+    fn run_git(repo: &str, args: &[&str]) {
+        let output = Command::new("git").args(["-C", repo]).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {}: {}",
+            args,
+            repo,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    fn demo_session(
+        repo_path: &str,
+        worktree: &str,
+        branch: &str,
+        has_commits: bool,
+        has_pending_changes: bool,
+    ) -> SessionRecord {
+        let now = Utc::now();
+        SessionRecord {
+            session_id: "demo".to_string(),
+            thread_id: Some("thread-demo".to_string()),
+            agent: "codex".to_string(),
+            model: Some("gpt-5.4".to_string()),
+            mode: SessionMode::Execute,
+            workspace: repo_path.to_string(),
+            repo_path: repo_path.to_string(),
+            repo_name: "repo".to_string(),
+            base_branch: "main".to_string(),
+            branch: branch.to_string(),
+            worktree: worktree.to_string(),
+            status: SessionStatus::Running,
+            integration_policy: IntegrationPolicy::ManualReview,
+            apply_state: ApplyState::Idle,
+            has_commits,
+            has_pending_changes,
+            pid: Some(1),
+            exit_code: None,
+            error: None,
+            attention: AttentionLevel::Info,
+            attention_summary: None,
+            created_at: now,
+            updated_at: now,
+            exited_at: None,
+        }
     }
 }

@@ -70,6 +70,7 @@ pub struct SessionRecord {
     pub integration_policy: IntegrationPolicy,
     pub apply_state: ApplyState,
     pub has_commits: bool,
+    pub has_pending_changes: bool,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
     pub error: Option<String>,

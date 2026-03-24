@@ -1260,6 +1260,7 @@ fn print_session(session: &SessionRecord) {
     println!("status: {}", session.status_string());
     println!("apply_state: {}", session.apply_state_string());
     println!("has_commits: {}", session.has_commits);
+    println!("has_pending_changes: {}", session.has_pending_changes);
     println!("attention: {}", session.attention_string());
     if let Some(summary) = &session.attention_summary {
         println!("attention_summary: {summary}");
@@ -1888,10 +1889,7 @@ mod tests {
 
     #[test]
     fn kill_keeps_unavailable_degraded_notice() {
-        assert!(should_print_degraded_notice(
-            DegradedNoticeCommand::Kill,
-            "agentd is unavailable"
-        ));
+        assert!(should_print_degraded_notice(DegradedNoticeCommand::Kill, "agentd is unavailable"));
     }
 
     #[test]
