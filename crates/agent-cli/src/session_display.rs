@@ -28,8 +28,7 @@ fn format_elapsed_seconds(seconds: u64) -> String {
 mod tests {
     use super::{format_elapsed_seconds, session_elapsed_label_at};
     use agentd_shared::session::{
-        ApplyState, AttentionLevel, IntegrationPolicy, MergeStatus, SessionMode, SessionRecord,
-        SessionStatus,
+        ApplyState, AttentionLevel, IntegrationPolicy, SessionMode, SessionRecord, SessionStatus,
     };
     use chrono::{Duration, Utc};
 
@@ -80,9 +79,7 @@ mod tests {
             status: SessionStatus::Running,
             integration_policy: IntegrationPolicy::AutoApplySafe,
             apply_state: ApplyState::Idle,
-            merge_status: MergeStatus::Unknown,
-            merge_summary: None,
-            has_conflicts: false,
+            has_commits: false,
             pid: Some(1),
             exit_code: None,
             error: None,

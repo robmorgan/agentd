@@ -5,11 +5,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::session::{
     ApplyState, AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult,
-    IntegrationPolicy, MergeStatus, SessionDiff, SessionMode, SessionRecord, SessionStatus,
-    WorktreeRecord,
+    IntegrationPolicy, SessionDiff, SessionMode, SessionRecord, SessionStatus, WorktreeRecord,
 };
 
-pub const PROTOCOL_VERSION: u16 = 23;
+pub const PROTOCOL_VERSION: u16 = 24;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
@@ -149,7 +148,7 @@ pub enum Response {
         session_id: String,
         status: SessionStatus,
         apply_state: ApplyState,
-        merge_status: MergeStatus,
+        has_commits: bool,
         branch: String,
         worktree: String,
         exit_code: Option<i32>,
@@ -634,7 +633,7 @@ fn encode_response(response: &Response) -> Result<(MessageKind, Vec<u8>)> {
             session_id,
             status,
             apply_state,
-            merge_status,
+            has_commits,
             branch,
             worktree,
             exit_code,
@@ -643,7 +642,7 @@ fn encode_response(response: &Response) -> Result<(MessageKind, Vec<u8>)> {
             put_string(&mut payload, session_id)?;
             put_session_status(&mut payload, *status);
             put_apply_state(&mut payload, *apply_state);
-            put_merge_status(&mut payload, *merge_status);
+            put_bool(&mut payload, *has_commits);
             put_string(&mut payload, branch)?;
             put_string(&mut payload, worktree)?;
             put_optional_i32(&mut payload, *exit_code);
@@ -718,7 +717,7 @@ fn decode_response(kind: MessageKind, payload: &[u8]) -> Result<Response> {
             session_id: cursor.take_string()?,
             status: cursor.take_session_status()?,
             apply_state: cursor.take_apply_state()?,
-            merge_status: cursor.take_merge_status()?,
+            has_commits: cursor.take_bool()?,
             branch: cursor.take_string()?,
             worktree: cursor.take_string()?,
             exit_code: cursor.take_optional_i32()?,
@@ -899,16 +898,6 @@ fn put_integration_policy(buf: &mut Vec<u8>, policy: IntegrationPolicy) {
     });
 }
 
-fn put_merge_status(buf: &mut Vec<u8>, status: MergeStatus) {
-    buf.push(match status {
-        MergeStatus::Unknown => 1,
-        MergeStatus::UpToDate => 2,
-        MergeStatus::Ready => 3,
-        MergeStatus::Blocked => 4,
-        MergeStatus::Conflicted => 5,
-    });
-}
-
 fn put_session_mode(buf: &mut Vec<u8>, mode: SessionMode) {
     buf.push(match mode {
         SessionMode::Execute => 1,
@@ -961,9 +950,7 @@ fn put_session_record(buf: &mut Vec<u8>, session: &SessionRecord) -> Result<()> 
     put_session_status(buf, session.status);
     put_integration_policy(buf, session.integration_policy);
     put_apply_state(buf, session.apply_state);
-    put_merge_status(buf, session.merge_status);
-    put_optional_string(buf, session.merge_summary.as_deref())?;
-    put_bool(buf, session.has_conflicts);
+    put_bool(buf, session.has_commits);
     put_optional_u32(buf, session.pid);
     put_optional_i32(buf, session.exit_code);
     put_optional_string(buf, session.error.as_deref())?;
@@ -1147,17 +1134,6 @@ impl<'a> Cursor<'a> {
         })
     }
 
-    fn take_merge_status(&mut self) -> Result<MergeStatus> {
-        Ok(match self.take_u8()? {
-            1 => MergeStatus::Unknown,
-            2 => MergeStatus::UpToDate,
-            3 => MergeStatus::Ready,
-            4 => MergeStatus::Blocked,
-            5 => MergeStatus::Conflicted,
-            other => bail!("invalid merge status `{other}`"),
-        })
-    }
-
     fn take_session_mode(&mut self) -> Result<SessionMode> {
         Ok(match self.take_u8()? {
             1 => SessionMode::Execute,
@@ -1229,9 +1205,7 @@ impl<'a> Cursor<'a> {
             status: self.take_session_status()?,
             integration_policy: self.take_integration_policy()?,
             apply_state: self.take_apply_state()?,
-            merge_status: self.take_merge_status()?,
-            merge_summary: self.take_optional_string()?,
-            has_conflicts: self.take_bool()?,
+            has_commits: self.take_bool()?,
             pid: self.take_optional_u32()?,
             exit_code: self.take_optional_i32()?,
             error: self.take_optional_string()?,
@@ -1293,7 +1267,7 @@ mod tests {
     };
     use crate::session::{
         ApplyState, AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult,
-        IntegrationPolicy, MergeStatus, SessionMode, SessionRecord, SessionStatus,
+        IntegrationPolicy, SessionMode, SessionRecord, SessionStatus,
     };
     use chrono::Utc;
     use tokio::io::AsyncWriteExt;
@@ -1444,9 +1418,7 @@ mod tests {
                 status: SessionStatus::Running,
                 integration_policy: IntegrationPolicy::AutoApplySafe,
                 apply_state: ApplyState::Idle,
-                merge_status: MergeStatus::Unknown,
-                merge_summary: None,
-                has_conflicts: false,
+                has_commits: false,
                 pid: Some(123),
                 exit_code: None,
                 error: None,
@@ -1497,7 +1469,7 @@ mod tests {
             session_id: "demo".to_string(),
             status: SessionStatus::Exited,
             apply_state: ApplyState::Idle,
-            merge_status: MergeStatus::Ready,
+            has_commits: true,
             branch: "agent/demo".to_string(),
             worktree: "/tmp/worktree".to_string(),
             exit_code: Some(0),

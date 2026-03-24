@@ -20,9 +20,7 @@ use agentd_shared::{
     config::Config,
     paths::AppPaths,
     protocol::{Request, Response},
-    session::{
-        ApplyState, IntegrationPolicy, MergeStatus, SessionMode, SessionRecord, SessionStatus,
-    },
+    session::{ApplyState, IntegrationPolicy, SessionMode, SessionRecord, SessionStatus},
 };
 
 use crate::{
@@ -119,7 +117,8 @@ struct PickerScreenGuard;
 
 impl PickerScreenGuard {
     fn enter() -> Result<Self> {
-        write_screen_bytes(HOST_PICKER_ENTER_SEQUENCE).context("failed to prepare session picker")?;
+        write_screen_bytes(HOST_PICKER_ENTER_SEQUENCE)
+            .context("failed to prepare session picker")?;
         Ok(Self)
     }
 }
@@ -216,7 +215,7 @@ fn clear_host_picker(previous_lines: usize) -> Result<()> {
         MoveUp(previous_lines.saturating_sub(1) as u16),
         Clear(ClearType::FromCursorDown)
     )
-        .context("failed to clear session picker")?;
+    .context("failed to clear session picker")?;
     stdout.flush().context("failed to flush session picker clear")
 }
 
@@ -824,7 +823,7 @@ impl SessionPicker {
             actions.push(SessionAction::Attach);
         }
         actions.push(SessionAction::Diff);
-        if session.merge_status == MergeStatus::Ready {
+        if session.has_commits {
             actions.push(SessionAction::Merge);
         }
         actions.push(SessionAction::Delete);
@@ -1511,22 +1510,15 @@ impl AttachOverlay {
             }
             Command::GitStatus => {
                 let session = daemon_get_session(&self.paths, &self.session_id).await?;
-                let sync = session.merge_status.as_str();
-                let summary = session
-                    .merge_summary
-                    .clone()
-                    .unwrap_or_else(|| "merge status unavailable".to_string());
                 self.detail_text = format!(
-                    "repo      {}\nrepo_path  {}\nworktree   {}\nbranch     {}\nbase       {}\nmerge     {}\nconflicts  {}\nstatus     {}\n\n{}",
+                    "repo      {}\nrepo_path  {}\nworktree   {}\nbranch     {}\nbase       {}\ncommits   {}\nstatus     {}",
                     session.repo_name,
                     session.repo_path,
                     session.worktree,
                     session.branch,
                     session.base_branch,
-                    sync,
-                    if session.has_conflicts { "yes" } else { "no" },
+                    if session.has_commits { "yes" } else { "no" },
                     session_status_text(&session),
-                    summary,
                 );
                 self.detail_scroll = 0;
                 self.mode = OverlayMode::GitStatus;
@@ -1761,48 +1753,42 @@ fn session_search_text(session: &SessionRecord) -> String {
 fn session_rank(session: &SessionRecord) -> u8 {
     if session.status == SessionStatus::NeedsInput {
         0
-    } else if matches!(session.status, SessionStatus::Failed | SessionStatus::UnknownRecovered)
-        || session.has_conflicts
-    {
+    } else if matches!(session.status, SessionStatus::Failed | SessionStatus::UnknownRecovered) {
         1
-    } else if session.merge_status == MergeStatus::Conflicted {
+    } else if session.has_commits {
         2
-    } else if matches!(session.merge_status, MergeStatus::Ready | MergeStatus::Blocked) {
-        3
     } else if matches!(session.status, SessionStatus::Running | SessionStatus::Creating) {
-        4
+        3
     } else {
-        5
+        4
     }
 }
 
 fn session_icon(session: &SessionRecord) -> &'static str {
-    match session.merge_status {
-        MergeStatus::Ready => "⧖",
-        MergeStatus::Blocked => "⚠",
-        MergeStatus::Conflicted => "✖",
-        _ => match session.status {
+    if session.has_commits {
+        "⧖"
+    } else {
+        match session.status {
             SessionStatus::NeedsInput => "◦",
             SessionStatus::Failed => "✖",
             SessionStatus::UnknownRecovered => "⚠",
             SessionStatus::Running | SessionStatus::Creating => "●",
             SessionStatus::Exited => "✔",
-        },
+        }
     }
 }
 
 fn session_icon_color(session: &SessionRecord) -> Color {
-    match session.merge_status {
-        MergeStatus::Ready => Color::Blue,
-        MergeStatus::Blocked => Color::Yellow,
-        MergeStatus::Conflicted => Color::Red,
-        _ => match session.status {
+    if session.has_commits {
+        Color::Blue
+    } else {
+        match session.status {
             SessionStatus::NeedsInput => Color::Yellow,
             SessionStatus::Failed => Color::Red,
             SessionStatus::UnknownRecovered => Color::Yellow,
             SessionStatus::Running | SessionStatus::Creating => Color::Green,
             SessionStatus::Exited => Color::Green,
-        },
+        }
     }
 }
 
@@ -1842,18 +1828,10 @@ fn render_host_picker_legend_row(width: usize, sessions: &[SessionRecord]) -> St
         (
             {
                 let mut session = demo_status_session(SessionStatus::Exited, ApplyState::Idle);
-                session.merge_status = MergeStatus::Ready;
+                session.has_commits = true;
                 session
             },
-            "ready to merge",
-        ),
-        (
-            {
-                let mut session = demo_status_session(SessionStatus::Exited, ApplyState::Idle);
-                session.merge_status = MergeStatus::Blocked;
-                session
-            },
-            "merge blocked",
+            "has commits",
         ),
         (demo_status_session(SessionStatus::Running, ApplyState::Idle), "running"),
         (demo_status_session(SessionStatus::UnknownRecovered, ApplyState::Idle), "recovered"),
@@ -1916,9 +1894,7 @@ fn demo_status_session(status: SessionStatus, apply_state: ApplyState) -> Sessio
         status,
         integration_policy: IntegrationPolicy::AutoApplySafe,
         apply_state,
-        merge_status: MergeStatus::Unknown,
-        merge_summary: None,
-        has_conflicts: false,
+        has_commits: false,
         pid: None,
         exit_code: None,
         error: None,
@@ -1931,12 +1907,8 @@ fn demo_status_session(status: SessionStatus, apply_state: ApplyState) -> Sessio
 }
 
 fn session_list_status_label(session: &SessionRecord) -> &'static str {
-    if session.merge_status == MergeStatus::Ready {
-        "ready to merge"
-    } else if session.merge_status == MergeStatus::Blocked {
-        "merge blocked"
-    } else if session.merge_status == MergeStatus::Conflicted {
-        "merge conflicted"
+    if session.has_commits {
+        "has commits"
     } else if session.apply_state == ApplyState::Applied {
         "applied"
     } else {
@@ -1956,12 +1928,13 @@ fn host_picker_icon_ansi_prefix(session: &SessionRecord) -> String {
         SessionStatus::Failed => HOST_PICKER_STATUS_RED_FG.to_string(),
         SessionStatus::UnknownRecovered => HOST_PICKER_STATUS_YELLOW_FG.to_string(),
         SessionStatus::Running | SessionStatus::Creating => HOST_PICKER_STATUS_GREEN_FG.to_string(),
-        SessionStatus::Exited => match session.merge_status {
-            MergeStatus::Ready => HOST_PICKER_STATUS_BLUE_FG.to_string(),
-            MergeStatus::Blocked => HOST_PICKER_STATUS_YELLOW_FG.to_string(),
-            MergeStatus::Conflicted => HOST_PICKER_STATUS_RED_FG.to_string(),
-            _ => HOST_PICKER_STATUS_GREEN_FG.to_string(),
-        },
+        SessionStatus::Exited => {
+            if session.has_commits {
+                HOST_PICKER_STATUS_BLUE_FG.to_string()
+            } else {
+                HOST_PICKER_STATUS_GREEN_FG.to_string()
+            }
+        }
     }
 }
 
@@ -1971,9 +1944,6 @@ fn session_status_text(session: &SessionRecord) -> String {
     }
     if session.apply_state == ApplyState::Applied {
         return "applied".to_string();
-    }
-    if let Some(summary) = &session.merge_summary {
-        return summary.clone();
     }
     match session.status {
         SessionStatus::Creating => "starting".to_string(),
@@ -2018,7 +1988,7 @@ mod tests {
     use agentd_shared::{
         paths::AppPaths,
         session::{
-            ApplyState, AttentionLevel, IntegrationPolicy, MergeStatus, SessionMode, SessionRecord,
+            ApplyState, AttentionLevel, IntegrationPolicy, SessionMode, SessionRecord,
             SessionStatus,
         },
     };
@@ -2154,7 +2124,7 @@ mod tests {
     #[test]
     fn action_menu_shows_merge_for_pending_review() {
         let mut session = demo("alpha", "repo-a");
-        session.merge_status = MergeStatus::Ready;
+        session.has_commits = true;
         session.status = SessionStatus::Exited;
         let picker = SessionPicker {
             paths: test_paths(),
@@ -2176,7 +2146,7 @@ mod tests {
     #[test]
     fn action_menu_shows_attach_and_merge_when_both_apply() {
         let mut session = demo("alpha", "repo-a");
-        session.merge_status = MergeStatus::Ready;
+        session.has_commits = true;
         let picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![session],
@@ -2532,7 +2502,7 @@ mod tests {
         assert!(rendered.contains("⧖"));
         assert!(rendered.contains("⚠"));
         assert!(rendered.contains("needs input"));
-        assert!(rendered.contains("ready to merge"));
+        assert!(rendered.contains("has commits"));
         assert!(rendered.contains("recovered"));
         assert!(rendered.contains(" • "));
         assert!(!rendered.contains("failed"));
@@ -2774,11 +2744,11 @@ mod tests {
         status: SessionStatus,
         integration_state: IntegrationState,
     ) -> SessionRecord {
-        let (apply_state, merge_status) = match integration_state {
-            IntegrationState::Clean => (ApplyState::Idle, MergeStatus::Unknown),
-            IntegrationState::PendingReview => (ApplyState::Idle, MergeStatus::Ready),
-            IntegrationState::Blocked => (ApplyState::Idle, MergeStatus::Blocked),
-            IntegrationState::Conflicted => (ApplyState::Idle, MergeStatus::Conflicted),
+        let (apply_state, has_commits) = match integration_state {
+            IntegrationState::Clean => (ApplyState::Idle, false),
+            IntegrationState::PendingReview
+            | IntegrationState::Blocked
+            | IntegrationState::Conflicted => (ApplyState::Idle, true),
         };
         let now = Utc::now();
         SessionRecord {
@@ -2797,9 +2767,7 @@ mod tests {
             status,
             integration_policy: IntegrationPolicy::AutoApplySafe,
             apply_state,
-            merge_status,
-            merge_summary: None,
-            has_conflicts: false,
+            has_commits,
             pid: Some(123),
             exit_code: None,
             error: None,

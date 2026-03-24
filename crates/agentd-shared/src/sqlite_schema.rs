@@ -1,7 +1,7 @@
 use anyhow::{Result, bail, ensure};
 use rusqlite::Connection;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 2;
+pub const CURRENT_SCHEMA_VERSION: i32 = 3;
 const EXPECTED_SESSIONS_COLUMNS: &[&str] = &[
     "session_id",
     "thread_id",
@@ -21,9 +21,6 @@ const EXPECTED_SESSIONS_COLUMNS: &[&str] = &[
     "exit_code",
     "error",
     "integration_state",
-    "git_sync",
-    "git_status_summary",
-    "has_conflicts",
     "attention",
     "attention_summary",
     "created_at",
@@ -62,9 +59,8 @@ fn ensure_supported_schema(conn: &Connection, schema_version: i32) -> Result<()>
     );
 
     let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
-    let columns = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let columns =
+        stmt.query_map([], |row| row.get::<_, String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
 
     if columns.is_empty() {
         bail!(
@@ -102,16 +98,13 @@ fn create_schema(conn: &Connection) -> Result<()> {
             exit_code INTEGER,
             error TEXT,
             integration_state TEXT NOT NULL CHECK (integration_state IN ('idle', 'auto_applying', 'applied', 'discarded')),
-            git_sync TEXT NOT NULL CHECK (git_sync IN ('unknown', 'up_to_date', 'ready', 'blocked', 'conflicted')),
-            git_status_summary TEXT,
-            has_conflicts INTEGER NOT NULL DEFAULT 0 CHECK (has_conflicts IN (0, 1)),
             attention TEXT NOT NULL CHECK (attention IN ('info', 'notice', 'action')),
             attention_summary TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             exited_at TEXT
         );
-        PRAGMA user_version = 2;
+        PRAGMA user_version = 3;
         ",
     )?;
     Ok(())

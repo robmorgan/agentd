@@ -187,6 +187,19 @@ pub fn has_committed_diff_against_base(worktree: &Utf8Path, base_branch: &str) -
     Ok(!run_git(worktree, &["diff", "--stat", &format!("{base_branch}...HEAD")])?.trim().is_empty())
 }
 
+pub fn branch_has_committed_diff(
+    repo_root: &Utf8Path,
+    base_branch: &str,
+    branch: &str,
+) -> Result<bool> {
+    if !branch_exists(repo_root, branch)? {
+        return Ok(false);
+    }
+    Ok(!run_git(repo_root, &["diff", "--stat", &format!("{base_branch}...{branch}")])?
+        .trim()
+        .is_empty())
+}
+
 pub fn commit_all(worktree: &Utf8Path, message: &str) -> Result<()> {
     let add = Command::new("git")
         .arg("-C")

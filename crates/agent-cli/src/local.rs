@@ -7,8 +7,7 @@ use std::{
 use agentd_shared::{
     paths::AppPaths,
     session::{
-        ApplyState, AttentionLevel, IntegrationPolicy, MergeStatus, SessionMode, SessionRecord,
-        SessionStatus,
+        ApplyState, AttentionLevel, IntegrationPolicy, SessionMode, SessionRecord, SessionStatus,
     },
     sqlite_schema::init_state_db,
 };
@@ -37,19 +36,21 @@ impl LocalStore {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, repo_name, title, base_branch, branch,
-                    worktree, status, integration_policy, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
+                    worktree, status, integration_policy, integration_state, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into).and_then(|sessions| {
+            sessions.into_iter().map(refresh_commit_state).collect::<Result<Vec<_>>>()
+        })
     }
 
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, repo_name, title, base_branch, branch,
-                    worktree, status, integration_policy, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
+                    worktree, status, integration_policy, integration_state, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
             params![session_id],
@@ -57,6 +58,7 @@ impl LocalStore {
         )
         .optional()
         .map_err(Into::into)
+        .and_then(|session| session.map(refresh_commit_state).transpose())
     }
 
     pub fn mark_exited(&self, session_id: &str, exit_code: Option<i32>) -> Result<()> {
@@ -188,30 +190,53 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
                 Box::new(err),
             )
         })?,
-        merge_status: str_to_merge_status(&row.get::<_, String>(15)?).map_err(|err| {
+        has_commits: false,
+        pid: row.get::<_, Option<u32>>(15)?,
+        exit_code: row.get(16)?,
+        error: row.get(17)?,
+        attention: str_to_attention(&row.get::<_, String>(18)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                15,
+                18,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        merge_summary: row.get(16)?,
-        has_conflicts: row.get::<_, bool>(17)?,
-        pid: row.get::<_, Option<u32>>(18)?,
-        exit_code: row.get(19)?,
-        error: row.get(20)?,
-        attention: str_to_attention(&row.get::<_, String>(21)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(
-                21,
-                rusqlite::types::Type::Text,
-                Box::new(err),
-            )
-        })?,
-        attention_summary: row.get(22)?,
-        created_at: parse_time(row.get::<_, String>(23)?)?,
-        updated_at: parse_time(row.get::<_, String>(24)?)?,
-        exited_at: row.get::<_, Option<String>>(25)?.map(parse_time).transpose()?,
+        attention_summary: row.get(19)?,
+        created_at: parse_time(row.get::<_, String>(20)?)?,
+        updated_at: parse_time(row.get::<_, String>(21)?)?,
+        exited_at: row.get::<_, Option<String>>(22)?.map(parse_time).transpose()?,
     })
+}
+
+fn refresh_commit_state(mut session: SessionRecord) -> Result<SessionRecord> {
+    session.has_commits =
+        branch_has_committed_diff(&session.repo_path, &session.base_branch, &session.branch)?;
+    Ok(session)
+}
+
+fn branch_has_committed_diff(repo_path: &str, base_branch: &str, branch: &str) -> Result<bool> {
+    let exists = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["show-ref", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .status()
+        .with_context(|| format!("failed to inspect branch {branch}"))?;
+    if !exists.success() {
+        return Ok(false);
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["diff", "--stat", &format!("{base_branch}...{branch}")])
+        .output()
+        .with_context(|| format!("failed to inspect branch diff for {branch}"))?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+
+    Ok(!String::from_utf8(output.stdout)?.trim().is_empty())
 }
 
 fn parse_time(value: String) -> rusqlite::Result<DateTime<Utc>> {
@@ -269,20 +294,6 @@ fn str_to_integration_policy(
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown integration policy `{value}`"),
-        )),
-    }
-}
-
-fn str_to_merge_status(value: &str) -> std::result::Result<MergeStatus, std::io::Error> {
-    match value {
-        "unknown" => Ok(MergeStatus::Unknown),
-        "up_to_date" => Ok(MergeStatus::UpToDate),
-        "ready" | "in_sync" => Ok(MergeStatus::Ready),
-        "blocked" | "needs_sync" => Ok(MergeStatus::Blocked),
-        "conflicted" => Ok(MergeStatus::Conflicted),
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("unknown merge status `{value}`"),
         )),
     }
 }

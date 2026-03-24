@@ -5,8 +5,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use agentd_shared::{
     paths::AppPaths,
     session::{
-        ApplyState, AttentionLevel, IntegrationPolicy, MergeStatus, SessionMode, SessionRecord,
-        SessionStatus,
+        ApplyState, AttentionLevel, IntegrationPolicy, SessionMode, SessionRecord, SessionStatus,
     },
     sqlite_schema::init_state_db,
 };
@@ -71,8 +70,8 @@ impl Database {
             "INSERT INTO sessions (
                 session_id, thread_id, agent, model, mode, workspace,
                 repo_path, repo_name, title, base_branch, branch, worktree, status, integration_policy, attention, attention_summary,
-                integration_state, git_sync, git_status_summary, has_conflicts, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21)",
+                integration_state, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?18)",
             params![
                 new_session.session_id,
                 new_session.thread_id,
@@ -91,9 +90,6 @@ impl Database {
                 attention_to_str(AttentionLevel::Info),
                 new_session.title,
                 apply_state_to_str(ApplyState::Idle),
-                merge_status_to_str(MergeStatus::Unknown),
-                Option::<String>::None,
-                false,
                 now,
             ],
         )?;
@@ -234,7 +230,7 @@ impl Database {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, repo_name, title, base_branch, branch,
-                    worktree, status, integration_policy, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
+                    worktree, status, integration_policy, integration_state, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
             params![session_id],
@@ -248,7 +244,7 @@ impl Database {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, repo_name, title, base_branch, branch,
-                    worktree, status, integration_policy, integration_state, git_sync, git_status_summary, has_conflicts, pid, exit_code, error, attention, attention_summary,
+                    worktree, status, integration_policy, integration_state, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
         )?;
@@ -302,29 +298,21 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
                 Box::new(err),
             )
         })?,
-        merge_status: str_to_merge_status(&row.get::<_, String>(15)?).map_err(|err| {
+        has_commits: false,
+        pid: row.get::<_, Option<u32>>(15)?,
+        exit_code: row.get(16)?,
+        error: row.get(17)?,
+        attention: str_to_attention(&row.get::<_, String>(18)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                15,
+                18,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        merge_summary: row.get(16)?,
-        has_conflicts: row.get::<_, bool>(17)?,
-        pid: row.get::<_, Option<u32>>(18)?,
-        exit_code: row.get(19)?,
-        error: row.get(20)?,
-        attention: str_to_attention(&row.get::<_, String>(21)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(
-                21,
-                rusqlite::types::Type::Text,
-                Box::new(err),
-            )
-        })?,
-        attention_summary: row.get(22)?,
-        created_at: parse_time(row.get::<_, String>(23)?)?,
-        updated_at: parse_time(row.get::<_, String>(24)?)?,
-        exited_at: row.get::<_, Option<String>>(25)?.map(parse_time).transpose()?,
+        attention_summary: row.get(19)?,
+        created_at: parse_time(row.get::<_, String>(20)?)?,
+        updated_at: parse_time(row.get::<_, String>(21)?)?,
+        exited_at: row.get::<_, Option<String>>(22)?.map(parse_time).transpose()?,
     })
 }
 
@@ -369,10 +357,6 @@ fn attention_to_str(attention: AttentionLevel) -> &'static str {
     }
 }
 
-fn merge_status_to_str(status: MergeStatus) -> &'static str {
-    status.as_str()
-}
-
 fn integration_policy_to_str(policy: IntegrationPolicy) -> &'static str {
     policy.as_str()
 }
@@ -407,20 +391,6 @@ fn str_to_integration_policy(
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown integration policy `{value}`"),
-        )),
-    }
-}
-
-fn str_to_merge_status(value: &str) -> std::result::Result<MergeStatus, std::io::Error> {
-    match value {
-        "unknown" => Ok(MergeStatus::Unknown),
-        "up_to_date" => Ok(MergeStatus::UpToDate),
-        "ready" | "in_sync" => Ok(MergeStatus::Ready),
-        "blocked" | "needs_sync" => Ok(MergeStatus::Blocked),
-        "conflicted" => Ok(MergeStatus::Conflicted),
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("unknown merge status `{value}`"),
         )),
     }
 }

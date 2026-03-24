@@ -448,7 +448,7 @@ fn session_ended_response(session: &SessionRecord) -> Option<Response> {
             session_id: session.session_id.clone(),
             status: session.status,
             apply_state: session.apply_state,
-            merge_status: session.merge_status,
+            has_commits: session.has_commits,
             branch: session.branch.clone(),
             worktree: session.worktree.clone(),
             exit_code: session.exit_code,
@@ -468,7 +468,7 @@ mod tests {
     use agentd_shared::{
         protocol::Response,
         session::{
-            ApplyState, AttentionLevel, IntegrationPolicy, MergeStatus, SessionMode, SessionRecord,
+            ApplyState, AttentionLevel, IntegrationPolicy, SessionMode, SessionRecord,
             SessionStatus,
         },
     };
@@ -492,9 +492,7 @@ mod tests {
             status,
             integration_policy: IntegrationPolicy::AutoApplySafe,
             apply_state: ApplyState::Idle,
-            merge_status: MergeStatus::Unknown,
-            merge_summary: None,
-            has_conflicts: false,
+            has_commits: false,
             pid: Some(123),
             exit_code: Some(0),
             error: None,
@@ -515,7 +513,7 @@ mod tests {
                 session_id: "demo".to_string(),
                 status: SessionStatus::Exited,
                 apply_state: ApplyState::Idle,
-                merge_status: MergeStatus::Unknown,
+                has_commits: false,
                 branch: "agent/task".to_string(),
                 worktree: "/tmp/worktree".to_string(),
                 exit_code: Some(0),

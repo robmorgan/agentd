@@ -40,16 +40,6 @@ pub enum IntegrationPolicy {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum MergeStatus {
-    Unknown,
-    UpToDate,
-    Ready,
-    Blocked,
-    Conflicted,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum SessionMode {
     Execute,
     Plan,
@@ -79,9 +69,7 @@ pub struct SessionRecord {
     pub status: SessionStatus,
     pub integration_policy: IntegrationPolicy,
     pub apply_state: ApplyState,
-    pub merge_status: MergeStatus,
-    pub merge_summary: Option<String>,
-    pub has_conflicts: bool,
+    pub has_commits: bool,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
     pub error: Option<String>,
@@ -171,18 +159,6 @@ impl IntegrationPolicy {
         match self {
             Self::ManualReview => "manual_review",
             Self::AutoApplySafe => "auto_apply_safe",
-        }
-    }
-}
-
-impl MergeStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Unknown => "unknown",
-            Self::UpToDate => "up_to_date",
-            Self::Ready => "ready",
-            Self::Blocked => "blocked",
-            Self::Conflicted => "conflicted",
         }
     }
 }

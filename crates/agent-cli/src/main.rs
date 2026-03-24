@@ -42,7 +42,7 @@ use agentd_shared::{
     },
     session::{
         ApplyState, AttachmentKind, AttachmentRecord, AttentionLevel, IntegrationPolicy,
-        MergeStatus, SessionDiff, SessionRecord, SessionStatus, WorktreeRecord,
+        SessionDiff, SessionRecord, SessionStatus, WorktreeRecord,
     },
 };
 
@@ -951,12 +951,9 @@ fn local_kill(paths: &AppPaths, session_id: &str, remove: bool) -> Result<()> {
     }
 
     if remove {
-        if matches!(
-            session.merge_status,
-            MergeStatus::Ready | MergeStatus::Blocked | MergeStatus::Conflicted
-        ) {
+        if session.has_commits {
             bail!(
-                "session `{session_id}` has mergeable changes; use `agent diff {session_id}` and `agent merge {session_id}` before removing it, or reconnect to the daemon and run `agent discard {session_id}`"
+                "session `{session_id}` has committed changes; use `agent diff {session_id}` and `agent merge {session_id}` before removing it, or reconnect to the daemon and run `agent discard {session_id}`"
             );
         }
         remove_session_artifacts(paths, &session)?;
@@ -1030,7 +1027,7 @@ pub(crate) async fn connect_attached_session(
             session_id,
             status,
             apply_state,
-            merge_status,
+            has_commits,
             branch,
             worktree,
             exit_code,
@@ -1039,7 +1036,7 @@ pub(crate) async fn connect_attached_session(
             session_id,
             status,
             apply_state,
-            merge_status,
+            has_commits,
             branch,
             worktree,
             exit_code,
@@ -1112,7 +1109,7 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
                         session_id,
                         status,
                         apply_state,
-                        merge_status,
+                        has_commits,
                         branch,
                         worktree,
                         exit_code,
@@ -1123,7 +1120,7 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
                             session_id,
                             status,
                             apply_state,
-                            merge_status,
+                            has_commits,
                             branch,
                             worktree,
                             exit_code,
@@ -1199,7 +1196,7 @@ fn print_session(session: &SessionRecord) {
     }
     println!("status: {}", session.status_string());
     println!("apply_state: {}", session.apply_state_string());
-    println!("merge_status: {}", session.merge_status.as_str());
+    println!("has_commits: {}", session.has_commits);
     println!("attention: {}", session.attention_string());
     if let Some(summary) = &session.attention_summary {
         println!("attention_summary: {summary}");
@@ -1211,10 +1208,6 @@ fn print_session(session: &SessionRecord) {
     println!("base_branch: {}", session.base_branch);
     println!("branch: {}", session.branch);
     println!("worktree: {}", session.worktree);
-    println!("has_conflicts: {}", session.has_conflicts);
-    if let Some(summary) = &session.merge_summary {
-        println!("merge_summary: {summary}");
-    }
     if let Some(pid) = session.pid {
         println!("pid: {pid}");
     }
@@ -1513,7 +1506,7 @@ struct SessionEndSummary {
     session_id: String,
     status: SessionStatus,
     apply_state: ApplyState,
-    merge_status: MergeStatus,
+    has_commits: bool,
     branch: String,
     worktree: String,
     exit_code: Option<i32>,
@@ -1538,7 +1531,7 @@ fn format_session_end_summary(summary: &SessionEndSummary) -> String {
                     summary.session_id, summary.branch, summary.worktree
                 );
             }
-            if summary.merge_status == MergeStatus::Ready {
+            if summary.has_commits {
                 return format!(
                     "session {} finished with changes on {} ({})\nrun: agent diff {} | agent merge {} | agent discard {}",
                     summary.session_id,
@@ -1746,13 +1739,13 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 mod tests {
     use super::{
         AGENTD_ATTACH_RESTORE_SEQUENCE, ATTACH_DETACH_BYTE, AttachInputAction, AttachInputParser,
-        Cli, Command, DaemonCommand, SessionEndSummary, attach_startup_bytes,
-        bail_daemon_command, clear_stale_daemon_state, format_session_end_summary,
-        render_diff_text, resolve_detach_session_id, resolve_merge_session_id,
-        resolve_new_session_options, should_colorize_diff_output,
+        Cli, Command, DaemonCommand, SessionEndSummary, attach_startup_bytes, bail_daemon_command,
+        clear_stale_daemon_state, format_session_end_summary, render_diff_text,
+        resolve_detach_session_id, resolve_merge_session_id, resolve_new_session_options,
+        should_colorize_diff_output,
     };
     use agentd_shared::paths::AppPaths;
-    use agentd_shared::session::{ApplyState, MergeStatus, SessionStatus};
+    use agentd_shared::session::{ApplyState, SessionStatus};
     use clap::Parser;
     use std::{
         ffi::OsString,
@@ -2069,7 +2062,7 @@ command = "claude"
             session_id: "demo".to_string(),
             status: SessionStatus::Exited,
             apply_state: ApplyState::Idle,
-            merge_status: MergeStatus::Unknown,
+            has_commits: false,
             branch: "agent/demo".to_string(),
             worktree: "/tmp/worktree".to_string(),
             exit_code: Some(0),
@@ -2084,7 +2077,7 @@ command = "claude"
             session_id: "demo".to_string(),
             status: SessionStatus::Failed,
             apply_state: ApplyState::Idle,
-            merge_status: MergeStatus::Unknown,
+            has_commits: false,
             branch: "agent/demo".to_string(),
             worktree: "/tmp/worktree".to_string(),
             exit_code: Some(1),
@@ -2099,7 +2092,7 @@ command = "claude"
             session_id: "demo".to_string(),
             status: SessionStatus::Exited,
             apply_state: ApplyState::Idle,
-            merge_status: MergeStatus::Ready,
+            has_commits: true,
             branch: "agent/demo".to_string(),
             worktree: "/tmp/worktree".to_string(),
             exit_code: Some(0),
@@ -2114,7 +2107,7 @@ command = "claude"
             session_id: "demo".to_string(),
             status: SessionStatus::Exited,
             apply_state: ApplyState::Applied,
-            merge_status: MergeStatus::UpToDate,
+            has_commits: false,
             branch: "agent/demo".to_string(),
             worktree: "/tmp/worktree".to_string(),
             exit_code: Some(0),

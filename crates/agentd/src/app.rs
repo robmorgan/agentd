@@ -23,8 +23,8 @@ use agentd_shared::{
     paths::AppPaths,
     session::{
         ApplyState, AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult,
-        IntegrationPolicy, MergeStatus, SessionDiff, SessionMode, SessionRecord, SessionStatus,
-        WorktreeRecord, branch_name_from_title, repo_name_from_path,
+        IntegrationPolicy, SessionDiff, SessionMode, SessionRecord, SessionStatus, WorktreeRecord,
+        branch_name_from_title, repo_name_from_path,
     },
 };
 
@@ -137,7 +137,7 @@ impl AppState {
         task::spawn_blocking(move || {
             let session = db.get_session(&session_id)?;
             if let Some(session) = session {
-                Ok(Some(refresh_merge_state(&db, session)?))
+                Ok(Some(refresh_commit_state(&db, session)?))
             } else {
                 Ok(None)
             }
@@ -151,7 +151,7 @@ impl AppState {
             let sessions = db.list_sessions()?;
             sessions
                 .into_iter()
-                .map(|session| refresh_merge_state(&db, session))
+                .map(|session| refresh_commit_state(&db, session))
                 .collect::<Result<Vec<_>>>()
         })
         .await?
@@ -210,7 +210,7 @@ impl AppState {
                 .get_session(&session_id)?
                 .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
             ensure_session_not_running(&session)?;
-            let session = refresh_merge_state(&db, session)?;
+            let session = refresh_commit_state(&db, session)?;
             ensure_not_mergeable(&session, "cleanup")?;
 
             let repo_root = Utf8PathBuf::from(session.repo_path.clone());
@@ -254,7 +254,7 @@ impl AppState {
             }
 
             if remove {
-                let session = refresh_merge_state(&db, session)?;
+                let session = refresh_commit_state(&db, session)?;
                 ensure_not_mergeable(&session, "remove")?;
                 remove_session_artifacts(&paths, &session)?;
                 db.delete_session(&session_id)?;
@@ -272,7 +272,7 @@ impl AppState {
             let session = db
                 .get_session(&session_id)?
                 .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
-            let session = refresh_merge_state(&db, session)?;
+            let session = refresh_commit_state(&db, session)?;
             let worktree = Utf8PathBuf::from(session.worktree.clone());
             if !worktree.exists() {
                 bail!("worktree `{worktree}` does not exist");
@@ -297,16 +297,8 @@ impl AppState {
             let session = db
                 .get_session(&session_id)?
                 .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
-            let session = refresh_merge_state(&db, session)?;
-            let review = merge_state_for_apply(&session)?;
-
-            match review.merge_status {
-                MergeStatus::Ready | MergeStatus::UpToDate => {}
-                MergeStatus::Blocked | MergeStatus::Conflicted => bail!(review.summary),
-                MergeStatus::Unknown => {
-                    bail!("session `{}` is not ready to merge", session.session_id)
-                }
-            }
+            let session = refresh_commit_state(&db, session)?;
+            ensure_applyable(&session)?;
 
             let repo_root = Utf8PathBuf::from(session.repo_path.clone());
             match git::preview_merge(&repo_root, &session.base_branch, &session.branch)? {
@@ -330,7 +322,7 @@ impl AppState {
                 git::MergePreview::Conflicted => bail!(manual_accept_conflict_summary(&session)),
             }
             db.get_session(&session_id)?
-                .map(|session| refresh_merge_state(&db, session))
+                .map(|session| refresh_commit_state(&db, session))
                 .transpose()?
                 .ok_or_else(|| anyhow!("session `{session_id}` not found after apply"))
         })
@@ -360,7 +352,7 @@ impl AppState {
                 "changes discarded",
             )?;
             db.get_session(&session_id)?
-                .map(|session| refresh_merge_state(&db, session))
+                .map(|session| refresh_commit_state(&db, session))
                 .transpose()?
                 .ok_or_else(|| anyhow!("session `{session_id}` not found after discard"))
         })
@@ -910,34 +902,27 @@ fn finalize_mergeable_session(db: &Database, session: &SessionRecord) -> Result<
         git::commit_all(&worktree, &auto_commit_message(session))?;
     }
 
-    let merge = inspect_merge_state(session)?;
-    let attention = match merge.merge_status {
-        MergeStatus::Ready => AttentionLevel::Notice,
-        MergeStatus::Blocked => AttentionLevel::Notice,
-        MergeStatus::Conflicted => AttentionLevel::Action,
-        MergeStatus::UpToDate => AttentionLevel::Info,
-        MergeStatus::Unknown => AttentionLevel::Action,
+    let committed = git::branch_has_committed_diff(
+        &Utf8PathBuf::from(&session.repo_path),
+        &session.base_branch,
+        &session.branch,
+    )?;
+    let attention = if committed { AttentionLevel::Notice } else { AttentionLevel::Info };
+    let summary = if committed {
+        format!("session has committed changes on {}", session.branch)
+    } else {
+        "branch is already up to date with base".to_string()
     };
-    let summary = match merge.merge_status {
-        MergeStatus::Unknown => "could not determine merge readiness".to_string(),
-        _ => merge.summary,
-    };
-    db.set_apply_state(&session.session_id, ApplyState::Idle, attention, &summary)?;
-
-    if merge.merge_status == MergeStatus::Conflicted {
-        return Ok(());
-    }
-
-    Ok(())
+    db.set_apply_state(&session.session_id, ApplyState::Idle, attention, &summary)
 }
 
 fn session_has_pending_changes(session: &SessionRecord) -> Result<bool> {
     let worktree = Utf8PathBuf::from(&session.worktree);
-    if !worktree.exists() {
-        return Ok(false);
-    }
-    Ok(git::has_worktree_changes(&worktree)?
-        || git::has_committed_diff_against_base(&worktree, &session.base_branch)?)
+    let repo_root = Utf8PathBuf::from(&session.repo_path);
+    let has_worktree_changes =
+        if worktree.exists() { git::has_worktree_changes(&worktree)? } else { false };
+    Ok(has_worktree_changes
+        || git::branch_has_committed_diff(&repo_root, &session.base_branch, &session.branch)?)
 }
 
 fn auto_commit_message(session: &SessionRecord) -> String {
@@ -1112,51 +1097,29 @@ fn accepts_live_io(session: &SessionRecord) -> bool {
         && process_exists(session.pid)
 }
 
-#[derive(Debug, Clone)]
-struct MergeState {
-    merge_status: MergeStatus,
-    summary: String,
-    has_conflicts: bool,
-}
-
 fn ensure_not_mergeable(session: &SessionRecord, action: &str) -> Result<()> {
-    match session.merge_status {
-        MergeStatus::Ready | MergeStatus::Blocked | MergeStatus::Conflicted => {
-            let summary = session
-                .merge_summary
-                .clone()
-                .unwrap_or_else(|| "session has mergeable committed work".to_string());
-            bail!(
-                "session `{}` has mergeable committed work; use `agent diff {}` and `agent merge {}` before {action}, or `agent discard {}` to drop it\n{}",
-                session.session_id,
-                session.session_id,
-                session.session_id,
-                session.session_id,
-                summary
-            );
-        }
-        MergeStatus::Unknown | MergeStatus::UpToDate => Ok(()),
+    if session.has_commits {
+        bail!(
+            "session `{}` has committed changes; use `agent diff {}` and `agent merge {}` before {action}, or `agent discard {}` to drop it",
+            session.session_id,
+            session.session_id,
+            session.session_id,
+            session.session_id,
+        );
     }
+    Ok(())
 }
 
-fn refresh_merge_state(_db: &Database, mut session: SessionRecord) -> Result<SessionRecord> {
-    let merge = inspect_merge_state(&session)?;
-    session.merge_status = merge.merge_status;
-    session.merge_summary = Some(merge.summary);
-    session.has_conflicts = merge.has_conflicts;
+fn refresh_commit_state(_db: &Database, mut session: SessionRecord) -> Result<SessionRecord> {
+    session.has_commits = git::branch_has_committed_diff(
+        &Utf8PathBuf::from(&session.repo_path),
+        &session.base_branch,
+        &session.branch,
+    )?;
     Ok(session)
 }
 
-fn inspect_merge_state(session: &SessionRecord) -> Result<MergeState> {
-    let worktree = Utf8PathBuf::from(session.worktree.clone());
-    if !worktree.exists() {
-        return Ok(MergeState {
-            merge_status: MergeStatus::Blocked,
-            summary: format!("worktree {} is missing; recreate or discard it", session.worktree),
-            has_conflicts: false,
-        });
-    }
-
+fn ensure_applyable(session: &SessionRecord) -> Result<()> {
     let repo_root = Utf8PathBuf::from(session.repo_path.clone());
     let current_branch = git::current_branch(&repo_root)?;
     if git::has_worktree_changes(&repo_root)? {
@@ -1171,62 +1134,26 @@ fn inspect_merge_state(session: &SessionRecord) -> Result<MergeState> {
                 session.repo_path, current_branch
             )
         };
-        return Ok(MergeState {
-            merge_status: MergeStatus::Blocked,
-            summary,
-            has_conflicts: false,
-        });
+        bail!(summary);
     }
 
     if current_branch != session.base_branch {
-        return Ok(MergeState {
-            merge_status: MergeStatus::Blocked,
-            summary: format!(
-                "repo is on {}; switch to {} before merge",
-                current_branch, session.base_branch
-            ),
-            has_conflicts: false,
-        });
+        bail!("repo is on {}; switch to {} before merge", current_branch, session.base_branch);
     }
 
-    let has_worktree_changes = git::has_worktree_changes(&worktree)?;
-    if !has_worktree_changes
-        && !git::has_committed_diff_against_base(&worktree, &session.base_branch)?
-    {
-        return Ok(MergeState {
-            merge_status: MergeStatus::UpToDate,
-            summary: "branch is already up to date with base".to_string(),
-            has_conflicts: false,
-        });
-    }
-
-    let dirty_suffix = if has_worktree_changes {
+    let worktree = Utf8PathBuf::from(session.worktree.clone());
+    let dirty_suffix = if worktree.exists() && git::has_worktree_changes(&worktree)? {
         " Uncommitted worktree changes are excluded from merge."
     } else {
         ""
     };
 
     match git::preview_merge(&repo_root, &session.base_branch, &session.branch)? {
-        git::MergePreview::NoChanges => Ok(MergeState {
-            merge_status: MergeStatus::UpToDate,
-            summary: format!("changes already present on base branch{dirty_suffix}"),
-            has_conflicts: false,
-        }),
-        git::MergePreview::HasChanges => Ok(MergeState {
-            merge_status: MergeStatus::Ready,
-            summary: format!("ready to merge into {}.{dirty_suffix}", session.base_branch),
-            has_conflicts: false,
-        }),
-        git::MergePreview::Conflicted => Ok(MergeState {
-            merge_status: MergeStatus::Conflicted,
-            summary: format!("{}{}", manual_accept_conflict_summary(session), dirty_suffix),
-            has_conflicts: true,
-        }),
+        git::MergePreview::Conflicted => {
+            bail!("{}{}", manual_accept_conflict_summary(session), dirty_suffix)
+        }
+        git::MergePreview::HasChanges | git::MergePreview::NoChanges => Ok(()),
     }
-}
-
-fn merge_state_for_apply(session: &SessionRecord) -> Result<MergeState> {
-    inspect_merge_state(session)
 }
 
 fn manual_accept_conflict_summary(session: &SessionRecord) -> String {
@@ -1247,8 +1174,8 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachControl, SessionRuntime, finalize_session_exit, inspect_merge_state,
-        manual_accept_conflict_summary, merge_state_for_apply, shell_quote,
+        AttachControl, SessionRuntime, ensure_applyable, finalize_session_exit,
+        manual_accept_conflict_summary, refresh_commit_state, shell_quote,
     };
     use crate::app::SessionRuntimeRegistry;
     use crate::db::{Database, NewSession};
@@ -1256,7 +1183,7 @@ mod tests {
     use agentd_shared::{
         paths::AppPaths,
         session::{
-            ApplyState, AttachmentKind, IntegrationPolicy, MergeStatus, SessionMode, SessionRecord,
+            ApplyState, AttachmentKind, IntegrationPolicy, SessionMode, SessionRecord,
             SessionStatus,
         },
     };
@@ -1555,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_session_exit_commits_changes_and_leaves_session_mergeable() {
+    fn finalize_session_exit_commits_changes_and_marks_session_has_commits() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
         let db = Database::open(&paths).unwrap();
@@ -1567,15 +1494,14 @@ mod tests {
         fs::write(worktree.join("README.md"), "updated\n").unwrap();
         finalize_session_exit(&db, "demo", Some(0)).unwrap();
 
-        let session = db.get_session("demo").unwrap().unwrap();
+        let session = refresh_commit_state(&db, db.get_session("demo").unwrap().unwrap()).unwrap();
         assert_eq!(session.status, agentd_shared::session::SessionStatus::Exited);
         assert_eq!(session.apply_state, ApplyState::Idle);
-        let review = inspect_merge_state(&session).unwrap();
-        assert_eq!(review.merge_status, MergeStatus::Ready);
+        assert!(session.has_commits);
     }
 
     #[test]
-    fn inspect_merge_state_allows_dirty_session_worktree_but_excludes_it() {
+    fn refresh_commit_state_allows_dirty_session_worktree() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
         let db = Database::open(&paths).unwrap();
@@ -1588,14 +1514,12 @@ mod tests {
         commit_all(worktree.as_str(), "session change");
         fs::write(worktree.join("README.md"), "repo dirty\n").unwrap();
 
-        let session = db.get_session("demo").unwrap().unwrap();
-        let review = inspect_merge_state(&session).unwrap();
-        assert_eq!(review.merge_status, MergeStatus::Ready);
-        assert!(review.summary.contains("excluded from merge"));
+        let session = refresh_commit_state(&db, db.get_session("demo").unwrap().unwrap()).unwrap();
+        assert!(session.has_commits);
     }
 
     #[test]
-    fn merge_state_for_apply_detects_conflicts() {
+    fn ensure_applyable_detects_conflicts() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
         let db = Database::open(&paths).unwrap();
@@ -1626,16 +1550,14 @@ mod tests {
         commit_all(repo.as_str(), "base change");
 
         let session = db.get_session("demo").unwrap().unwrap();
-        let review = merge_state_for_apply(&session).unwrap();
-        assert_eq!(review.merge_status, MergeStatus::Conflicted);
-        assert!(review.has_conflicts);
-        assert!(review.summary.contains("git -C"));
-        assert!(review.summary.contains("checkout 'main'"));
-        assert!(review.summary.contains("merge 'agent/demo'"));
+        let err = ensure_applyable(&session).unwrap_err().to_string();
+        assert!(err.contains("git -C"));
+        assert!(err.contains("checkout 'main'"));
+        assert!(err.contains("merge 'agent/demo'"));
     }
 
     #[test]
-    fn inspect_merge_state_blocks_dirty_upstream_checkout() {
+    fn ensure_applyable_blocks_dirty_upstream_checkout() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
         let db = Database::open(&paths).unwrap();
@@ -1647,10 +1569,9 @@ mod tests {
         fs::write(repo.join("README.md"), "repo dirty\n").unwrap();
 
         let session = db.get_session("demo").unwrap().unwrap();
-        let review = inspect_merge_state(&session).unwrap();
-        assert_eq!(review.merge_status, MergeStatus::Blocked);
-        assert!(review.summary.contains("upstream checkout"));
-        assert!(review.summary.contains("main"));
+        let err = ensure_applyable(&session).unwrap_err().to_string();
+        assert!(err.contains("upstream checkout"));
+        assert!(err.contains("main"));
     }
 
     #[test]
@@ -1671,9 +1592,7 @@ mod tests {
             status: SessionStatus::Exited,
             integration_policy: IntegrationPolicy::AutoApplySafe,
             apply_state: ApplyState::Idle,
-            merge_status: MergeStatus::Conflicted,
-            merge_summary: None,
-            has_conflicts: true,
+            has_commits: true,
             pid: None,
             exit_code: Some(0),
             error: None,
@@ -1690,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn inspect_merge_state_marks_noop_merge_as_already_present() {
+    fn refresh_commit_state_marks_noop_merge_as_already_present() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
         let db = Database::open(&paths).unwrap();
@@ -1720,11 +1639,8 @@ mod tests {
         fs::write(repo.join("README.md"), "branch copy\n").unwrap();
         commit_all(repo.as_str(), "same change on main");
 
-        let session = db.get_session("demo").unwrap().unwrap();
-        let review = inspect_merge_state(&session).unwrap();
-        assert_eq!(review.merge_status, MergeStatus::UpToDate);
-        assert_eq!(review.summary, "changes already present on base branch");
-        assert!(!review.has_conflicts);
+        let session = refresh_commit_state(&db, db.get_session("demo").unwrap().unwrap()).unwrap();
+        assert!(!session.has_commits);
     }
 
     #[test]
