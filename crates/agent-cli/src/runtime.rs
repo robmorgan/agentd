@@ -97,8 +97,8 @@ const SESSION_LIST_BRANCH_MIN_WIDTH: usize = 12;
 const SESSION_LIST_BRANCH_MAX_WIDTH: usize = 34;
 const SESSION_LIST_BRANCH_FLOOR_WIDTH: usize = 8;
 const SESSION_LIST_STRUCTURAL_WIDTH: usize = 12;
-const HOST_PICKER_SESSION_PREFIX_WIDTH: usize = 6;
-const HOST_PICKER_SESSION_STRUCTURAL_WIDTH: usize = 6;
+const HOST_PICKER_SESSION_PREFIX_WIDTH: usize = 5;
+const HOST_PICKER_SESSION_STRUCTURAL_WIDTH: usize = 3;
 
 fn default_integration_policy(paths: &AppPaths) -> IntegrationPolicy {
     let _ = Config::load(paths);
@@ -597,11 +597,7 @@ impl SessionPicker {
                         } else {
                             format!(" Create new session: {}", self.composer.query.trim())
                         };
-                        lines.push(render_host_picker_option_line(
-                            &format!("+  {label}"),
-                            width,
-                            selected,
-                        ));
+                        lines.push(render_host_picker_create_row(&label, width, selected));
                     }
                     PickerRow::Session(session_id) => {
                         if let Some(session) =
@@ -1140,13 +1136,15 @@ fn render_host_picker_title_line(_width: usize) -> String {
     agentd_header()
 }
 
-fn render_host_picker_option_line(content: &str, width: usize, selected: bool) -> String {
-    let label = if selected {
-        format!("{HOST_PICKER_SELECTED_STYLE}› {content}{ANSI_RESET}")
-    } else {
-        format!("  {content}")
-    };
-    fit_host_picker_line(label, width)
+fn render_host_picker_create_row(label: &str, width: usize, selected: bool) -> String {
+    let max_chars = width.saturating_sub(1).max(1);
+    let leader = if selected { "› ".to_string() } else { "  ".to_string() };
+    let separator = " ";
+    let used = leader.chars().count() + 1 + 1 + separator.len();
+    let remaining = max_chars.saturating_sub(used);
+    let visible_tail = truncate_session_list_cell(label, remaining);
+    let tail_style = if selected { HOST_PICKER_SELECTED_STYLE } else { "" };
+    format!("{tail_style}{leader}{ANSI_RESET}+ {separator}{tail_style}{visible_tail}{ANSI_RESET}")
 }
 
 fn render_session_list_header_row(layout: SessionListLayout) -> String {
@@ -2067,7 +2065,7 @@ fn pending_changes_marker_style(session: &SessionRecord) -> Style {
 fn render_host_picker_session_row(session: &SessionRecord, width: usize, selected: bool) -> String {
     let max_chars = width.saturating_sub(1).max(1);
     let leader = if selected { "› ".to_string() } else { "  ".to_string() };
-    let separator = "  ";
+    let separator = " ";
     let used = leader.chars().count()
         + session_icon(session).chars().count()
         + pending_changes_marker(session).chars().count()
@@ -2075,7 +2073,7 @@ fn render_host_picker_session_row(session: &SessionRecord, width: usize, selecte
     let remaining = max_chars.saturating_sub(used);
     let layout = host_picker_session_layout(width);
     let body = format!(
-        "{}  {}  {}  {}",
+        "{} {} {} {}",
         format_session_list_cell(&session_elapsed_label(session), layout.age),
         format_session_list_cell(&session.session_id, layout.session),
         format_session_list_cell(&session.repo_name, layout.repo),
@@ -2257,16 +2255,16 @@ mod tests {
         HOST_PICKER_DIFF_HEADER_STYLE, HOST_PICKER_DIFF_HUNK_STYLE, HOST_PICKER_DIFF_REMOVE_STYLE,
         HOST_PICKER_ENTER_SEQUENCE, HOST_PICKER_EXIT_SEQUENCE, HOST_PICKER_LEGEND_TEXT_STYLE,
         HOST_PICKER_PLACEHOLDER_FG, HOST_PICKER_QUERY_BG, HOST_PICKER_SELECTED_STYLE,
-        HOST_PICKER_STATUS_BLUE_FG, HOST_PICKER_STATUS_GREEN_FG, HOST_PICKER_STATUS_RED_FG,
-        HOST_PICKER_STATUS_YELLOW_FG, HOST_PICKER_TEXT_FG, OverlayMode, OverlayOutcome,
-        PickerComposer, PickerMode, PickerRow, PickerToast, SessionAction, SessionPicker,
-        configured_agent_names, fit_host_picker_line, format_merge_failure_toast,
-        pending_changes_marker, render_host_picker_legend_row, render_host_picker_session_row,
-        render_host_picker_title_line, render_host_picker_toast_line,
-        render_session_list_header_content, render_session_list_header_row,
-        render_session_list_lines, sanitize_picker_message, session_icon, session_icon_color,
-        session_list_layout, style_host_picker_background_row, style_host_picker_diff_line,
-        style_host_picker_query_line,
+        HOST_PICKER_SESSION_PREFIX_WIDTH, HOST_PICKER_STATUS_BLUE_FG, HOST_PICKER_STATUS_GREEN_FG,
+        HOST_PICKER_STATUS_RED_FG, HOST_PICKER_STATUS_YELLOW_FG, HOST_PICKER_TEXT_FG, OverlayMode,
+        OverlayOutcome, PickerComposer, PickerMode, PickerRow, PickerToast, SessionAction,
+        SessionPicker, configured_agent_names, fit_host_picker_line, format_merge_failure_toast,
+        pending_changes_marker, render_host_picker_create_row, render_host_picker_legend_row,
+        render_host_picker_session_row, render_host_picker_title_line,
+        render_host_picker_toast_line, render_session_list_header_content,
+        render_session_list_header_row, render_session_list_lines, sanitize_picker_message,
+        session_icon, session_icon_color, session_list_layout, style_host_picker_background_row,
+        style_host_picker_diff_line, style_host_picker_query_line,
     };
     use agentd_shared::{
         paths::AppPaths,
@@ -3014,13 +3012,46 @@ mod tests {
         let wide = strip_ansi(&render_host_picker_session_row(&session, 120, false));
         let narrow = strip_ansi(&render_host_picker_session_row(&session, 60, false));
 
-        assert!(wide.contains("23m     a-very-long-session-n..."));
+        assert!(wide.contains("23m    a-very-long-session-n..."));
         assert!(wide.contains("repository-with..."));
         assert!(wide.contains("agent/this-is-a-very-long-branc..."));
-        assert!(narrow.contains("23m     a-ver..."));
+        assert!(narrow.contains("23m    a-ver..."));
         assert!(narrow.contains("repos..."));
         assert!(narrow.contains("agent/this-is-a-very"));
         assert!(narrow.trim_end().ends_with("..."));
+    }
+
+    #[test]
+    fn host_picker_create_row_aligns_with_elapsed_column() {
+        let mut session = demo("alpha", "repo-a");
+        session.created_at = Utc::now() - Duration::minutes(23);
+
+        let session_row = strip_ansi(&render_host_picker_session_row(&session, 120, false));
+        let create_row =
+            strip_ansi(&render_host_picker_create_row("Create new session", 120, false));
+        let session_column = session_row
+            .split("23m")
+            .next()
+            .expect("session row should include elapsed time")
+            .chars()
+            .count();
+        let create_column = create_row
+            .split("Create new session")
+            .next()
+            .expect("create row should include label")
+            .chars()
+            .count();
+
+        assert_eq!(session_column, create_column);
+    }
+
+    #[test]
+    fn host_picker_create_row_truncates_query_text() {
+        let rendered =
+            strip_ansi(&render_host_picker_create_row("Create new session: beta", 20, false));
+
+        assert_eq!(rendered.find("Create"), Some(HOST_PICKER_SESSION_PREFIX_WIDTH));
+        assert!(rendered.trim_end().ends_with("..."));
     }
 
     #[test]
