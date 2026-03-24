@@ -248,7 +248,7 @@ struct SessionPicker {
     mode: PickerMode,
     detail_text: String,
     detail_scroll: usize,
-    toast: Option<String>,
+    toast: Option<PickerToast>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -278,6 +278,18 @@ enum SessionAction {
 enum ConfirmAction {
     Yes,
     No,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PickerToast {
+    kind: PickerToastKind,
+    message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PickerToastKind {
+    Notice,
+    Error,
 }
 
 #[derive(Clone, Debug)]
@@ -364,7 +376,9 @@ impl SessionPicker {
                     if !self.composer.query.trim().is_empty()
                         && self.composer_requested_name().is_none()
                     {
-                        self.toast = Some(format!("invalid session name: {SESSION_NAME_RULES}"));
+                        self.toast = Some(PickerToast::error(format!(
+                            "invalid session name: {SESSION_NAME_RULES}"
+                        )));
                         return Ok(None);
                     }
                     self.open_create_agent_menu();
@@ -475,7 +489,7 @@ impl SessionPicker {
                 ConfirmAction::Yes => {
                     self.remove_session(&session_id).await?;
                     self.mode = PickerMode::Browse;
-                    self.toast = Some(format!("removed session {session_id}"));
+                    self.toast = Some(PickerToast::notice(format!("removed session {session_id}")));
                 }
                 ConfirmAction::No => {
                     self.mode = PickerMode::SessionActions {
@@ -487,7 +501,7 @@ impl SessionPicker {
             KeyCode::Char('y') if key.modifiers.is_empty() => {
                 self.remove_session(&session_id).await?;
                 self.mode = PickerMode::Browse;
-                self.toast = Some(format!("removed session {session_id}"));
+                self.toast = Some(PickerToast::notice(format!("removed session {session_id}")));
             }
             KeyCode::Char('n') if key.modifiers.is_empty() => {
                 self.mode = PickerMode::SessionActions {
@@ -578,7 +592,7 @@ impl SessionPicker {
 
         if let Some(toast) = &self.toast {
             lines.push(String::new());
-            lines.push(fit_host_picker_line(format!("notice: {toast}"), width));
+            lines.push(render_host_picker_toast_line(toast, width));
         }
 
         lines
@@ -821,7 +835,9 @@ impl SessionPicker {
     fn refresh_agent_names(&mut self) -> Result<()> {
         self.create_agents = configured_agent_names(&self.paths)?;
         if self.create_agents.is_empty() {
-            self.toast = Some("no configured agents found; falling back to codex".to_string());
+            self.toast = Some(PickerToast::notice(
+                "no configured agents found; falling back to codex".to_string(),
+            ));
             self.create_agents = vec!["codex".to_string()];
         }
         Ok(())
@@ -914,7 +930,8 @@ impl SessionPicker {
     async fn create_session_with_agent(&mut self, agent: &str) -> Result<Option<Option<String>>> {
         let name = self.composer_requested_name();
         if !self.composer.query.trim().is_empty() && name.is_none() {
-            self.toast = Some(format!("invalid session name: {SESSION_NAME_RULES}"));
+            self.toast =
+                Some(PickerToast::error(format!("invalid session name: {SESSION_NAME_RULES}")));
             return Ok(None);
         }
         let workspace = std::env::current_dir().context("failed to determine current directory")?;
@@ -932,7 +949,7 @@ impl SessionPicker {
         match response {
             Response::CreateSession { session } => Ok(Some(Some(session.session_id))),
             Response::Error { message } => {
-                self.toast = Some(message);
+                self.toast = Some(PickerToast::error(message));
                 Ok(None)
             }
             other => bail!("unexpected response: {:?}", other),
@@ -948,11 +965,12 @@ impl SessionPicker {
         match response {
             Response::Session { session } => {
                 self.refresh_sessions().await?;
-                self.toast = Some(format!("merged {}", session.session_id));
+                self.toast = Some(PickerToast::notice(format!("merged {}", session.session_id)));
                 Ok(())
             }
             Response::Error { message } => {
-                self.toast = Some(message);
+                self.toast =
+                    Some(PickerToast::error(format_merge_failure_toast(session_id, &message)));
                 Ok(())
             }
             other => bail!("unexpected response: {:?}", other),
@@ -986,11 +1004,21 @@ impl SessionPicker {
                 Ok(())
             }
             Response::Error { message } => {
-                self.toast = Some(message);
+                self.toast = Some(PickerToast::error(message));
                 Ok(())
             }
             other => bail!("unexpected response: {:?}", other),
         }
+    }
+}
+
+impl PickerToast {
+    fn notice(message: String) -> Self {
+        Self { kind: PickerToastKind::Notice, message }
+    }
+
+    fn error(message: String) -> Self {
+        Self { kind: PickerToastKind::Error, message }
     }
 }
 
@@ -1010,6 +1038,32 @@ fn fit_host_picker_line(mut line: String, width: usize) -> String {
 fn style_host_picker_background_row(width: usize) -> String {
     let max_chars = width.saturating_sub(1).max(1);
     format!("{HOST_PICKER_QUERY_BG}{}{ANSI_RESET}", " ".repeat(max_chars))
+}
+
+fn sanitize_picker_message(message: &str) -> String {
+    message.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn format_merge_failure_toast(session_id: &str, message: &str) -> String {
+    format!(
+        "{} Exit the tui and run `agent merge {session_id}` for detailed instructions.",
+        sanitize_picker_message(message)
+    )
+}
+
+fn render_host_picker_toast_line(toast: &PickerToast, width: usize) -> String {
+    let prefix = match toast.kind {
+        PickerToastKind::Notice => "notice",
+        PickerToastKind::Error => "error",
+    };
+    let line = fit_host_picker_line(
+        format!("{prefix}: {}", sanitize_picker_message(&toast.message)),
+        width,
+    );
+    match toast.kind {
+        PickerToastKind::Notice => line,
+        PickerToastKind::Error => format!("{HOST_PICKER_STATUS_RED_FG}{line}{ANSI_RESET}"),
+    }
 }
 
 fn render_host_picker_title_line(_width: usize) -> String {
@@ -1987,13 +2041,14 @@ mod tests {
         HOST_PICKER_PLACEHOLDER_FG, HOST_PICKER_QUERY_BG, HOST_PICKER_SELECTED_STYLE,
         HOST_PICKER_STATUS_BLUE_FG, HOST_PICKER_STATUS_GREEN_FG, HOST_PICKER_STATUS_RED_FG,
         HOST_PICKER_STATUS_YELLOW_FG, HOST_PICKER_TEXT_FG, OverlayMode, OverlayOutcome,
-        PickerComposer, PickerMode, PickerRow, SessionAction, SessionPicker,
-        configured_agent_names, fit_host_picker_line, pending_changes_marker,
-        render_host_picker_legend_row, render_host_picker_session_row,
-        render_host_picker_title_line, render_session_list_header_content,
-        render_session_list_header_row, render_session_list_lines, session_icon,
-        session_icon_color, session_list_layout, style_host_picker_background_row,
-        style_host_picker_diff_line, style_host_picker_query_line,
+        PickerComposer, PickerMode, PickerRow, PickerToast, SessionAction, SessionPicker,
+        configured_agent_names, fit_host_picker_line, format_merge_failure_toast,
+        pending_changes_marker, render_host_picker_legend_row, render_host_picker_session_row,
+        render_host_picker_title_line, render_host_picker_toast_line,
+        render_session_list_header_content, render_session_list_header_row,
+        render_session_list_lines, sanitize_picker_message, session_icon, session_icon_color,
+        session_list_layout, style_host_picker_background_row, style_host_picker_diff_line,
+        style_host_picker_query_line,
     };
     use agentd_shared::{
         paths::AppPaths,
@@ -2676,6 +2731,49 @@ mod tests {
         assert!(rendered.contains("+new"));
         assert!(!rendered.contains("pending review"));
         assert!(!rendered.contains("needs input"));
+    }
+
+    #[test]
+    fn picker_toast_flattens_embedded_newlines() {
+        assert_eq!(
+            sanitize_picker_message("merge would conflict\nrun:\n  git status"),
+            "merge would conflict run: git status"
+        );
+    }
+
+    #[test]
+    fn picker_error_toast_renders_in_red() {
+        let rendered =
+            render_host_picker_toast_line(&PickerToast::error("merge blocked".to_string()), 120);
+
+        assert!(rendered.starts_with(HOST_PICKER_STATUS_RED_FG));
+        assert!(rendered.contains("error: merge blocked"));
+        assert!(rendered.ends_with(ANSI_RESET));
+    }
+
+    #[test]
+    fn merge_failure_toast_points_to_agent_merge() {
+        let message = format_merge_failure_toast("alpha", "merge would conflict\nrun:\n  git -C x");
+        assert!(message.contains("merge would conflict run: git -C x"));
+        assert!(message.contains("agent merge alpha"));
+    }
+
+    #[test]
+    fn browse_mode_renders_error_toast_on_single_line() {
+        let picker = SessionPicker {
+            paths: test_paths(),
+            sessions: vec![demo("alpha", "repo-a")],
+            create_agents: vec!["claude".to_string(), "codex".to_string()],
+            composer: default_composer(),
+            mode: PickerMode::Browse,
+            detail_text: String::new(),
+            detail_scroll: 0,
+            toast: Some(PickerToast::error("merge would conflict\nrun:\n  git status".to_string())),
+        };
+
+        let rendered = picker.render_lines(200, true).join("\n");
+        assert!(rendered.contains("error: merge would conflict run: git status"));
+        assert!(!rendered.contains("error: merge would conflict\nrun:\n  git status"));
     }
 
     #[test]
