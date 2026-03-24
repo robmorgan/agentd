@@ -56,6 +56,7 @@ use crate::local::{LocalStore, normalize_session, remove_session_artifacts};
 const AGENTD_ATTACH_RESTORE_SEQUENCE: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[?25h";
 const AGENTD_ATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
+const AGENTD_ATTACH_EXIT_TITLE: &str = "agentd";
 const CODEX_MODELS: &[&str] = &[
     "gpt-5.4",
     "gpt-5.3-codex",
@@ -1029,8 +1030,9 @@ fn local_kill(paths: &AppPaths, session_id: &str, remove: bool) -> Result<()> {
 
 async fn attach_session(paths: &AppPaths, session_id: &str) -> Result<()> {
     let mut next_session_id = session_id.to_string();
+    let mut title_guard = AttachTitleGuard::new();
     loop {
-        match attach_session_once(paths, &next_session_id).await? {
+        match attach_session_once(paths, &next_session_id, &mut title_guard).await? {
             AttachOutcome::Detached => return Ok(()),
             AttachOutcome::SessionEnded(summary) => {
                 print_session_end_summary(&summary);
@@ -1110,7 +1112,11 @@ pub(crate) async fn connect_attached_session(
     }
 }
 
-async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<AttachOutcome> {
+async fn attach_session_once(
+    paths: &AppPaths,
+    session_id: &str,
+    title_guard: &mut AttachTitleGuard,
+) -> Result<AttachOutcome> {
     let (cols, rows) = current_terminal_size();
     let attached =
         match connect_attached_session(paths, session_id, AttachmentKind::Attach, cols, rows)
@@ -1123,6 +1129,7 @@ async fn attach_session_once(paths: &AppPaths, session_id: &str) -> Result<Attac
         };
     let AttachedSessionStream { attach_id, snapshot, mut reader, mut write_half } = attached;
 
+    title_guard.set_session(session_id)?;
     eprintln!("attached to {session_id} ({attach_id}); detach with Ctrl-]");
     let _terminal = AttachTerminalGuard::enter()?;
     let raw_input = AttachRawInput::new()?;
@@ -1219,6 +1226,25 @@ fn attach_startup_bytes(snapshot: &[u8]) -> Vec<u8> {
     bytes.extend_from_slice(AGENTD_ATTACH_CLEAR_SEQUENCE);
     bytes.extend_from_slice(snapshot);
     bytes
+}
+
+fn format_attach_title(session_id: &str) -> String {
+    format!("{session_id} - {AGENTD_ATTACH_EXIT_TITLE}")
+}
+
+fn terminal_title_bytes(title: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity((title.len() * 2) + 10);
+    bytes.extend_from_slice(b"\x1b]0;");
+    bytes.extend_from_slice(title.as_bytes());
+    bytes.push(b'\x07');
+    bytes.extend_from_slice(b"\x1b]2;");
+    bytes.extend_from_slice(title.as_bytes());
+    bytes.push(b'\x07');
+    bytes
+}
+
+fn write_terminal_title(title: &str) -> Result<()> {
+    write_attach_bytes(&terminal_title_bytes(title))
 }
 
 async fn try_connect(paths: &AppPaths) -> Result<UnixStream> {
@@ -1631,6 +1657,30 @@ impl Drop for RawModeGuard {
     }
 }
 
+struct AttachTitleGuard {
+    owns_title: bool,
+}
+
+impl AttachTitleGuard {
+    fn new() -> Self {
+        Self { owns_title: false }
+    }
+
+    fn set_session(&mut self, session_id: &str) -> Result<()> {
+        write_terminal_title(&format_attach_title(session_id))?;
+        self.owns_title = true;
+        Ok(())
+    }
+}
+
+impl Drop for AttachTitleGuard {
+    fn drop(&mut self) {
+        if self.owns_title {
+            let _ = write_terminal_title(AGENTD_ATTACH_EXIT_TITLE);
+        }
+    }
+}
+
 struct AttachTerminalGuard {
     stdin_fd: i32,
     orig_termios: Option<termios>,
@@ -1801,12 +1851,12 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENTD_ATTACH_RESTORE_SEQUENCE, ATTACH_DETACH_BYTE, AttachInputAction, AttachInputParser,
-        Cli, Command, DaemonCommand, DegradedNoticeCommand, SessionEndSummary,
-        attach_startup_bytes, bail_daemon_command, clear_stale_daemon_state, cli_command,
-        cli_styles, format_session_end_summary, render_diff_text, resolve_detach_session_id,
-        resolve_merge_session_id, resolve_new_session_options, should_colorize_diff_output,
-        should_print_degraded_notice,
+        AGENTD_ATTACH_EXIT_TITLE, AGENTD_ATTACH_RESTORE_SEQUENCE, ATTACH_DETACH_BYTE,
+        AttachInputAction, AttachInputParser, Cli, Command, DaemonCommand, DegradedNoticeCommand,
+        SessionEndSummary, attach_startup_bytes, bail_daemon_command, clear_stale_daemon_state,
+        cli_command, cli_styles, format_attach_title, format_session_end_summary, render_diff_text,
+        resolve_detach_session_id, resolve_merge_session_id, resolve_new_session_options,
+        should_colorize_diff_output, should_print_degraded_notice, terminal_title_bytes,
     };
     use agentd_shared::session::{ApplyState, SessionStatus};
     use agentd_shared::{header::AGENTD_PRIMARY_BLUE_RGB, paths::AppPaths};
@@ -2224,6 +2274,27 @@ command = "claude"
     fn attach_startup_sequence_does_not_force_alternate_screen() {
         let startup = attach_startup_bytes(b"snapshot");
         assert!(!startup.windows(6).any(|window| window == b"\x1b[?1049"));
+    }
+
+    #[test]
+    fn format_attach_title_appends_agentd_suffix() {
+        assert_eq!(format_attach_title("fix-tests"), "fix-tests - agentd");
+    }
+
+    #[test]
+    fn terminal_title_bytes_set_both_window_title_sequences() {
+        assert_eq!(
+            terminal_title_bytes("fix-tests - agentd"),
+            b"\x1b]0;fix-tests - agentd\x07\x1b]2;fix-tests - agentd\x07".to_vec()
+        );
+    }
+
+    #[test]
+    fn terminal_title_bytes_reset_to_agentd_on_exit() {
+        assert_eq!(
+            terminal_title_bytes(AGENTD_ATTACH_EXIT_TITLE),
+            b"\x1b]0;agentd\x07\x1b]2;agentd\x07".to_vec()
+        );
     }
 
     #[test]
