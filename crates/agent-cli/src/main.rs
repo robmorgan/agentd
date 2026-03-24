@@ -1950,14 +1950,14 @@ mod tests {
     use crate::runtime;
 
     use super::{
-        AGENTD_ATTACH_ENTER_SEQUENCE, AGENTD_ATTACH_RESTORE_SEQUENCE, ATTACH_DETACH_BYTE,
-        ATTACH_NEXT_SESSION_BYTE, AttachInputAction, AttachInputParser, AttachSessionDirection,
-        Cli, Command, DaemonCommand, DegradedNoticeCommand, SessionEndSummary,
-        adjacent_live_session_id_in, attach_startup_bytes, bail_daemon_command,
-        clear_stale_daemon_state, cli_command, cli_styles, format_session_end_summary,
-        render_diff_text, resolve_detach_session_id, resolve_merge_session_id,
-        resolve_new_session_options, should_colorize_diff_output, should_print_degraded_notice,
-        terminal_title_bytes, AGENTD_ATTACH_EXIT_TITLE, format_attach_title,
+        AGENTD_ATTACH_ENTER_SEQUENCE, AGENTD_ATTACH_EXIT_TITLE, AGENTD_ATTACH_RESTORE_SEQUENCE,
+        ATTACH_DETACH_BYTE, ATTACH_NEXT_SESSION_BYTE, AttachInputAction, AttachInputParser,
+        AttachSessionDirection, Cli, Command, DaemonCommand, DegradedNoticeCommand,
+        SessionEndSummary, adjacent_live_session_id_in, attach_startup_bytes, bail_daemon_command,
+        clear_stale_daemon_state, cli_command, cli_styles, format_attach_title,
+        format_session_end_summary, render_diff_text, resolve_detach_session_id,
+        resolve_merge_session_id, resolve_new_session_options, should_colorize_diff_output,
+        should_print_degraded_notice, terminal_title_bytes,
     };
     use agentd_shared::session::{
         ApplyState, AttentionLevel, IntegrationPolicy, SessionMode, SessionRecord, SessionStatus,
