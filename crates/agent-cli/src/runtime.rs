@@ -5,7 +5,6 @@ use crossterm::{
     cursor::{MoveToColumn, MoveUp},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
-    style::{Color as CrosColor, Stylize},
     terminal::{self, Clear, ClearType},
 };
 use ratatui::{
@@ -18,6 +17,7 @@ use ratatui::{
 
 use agentd_shared::{
     config::Config,
+    header::agentd_header,
     paths::AppPaths,
     protocol::{Request, Response},
     session::{ApplyState, IntegrationPolicy, SessionMode, SessionRecord, SessionStatus},
@@ -976,65 +976,8 @@ fn style_host_picker_background_row(width: usize) -> String {
     format!("{HOST_PICKER_QUERY_BG}{}{ANSI_RESET}", " ".repeat(max_chars))
 }
 
-fn render_host_picker_title_line(width: usize) -> String {
-    let title = format!("{} - {}", render_host_picker_brand(), render_host_picker_subtitle());
-    fit_host_picker_line(title, width)
-}
-
-fn render_host_picker_brand() -> String {
-    "agentd".to_string()
-}
-
-fn render_host_picker_subtitle() -> String {
-    render_ansi_gradient("agent multiplexer", (162, 96, 252), (104, 250, 253))
-}
-
-fn render_host_picker_gradient_text(text: &str) -> String {
-    const START: u8 = 54;
-    const END: u8 = 159;
-    let chars = text.chars().collect::<Vec<_>>();
-    let last_index = chars.len().saturating_sub(1);
-    let mut rendered = String::new();
-    for (index, ch) in chars.into_iter().enumerate() {
-        let value = interpolate_ansi_value(START, END, index, last_index);
-        rendered.push_str(&format!("{}", ch.to_string().with(CrosColor::AnsiValue(value))));
-    }
-    rendered
-}
-
-pub fn render_ansi_gradient(text: &str, start: (u8, u8, u8), end: (u8, u8, u8)) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
-
-    if len == 0 {
-        return String::new();
-    }
-
-    chars
-        .iter()
-        .enumerate()
-        .map(|(i, ch)| {
-            let t = if len == 1 { 0.0 } else { i as f32 / (len - 1) as f32 };
-
-            let r = start.0 as f32 + (end.0 as f32 - start.0 as f32) * t;
-            let g = start.1 as f32 + (end.1 as f32 - start.1 as f32) * t;
-            let b = start.2 as f32 + (end.2 as f32 - start.2 as f32) * t;
-
-            format!("\x1b[38;2;{};{};{}m{}", r as u8, g as u8, b as u8, ch)
-        })
-        .collect::<String>()
-        + "\x1b[0m"
-}
-
-fn interpolate_ansi_value(start: u8, end: u8, index: usize, last_index: usize) -> u8 {
-    if last_index == 0 {
-        return start;
-    }
-
-    let start = start as f32;
-    let end = end as f32;
-    let t = index as f32 / last_index as f32;
-    (start + ((end - start) * t)).round() as u8
+fn render_host_picker_title_line(_width: usize) -> String {
+    agentd_header()
 }
 
 fn render_host_picker_option_line(content: &str, width: usize, selected: bool) -> String {
@@ -1977,9 +1920,8 @@ mod tests {
         HOST_PICKER_STATUS_BLUE_FG, HOST_PICKER_STATUS_GREEN_FG, HOST_PICKER_STATUS_RED_FG,
         HOST_PICKER_STATUS_YELLOW_FG, HOST_PICKER_TEXT_FG, OverlayMode, OverlayOutcome,
         PickerComposer, PickerMode, PickerRow, SessionAction, SessionPicker,
-        configured_agent_names, fit_host_picker_line, interpolate_ansi_value,
-        render_host_picker_brand, render_host_picker_gradient_text, render_host_picker_legend_row,
-        render_host_picker_session_row, render_host_picker_subtitle, render_host_picker_title_line,
+        configured_agent_names, fit_host_picker_line, render_host_picker_legend_row,
+        render_host_picker_session_row, render_host_picker_title_line,
         render_session_list_header_content, render_session_list_header_row,
         render_session_list_lines, session_icon, session_icon_color, session_list_layout,
         style_host_picker_background_row, style_host_picker_diff_line,
@@ -2510,37 +2452,15 @@ mod tests {
     }
 
     #[test]
-    fn host_picker_title_renders_brand_gradient() {
-        let brand = render_host_picker_brand();
-        let subtitle = render_host_picker_subtitle();
+    fn host_picker_title_uses_shared_header() {
         let title = render_host_picker_title_line(120);
-        assert_eq!(brand, "agentd");
-        assert_eq!(strip_ansi(&subtitle), "agent multiplexer");
-        assert!(subtitle.contains('\u{1b}'));
-        assert!(subtitle.contains('a'));
-        assert!(subtitle.contains('r'));
-        assert!(title.contains("agentd - "));
+        assert_eq!(strip_ansi(&title), "agentd - agent multiplexer");
     }
 
     #[test]
-    fn host_picker_gradient_progresses_without_repeating() {
-        let last_index = "agent multiplexer".chars().count() - 1;
-        let values = (0..=last_index)
-            .map(|index| interpolate_ansi_value(54, 159, index, last_index))
-            .collect::<Vec<_>>();
-        assert_eq!(values.first().copied(), Some(54));
-        assert_eq!(values.last().copied(), Some(159));
-        assert_eq!(values.len(), "agent multiplexer".chars().count());
-        assert!(values.windows(2).all(|window| window[0] <= window[1]));
-        assert!(values.windows(7).all(|window| window.first() != window.last()));
-    }
-
-    #[test]
-    fn host_picker_gradient_handles_short_strings() {
-        assert_eq!(strip_ansi(&render_host_picker_gradient_text("")), "");
-        let single = render_host_picker_gradient_text("a");
-        assert_eq!(strip_ansi(&single), "a");
-        assert_eq!(interpolate_ansi_value(54, 159, 0, 0), 54);
+    fn host_picker_title_does_not_truncate_for_narrow_widths() {
+        let title = render_host_picker_title_line(4);
+        assert_eq!(strip_ansi(&title), "agentd - agent multiplexer");
     }
 
     #[test]
