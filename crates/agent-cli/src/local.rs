@@ -115,6 +115,17 @@ pub fn normalize_session(session: SessionRecord) -> SessionRecord {
     session
 }
 
+pub fn normalize_degraded_session(session: SessionRecord) -> SessionRecord {
+    match session.status {
+        SessionStatus::Running | SessionStatus::NeedsInput => {
+            let mut session = session;
+            session.status = SessionStatus::UnknownRecovered;
+            session
+        }
+        _ => normalize_session(session),
+    }
+}
+
 pub fn terminate_session_process(session_id: &str, pid: Option<u32>) -> Result<()> {
     let pid = pid.ok_or_else(|| anyhow!("session `{session_id}` has no recorded pid"))?;
     if pid == 0 {
@@ -405,7 +416,7 @@ fn remove_log_if_present(paths: &AppPaths, session: &SessionRecord) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalStore, refresh_commit_state};
+    use super::{LocalStore, normalize_degraded_session, refresh_commit_state};
     use agentd_shared::{
         paths::AppPaths,
         session::{
@@ -603,5 +614,28 @@ mod tests {
             updated_at: now,
             exited_at: None,
         }
+    }
+
+    #[test]
+    fn degraded_mode_normalizes_running_session_to_recovered() {
+        let session = demo_session("/tmp/repo", "/tmp/worktree", "agent/demo", false, false);
+        let normalized = normalize_degraded_session(session);
+        assert_eq!(normalized.status, SessionStatus::UnknownRecovered);
+    }
+
+    #[test]
+    fn degraded_mode_normalizes_needs_input_session_to_recovered() {
+        let mut session = demo_session("/tmp/repo", "/tmp/worktree", "agent/demo", false, false);
+        session.status = SessionStatus::NeedsInput;
+        let normalized = normalize_degraded_session(session);
+        assert_eq!(normalized.status, SessionStatus::UnknownRecovered);
+    }
+
+    #[test]
+    fn degraded_mode_preserves_exited_status() {
+        let mut session = demo_session("/tmp/repo", "/tmp/worktree", "agent/demo", false, false);
+        session.status = SessionStatus::Exited;
+        let normalized = normalize_degraded_session(session);
+        assert_eq!(normalized.status, SessionStatus::Exited);
     }
 }

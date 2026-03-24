@@ -276,7 +276,7 @@ pub(crate) fn render_session_list_lines(sessions: &[SessionRecord], width: usize
         return lines;
     }
 
-    for session in sessions {
+    for session in ordered_sessions(sessions) {
         lines.push(render_session_list_row(session, layout));
     }
 
@@ -593,9 +593,9 @@ impl SessionPicker {
                 match row {
                     PickerRow::Create => {
                         let label = if self.composer.query.trim().is_empty() {
-                            " Create new session".to_string()
+                            "Create new session".to_string()
                         } else {
-                            format!(" Create new session: {}", self.composer.query.trim())
+                            format!("Create new session: {}", self.composer.query.trim())
                         };
                         lines.push(render_host_picker_create_row(&label, width, selected));
                     }
@@ -821,13 +821,10 @@ impl SessionPicker {
     }
 
     fn filtered_sessions(&self) -> Vec<&SessionRecord> {
-        let mut sessions = self
-            .sessions
-            .iter()
+        ordered_sessions(&self.sessions)
+            .into_iter()
             .filter(|session| matches_query(session_search_text(session), &self.composer.query))
-            .collect::<Vec<_>>();
-        sessions.sort_by(|left, right| compare_session_switcher_order(left, right));
-        sessions
+            .collect()
     }
 
     fn picker_rows(&self) -> Vec<PickerRow> {
@@ -1894,13 +1891,10 @@ impl AttachOverlay {
     }
 
     fn filtered_sessions(&self) -> Vec<&SessionRecord> {
-        let mut sessions = self
-            .sessions
-            .iter()
+        ordered_sessions(&self.sessions)
+            .into_iter()
             .filter(|session| matches_query(session_search_text(session), &self.switcher_query))
-            .collect::<Vec<_>>();
-        sessions.sort_by(|left, right| compare_session_switcher_order(left, right));
-        sessions
+            .collect()
     }
 }
 
@@ -1985,6 +1979,12 @@ pub(crate) fn compare_session_switcher_order(
         .then_with(|| right.updated_at.cmp(&left.updated_at))
 }
 
+pub(crate) fn ordered_sessions(sessions: &[SessionRecord]) -> Vec<&SessionRecord> {
+    let mut sessions = sessions.iter().collect::<Vec<_>>();
+    sessions.sort_by(|left, right| compare_session_switcher_order(left, right));
+    sessions
+}
+
 pub(crate) fn session_accepts_attach(session: &SessionRecord) -> bool {
     matches!(session.status, SessionStatus::Running | SessionStatus::NeedsInput)
 }
@@ -2012,43 +2012,73 @@ fn session_search_text(session: &SessionRecord) -> String {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionDisplayState {
+    NeedsInput,
+    Failed,
+    Recovered,
+    Applied,
+    Creating,
+    Running,
+    Exited,
+}
+
+fn session_display_state(session: &SessionRecord) -> SessionDisplayState {
+    if session.apply_state == ApplyState::Applied
+        && !matches!(
+            session.status,
+            SessionStatus::NeedsInput | SessionStatus::Failed | SessionStatus::UnknownRecovered
+        )
+    {
+        return SessionDisplayState::Applied;
+    }
+
+    match session.status {
+        SessionStatus::Creating => SessionDisplayState::Creating,
+        SessionStatus::Running => SessionDisplayState::Running,
+        SessionStatus::NeedsInput => SessionDisplayState::NeedsInput,
+        SessionStatus::Exited => SessionDisplayState::Exited,
+        SessionStatus::Failed => SessionDisplayState::Failed,
+        SessionStatus::UnknownRecovered => SessionDisplayState::Recovered,
+    }
+}
+
 fn session_rank(session: &SessionRecord) -> u8 {
-    if session.status == SessionStatus::NeedsInput {
-        0
-    } else if matches!(session.status, SessionStatus::Failed | SessionStatus::UnknownRecovered) {
-        1
-    } else if session.has_pending_changes {
-        2
-    } else if matches!(session.status, SessionStatus::Running | SessionStatus::Creating) {
-        3
-    } else {
-        4
+    match session_display_state(session) {
+        SessionDisplayState::NeedsInput => 0,
+        SessionDisplayState::Failed | SessionDisplayState::Recovered => 1,
+        _ if session.has_pending_changes => 2,
+        SessionDisplayState::Applied => 3,
+        SessionDisplayState::Running | SessionDisplayState::Creating => 4,
+        SessionDisplayState::Exited => 5,
     }
 }
 
 fn session_icon(session: &SessionRecord) -> &'static str {
-    match session.status {
-        SessionStatus::NeedsInput => "◦",
-        SessionStatus::Failed => "✖",
-        SessionStatus::UnknownRecovered => "⚠",
-        SessionStatus::Running | SessionStatus::Creating => "●",
-        SessionStatus::Exited => "✔",
+    match session_display_state(session) {
+        SessionDisplayState::NeedsInput => "◦",
+        SessionDisplayState::Failed => "✖",
+        SessionDisplayState::Recovered => "⚠",
+        SessionDisplayState::Applied | SessionDisplayState::Exited => "✔",
+        SessionDisplayState::Running | SessionDisplayState::Creating => "●",
     }
 }
 
 fn session_icon_color(session: &SessionRecord) -> Color {
-    match session.status {
-        SessionStatus::NeedsInput => Color::Yellow,
-        SessionStatus::Failed => Color::Red,
-        SessionStatus::UnknownRecovered => Color::Yellow,
-        SessionStatus::Running | SessionStatus::Creating => Color::Green,
-        SessionStatus::Exited => Color::Green,
+    match session_display_state(session) {
+        SessionDisplayState::NeedsInput => Color::Yellow,
+        SessionDisplayState::Failed => Color::Red,
+        SessionDisplayState::Recovered => Color::Yellow,
+        SessionDisplayState::Applied
+        | SessionDisplayState::Running
+        | SessionDisplayState::Creating
+        | SessionDisplayState::Exited => Color::Green,
     }
 }
 
 fn session_icon_style(session: &SessionRecord) -> Style {
     let mut style = Style::default().fg(session_icon_color(session));
-    if session.status == SessionStatus::NeedsInput {
+    if session_display_state(session) == SessionDisplayState::NeedsInput {
         style = style.add_modifier(Modifier::DIM);
     }
     style
@@ -2104,6 +2134,7 @@ fn render_host_picker_legend_row(width: usize, sessions: &[SessionRecord]) -> St
         (demo_status_session(SessionStatus::NeedsInput, ApplyState::Idle), "needs input"),
         (demo_status_session(SessionStatus::Failed, ApplyState::Idle), "failed"),
         (demo_status_session(SessionStatus::UnknownRecovered, ApplyState::Idle), "recovered"),
+        (demo_status_session(SessionStatus::Running, ApplyState::Applied), "applied"),
         (demo_status_session(SessionStatus::Running, ApplyState::Idle), "running"),
         (demo_status_session(SessionStatus::Exited, ApplyState::Idle), "exited"),
     ];
@@ -2112,7 +2143,9 @@ fn render_host_picker_legend_row(width: usize, sessions: &[SessionRecord]) -> St
     let mut matching_entries = entries
         .into_iter()
         .filter(|(entry_session, _)| {
-            sessions.iter().any(|session| session_icon(session) == session_icon(entry_session))
+            sessions
+                .iter()
+                .any(|session| session_display_state(session) == session_display_state(entry_session))
         })
         .map(|(session, label)| {
             (
@@ -2191,27 +2224,25 @@ fn demo_status_session(status: SessionStatus, apply_state: ApplyState) -> Sessio
 }
 
 fn session_list_status_label(session: &SessionRecord) -> &'static str {
-    if session.apply_state == ApplyState::Applied {
-        "applied"
-    } else {
-        match session.status {
-            SessionStatus::NeedsInput => "needs input",
-            SessionStatus::Failed => "failed",
-            SessionStatus::UnknownRecovered => "recovered",
-            SessionStatus::Running | SessionStatus::Creating => "running",
-            SessionStatus::Exited => "exited",
-        }
+    match session_display_state(session) {
+        SessionDisplayState::NeedsInput => "needs input",
+        SessionDisplayState::Failed => "failed",
+        SessionDisplayState::Recovered => "recovered",
+        SessionDisplayState::Applied => "applied",
+        SessionDisplayState::Running | SessionDisplayState::Creating => "running",
+        SessionDisplayState::Exited => "exited",
     }
 }
 
 fn host_picker_icon_ansi_prefix(session: &SessionRecord) -> String {
-    match session.status {
-        SessionStatus::NeedsInput => format!("{ANSI_DIM}{HOST_PICKER_STATUS_YELLOW_FG}"),
-        SessionStatus::Failed => HOST_PICKER_STATUS_RED_FG.to_string(),
-        SessionStatus::UnknownRecovered => HOST_PICKER_STATUS_YELLOW_FG.to_string(),
-        SessionStatus::Running | SessionStatus::Creating | SessionStatus::Exited => {
-            HOST_PICKER_STATUS_GREEN_FG.to_string()
-        }
+    match session_display_state(session) {
+        SessionDisplayState::NeedsInput => format!("{ANSI_DIM}{HOST_PICKER_STATUS_YELLOW_FG}"),
+        SessionDisplayState::Failed => HOST_PICKER_STATUS_RED_FG.to_string(),
+        SessionDisplayState::Recovered => HOST_PICKER_STATUS_YELLOW_FG.to_string(),
+        SessionDisplayState::Applied
+        | SessionDisplayState::Running
+        | SessionDisplayState::Creating
+        | SessionDisplayState::Exited => HOST_PICKER_STATUS_GREEN_FG.to_string(),
     }
 }
 
@@ -2223,16 +2254,16 @@ fn session_status_text(session: &SessionRecord) -> String {
     if let Some(summary) = &session.attention_summary {
         return summary.clone();
     }
-    if session.apply_state == ApplyState::Applied {
-        return "applied".to_string();
-    }
-    match session.status {
-        SessionStatus::Creating => "starting".to_string(),
-        SessionStatus::Running => "running".to_string(),
-        SessionStatus::NeedsInput => "needs input".to_string(),
-        SessionStatus::Exited => "complete".to_string(),
-        SessionStatus::Failed => session.error.clone().unwrap_or_else(|| "blocked".to_string()),
-        SessionStatus::UnknownRecovered => "daemon lost the live process".to_string(),
+    match session_display_state(session) {
+        SessionDisplayState::Creating => "starting".to_string(),
+        SessionDisplayState::Running => "running".to_string(),
+        SessionDisplayState::NeedsInput => "needs input".to_string(),
+        SessionDisplayState::Failed => {
+            session.error.clone().unwrap_or_else(|| "blocked".to_string())
+        }
+        SessionDisplayState::Recovered => "daemon lost the live process".to_string(),
+        SessionDisplayState::Applied => "applied".to_string(),
+        SessionDisplayState::Exited => "complete".to_string(),
     }
 }
 
@@ -2281,6 +2312,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum IntegrationState {
         Clean,
+        Applied,
         PendingReview,
         Blocked,
         Conflicted,
@@ -2706,6 +2738,15 @@ mod tests {
                 "alpha",
                 "repo-a",
                 SessionStatus::Running,
+                IntegrationState::Applied
+            )),
+            "✔"
+        );
+        assert_eq!(
+            session_icon(&demo_with(
+                "alpha",
+                "repo-a",
+                SessionStatus::Running,
                 IntegrationState::PendingReview
             )),
             "●"
@@ -2830,7 +2871,8 @@ mod tests {
         assert!(running.contains("› "));
         assert!(running.contains("●"));
         let running_plain = strip_ansi(&running);
-        assert!(running_plain.contains("23m     alpha"));
+        assert!(running_plain.contains("23m"));
+        assert!(running_plain.contains("alpha"));
         assert!(running_plain.contains("repo-a"));
         assert!(running_plain.contains("agent/alpha"));
         assert!(review.contains("⧖"));
@@ -2849,7 +2891,8 @@ mod tests {
             200,
             &[
                 demo_with("alpha", "repo-a", SessionStatus::NeedsInput, IntegrationState::Clean),
-                demo_with("beta", "repo-b", SessionStatus::Exited, IntegrationState::PendingReview),
+                demo_with("beta", "repo-b", SessionStatus::Running, IntegrationState::Applied),
+                demo_with("delta", "repo-d", SessionStatus::Exited, IntegrationState::PendingReview),
                 demo_with(
                     "gamma",
                     "repo-c",
@@ -2860,12 +2903,15 @@ mod tests {
         );
         assert!(rendered.contains(HOST_PICKER_STATUS_YELLOW_FG));
         assert!(rendered.contains(HOST_PICKER_STATUS_BLUE_FG));
+        assert!(rendered.contains(HOST_PICKER_STATUS_GREEN_FG));
         assert!(rendered.contains(HOST_PICKER_LEGEND_TEXT_STYLE));
         assert!(rendered.starts_with("  "));
         assert!(rendered.contains("◦"));
         assert!(rendered.contains("⧖"));
         assert!(rendered.contains("⚠"));
+        assert!(rendered.contains("✔"));
         assert!(rendered.contains("needs input"));
+        assert!(rendered.contains("applied"));
         assert!(rendered.contains("pending"));
         assert!(rendered.contains("recovered"));
         assert!(rendered.contains(" • "));
@@ -2896,6 +2942,27 @@ mod tests {
         assert!(rendered.contains("NAME"));
         assert!(rendered.contains("running"));
         assert!(!rendered.contains("› "));
+    }
+
+    #[test]
+    fn session_list_prefers_applied_label_and_sorts_with_shared_order() {
+        let running = demo("running", "repo-a");
+        let applied = demo_with("applied", "repo-b", SessionStatus::Running, IntegrationState::Applied);
+        let rendered = strip_ansi(&render_session_list_lines(&[running, applied], 120).join("\n"));
+
+        assert!(rendered.contains("✔ applied"));
+        assert!(rendered.find("applied").unwrap() < rendered.find("running").unwrap());
+    }
+
+    #[test]
+    fn host_picker_uses_applied_icon_for_live_applied_sessions() {
+        let session =
+            demo_with("alpha", "repo-a", SessionStatus::Running, IntegrationState::Applied);
+        let rendered = render_host_picker_session_row(&session, 120, false);
+
+        assert!(rendered.contains(HOST_PICKER_STATUS_GREEN_FG));
+        assert!(rendered.contains("✔"));
+        assert!(!rendered.contains("●"));
     }
 
     #[test]
@@ -3194,6 +3261,7 @@ mod tests {
     ) -> SessionRecord {
         let (apply_state, has_commits) = match integration_state {
             IntegrationState::Clean => (ApplyState::Idle, false),
+            IntegrationState::Applied => (ApplyState::Applied, false),
             IntegrationState::PendingReview
             | IntegrationState::Blocked
             | IntegrationState::Conflicted => (ApplyState::Idle, true),

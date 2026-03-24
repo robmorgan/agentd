@@ -51,7 +51,9 @@ use agentd_shared::{
     },
 };
 
-use crate::local::{LocalStore, normalize_session, remove_session_artifacts};
+use crate::local::{
+    LocalStore, normalize_degraded_session, remove_session_artifacts,
+};
 
 const AGENTD_ATTACH_ENTER_SEQUENCE: &[u8] = b"\x1b[>1u";
 const AGENTD_ATTACH_RESTORE_SEQUENCE: &[u8] =
@@ -475,7 +477,7 @@ async fn main() -> Result<()> {
             }
             let store = LocalStore::open(&paths)?;
             let sessions =
-                store.list_sessions()?.into_iter().map(normalize_session).collect::<Vec<_>>();
+                store.list_sessions()?.into_iter().map(normalize_degraded_session).collect::<Vec<_>>();
             print_sessions(&sessions);
         }
         (Some(Command::Attachments { session_id }), ExecutionMode::Daemon) => {
@@ -513,7 +515,7 @@ async fn main() -> Result<()> {
             let store = LocalStore::open(&paths)?;
             let session = store
                 .get_session(&session_id)?
-                .map(normalize_session)
+                .map(normalize_degraded_session)
                 .ok_or_else(|| anyhow::anyhow!("session `{session_id}` not found"))?;
             print_session(&session);
         }
@@ -1288,18 +1290,18 @@ async fn adjacent_live_session_id(
     current_session_id: &str,
     direction: AttachSessionDirection,
 ) -> Result<Option<String>> {
-    let mut sessions = daemon_list_sessions(paths)
+    let sessions = daemon_list_sessions(paths)
         .await?
         .into_iter()
         .filter(runtime::session_accepts_attach)
         .collect::<Vec<_>>();
-    sessions.sort_by(runtime::compare_session_switcher_order);
+    let ordered = runtime::ordered_sessions(&sessions);
 
-    Ok(adjacent_live_session_id_in(&sessions, current_session_id, direction))
+    Ok(adjacent_live_session_id_in(&ordered, current_session_id, direction))
 }
 
 fn adjacent_live_session_id_in(
-    sessions: &[SessionRecord],
+    sessions: &[&SessionRecord],
     current_session_id: &str,
     direction: AttachSessionDirection,
 ) -> Option<String> {
@@ -2422,6 +2424,7 @@ command = "claude"
             demo_session("running", SessionStatus::Running, true, 2),
             demo_session("idle", SessionStatus::Running, false, 3),
         ];
+        let sessions = runtime::ordered_sessions(&sessions);
 
         assert_eq!(
             adjacent_live_session_id_in(&sessions, "needs-input", AttachSessionDirection::Previous),
@@ -2450,6 +2453,7 @@ command = "claude"
         .into_iter()
         .filter(runtime::session_accepts_attach)
         .collect::<Vec<_>>();
+        let sessions = runtime::ordered_sessions(&sessions);
 
         assert_eq!(
             adjacent_live_session_id_in(&sessions, "current", AttachSessionDirection::Next),
@@ -2459,12 +2463,12 @@ command = "claude"
 
     #[test]
     fn adjacent_session_selection_uses_switcher_order() {
-        let mut sessions = vec![
+        let sessions = vec![
             demo_session("running", SessionStatus::Running, false, 1),
             demo_session("pending", SessionStatus::Running, true, 2),
             demo_session("needs-input", SessionStatus::NeedsInput, false, 3),
         ];
-        sessions.sort_by(runtime::compare_session_switcher_order);
+        let sessions = runtime::ordered_sessions(&sessions);
 
         assert_eq!(
             sessions.iter().map(|session| session.session_id.as_str()).collect::<Vec<_>>(),
