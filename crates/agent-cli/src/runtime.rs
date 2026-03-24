@@ -96,6 +96,8 @@ const SESSION_LIST_BRANCH_MIN_WIDTH: usize = 12;
 const SESSION_LIST_BRANCH_MAX_WIDTH: usize = 34;
 const SESSION_LIST_BRANCH_FLOOR_WIDTH: usize = 8;
 const SESSION_LIST_STRUCTURAL_WIDTH: usize = 10;
+const HOST_PICKER_SESSION_PREFIX_WIDTH: usize = 5;
+const HOST_PICKER_SESSION_STRUCTURAL_WIDTH: usize = 6;
 
 fn default_integration_policy(paths: &AppPaths) -> IntegrationPolicy {
     let _ = Config::load(paths);
@@ -106,6 +108,14 @@ fn default_integration_policy(paths: &AppPaths) -> IntegrationPolicy {
 struct SessionListLayout {
     visible_width: usize,
     status: usize,
+    age: usize,
+    session: usize,
+    repo: usize,
+    branch: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HostPickerSessionLayout {
     age: usize,
     session: usize,
     repo: usize,
@@ -331,9 +341,7 @@ impl SessionPicker {
         self.toast = None;
         self.composer.query.push_str(data);
         self.clamp_selection();
-        if self.picker_rows().len() > 1 {
-            self.composer.selected = 1;
-        }
+        self.composer.selected = 0;
     }
 
     async fn handle_composer_key(&mut self, key: KeyEvent) -> Result<Option<Option<String>>> {
@@ -374,9 +382,7 @@ impl SessionPicker {
                 self.toast = None;
                 self.composer.query.push(ch);
                 self.clamp_selection();
-                if self.picker_rows().len() > 1 {
-                    self.composer.selected = 1;
-                }
+                self.composer.selected = 0;
             }
             _ => {}
         }
@@ -746,12 +752,12 @@ impl SessionPicker {
     }
 
     fn picker_rows(&self) -> Vec<PickerRow> {
-        let mut rows = vec![PickerRow::Create];
-        rows.extend(
-            self.filtered_sessions()
-                .into_iter()
-                .map(|session| PickerRow::Session(session.session_id.clone())),
-        );
+        let mut rows = self
+            .filtered_sessions()
+            .into_iter()
+            .map(|session| PickerRow::Session(session.session_id.clone()))
+            .collect::<Vec<_>>();
+        rows.push(PickerRow::Create);
         rows
     }
 
@@ -1110,6 +1116,39 @@ fn shrink_session_list_column(width: &mut usize, floor_width: usize, deficit: &m
     let remove = (*deficit).min(width.saturating_sub(floor_width));
     *width -= remove;
     *deficit -= remove;
+}
+
+fn host_picker_session_layout(width: usize) -> HostPickerSessionLayout {
+    let body_width =
+        width.saturating_sub(1).max(1).saturating_sub(HOST_PICKER_SESSION_PREFIX_WIDTH);
+    let mut layout = HostPickerSessionLayout {
+        age: SESSION_LIST_AGE_WIDTH,
+        session: SESSION_LIST_SESSION_MIN_WIDTH,
+        repo: SESSION_LIST_REPO_MIN_WIDTH,
+        branch: SESSION_LIST_BRANCH_MIN_WIDTH,
+    };
+    let min_total = host_picker_session_total_width(layout);
+    if body_width >= min_total {
+        let mut remaining = body_width - min_total;
+        grow_session_list_column(&mut layout.branch, SESSION_LIST_BRANCH_MAX_WIDTH, &mut remaining);
+        grow_session_list_column(
+            &mut layout.session,
+            SESSION_LIST_SESSION_MAX_WIDTH,
+            &mut remaining,
+        );
+        grow_session_list_column(&mut layout.repo, SESSION_LIST_REPO_MAX_WIDTH, &mut remaining);
+        return layout;
+    }
+
+    let mut deficit = min_total - body_width;
+    shrink_session_list_column(&mut layout.repo, SESSION_LIST_REPO_FLOOR_WIDTH, &mut deficit);
+    shrink_session_list_column(&mut layout.session, SESSION_LIST_SESSION_FLOOR_WIDTH, &mut deficit);
+    shrink_session_list_column(&mut layout.branch, SESSION_LIST_BRANCH_FLOOR_WIDTH, &mut deficit);
+    layout
+}
+
+fn host_picker_session_total_width(layout: HostPickerSessionLayout) -> usize {
+    HOST_PICKER_SESSION_STRUCTURAL_WIDTH + layout.age + layout.session + layout.repo + layout.branch
 }
 
 fn format_session_list_cell(content: &str, width: usize) -> String {
@@ -1776,12 +1815,17 @@ fn render_host_picker_session_row(session: &SessionRecord, width: usize, selecte
     let max_chars = width.saturating_sub(1).max(1);
     let leader = if selected { "› ".to_string() } else { "  ".to_string() };
     let separator = "  ";
-    let elapsed = session_elapsed_label(session);
-    let tail =
-        format!("{}  {}  {}  {}", elapsed, session.session_id, session.repo_name, session.branch);
     let used = leader.chars().count() + session_icon(session).chars().count() + separator.len();
     let remaining = max_chars.saturating_sub(used);
-    let visible_tail = tail.chars().take(remaining).collect::<String>();
+    let layout = host_picker_session_layout(width);
+    let body = format!(
+        "{}  {}  {}  {}",
+        format_session_list_cell(&session_elapsed_label(session), layout.age),
+        format_session_list_cell(&session.session_id, layout.session),
+        format_session_list_cell(&session.repo_name, layout.repo),
+        format_session_list_cell(&session.branch, layout.branch),
+    );
+    let visible_tail = body.chars().take(remaining).collect::<String>();
     let tail_style = if selected { HOST_PICKER_SELECTED_STYLE } else { "" };
     format!(
         "{tail_style}{leader}{ANSI_RESET}{}{icon}{ANSI_RESET}{separator}{tail_style}{visible_tail}{ANSI_RESET}",
@@ -1999,7 +2043,9 @@ mod tests {
         picker.sessions = vec![demo("alpha", "repo-a"), demo("beta", "repo-b")];
 
         let rows = picker.picker_rows();
-        assert_eq!(rows[0], PickerRow::Create);
+        assert_eq!(rows[2], PickerRow::Create);
+        assert!(rows[..2].contains(&PickerRow::Session("alpha".to_string())));
+        assert!(rows[..2].contains(&PickerRow::Session("beta".to_string())));
         assert_eq!(rows.len(), 3);
     }
 
@@ -2010,7 +2056,7 @@ mod tests {
         picker.composer = PickerComposer { query: "beta".to_string(), selected: 0 };
 
         let rows = picker.picker_rows();
-        assert_eq!(rows, vec![PickerRow::Create, PickerRow::Session("beta".to_string())]);
+        assert_eq!(rows, vec![PickerRow::Session("beta".to_string()), PickerRow::Create]);
     }
 
     #[test]
@@ -2035,6 +2081,38 @@ mod tests {
 
         assert_eq!(outcome, None);
         assert_eq!(picker.composer.query, "q");
+    }
+
+    #[test]
+    fn composer_input_selects_first_matching_session_before_create_row() {
+        let mut picker = SessionPicker::new(test_paths());
+        picker.sessions = vec![demo("alpha", "repo-a"), demo("beta", "repo-b")];
+
+        let outcome = block_on(
+            picker.handle_composer_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, None);
+        assert_eq!(picker.composer.selected, 0);
+        assert_eq!(
+            picker.picker_rows(),
+            vec![PickerRow::Session("beta".to_string()), PickerRow::Create]
+        );
+    }
+
+    #[test]
+    fn paste_selects_first_matching_session_before_create_row() {
+        let mut picker = SessionPicker::new(test_paths());
+        picker.sessions = vec![demo("alpha", "repo-a"), demo("beta", "repo-b")];
+
+        picker.handle_paste("beta");
+
+        assert_eq!(picker.composer.selected, 0);
+        assert_eq!(
+            picker.picker_rows(),
+            vec![PickerRow::Session("beta".to_string()), PickerRow::Create]
+        );
     }
 
     #[test]
@@ -2473,7 +2551,10 @@ mod tests {
         assert!(running.contains(HOST_PICKER_SELECTED_STYLE));
         assert!(running.contains("› "));
         assert!(running.contains("●"));
-        assert!(running.contains("23m  alpha  repo-a  agent/alpha"));
+        let running_plain = strip_ansi(&running);
+        assert!(running_plain.contains("23m     alpha"));
+        assert!(running_plain.contains("repo-a"));
+        assert!(running_plain.contains("agent/alpha"));
         assert!(review.contains("⧖"));
         assert!(failed.contains("✖"));
         let needs_input = render_host_picker_session_row(
@@ -2633,9 +2714,32 @@ mod tests {
         session.created_at = created_at;
         session.exited_at = Some(created_at + Duration::minutes(90));
 
-        let rendered = render_host_picker_session_row(&session, 120, false);
+        let rendered = strip_ansi(&render_host_picker_session_row(&session, 120, false));
 
-        assert!(rendered.contains("1h  alpha"));
+        assert!(rendered.contains("1h"));
+        assert!(rendered.contains("alpha"));
+    }
+
+    #[test]
+    fn host_picker_session_row_uses_fixed_width_columns_and_truncation() {
+        let mut session = demo("alpha", "repository-with-a-long-name");
+        session.created_at = Utc::now() - Duration::minutes(23);
+        session.session_id =
+            "a-very-long-session-name-that-should-be-truncated-in-the-fixed-width-column"
+                .to_string();
+        session.branch =
+            "agent/this-is-a-very-long-branch-name-that-should-be-truncated".to_string();
+
+        let wide = strip_ansi(&render_host_picker_session_row(&session, 120, false));
+        let narrow = strip_ansi(&render_host_picker_session_row(&session, 60, false));
+
+        assert!(wide.contains("23m     a-very-long-session-n..."));
+        assert!(wide.contains("repository-with..."));
+        assert!(wide.contains("agent/this-is-a-very-long-branc..."));
+        assert!(narrow.contains("23m     a-ver..."));
+        assert!(narrow.contains("repos..."));
+        assert!(narrow.contains("agent/this-is-a-very"));
+        assert!(narrow.trim_end().ends_with("..."));
     }
 
     #[test]
