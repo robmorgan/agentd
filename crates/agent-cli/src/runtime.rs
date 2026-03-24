@@ -339,7 +339,7 @@ impl SessionPicker {
     async fn handle_composer_key(&mut self, key: KeyEvent) -> Result<Option<Option<String>>> {
         let row_count = self.picker_rows().len();
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => return Ok(Some(None)),
+            KeyCode::Esc => return Ok(Some(None)),
             KeyCode::Up => {
                 self.composer.selected = self.composer.selected.saturating_sub(1);
             }
@@ -368,9 +368,6 @@ impl SessionPicker {
                     self.open_create_agent_menu();
                 }
             },
-            KeyCode::Char('r') if key.modifiers.is_empty() => {
-                self.refresh_sessions().await?;
-            }
             KeyCode::Char(ch)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
@@ -2025,6 +2022,43 @@ mod tests {
         picker.clamp_selection();
 
         assert_eq!(picker.composer.selected, 1);
+    }
+
+    #[test]
+    fn composer_q_is_treated_as_query_input() {
+        let mut picker = SessionPicker::new(test_paths());
+
+        let outcome = block_on(
+            picker.handle_composer_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, None);
+        assert_eq!(picker.composer.query, "q");
+    }
+
+    #[test]
+    fn composer_r_is_treated_as_query_input() {
+        let mut picker = SessionPicker::new(test_paths());
+
+        let outcome = block_on(
+            picker.handle_composer_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, None);
+        assert_eq!(picker.composer.query, "r");
+    }
+
+    #[test]
+    fn composer_escape_still_closes_picker() {
+        let mut picker = SessionPicker::new(test_paths());
+
+        let outcome =
+            block_on(picker.handle_composer_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+                .unwrap();
+
+        assert_eq!(outcome, Some(None));
     }
 
     #[test]
