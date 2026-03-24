@@ -61,7 +61,8 @@ agent attach fix-tests
 Multiple clients can attach to the same running session at once, including the TUI and one or
 more `agent attach` processes.
 
-Detach the local `agent attach` client using `ctrl + ]`. To inspect or manage other attached
+Detach the local `agent attach` client using `ctrl + \`. Switch to the previous attached session
+with `ctrl + [` and the next one with `ctrl + ]`. To inspect or manage other attached
 clients:
 
 ```sh
@@ -202,7 +203,8 @@ The selected root contains `config.toml`, `agentd.sock`, `agentd.pid`, `state.db
 macOS typically does not set `XDG_RUNTIME_DIR`, so the default root on macOS becomes `~/.agentd`
 unless `AGENTD_DIR` is set explicitly.
 
-Interactive PTY attach is available with `agent attach <name>`. Detach with `Ctrl-]` or
+Interactive PTY attach is available with `agent attach <name>`. Detach with `Ctrl-\`, switch to
+the previous live session with `Ctrl-[`, or switch to the next live session with `Ctrl-]`, or
 `agent detach <name> --attach <attach_id>` for a specific client, or
 `agent detach <name> --all` to disconnect every attached client on the session.
 Use `agent attachments <name>` to inspect the current attachment ids.

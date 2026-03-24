@@ -53,6 +53,7 @@ use agentd_shared::{
 
 use crate::local::{LocalStore, normalize_session, remove_session_artifacts};
 
+const AGENTD_ATTACH_ENTER_SEQUENCE: &[u8] = b"\x1b[>1u";
 const AGENTD_ATTACH_RESTORE_SEQUENCE: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[?25h";
 const AGENTD_ATTACH_CLEAR_SEQUENCE: &[u8] = b"\x1b[2J\x1b[H";
@@ -383,7 +384,7 @@ async fn main() -> Result<()> {
                     Request::DetachAttachment { session_id: session_id.clone(), attach_id }
                 }
                 (false, None) => bail!(
-                    "shared attach requires either `--all` or `--attach <attach_id>`; use Ctrl-] to detach the local client"
+                    "shared attach requires either `--all` or `--attach <attach_id>`; use Ctrl-\\ to detach the local client"
                 ),
                 (true, Some(_)) => unreachable!(),
             };
@@ -1130,7 +1131,9 @@ async fn attach_session_once(
     let AttachedSessionStream { attach_id, snapshot, mut reader, mut write_half } = attached;
 
     title_guard.set_session(session_id)?;
-    eprintln!("attached to {session_id} ({attach_id}); detach with Ctrl-]");
+    eprintln!(
+        "attached to {session_id} ({attach_id}); Ctrl-\\\\ detaches, Ctrl-[/Ctrl-] switch sessions"
+    );
     let _terminal = AttachTerminalGuard::enter()?;
     let raw_input = AttachRawInput::new()?;
     let mut resize_signal =
@@ -1152,6 +1155,30 @@ async fn attach_session_once(
                         AttachInputAction::Detach => {
                             drop(write_half);
                             return Ok(AttachOutcome::Detached);
+                        }
+                        AttachInputAction::PreviousSession => {
+                            if let Some(target_session_id) = adjacent_live_session_id(
+                                paths,
+                                session_id,
+                                AttachSessionDirection::Previous,
+                            )
+                            .await?
+                            {
+                                drop(write_half);
+                                return Ok(AttachOutcome::SwitchSession(target_session_id));
+                            }
+                        }
+                        AttachInputAction::NextSession => {
+                            if let Some(target_session_id) = adjacent_live_session_id(
+                                paths,
+                                session_id,
+                                AttachSessionDirection::Next,
+                            )
+                            .await?
+                            {
+                                drop(write_half);
+                                return Ok(AttachOutcome::SwitchSession(target_session_id));
+                            }
                         }
                     }
                 }
@@ -1222,7 +1249,10 @@ fn write_session_snapshot(snapshot: &[u8]) -> Result<()> {
 }
 
 fn attach_startup_bytes(snapshot: &[u8]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(AGENTD_ATTACH_CLEAR_SEQUENCE.len() + snapshot.len());
+    let mut bytes = Vec::with_capacity(
+        AGENTD_ATTACH_ENTER_SEQUENCE.len() + AGENTD_ATTACH_CLEAR_SEQUENCE.len() + snapshot.len(),
+    );
+    bytes.extend_from_slice(AGENTD_ATTACH_ENTER_SEQUENCE);
     bytes.extend_from_slice(AGENTD_ATTACH_CLEAR_SEQUENCE);
     bytes.extend_from_slice(snapshot);
     bytes
@@ -1245,6 +1275,60 @@ fn terminal_title_bytes(title: &str) -> Vec<u8> {
 
 fn write_terminal_title(title: &str) -> Result<()> {
     write_attach_bytes(&terminal_title_bytes(title))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachSessionDirection {
+    Previous,
+    Next,
+}
+
+async fn adjacent_live_session_id(
+    paths: &AppPaths,
+    current_session_id: &str,
+    direction: AttachSessionDirection,
+) -> Result<Option<String>> {
+    let mut sessions = daemon_list_sessions(paths)
+        .await?
+        .into_iter()
+        .filter(runtime::session_accepts_attach)
+        .collect::<Vec<_>>();
+    sessions.sort_by(runtime::compare_session_switcher_order);
+
+    Ok(adjacent_live_session_id_in(&sessions, current_session_id, direction))
+}
+
+fn adjacent_live_session_id_in(
+    sessions: &[SessionRecord],
+    current_session_id: &str,
+    direction: AttachSessionDirection,
+) -> Option<String> {
+    if sessions.len() <= 1 {
+        return None;
+    }
+
+    let Some(current_index) =
+        sessions.iter().position(|session| session.session_id == current_session_id)
+    else {
+        return None;
+    };
+
+    let target_index = match direction {
+        AttachSessionDirection::Previous => {
+            if current_index == 0 {
+                sessions.len() - 1
+            } else {
+                current_index - 1
+            }
+        }
+        AttachSessionDirection::Next => (current_index + 1) % sessions.len(),
+    };
+
+    if target_index == current_index {
+        return None;
+    }
+
+    Some(sessions[target_index].session_id.clone())
 }
 
 async fn try_connect(paths: &AppPaths) -> Result<UnixStream> {
@@ -1374,12 +1458,18 @@ fn print_kill_result(session_id: &str, was_running: bool, removed: bool) {
     }
 }
 
-const ATTACH_DETACH_BYTE: u8 = 0x1d;
+const ATTACH_DETACH_BYTE: u8 = 0x1c;
+const ATTACH_NEXT_SESSION_BYTE: u8 = 0x1d;
+const ATTACH_PREVIOUS_SESSION_CODEPOINT: u32 = 91;
+const ATTACH_DETACH_CODEPOINT: u32 = 92;
+const ATTACH_NEXT_SESSION_CODEPOINT: u32 = 93;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AttachInputAction {
     Data(Vec<u8>),
     Detach,
+    PreviousSession,
+    NextSession,
 }
 
 #[derive(Default)]
@@ -1397,10 +1487,10 @@ impl AttachInputParser {
 
         while index < input.len() {
             if input[index] == 0x1b {
-                match parse_attach_detach_csi_u(&input[index..]) {
-                    Some(AttachCsiUParse::Action(consumed)) => {
+                match parse_attach_hotkey_csi_u(&input[index..]) {
+                    Some(AttachCsiUParse::Action(action, consumed)) => {
                         flush_attach_bytes(&mut actions, &mut forwarded);
-                        actions.push(AttachInputAction::Detach);
+                        actions.push(action);
                         index += consumed;
                         continue;
                     }
@@ -1417,6 +1507,10 @@ impl AttachInputParser {
                     flush_attach_bytes(&mut actions, &mut forwarded);
                     actions.push(AttachInputAction::Detach);
                 }
+                ATTACH_NEXT_SESSION_BYTE => {
+                    flush_attach_bytes(&mut actions, &mut forwarded);
+                    actions.push(AttachInputAction::NextSession);
+                }
                 byte => forwarded.push(byte),
             }
             index += 1;
@@ -1428,20 +1522,23 @@ impl AttachInputParser {
 }
 
 enum AttachCsiUParse {
-    Action(usize),
+    Action(AttachInputAction, usize),
     Incomplete,
 }
 
-fn parse_attach_detach_csi_u(bytes: &[u8]) -> Option<AttachCsiUParse> {
+fn parse_attach_hotkey_csi_u(bytes: &[u8]) -> Option<AttachCsiUParse> {
     if bytes.len() < 2 || bytes[0] != 0x1b || bytes[1] != b'[' {
         return None;
     }
 
     let mut index = 2;
     let key_code = parse_csi_u_decimal(bytes, &mut index)?;
-    if key_code != 93 {
-        return None;
-    }
+    let action = match key_code {
+        ATTACH_PREVIOUS_SESSION_CODEPOINT => AttachInputAction::PreviousSession,
+        ATTACH_DETACH_CODEPOINT => AttachInputAction::Detach,
+        ATTACH_NEXT_SESSION_CODEPOINT => AttachInputAction::NextSession,
+        _ => return None,
+    };
 
     while index < bytes.len() && bytes[index] == b':' {
         index += 1;
@@ -1499,7 +1596,7 @@ fn parse_attach_detach_csi_u(bytes: &[u8]) -> Option<AttachCsiUParse> {
         return None;
     }
 
-    Some(AttachCsiUParse::Action(index + 1))
+    Some(AttachCsiUParse::Action(action, index + 1))
 }
 
 fn parse_csi_u_decimal(bytes: &[u8], index: &mut usize) -> Option<u32> {
@@ -1850,16 +1947,23 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime;
+
     use super::{
-        AGENTD_ATTACH_EXIT_TITLE, AGENTD_ATTACH_RESTORE_SEQUENCE, ATTACH_DETACH_BYTE,
-        AttachInputAction, AttachInputParser, Cli, Command, DaemonCommand, DegradedNoticeCommand,
-        SessionEndSummary, attach_startup_bytes, bail_daemon_command, clear_stale_daemon_state,
-        cli_command, cli_styles, format_attach_title, format_session_end_summary, render_diff_text,
-        resolve_detach_session_id, resolve_merge_session_id, resolve_new_session_options,
-        should_colorize_diff_output, should_print_degraded_notice, terminal_title_bytes,
+        AGENTD_ATTACH_ENTER_SEQUENCE, AGENTD_ATTACH_RESTORE_SEQUENCE, ATTACH_DETACH_BYTE,
+        ATTACH_NEXT_SESSION_BYTE, AttachInputAction, AttachInputParser, AttachSessionDirection,
+        Cli, Command, DaemonCommand, DegradedNoticeCommand, SessionEndSummary,
+        adjacent_live_session_id_in, attach_startup_bytes, bail_daemon_command,
+        clear_stale_daemon_state, cli_command, cli_styles, format_session_end_summary,
+        render_diff_text, resolve_detach_session_id, resolve_merge_session_id,
+        resolve_new_session_options, should_colorize_diff_output, should_print_degraded_notice,
+        terminal_title_bytes, AGENTD_ATTACH_EXIT_TITLE, format_attach_title,
     };
-    use agentd_shared::session::{ApplyState, SessionStatus};
+    use agentd_shared::session::{
+        ApplyState, AttentionLevel, IntegrationPolicy, SessionMode, SessionRecord, SessionStatus,
+    };
     use agentd_shared::{header::AGENTD_PRIMARY_BLUE_RGB, paths::AppPaths};
+    use chrono::{Duration, Utc};
     use clap::{
         Parser,
         builder::styling::{Color, Effects, RgbColor},
@@ -2200,12 +2304,6 @@ command = "claude"
     }
 
     #[test]
-    fn attach_parser_detaches_on_ctrl_right_bracket_byte() {
-        let mut parser = AttachInputParser::default();
-        assert_eq!(parser.push_bytes(&[ATTACH_DETACH_BYTE]), vec![AttachInputAction::Detach]);
-    }
-
-    #[test]
     fn attach_parser_forwards_regular_bytes() {
         let mut parser = AttachInputParser::default();
         assert_eq!(parser.push_bytes(b"hello"), vec![AttachInputAction::Data(b"hello".to_vec())]);
@@ -2219,13 +2317,25 @@ command = "claude"
     }
 
     #[test]
-    fn attach_parser_detaches_on_kitty_ctrl_right_bracket() {
+    fn attach_parser_switches_to_previous_session_on_kitty_ctrl_left_bracket() {
         let mut parser = AttachInputParser::default();
-        assert_eq!(parser.push_bytes(b"\x1b[93;5u"), vec![AttachInputAction::Detach]);
+        assert_eq!(parser.push_bytes(b"\x1b[91;5u"), vec![AttachInputAction::PreviousSession]);
     }
 
     #[test]
-    fn attach_parser_ignores_kitty_detach_key_release_events() {
+    fn attach_parser_detaches_on_kitty_ctrl_backslash() {
+        let mut parser = AttachInputParser::default();
+        assert_eq!(parser.push_bytes(b"\x1b[92;5u"), vec![AttachInputAction::Detach]);
+    }
+
+    #[test]
+    fn attach_parser_switches_to_next_session_on_kitty_ctrl_right_bracket() {
+        let mut parser = AttachInputParser::default();
+        assert_eq!(parser.push_bytes(b"\x1b[93;5u"), vec![AttachInputAction::NextSession]);
+    }
+
+    #[test]
+    fn attach_parser_ignores_kitty_hotkey_release_events() {
         let mut parser = AttachInputParser::default();
         assert_eq!(
             parser.push_bytes(b"\x1b[93;5:3u"),
@@ -2234,23 +2344,38 @@ command = "claude"
     }
 
     #[test]
-    fn attach_parser_carries_incomplete_kitty_detach_sequences_between_reads() {
+    fn attach_parser_carries_incomplete_kitty_hotkey_sequences_between_reads() {
         let mut parser = AttachInputParser::default();
-        assert!(parser.push_bytes(b"\x1b[93;").is_empty());
-        assert_eq!(parser.push_bytes(b"5u"), vec![AttachInputAction::Detach]);
+        assert!(parser.push_bytes(b"\x1b[91;").is_empty());
+        assert_eq!(parser.push_bytes(b"5u"), vec![AttachInputAction::PreviousSession]);
     }
 
     #[test]
     fn attach_parser_flushes_bytes_around_control_sequences() {
         let mut parser = AttachInputParser::default();
         assert_eq!(
-            parser.push_bytes(b"ab\x1dcd\x1d"),
+            parser.push_bytes(b"ab\x1ccd\x1d"),
             vec![
                 AttachInputAction::Data(b"ab".to_vec()),
                 AttachInputAction::Detach,
                 AttachInputAction::Data(b"cd".to_vec()),
-                AttachInputAction::Detach,
+                AttachInputAction::NextSession,
             ]
+        );
+    }
+
+    #[test]
+    fn attach_parser_detaches_on_ctrl_backslash_byte() {
+        let mut parser = AttachInputParser::default();
+        assert_eq!(parser.push_bytes(&[ATTACH_DETACH_BYTE]), vec![AttachInputAction::Detach]);
+    }
+
+    #[test]
+    fn attach_parser_switches_to_next_session_on_ctrl_right_bracket_byte() {
+        let mut parser = AttachInputParser::default();
+        assert_eq!(
+            parser.push_bytes(&[ATTACH_NEXT_SESSION_BYTE]),
+            vec![AttachInputAction::NextSession]
         );
     }
 
@@ -2266,13 +2391,14 @@ command = "claude"
     fn attach_startup_sequence_clears_then_replays_snapshot() {
         assert_eq!(
             attach_startup_bytes(b"\x1b[?25lhello"),
-            b"\x1b[2J\x1b[H\x1b[?25lhello".to_vec()
+            b"\x1b[>1u\x1b[2J\x1b[H\x1b[?25lhello".to_vec()
         );
     }
 
     #[test]
     fn attach_startup_sequence_does_not_force_alternate_screen() {
         let startup = attach_startup_bytes(b"snapshot");
+        assert!(startup.starts_with(AGENTD_ATTACH_ENTER_SEQUENCE));
         assert!(!startup.windows(6).any(|window| window == b"\x1b[?1049"));
     }
 
@@ -2290,10 +2416,63 @@ command = "claude"
     }
 
     #[test]
+    fn adjacent_session_selection_wraps_in_both_directions() {
+        let sessions = vec![
+            demo_session("needs-input", SessionStatus::NeedsInput, false, 1),
+            demo_session("running", SessionStatus::Running, true, 2),
+            demo_session("idle", SessionStatus::Running, false, 3),
+        ];
+
+        assert_eq!(
+            adjacent_live_session_id_in(&sessions, "needs-input", AttachSessionDirection::Previous),
+            Some("idle".to_string())
+        );
+        assert_eq!(
+            adjacent_live_session_id_in(&sessions, "idle", AttachSessionDirection::Next),
+            Some("needs-input".to_string())
+        );
+    }
+
+    #[test]
     fn terminal_title_bytes_reset_to_agentd_on_exit() {
         assert_eq!(
             terminal_title_bytes(AGENTD_ATTACH_EXIT_TITLE),
             b"\x1b]0;agentd\x07\x1b]2;agentd\x07".to_vec()
+        );
+    }
+
+    #[test]
+    fn adjacent_session_selection_ignores_non_live_sessions() {
+        let sessions = vec![
+            demo_session("current", SessionStatus::Running, false, 1),
+            demo_session("finished", SessionStatus::Exited, false, 4),
+        ]
+        .into_iter()
+        .filter(runtime::session_accepts_attach)
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            adjacent_live_session_id_in(&sessions, "current", AttachSessionDirection::Next),
+            None
+        );
+    }
+
+    #[test]
+    fn adjacent_session_selection_uses_switcher_order() {
+        let mut sessions = vec![
+            demo_session("running", SessionStatus::Running, false, 1),
+            demo_session("pending", SessionStatus::Running, true, 2),
+            demo_session("needs-input", SessionStatus::NeedsInput, false, 3),
+        ];
+        sessions.sort_by(runtime::compare_session_switcher_order);
+
+        assert_eq!(
+            sessions.iter().map(|session| session.session_id.as_str()).collect::<Vec<_>>(),
+            vec!["needs-input", "pending", "running"]
+        );
+        assert_eq!(
+            adjacent_live_session_id_in(&sessions, "pending", AttachSessionDirection::Next),
+            Some("running".to_string())
         );
     }
 
@@ -2305,11 +2484,28 @@ command = "claude"
             apply_state: ApplyState::Idle,
             has_commits: false,
             branch: "agent/demo".to_string(),
-            worktree: "/tmp/worktree".to_string(),
-            exit_code: Some(0),
+            worktree: "/tmp/demo".to_string(),
+            exit_code: Some(7),
             error: None,
         };
-        assert_eq!(format_session_end_summary(&summary), "session demo finished (exit 0)");
+
+        assert_eq!(format_session_end_summary(&summary), "session demo finished (exit 7)");
+    }
+
+    #[test]
+    fn format_session_end_summary_reports_error() {
+        let summary = SessionEndSummary {
+            session_id: "demo".to_string(),
+            status: SessionStatus::Failed,
+            apply_state: ApplyState::Idle,
+            has_commits: false,
+            branch: "agent/demo".to_string(),
+            worktree: "/tmp/demo".to_string(),
+            exit_code: None,
+            error: Some("boom".to_string()),
+        };
+
+        assert_eq!(format_session_end_summary(&summary), "session demo failed: boom");
     }
 
     #[test]
@@ -2377,6 +2573,41 @@ command = "claude"
     fn render_diff_text_adds_ansi_when_enabled() {
         let rendered = render_diff_text("@@ -1 +1 @@\n-old\n+new\n", true);
         assert!(rendered.contains("\u{1b}["));
+    }
+
+    fn demo_session(
+        session_id: &str,
+        status: SessionStatus,
+        has_pending_changes: bool,
+        updated_minutes_ago: i64,
+    ) -> SessionRecord {
+        let now = Utc::now();
+        SessionRecord {
+            session_id: session_id.to_string(),
+            thread_id: Some(format!("thread-{session_id}")),
+            agent: "codex".to_string(),
+            model: Some("gpt-5.4".to_string()),
+            mode: SessionMode::Execute,
+            workspace: "/tmp/workspace".to_string(),
+            repo_path: "/tmp/workspace".to_string(),
+            repo_name: "workspace".to_string(),
+            base_branch: "main".to_string(),
+            branch: format!("agent/{session_id}"),
+            worktree: format!("/tmp/{session_id}"),
+            status,
+            integration_policy: IntegrationPolicy::ManualReview,
+            apply_state: ApplyState::Idle,
+            has_commits: has_pending_changes,
+            has_pending_changes,
+            pid: Some(123),
+            exit_code: None,
+            error: None,
+            attention: AttentionLevel::Info,
+            attention_summary: None,
+            created_at: now - Duration::minutes(updated_minutes_ago + 5),
+            updated_at: now - Duration::minutes(updated_minutes_ago),
+            exited_at: None,
+        }
     }
 
     fn test_paths() -> AppPaths {
