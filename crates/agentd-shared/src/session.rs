@@ -55,7 +55,6 @@ pub enum AttachmentKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionRecord {
     pub session_id: String,
-    pub thread_id: Option<String>,
     pub agent: String,
     pub model: Option<String>,
     pub mode: SessionMode,

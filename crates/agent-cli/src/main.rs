@@ -1327,9 +1327,6 @@ fn print_attachments(attachments: &[AttachmentRecord]) {
 
 fn print_session(session: &SessionRecord) {
     println!("name: {}", session.session_id);
-    if let Some(thread_id) = &session.thread_id {
-        println!("thread_id: {thread_id}");
-    }
     println!("agent: {}", session.agent);
     if let Some(model) = &session.model {
         println!("model: {model}");
@@ -2573,7 +2570,6 @@ command = "claude"
         let now = Utc::now();
         SessionRecord {
             session_id: session_id.to_string(),
-            thread_id: Some(format!("thread-{session_id}")),
             agent: "codex".to_string(),
             model: Some("gpt-5.4".to_string()),
             mode: SessionMode::Execute,

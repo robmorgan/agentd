@@ -17,7 +17,6 @@ pub struct Database {
 
 pub struct NewSession<'a> {
     pub session_id: &'a str,
-    pub thread_id: Option<&'a str>,
     pub agent: &'a str,
     pub model: Option<&'a str>,
     pub mode: SessionMode,
@@ -44,22 +43,7 @@ impl Database {
     fn init(&self) -> Result<()> {
         let mut conn = self.connect()?;
         init_state_db(&mut conn)
-            .with_context(|| format!("unsupported state database schema in {}", self.path))?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS threads (
-                thread_id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL UNIQUE,
-                agent TEXT NOT NULL,
-                title TEXT NOT NULL,
-                initial_prompt TEXT NOT NULL,
-                upstream_thread_id TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_threads_session_id
-                ON threads (session_id);",
-        )?;
-        Ok(())
+            .with_context(|| format!("unsupported state database schema in {}", self.path))
     }
 
     pub fn insert_session(&self, new_session: &NewSession<'_>) -> Result<()> {
@@ -67,13 +51,11 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO sessions (
-                session_id, thread_id, agent, model, mode, workspace,
-                repo_path, repo_name, base_branch, branch, worktree, status, integration_policy, attention, attention_summary,
-                integration_state, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
+                session_id, agent, model, mode, workspace, repo_path, repo_name, base_branch, branch, worktree,
+                status, integration_policy, attention, attention_summary, integration_state, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)",
             params![
                 new_session.session_id,
-                new_session.thread_id,
                 new_session.agent,
                 new_session.model,
                 session_mode_to_str(new_session.mode),
@@ -232,7 +214,7 @@ impl Database {
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, repo_name, base_branch, branch,
+            "SELECT session_id, agent, model, mode, workspace, repo_path, repo_name, base_branch, branch,
                     worktree, status, integration_policy, integration_state, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
@@ -246,7 +228,7 @@ impl Database {
     pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT session_id, thread_id, agent, model, mode, workspace, repo_path, repo_name, base_branch, branch,
+            "SELECT session_id, agent, model, mode, workspace, repo_path, repo_name, base_branch, branch,
                     worktree, status, integration_policy, integration_state, pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
@@ -265,37 +247,36 @@ impl Database {
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     Ok(SessionRecord {
         session_id: row.get(0)?,
-        thread_id: row.get(1)?,
-        agent: row.get(2)?,
-        model: row.get(3)?,
-        mode: str_to_session_mode(&row.get::<_, String>(4)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err))
+        agent: row.get(1)?,
+        model: row.get(2)?,
+        mode: str_to_session_mode(&row.get::<_, String>(3)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(err))
         })?,
-        workspace: row.get(5)?,
-        repo_path: row.get(6)?,
-        repo_name: row.get(7)?,
-        base_branch: row.get(8)?,
-        branch: row.get(9)?,
-        worktree: row.get(10)?,
-        status: str_to_status(&row.get::<_, String>(11)?).map_err(|err| {
+        workspace: row.get(4)?,
+        repo_path: row.get(5)?,
+        repo_name: row.get(6)?,
+        base_branch: row.get(7)?,
+        branch: row.get(8)?,
+        worktree: row.get(9)?,
+        status: str_to_status(&row.get::<_, String>(10)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                11,
+                10,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        integration_policy: str_to_integration_policy(&row.get::<_, String>(12)?).map_err(
+        integration_policy: str_to_integration_policy(&row.get::<_, String>(11)?).map_err(
             |err| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    12,
+                    11,
                     rusqlite::types::Type::Text,
                     Box::new(err),
                 )
             },
         )?,
-        apply_state: str_to_apply_state(&row.get::<_, String>(13)?).map_err(|err| {
+        apply_state: str_to_apply_state(&row.get::<_, String>(12)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                13,
+                12,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
@@ -304,20 +285,20 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         ahead_count: 0,
         has_commits: false,
         has_pending_changes: false,
-        pid: row.get::<_, Option<u32>>(14)?,
-        exit_code: row.get(15)?,
-        error: row.get(16)?,
-        attention: str_to_attention(&row.get::<_, String>(17)?).map_err(|err| {
+        pid: row.get::<_, Option<u32>>(13)?,
+        exit_code: row.get(14)?,
+        error: row.get(15)?,
+        attention: str_to_attention(&row.get::<_, String>(16)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                17,
+                16,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        attention_summary: row.get(18)?,
-        created_at: parse_time(row.get::<_, String>(19)?)?,
-        updated_at: parse_time(row.get::<_, String>(20)?)?,
-        exited_at: row.get::<_, Option<String>>(21)?.map(parse_time).transpose()?,
+        attention_summary: row.get(17)?,
+        created_at: parse_time(row.get::<_, String>(18)?)?,
+        updated_at: parse_time(row.get::<_, String>(19)?)?,
+        exited_at: row.get::<_, Option<String>>(20)?.map(parse_time).transpose()?,
     })
 }
 
@@ -452,7 +433,6 @@ mod tests {
         let db = Database::open(&paths).unwrap();
         db.insert_session(&super::NewSession {
             session_id: "demo",
-            thread_id: None,
             agent: "codex",
             model: Some("gpt-5.3-codex"),
             mode: SessionMode::Execute,
@@ -469,45 +449,5 @@ mod tests {
         let session = db.get_session("demo").unwrap().unwrap();
         assert_eq!(session.repo_name, "repo");
         assert_eq!(session.branch, "agent/test");
-    }
-
-    #[test]
-    fn open_rejects_legacy_schema() {
-        let paths = test_paths();
-        paths.ensure_layout().unwrap();
-        let conn = rusqlite::Connection::open(paths.database.as_str()).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE sessions (
-                session_id TEXT PRIMARY KEY,
-                agent TEXT NOT NULL,
-                workspace TEXT NOT NULL,
-                task TEXT NOT NULL,
-                branch TEXT NOT NULL,
-                worktree TEXT NOT NULL,
-                status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO sessions (
-                session_id, agent, workspace, task, branch, worktree, status, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-            params![
-                "legacy",
-                "codex",
-                "/tmp/repo",
-                "legacy",
-                "agent/legacy",
-                "/tmp/worktree",
-                "running",
-                chrono::Utc::now().to_rfc3339(),
-            ],
-        )
-        .unwrap();
-
-        let err = Database::open(&paths).unwrap_err().to_string();
-        assert!(err.contains("unsupported state database schema"));
     }
 }

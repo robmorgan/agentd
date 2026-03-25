@@ -77,7 +77,6 @@ impl AppState {
 
             db.insert_session(&NewSession {
                 session_id: &session_id,
-                thread_id: None,
                 agent: &agent_name,
                 model: model.as_deref(),
                 mode,
@@ -1658,7 +1657,6 @@ mod tests {
     fn manual_accept_conflict_summary_shell_quotes_values() {
         let session = SessionRecord {
             session_id: "demo".to_string(),
-            thread_id: None,
             agent: "codex".to_string(),
             model: Some("gpt-5.3-codex".to_string()),
             mode: SessionMode::Execute,
@@ -1837,7 +1835,6 @@ mod tests {
 
         db.insert_session(&NewSession {
             session_id,
-            thread_id: None,
             agent: "codex",
             model: Some("gpt-5.3-codex"),
             mode: SessionMode::Execute,

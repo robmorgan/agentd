@@ -2150,7 +2150,6 @@ fn demo_legend_entry(
     (
         SessionRecord {
             session_id: String::new(),
-            thread_id: None,
             agent: "codex".to_string(),
             model: None,
             mode: SessionMode::Execute,
@@ -3246,7 +3245,6 @@ mod tests {
         let now = Utc::now();
         SessionRecord {
             session_id: session_id.to_string(),
-            thread_id: Some(format!("thread-{session_id}")),
             agent: "codex".to_string(),
             model: Some("gpt-5.4".to_string()),
             mode: SessionMode::Execute,
