@@ -130,14 +130,17 @@ Clients surface tasks based on attention instead of raw output.
 
 ## Build
 
-Bootstrap the pinned Ghostty checkout first:
+Initialize the pinned Ghostty submodule first:
 
 ```sh
-make bootstrap-ghostty
+git submodule update --init --recursive
 ```
 
-This clones `ghostty-org/ghostty` into `vendor/ghostty` and checks out the
-exact commit recorded in `third_party/ghostty.lock`.
+This checks out `ghostty-org/ghostty` into `vendor/ghostty` at the commit
+recorded by the repository's submodule pointer.
+
+If you create an ad hoc Git worktree outside `agentd`, run the same command in
+that worktree before building.
 
 Then build:
 

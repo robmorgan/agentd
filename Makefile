@@ -1,7 +1,4 @@
-.PHONY: bootstrap-ghostty build install test dev-run
-
-bootstrap-ghostty:
-	./scripts/bootstrap-ghostty.sh
+.PHONY: build install test dev-run
 
 build:
 	cargo build

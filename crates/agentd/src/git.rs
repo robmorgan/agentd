@@ -73,6 +73,10 @@ pub fn create_worktree(
         if !output.status.success() {
             bail!("failed to create worktree: {}", String::from_utf8_lossy(&output.stderr).trim());
         }
+        if let Err(err) = init_submodules(worktree) {
+            let _ = remove_worktree(repo_root, worktree);
+            return Err(err);
+        }
         return Ok(());
     }
 
@@ -98,6 +102,11 @@ pub fn create_worktree(
             "failed to create session branch: {}",
             String::from_utf8_lossy(&checkout.stderr).trim()
         );
+    }
+
+    if let Err(err) = init_submodules(worktree) {
+        let _ = remove_worktree(repo_root, worktree);
+        return Err(err);
     }
 
     Ok(())
@@ -349,6 +358,23 @@ pub fn apply_fast_forward(repo_root: &Utf8Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+fn init_submodules(worktree: &Utf8Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree.as_str())
+        .args(["submodule", "update", "--init", "--recursive"])
+        .env("GIT_ALLOW_PROTOCOL", "file:https:ssh:git")
+        .output()
+        .with_context(|| format!("failed to initialize submodules in {}", worktree))?;
+    if !output.status.success() {
+        bail!(
+            "failed to initialize submodules: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 fn run_git(worktree: &Utf8Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
@@ -403,4 +429,128 @@ fn merge_error_message(stdout: &[u8], stderr: &[u8]) -> String {
         return stderr;
     }
     String::from_utf8_lossy(stdout).trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_worktree;
+    use camino::Utf8PathBuf;
+    use std::{
+        fs,
+        process::Command,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn create_worktree_initializes_submodules_for_new_branch() {
+        let paths = test_paths();
+        init_git_repo(paths.submodule_source.as_str());
+        init_repo_with_submodule(&paths);
+
+        create_worktree(&paths.repo, "main", "agent/demo", &paths.worktree).unwrap();
+
+        assert!(paths.worktree.join("vendor/ghostty/.git").exists());
+        assert_eq!(
+            git_stdout(paths.worktree.join("vendor/ghostty").as_str(), &["rev-parse", "HEAD"]),
+            git_stdout(paths.repo.as_str(), &["rev-parse", "HEAD:vendor/ghostty"])
+        );
+    }
+
+    #[test]
+    fn create_worktree_initializes_submodules_for_existing_branch() {
+        let paths = test_paths();
+        init_git_repo(paths.submodule_source.as_str());
+        init_repo_with_submodule(&paths);
+        run_git(paths.repo.as_str(), &["branch", "agent/demo", "main"]);
+
+        create_worktree(&paths.repo, "main", "agent/demo", &paths.worktree).unwrap();
+
+        assert!(paths.worktree.join("vendor/ghostty/.git").exists());
+    }
+
+    #[test]
+    fn create_worktree_cleans_up_when_submodule_init_fails() {
+        let paths = test_paths();
+        init_git_repo(paths.submodule_source.as_str());
+        init_repo_with_submodule(&paths);
+
+        fs::remove_dir_all(paths.repo.join(".git/modules/vendor/ghostty")).unwrap();
+        run_git(
+            paths.repo.as_str(),
+            &["config", "submodule.vendor/ghostty.url", "/tmp/agentd-missing-ghostty"],
+        );
+
+        let err = create_worktree(&paths.repo, "main", "agent/demo", &paths.worktree).unwrap_err();
+
+        assert!(err.to_string().contains("failed to initialize submodules"));
+        assert!(!paths.worktree.exists());
+    }
+
+    struct TestPaths {
+        repo: Utf8PathBuf,
+        submodule_source: Utf8PathBuf,
+        worktree: Utf8PathBuf,
+    }
+
+    fn test_paths() -> TestPaths {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            + u128::from(TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed));
+        let root = Utf8PathBuf::from(format!("/tmp/agentd-git-test-{suffix}"));
+        TestPaths {
+            repo: root.join("repo"),
+            submodule_source: root.join("ghostty-source"),
+            worktree: root.join("worktree"),
+        }
+    }
+
+    fn init_repo_with_submodule(paths: &TestPaths) {
+        init_git_repo(paths.repo.as_str());
+        run_git(paths.repo.as_str(), &["config", "protocol.file.allow", "always"]);
+        run_git(
+            paths.repo.as_str(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                paths.submodule_source.as_str(),
+                "vendor/ghostty",
+            ],
+        );
+        run_git(paths.repo.as_str(), &["commit", "-am", "add ghostty submodule"]);
+    }
+
+    fn init_git_repo(path: &str) {
+        fs::create_dir_all(path).unwrap();
+        run_git(".", &["init", "-b", "main", path]);
+        run_git(path, &["config", "user.email", "agentd@example.com"]);
+        run_git(path, &["config", "user.name", "agentd"]);
+        fs::write(format!("{path}/README.md"), "hello\n").unwrap();
+        run_git(path, &["add", "README.md"]);
+        run_git(path, &["commit", "-m", "init"]);
+    }
+
+    fn git_stdout(path: &str, args: &[&str]) -> String {
+        let output = Command::new("git").arg("-C").arg(path).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git -C {path} {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn run_git(path: &str, args: &[&str]) {
+        let output = Command::new("git").arg("-C").arg(path).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git -C {path} {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

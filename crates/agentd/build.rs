@@ -1,5 +1,5 @@
 use std::{
-    env, fs,
+    env,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -11,10 +11,9 @@ fn main() {
         .and_then(Path::parent)
         .expect("agentd crate should live under the workspace root");
     let ghostty_dir = workspace_root.join("vendor/ghostty");
-    let lock_path = workspace_root.join("third_party/ghostty.lock");
-    let lock = read_lock_file(&lock_path);
+    let expected_commit = git_gitlink_commit(&workspace_root, "vendor/ghostty");
 
-    println!("cargo:rerun-if-changed={}", lock_path.display());
+    println!("cargo:rerun-if-changed={}", workspace_root.join(".gitmodules").display());
 
     println!("cargo:rerun-if-changed={}", ghostty_dir.join("include").display());
     println!("cargo:rerun-if-changed={}", ghostty_dir.join("src").display());
@@ -23,19 +22,17 @@ fn main() {
 
     if !ghostty_dir.join(".git").exists() {
         panic!(
-            "Ghostty checkout not found at {}.\nRun `make bootstrap-ghostty` to clone {} at {}.",
+            "Ghostty checkout not found at {}.\nRun `git submodule update --init --recursive` to populate the pinned submodule checkout.",
             ghostty_dir.display(),
-            lock.url,
-            lock.commit
         );
     }
 
     let actual_commit = git_stdout(&ghostty_dir, &["rev-parse", "HEAD"]);
-    if actual_commit != lock.commit {
+    if actual_commit != expected_commit {
         panic!(
-            "Ghostty checkout mismatch at {}.\nExpected commit: {}\nActual commit:   {}\nRun `make bootstrap-ghostty` to sync the local checkout.",
+            "Ghostty checkout mismatch at {}.\nExpected commit: {}\nActual commit:   {}\nRun `git submodule update --init --recursive` to sync the local checkout.",
             ghostty_dir.display(),
-            lock.commit,
+            expected_commit,
             actual_commit
         );
     }
@@ -55,29 +52,32 @@ fn main() {
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
 }
 
-struct GhosttyLock {
-    url: String,
-    commit: String,
-}
-
-fn read_lock_file(path: &Path) -> GhosttyLock {
-    let contents = fs::read_to_string(path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
-    let mut url = None;
-    let mut commit = None;
-
-    for line in contents.lines() {
-        if let Some(value) = line.strip_prefix("url=") {
-            url = Some(value.trim().to_string());
-        } else if let Some(value) = line.strip_prefix("commit=") {
-            commit = Some(value.trim().to_string());
-        }
+fn git_gitlink_commit(repo_dir: &Path, path: &str) -> String {
+    let output = Command::new("git")
+        .current_dir(repo_dir)
+        .args(["ls-files", "--stage", "--", path])
+        .output()
+        .unwrap_or_else(|err| {
+            panic!("failed to inspect git index in {}: {err}", repo_dir.display())
+        });
+    if !output.status.success() {
+        panic!(
+            "git ls-files --stage {} failed in {}: {}",
+            path,
+            repo_dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
 
-    GhosttyLock {
-        url: url.unwrap_or_else(|| panic!("missing `url` in {}", path.display())),
-        commit: commit.unwrap_or_else(|| panic!("missing `commit` in {}", path.display())),
+    let line = String::from_utf8(output.stdout).expect("git output should be valid UTF-8");
+    let mut fields = line.split_whitespace();
+    let mode = fields.next().unwrap_or_default();
+    let commit = fields.next().unwrap_or_default();
+    if mode != "160000" || commit.is_empty() {
+        panic!("expected gitlink entry for {} in {}", path, repo_dir.display());
     }
+
+    commit.to_string()
 }
 
 fn git_stdout(repo_dir: &Path, args: &[&str]) -> String {
