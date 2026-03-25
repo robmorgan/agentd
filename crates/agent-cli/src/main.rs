@@ -129,7 +129,7 @@ fn cli_styles() -> Styles {
     version,
     about = "Run, inspect, and review local coding sessions",
     before_help = "agent\nA local multi-session coding workflow for daemon-backed agents.\n\nCore flows:\n  Start a session      agent new fix-flaky-tests\n  Inspect sessions     agent list\n  Reconnect live PTY   agent attach <name>\n  Review changes       agent diff <name> | agent merge <name>",
-    after_help = "Examples:\n  agent new add-health-checks\n  agent create --workspace . --agent codex refactor-retries\n  agent list\n  agent status <name>\n  agent daemon info\n\nUse `agent <command> --help` for command-specific details.",
+    after_help = "Examples:\n  agent new add-health-checks\n  agent list\n  agent status <name>\n  agent daemon info\n\nUse `agent <command> --help` for command-specific details.",
     help_template = ROOT_HELP_TEMPLATE,
     styles = cli_styles(),
     disable_help_subcommand = true,
@@ -153,23 +153,15 @@ enum Command {
         #[arg(long)]
         agent: Option<String>,
     },
-    #[command(about = "Create a session without attaching", display_order = 2)]
-    Create {
-        #[arg(long)]
-        workspace: PathBuf,
-        #[arg(long)]
-        agent: String,
-        name: Option<String>,
-    },
-    #[command(about = "Stop a running session or remove its record", display_order = 3)]
+    #[command(about = "Stop a running session or remove its record", display_order = 2)]
     Kill {
         #[arg(long)]
         rm: bool,
         session_id: String,
     },
-    #[command(about = "Attach to a live session PTY", display_order = 4)]
+    #[command(about = "Attach to a live session PTY", display_order = 3)]
     Attach { session_id: String },
-    #[command(about = "Detach one or more attached clients", display_order = 5)]
+    #[command(about = "Detach one or more attached clients", display_order = 4)]
     Detach {
         session_id: Option<String>,
         #[arg(long)]
@@ -177,7 +169,7 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
-    #[command(about = "Send background input to a live session", display_order = 6)]
+    #[command(about = "Send background input to a live session", display_order = 5)]
     SendInput {
         session_id: String,
         #[arg(long)]
@@ -190,17 +182,17 @@ enum Command {
         )]
         data: Vec<String>,
     },
-    #[command(about = "Merge a session branch back to the base branch", display_order = 7)]
+    #[command(about = "Merge a session branch back to the base branch", display_order = 6)]
     Merge { session_id: Option<String> },
-    #[command(about = "Compatibility alias for `agent merge`", display_order = 8, hide = true)]
+    #[command(about = "Compatibility alias for `agent merge`", display_order = 7, hide = true)]
     Accept { session_id: String },
-    #[command(about = "Discard a session's worktree and changes", display_order = 9)]
+    #[command(about = "Discard a session's worktree and changes", display_order = 8)]
     Discard {
         session_id: String,
         #[arg(long)]
         force: bool,
     },
-    #[command(about = "Print captured session history", display_order = 10)]
+    #[command(about = "Print captured session history", display_order = 9)]
     History {
         session_id: String,
         #[arg(long)]
@@ -210,21 +202,21 @@ enum Command {
         visible_alias = "ls",
         alias = "sessions",
         about = "List known sessions",
-        display_order = 11
+        display_order = 10
     )]
     List,
-    #[command(about = "Show currently attached clients for a session", display_order = 12)]
+    #[command(about = "Show currently attached clients for a session", display_order = 11)]
     Attachments { session_id: String },
-    #[command(about = "Show detailed session status", display_order = 13)]
+    #[command(about = "Show detailed session status", display_order = 12)]
     Status { session_id: String },
-    #[command(about = "Show the session diff against its base branch", display_order = 14)]
+    #[command(about = "Show the session diff against its base branch", display_order = 13)]
     Diff { session_id: String },
-    #[command(about = "Create or clean up session worktrees", display_order = 15)]
+    #[command(about = "Create or clean up session worktrees", display_order = 14)]
     Worktree {
         #[command(subcommand)]
         command: WorktreeCommand,
     },
-    #[command(about = "Inspect or control the local agent daemon", display_order = 16)]
+    #[command(about = "Inspect or control the local agent daemon", display_order = 15)]
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -316,34 +308,6 @@ async fn main() -> Result<()> {
             }
         }
         (Some(Command::New { .. }), ExecutionMode::Local(reason)) => {
-            bail_live_command(&reason)?;
-        }
-        (Some(Command::Create { workspace, agent, name }), ExecutionMode::Daemon) => {
-            let name = normalize_requested_name(name)?;
-            let response = send_request(
-                &paths,
-                &Request::CreateSession {
-                    workspace: workspace.to_string_lossy().to_string(),
-                    name,
-                    agent,
-                    model: None,
-                    integration_policy: IntegrationPolicy::ManualReview,
-                },
-            )
-            .await?;
-
-            match response {
-                Response::CreateSession { session } => {
-                    println!("name: {}", session.session_id);
-                    println!("base_branch: {}", session.base_branch);
-                    println!("branch: {}", session.branch);
-                    println!("worktree: {}", session.worktree);
-                }
-                Response::Error { message } => bail!(message),
-                other => bail!("unexpected response: {:?}", other),
-            }
-        }
-        (Some(Command::Create { .. }), ExecutionMode::Local(reason)) => {
             bail_live_command(&reason)?;
         }
         (Some(Command::Kill { rm, session_id }), ExecutionMode::Daemon) => {
@@ -2019,6 +1983,7 @@ mod tests {
 
         assert!(help.contains("agentd - agent multiplexer"));
         assert!(help.contains("agent 0.1.0"));
+        assert!(!help.contains("agent create"));
         assert!(
             !help
                 .contains("agent\nA local multi-session coding workflow for daemon-backed agents.")
@@ -2105,6 +2070,22 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn create_command_is_rejected() {
+        let err = Cli::try_parse_from([
+            "agent",
+            "create",
+            "--workspace",
+            "/tmp/repo",
+            "--agent",
+            "codex",
+            "fix",
+        ])
+        .unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 
     #[test]
