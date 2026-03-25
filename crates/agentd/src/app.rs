@@ -249,7 +249,7 @@ impl AppState {
 
             if was_running {
                 terminate_session_process(&session_id, session.pid)?;
-                let _ = db.mark_exited(&session_id, None);
+                let _ = db.mark_exited(&session_id, None, ApplyState::Idle);
             }
 
             if remove {
@@ -884,7 +884,12 @@ fn finalize_session_exit(db: &Database, session_id: &str, exit_code: Option<i32>
 
     let has_changes = session_has_pending_changes(&session)?;
     if exit_code == Some(0) {
-        db.mark_exited(session_id, exit_code)?;
+        let final_apply_state = if !has_changes && session.apply_state == ApplyState::Applied {
+            ApplyState::Applied
+        } else {
+            ApplyState::Idle
+        };
+        db.mark_exited(session_id, exit_code, final_apply_state)?;
         if has_changes {
             finalize_mergeable_session(db, &session)?;
         }
@@ -1199,8 +1204,8 @@ mod tests {
     use agentd_shared::{
         paths::AppPaths,
         session::{
-            ApplyState, AttachmentKind, IntegrationPolicy, SessionMode, SessionRecord,
-            SessionStatus,
+            ApplyState, AttachmentKind, AttentionLevel, IntegrationPolicy, SessionMode,
+            SessionRecord, SessionStatus,
         },
     };
     use anyhow::{Error, Result};
@@ -1508,6 +1513,67 @@ mod tests {
 
         insert_session_with_worktree(&db, repo.as_str(), worktree.as_str(), "demo");
         fs::write(worktree.join("README.md"), "updated\n").unwrap();
+        finalize_session_exit(&db, "demo", Some(0)).unwrap();
+
+        let session = refresh_commit_state(&db, db.get_session("demo").unwrap().unwrap()).unwrap();
+        assert_eq!(session.status, agentd_shared::session::SessionStatus::Exited);
+        assert_eq!(session.apply_state, ApplyState::Idle);
+        assert!(session.has_commits);
+    }
+
+    #[test]
+    fn finalize_session_exit_preserves_applied_state_after_live_merge_when_clean() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        let repo = paths.root.join("repo");
+        let worktree = paths.root.join("worktree");
+        init_git_repo(repo.as_str());
+
+        insert_session_with_worktree(&db, repo.as_str(), worktree.as_str(), "demo");
+        fs::write(worktree.join("README.md"), "updated\n").unwrap();
+        commit_all(worktree.as_str(), "session change");
+        assert!(
+            Command::new("git")
+                .args(["-C", repo.as_str(), "merge", "--ff-only", "agent/demo"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        db.set_apply_state("demo", ApplyState::Applied, AttentionLevel::Info, "merged").unwrap();
+
+        finalize_session_exit(&db, "demo", Some(0)).unwrap();
+
+        let session = refresh_commit_state(&db, db.get_session("demo").unwrap().unwrap()).unwrap();
+        assert_eq!(session.status, agentd_shared::session::SessionStatus::Exited);
+        assert_eq!(session.apply_state, ApplyState::Applied);
+        assert!(!session.has_pending_changes);
+    }
+
+    #[test]
+    fn finalize_session_exit_clears_applied_state_when_new_changes_exist_after_live_merge() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        let repo = paths.root.join("repo");
+        let worktree = paths.root.join("worktree");
+        init_git_repo(repo.as_str());
+
+        insert_session_with_worktree(&db, repo.as_str(), worktree.as_str(), "demo");
+        fs::write(worktree.join("README.md"), "updated\n").unwrap();
+        commit_all(worktree.as_str(), "session change");
+        assert!(
+            Command::new("git")
+                .args(["-C", repo.as_str(), "merge", "--ff-only", "agent/demo"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        db.set_apply_state("demo", ApplyState::Applied, AttentionLevel::Info, "merged").unwrap();
+        fs::write(worktree.join("FOLLOWUP.md"), "follow-up\n").unwrap();
+
         finalize_session_exit(&db, "demo", Some(0)).unwrap();
 
         let session = refresh_commit_state(&db, db.get_session("demo").unwrap().unwrap()).unwrap();

@@ -204,7 +204,7 @@ macOS typically does not set `XDG_RUNTIME_DIR`, so the default root on macOS bec
 unless `AGENTD_DIR` is set explicitly.
 
 Interactive PTY attach is available with `agent attach <name>`. Detach with `Ctrl-\`, switch to
-the previous live session with `Ctrl-[`, or switch to the next live session with `Ctrl-]`, or
+the previous running session with `Ctrl-[`, or switch to the next running session with `Ctrl-]`, or
 `agent detach <name> --attach <attach_id>` for a specific client, or
 `agent detach <name> --all` to disconnect every attached client on the session.
 Use `agent attachments <name>` to inspect the current attachment ids.

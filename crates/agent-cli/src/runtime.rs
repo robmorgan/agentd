@@ -2024,12 +2024,7 @@ enum SessionDisplayState {
 }
 
 fn session_display_state(session: &SessionRecord) -> SessionDisplayState {
-    if session.apply_state == ApplyState::Applied
-        && !matches!(
-            session.status,
-            SessionStatus::NeedsInput | SessionStatus::Failed | SessionStatus::UnknownRecovered
-        )
-    {
+    if session.status == SessionStatus::Exited && session.apply_state == ApplyState::Applied {
         return SessionDisplayState::Applied;
     }
 
@@ -2134,7 +2129,7 @@ fn render_host_picker_legend_row(width: usize, sessions: &[SessionRecord]) -> St
         (demo_status_session(SessionStatus::NeedsInput, ApplyState::Idle), "needs input"),
         (demo_status_session(SessionStatus::Failed, ApplyState::Idle), "failed"),
         (demo_status_session(SessionStatus::UnknownRecovered, ApplyState::Idle), "recovered"),
-        (demo_status_session(SessionStatus::Running, ApplyState::Applied), "applied"),
+        (demo_status_session(SessionStatus::Exited, ApplyState::Applied), "applied"),
         (demo_status_session(SessionStatus::Running, ApplyState::Idle), "running"),
         (demo_status_session(SessionStatus::Exited, ApplyState::Idle), "exited"),
     ];
@@ -2143,9 +2138,9 @@ fn render_host_picker_legend_row(width: usize, sessions: &[SessionRecord]) -> St
     let mut matching_entries = entries
         .into_iter()
         .filter(|(entry_session, _)| {
-            sessions
-                .iter()
-                .any(|session| session_display_state(session) == session_display_state(entry_session))
+            sessions.iter().any(|session| {
+                session_display_state(session) == session_display_state(entry_session)
+            })
         })
         .map(|(session, label)| {
             (
@@ -2740,7 +2735,7 @@ mod tests {
                 SessionStatus::Running,
                 IntegrationState::Applied
             )),
-            "✔"
+            "●"
         );
         assert_eq!(
             session_icon(&demo_with(
@@ -2891,8 +2886,13 @@ mod tests {
             200,
             &[
                 demo_with("alpha", "repo-a", SessionStatus::NeedsInput, IntegrationState::Clean),
-                demo_with("beta", "repo-b", SessionStatus::Running, IntegrationState::Applied),
-                demo_with("delta", "repo-d", SessionStatus::Exited, IntegrationState::PendingReview),
+                demo_with("beta", "repo-b", SessionStatus::Exited, IntegrationState::Applied),
+                demo_with(
+                    "delta",
+                    "repo-d",
+                    SessionStatus::Exited,
+                    IntegrationState::PendingReview,
+                ),
                 demo_with(
                     "gamma",
                     "repo-c",
@@ -2947,7 +2947,8 @@ mod tests {
     #[test]
     fn session_list_prefers_applied_label_and_sorts_with_shared_order() {
         let running = demo("running", "repo-a");
-        let applied = demo_with("applied", "repo-b", SessionStatus::Running, IntegrationState::Applied);
+        let applied =
+            demo_with("applied", "repo-b", SessionStatus::Exited, IntegrationState::Applied);
         let rendered = strip_ansi(&render_session_list_lines(&[running, applied], 120).join("\n"));
 
         assert!(rendered.contains("✔ applied"));
@@ -2955,14 +2956,14 @@ mod tests {
     }
 
     #[test]
-    fn host_picker_uses_applied_icon_for_live_applied_sessions() {
+    fn host_picker_uses_running_icon_for_live_applied_sessions() {
         let session =
             demo_with("alpha", "repo-a", SessionStatus::Running, IntegrationState::Applied);
         let rendered = render_host_picker_session_row(&session, 120, false);
 
         assert!(rendered.contains(HOST_PICKER_STATUS_GREEN_FG));
-        assert!(rendered.contains("✔"));
-        assert!(!rendered.contains("●"));
+        assert!(rendered.contains("●"));
+        assert!(!rendered.contains("✔"));
     }
 
     #[test]
