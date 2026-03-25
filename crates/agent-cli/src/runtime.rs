@@ -1974,8 +1974,8 @@ pub(crate) fn compare_session_switcher_order(
     left: &SessionRecord,
     right: &SessionRecord,
 ) -> std::cmp::Ordering {
-    session_rank(left)
-        .cmp(&session_rank(right))
+    session_sort_bucket(left)
+        .cmp(&session_sort_bucket(right))
         .then_with(|| right.updated_at.cmp(&left.updated_at))
 }
 
@@ -2043,14 +2043,18 @@ fn session_display_state(session: &SessionRecord) -> SessionDisplayState {
     }
 }
 
-fn session_rank(session: &SessionRecord) -> u8 {
+fn session_sort_bucket(session: &SessionRecord) -> u8 {
+    if matches!(session.status, SessionStatus::Creating | SessionStatus::Running) {
+        return 0;
+    }
+
     match session_display_state(session) {
-        SessionDisplayState::NeedsInput => 0,
-        SessionDisplayState::Failed | SessionDisplayState::Recovered => 1,
-        _ if session.has_pending_changes => 2,
-        SessionDisplayState::Applied => 3,
-        SessionDisplayState::Running | SessionDisplayState::Creating => 4,
+        SessionDisplayState::NeedsInput => 1,
+        SessionDisplayState::Failed | SessionDisplayState::Recovered => 2,
+        _ if session.has_pending_changes => 3,
+        SessionDisplayState::Applied => 4,
         SessionDisplayState::Exited => 5,
+        SessionDisplayState::Running | SessionDisplayState::Creating => unreachable!(),
     }
 }
 
@@ -2143,9 +2147,9 @@ fn render_host_picker_legend_row(width: usize, sessions: &[SessionRecord]) -> St
     let mut matching_entries = entries
         .into_iter()
         .filter(|(entry_session, _)| {
-            sessions
-                .iter()
-                .any(|session| session_display_state(session) == session_display_state(entry_session))
+            sessions.iter().any(|session| {
+                session_display_state(session) == session_display_state(entry_session)
+            })
         })
         .map(|(session, label)| {
             (
@@ -2290,12 +2294,13 @@ mod tests {
         HOST_PICKER_STATUS_RED_FG, HOST_PICKER_STATUS_YELLOW_FG, HOST_PICKER_TEXT_FG, OverlayMode,
         OverlayOutcome, PickerComposer, PickerMode, PickerRow, PickerToast, SessionAction,
         SessionPicker, configured_agent_names, fit_host_picker_line, format_merge_failure_toast,
-        pending_changes_marker, render_host_picker_create_row, render_host_picker_legend_row,
-        render_host_picker_session_row, render_host_picker_title_line,
-        render_host_picker_toast_line, render_session_list_header_content,
-        render_session_list_header_row, render_session_list_lines, sanitize_picker_message,
-        session_icon, session_icon_color, session_list_layout, style_host_picker_background_row,
-        style_host_picker_diff_line, style_host_picker_query_line,
+        ordered_sessions, pending_changes_marker, render_host_picker_create_row,
+        render_host_picker_legend_row, render_host_picker_session_row,
+        render_host_picker_title_line, render_host_picker_toast_line,
+        render_session_list_header_content, render_session_list_header_row,
+        render_session_list_lines, sanitize_picker_message, session_icon, session_icon_color,
+        session_list_layout, style_host_picker_background_row, style_host_picker_diff_line,
+        style_host_picker_query_line,
     };
     use agentd_shared::{
         paths::AppPaths,
@@ -2892,7 +2897,12 @@ mod tests {
             &[
                 demo_with("alpha", "repo-a", SessionStatus::NeedsInput, IntegrationState::Clean),
                 demo_with("beta", "repo-b", SessionStatus::Running, IntegrationState::Applied),
-                demo_with("delta", "repo-d", SessionStatus::Exited, IntegrationState::PendingReview),
+                demo_with(
+                    "delta",
+                    "repo-d",
+                    SessionStatus::Exited,
+                    IntegrationState::PendingReview,
+                ),
                 demo_with(
                     "gamma",
                     "repo-c",
@@ -2945,13 +2955,38 @@ mod tests {
     }
 
     #[test]
-    fn session_list_prefers_applied_label_and_sorts_with_shared_order() {
+    fn ordered_sessions_keep_active_sessions_first_even_when_applied_or_pending() {
+        let now = Utc::now();
+        let mut running = demo("running", "repo-a");
+        running.updated_at = now - Duration::minutes(2);
+        let mut applied =
+            demo_with("applied", "repo-b", SessionStatus::Running, IntegrationState::Applied);
+        applied.updated_at = now - Duration::minutes(1);
+        let mut needs_input =
+            demo_with("needs-input", "repo-c", SessionStatus::NeedsInput, IntegrationState::Clean);
+        needs_input.updated_at = now;
+        let mut pending =
+            demo_with("pending", "repo-d", SessionStatus::Running, IntegrationState::PendingReview);
+        pending.updated_at = now - Duration::minutes(3);
+
+        let sessions = [needs_input, running, applied, pending];
+        let ordered = ordered_sessions(&sessions);
+
+        assert_eq!(
+            ordered.iter().map(|session| session.session_id.as_str()).collect::<Vec<_>>(),
+            vec!["applied", "running", "pending", "needs-input"]
+        );
+    }
+
+    #[test]
+    fn session_list_keeps_applied_label_for_live_applied_sessions() {
         let running = demo("running", "repo-a");
-        let applied = demo_with("applied", "repo-b", SessionStatus::Running, IntegrationState::Applied);
+        let applied =
+            demo_with("applied", "repo-b", SessionStatus::Running, IntegrationState::Applied);
         let rendered = strip_ansi(&render_session_list_lines(&[running, applied], 120).join("\n"));
 
         assert!(rendered.contains("✔ applied"));
-        assert!(rendered.find("applied").unwrap() < rendered.find("running").unwrap());
+        assert!(rendered.contains("running"));
     }
 
     #[test]
