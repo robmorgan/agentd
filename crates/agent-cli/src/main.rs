@@ -2475,11 +2475,11 @@ command = "claude"
 
         assert_eq!(
             sessions.iter().map(|session| session.session_id.as_str()).collect::<Vec<_>>(),
-            vec!["needs-input", "pending", "running"]
+            vec!["running", "pending", "needs-input"]
         );
         assert_eq!(
             adjacent_live_session_id_in(&sessions, "pending", AttachSessionDirection::Next),
-            Some("running".to_string())
+            Some("needs-input".to_string())
         );
     }
 
