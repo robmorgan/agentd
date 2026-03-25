@@ -71,19 +71,6 @@ fn ensure_supported_schema(conn: &Connection, schema_version: i32) -> Result<()>
             "unsupported state database schema: `sessions` does not match the current layout. Remove or migrate the runtime root."
         );
     }
-    let has_legacy_threads_table: bool = conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1
-            FROM sqlite_master
-            WHERE type = 'table' AND name = 'threads'
-        )",
-        [],
-        |row| row.get(0),
-    )?;
-    ensure!(
-        !has_legacy_threads_table,
-        "unsupported state database schema: legacy `threads` table is no longer supported. Remove or migrate the runtime root."
-    );
 
     Ok(())
 }
