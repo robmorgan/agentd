@@ -2586,6 +2586,8 @@ command = "claude"
             status,
             integration_policy: IntegrationPolicy::ManualReview,
             apply_state: ApplyState::Idle,
+            dirty_count: if has_pending_changes { 1 } else { 0 },
+            ahead_count: if has_pending_changes { 1 } else { 0 },
             has_commits: has_pending_changes,
             has_pending_changes,
             pid: Some(123),

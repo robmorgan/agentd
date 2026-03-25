@@ -948,6 +948,8 @@ fn put_session_record(buf: &mut Vec<u8>, session: &SessionRecord) -> Result<()> 
     put_session_status(buf, session.status);
     put_integration_policy(buf, session.integration_policy);
     put_apply_state(buf, session.apply_state);
+    put_u32(buf, session.dirty_count);
+    put_u32(buf, session.ahead_count);
     put_bool(buf, session.has_commits);
     put_bool(buf, session.has_pending_changes);
     put_optional_u32(buf, session.pid);
@@ -988,10 +990,14 @@ fn put_optional_u32(buf: &mut Vec<u8>, value: Option<u32>) {
     match value {
         Some(value) => {
             buf.push(1);
-            buf.extend_from_slice(&value.to_le_bytes());
+            put_u32(buf, value);
         }
         None => buf.push(0),
     }
+}
+
+fn put_u32(buf: &mut Vec<u8>, value: u32) {
+    buf.extend_from_slice(&value.to_le_bytes());
 }
 
 fn put_optional_i32(buf: &mut Vec<u8>, value: Option<i32>) {
@@ -1202,6 +1208,8 @@ impl<'a> Cursor<'a> {
             status: self.take_session_status()?,
             integration_policy: self.take_integration_policy()?,
             apply_state: self.take_apply_state()?,
+            dirty_count: self.take_u32()?,
+            ahead_count: self.take_u32()?,
             has_commits: self.take_bool()?,
             has_pending_changes: self.take_bool()?,
             pid: self.take_optional_u32()?,
@@ -1415,6 +1423,8 @@ mod tests {
                 status: SessionStatus::Running,
                 integration_policy: IntegrationPolicy::AutoApplySafe,
                 apply_state: ApplyState::Idle,
+                dirty_count: 0,
+                ahead_count: 0,
                 has_commits: false,
                 has_pending_changes: false,
                 pid: Some(123),

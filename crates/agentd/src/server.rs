@@ -485,6 +485,8 @@ mod tests {
             status,
             integration_policy: IntegrationPolicy::AutoApplySafe,
             apply_state: ApplyState::Idle,
+            dirty_count: 0,
+            ahead_count: 0,
             has_commits: false,
             has_pending_changes: false,
             pid: Some(123),

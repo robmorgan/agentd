@@ -183,8 +183,25 @@ pub fn has_worktree_changes(worktree: &Utf8Path) -> Result<bool> {
     Ok(!run_git(worktree, &["status", "--porcelain"])?.trim().is_empty())
 }
 
+pub fn worktree_dirty_count(worktree: &Utf8Path) -> Result<u32> {
+    Ok(run_git(worktree, &["status", "--porcelain"])?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count() as u32)
+}
+
 pub fn has_committed_diff_against_base(worktree: &Utf8Path, base_branch: &str) -> Result<bool> {
     Ok(!run_git(worktree, &["diff", "--stat", &format!("{base_branch}...HEAD")])?.trim().is_empty())
+}
+
+pub fn branch_ahead_count(repo_root: &Utf8Path, base_branch: &str, branch: &str) -> Result<u32> {
+    if !branch_exists(repo_root, branch)? {
+        return Ok(0);
+    }
+    Ok(run_git(repo_root, &["rev-list", "--count", &format!("{base_branch}..{branch}")])?
+        .trim()
+        .parse::<u32>()
+        .unwrap_or(0))
 }
 
 pub fn branch_has_committed_diff(

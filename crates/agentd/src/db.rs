@@ -300,6 +300,8 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
                 Box::new(err),
             )
         })?,
+        dirty_count: 0,
+        ahead_count: 0,
         has_commits: false,
         has_pending_changes: false,
         pid: row.get::<_, Option<u32>>(14)?,

@@ -200,6 +200,8 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
                 Box::new(err),
             )
         })?,
+        dirty_count: 0,
+        ahead_count: 0,
         has_commits: false,
         has_pending_changes: false,
         pid: row.get::<_, Option<u32>>(14)?,
@@ -220,15 +222,19 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
 }
 
 fn refresh_commit_state(mut session: SessionRecord) -> Result<SessionRecord> {
-    session.has_commits =
-        branch_has_committed_diff(&session.repo_path, &session.base_branch, &session.branch)?;
-    session.has_pending_changes = session.has_commits
-        || (std::path::Path::new(&session.worktree).exists()
-            && has_worktree_changes(&session.worktree)?);
+    session.dirty_count = if std::path::Path::new(&session.worktree).exists() {
+        worktree_dirty_count(&session.worktree)?
+    } else {
+        0
+    };
+    session.ahead_count =
+        branch_ahead_count(&session.repo_path, &session.base_branch, &session.branch)?;
+    session.has_commits = session.ahead_count > 0;
+    session.has_pending_changes = session.has_commits || session.dirty_count > 0;
     Ok(session)
 }
 
-fn has_worktree_changes(worktree: &str) -> Result<bool> {
+fn worktree_dirty_count(worktree: &str) -> Result<u32> {
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree)
@@ -239,10 +245,11 @@ fn has_worktree_changes(worktree: &str) -> Result<bool> {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
 
-    Ok(!String::from_utf8(output.stdout)?.trim().is_empty())
+    Ok(String::from_utf8(output.stdout)?.lines().filter(|line| !line.trim().is_empty()).count()
+        as u32)
 }
 
-fn branch_has_committed_diff(repo_path: &str, base_branch: &str, branch: &str) -> Result<bool> {
+fn branch_ahead_count(repo_path: &str, base_branch: &str, branch: &str) -> Result<u32> {
     let exists = Command::new("git")
         .arg("-C")
         .arg(repo_path)
@@ -251,20 +258,20 @@ fn branch_has_committed_diff(repo_path: &str, base_branch: &str, branch: &str) -
         .status()
         .with_context(|| format!("failed to inspect branch {branch}"))?;
     if !exists.success() {
-        return Ok(false);
+        return Ok(0);
     }
 
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_path)
-        .args(["diff", "--stat", &format!("{base_branch}...{branch}")])
+        .args(["rev-list", "--count", &format!("{base_branch}..{branch}")])
         .output()
         .with_context(|| format!("failed to inspect branch diff for {branch}"))?;
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
 
-    Ok(!String::from_utf8(output.stdout)?.trim().is_empty())
+    Ok(String::from_utf8(output.stdout)?.trim().parse::<u32>().unwrap_or(0))
 }
 
 fn parse_time(value: String) -> rusqlite::Result<DateTime<Utc>> {
@@ -491,7 +498,7 @@ mod tests {
     #[test]
     fn open_rejects_legacy_threads_table() {
         let paths = test_paths();
-        paths.ensure_layout().unwrap();
+        fs::create_dir_all(paths.root.as_str()).unwrap();
         let conn = rusqlite::Connection::open(paths.database.as_str()).unwrap();
         conn.execute_batch(
             "CREATE TABLE sessions (
@@ -601,6 +608,8 @@ mod tests {
             status: SessionStatus::Running,
             integration_policy: IntegrationPolicy::ManualReview,
             apply_state: ApplyState::Idle,
+            dirty_count: if has_pending_changes && !has_commits { 1 } else { 0 },
+            ahead_count: if has_commits { 1 } else { 0 },
             has_commits,
             has_pending_changes,
             pid: Some(1),

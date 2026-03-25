@@ -68,6 +68,8 @@ pub struct SessionRecord {
     pub status: SessionStatus,
     pub integration_policy: IntegrationPolicy,
     pub apply_state: ApplyState,
+    pub dirty_count: u32,
+    pub ahead_count: u32,
     pub has_commits: bool,
     pub has_pending_changes: bool,
     pub pid: Option<u32>,

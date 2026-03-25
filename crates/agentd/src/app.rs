@@ -1128,14 +1128,13 @@ fn ensure_not_mergeable(session: &SessionRecord, action: &str) -> Result<()> {
 }
 
 fn refresh_commit_state(_db: &Database, mut session: SessionRecord) -> Result<SessionRecord> {
-    session.has_commits = git::branch_has_committed_diff(
-        &Utf8PathBuf::from(&session.repo_path),
-        &session.base_branch,
-        &session.branch,
-    )?;
-    session.has_pending_changes = session.has_commits
-        || (Utf8PathBuf::from(&session.worktree).exists()
-            && git::has_worktree_changes(&Utf8PathBuf::from(&session.worktree))?);
+    let repo_root = Utf8PathBuf::from(&session.repo_path);
+    let worktree = Utf8PathBuf::from(&session.worktree);
+    session.dirty_count = if worktree.exists() { git::worktree_dirty_count(&worktree)? } else { 0 };
+    session.ahead_count =
+        git::branch_ahead_count(&repo_root, &session.base_branch, &session.branch)?;
+    session.has_commits = session.ahead_count > 0;
+    session.has_pending_changes = session.has_commits || session.dirty_count > 0;
     Ok(session)
 }
 
@@ -1672,6 +1671,8 @@ mod tests {
             status: SessionStatus::Exited,
             integration_policy: IntegrationPolicy::AutoApplySafe,
             apply_state: ApplyState::Idle,
+            dirty_count: 1,
+            ahead_count: 1,
             has_commits: true,
             has_pending_changes: true,
             pid: None,
