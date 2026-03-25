@@ -8,7 +8,7 @@ use crate::session::{
     IntegrationPolicy, SessionDiff, SessionMode, SessionRecord, SessionStatus, WorktreeRecord,
 };
 
-pub const PROTOCOL_VERSION: u16 = 26;
+pub const PROTOCOL_VERSION: u16 = 27;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
@@ -860,7 +860,6 @@ fn put_session_status(buf: &mut Vec<u8>, status: SessionStatus) {
     buf.push(match status {
         SessionStatus::Creating => 1,
         SessionStatus::Running => 2,
-        SessionStatus::NeedsInput => 4,
         SessionStatus::Exited => 5,
         SessionStatus::Failed => 6,
         SessionStatus::UnknownRecovered => 7,
@@ -1090,7 +1089,6 @@ impl<'a> Cursor<'a> {
             1 => SessionStatus::Creating,
             2 => SessionStatus::Running,
             3 => SessionStatus::UnknownRecovered,
-            4 => SessionStatus::NeedsInput,
             5 => SessionStatus::Exited,
             6 => SessionStatus::Failed,
             7 => SessionStatus::UnknownRecovered,

@@ -1712,7 +1712,6 @@ fn format_session_end_summary(summary: &SessionEndSummary) -> String {
             Some(error) => format!("session {} failed: {error}", summary.session_id),
             None => format!("session {} failed", summary.session_id),
         },
-        SessionStatus::NeedsInput => format!("session {} needs input", summary.session_id),
         SessionStatus::Exited | SessionStatus::UnknownRecovered => {
             if summary.apply_state == ApplyState::Applied {
                 return format!(
@@ -1833,7 +1832,6 @@ impl StatusString for SessionRecord {
         match self.status {
             SessionStatus::Creating => "creating",
             SessionStatus::Running => "running",
-            SessionStatus::NeedsInput => "needs_input",
             SessionStatus::Exited => "exited",
             SessionStatus::Failed => "failed",
             SessionStatus::UnknownRecovered => "unknown_recovered",
@@ -2421,18 +2419,19 @@ command = "claude"
     #[test]
     fn adjacent_session_selection_wraps_in_both_directions() {
         let sessions = vec![
-            demo_session("running", SessionStatus::Running, true, 2),
-            demo_session("idle", SessionStatus::Running, false, 3),
+            demo_session("needs-input", SessionStatus::Running, false, 1, AttentionLevel::Action),
+            demo_session("running", SessionStatus::Running, true, 2, AttentionLevel::Info),
+            demo_session("idle", SessionStatus::Running, false, 3, AttentionLevel::Info),
         ];
         let sessions = runtime::ordered_sessions(&sessions);
 
         assert_eq!(
             adjacent_live_session_id_in(&sessions, "running", AttachSessionDirection::Previous),
-            Some("idle".to_string())
+            Some("needs-input".to_string())
         );
         assert_eq!(
             adjacent_live_session_id_in(&sessions, "idle", AttachSessionDirection::Next),
-            Some("running".to_string())
+            Some("needs-input".to_string())
         );
     }
 
@@ -2447,8 +2446,8 @@ command = "claude"
     #[test]
     fn adjacent_session_selection_ignores_non_live_sessions() {
         let sessions = vec![
-            demo_session("current", SessionStatus::Running, false, 1),
-            demo_session("finished", SessionStatus::Exited, false, 4),
+            demo_session("current", SessionStatus::Running, false, 1, AttentionLevel::Info),
+            demo_session("finished", SessionStatus::Exited, false, 4, AttentionLevel::Info),
         ]
         .into_iter()
         .filter(runtime::session_accepts_attach)
@@ -2464,9 +2463,9 @@ command = "claude"
     #[test]
     fn adjacent_session_selection_uses_switcher_order() {
         let sessions = vec![
-            demo_session("running", SessionStatus::Running, false, 1),
-            demo_session("pending", SessionStatus::Running, true, 2),
-            demo_session("needs-input", SessionStatus::NeedsInput, false, 3),
+            demo_session("running", SessionStatus::Running, false, 1, AttentionLevel::Info),
+            demo_session("pending", SessionStatus::Running, true, 2, AttentionLevel::Info),
+            demo_session("needs-input", SessionStatus::Running, false, 3, AttentionLevel::Action),
         ];
         let sessions = sessions
             .into_iter()
@@ -2476,7 +2475,7 @@ command = "claude"
 
         assert_eq!(
             sessions.iter().map(|session| session.session_id.as_str()).collect::<Vec<_>>(),
-            vec!["pending", "running"]
+            vec!["needs-input", "pending", "running"]
         );
         assert_eq!(
             adjacent_live_session_id_in(&sessions, "pending", AttachSessionDirection::Next),
@@ -2588,6 +2587,7 @@ command = "claude"
         status: SessionStatus,
         has_pending_changes: bool,
         updated_minutes_ago: i64,
+        attention: AttentionLevel,
     ) -> SessionRecord {
         let now = Utc::now();
         SessionRecord {
@@ -2610,7 +2610,7 @@ command = "claude"
             pid: Some(123),
             exit_code: None,
             error: None,
-            attention: AttentionLevel::Info,
+            attention,
             attention_summary: None,
             created_at: now - Duration::minutes(updated_minutes_ago + 5),
             updated_at: now - Duration::minutes(updated_minutes_ago),

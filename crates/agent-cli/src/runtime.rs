@@ -21,8 +21,8 @@ use agentd_shared::{
     paths::AppPaths,
     protocol::{Request, Response},
     session::{
-        ApplyState, IntegrationPolicy, SESSION_NAME_RULES, SessionMode, SessionRecord,
-        SessionStatus, validate_session_name,
+        ApplyState, AttentionLevel, IntegrationPolicy, SESSION_NAME_RULES, SessionMode,
+        SessionRecord, SessionStatus, validate_session_name,
     },
 };
 
@@ -930,7 +930,7 @@ impl SessionPicker {
             return Vec::new();
         };
         let mut actions = Vec::new();
-        if matches!(session.status, SessionStatus::Running | SessionStatus::NeedsInput) {
+        if session_accepts_attach(session) {
             actions.push(SessionAction::Attach);
         }
         actions.push(SessionAction::Diff);
@@ -1986,7 +1986,7 @@ pub(crate) fn ordered_sessions(sessions: &[SessionRecord]) -> Vec<&SessionRecord
 }
 
 pub(crate) fn session_accepts_attach(session: &SessionRecord) -> bool {
-    matches!(session.status, SessionStatus::Running | SessionStatus::NeedsInput)
+    session.status == SessionStatus::Running
 }
 
 fn palette_items() -> Vec<PaletteItem> {
@@ -2012,6 +2012,10 @@ fn session_search_text(session: &SessionRecord) -> String {
     )
 }
 
+fn session_requires_action(session: &SessionRecord) -> bool {
+    session.status == SessionStatus::Running && session.attention == AttentionLevel::Action
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionDisplayState {
     NeedsInput,
@@ -2024,14 +2028,19 @@ enum SessionDisplayState {
 }
 
 fn session_display_state(session: &SessionRecord) -> SessionDisplayState {
-    if session.status == SessionStatus::Exited && session.apply_state == ApplyState::Applied {
+    if session_requires_action(session) {
+        return SessionDisplayState::NeedsInput;
+    }
+
+    if session.apply_state == ApplyState::Applied
+        && !matches!(session.status, SessionStatus::Failed | SessionStatus::UnknownRecovered)
+    {
         return SessionDisplayState::Applied;
     }
 
     match session.status {
         SessionStatus::Creating => SessionDisplayState::Creating,
         SessionStatus::Running => SessionDisplayState::Running,
-        SessionStatus::NeedsInput => SessionDisplayState::NeedsInput,
         SessionStatus::Exited => SessionDisplayState::Exited,
         SessionStatus::Failed => SessionDisplayState::Failed,
         SessionStatus::UnknownRecovered => SessionDisplayState::Recovered,
@@ -2126,12 +2135,34 @@ fn render_host_picker_session_row(session: &SessionRecord, width: usize, selecte
 
 fn render_host_picker_legend_row(width: usize, sessions: &[SessionRecord]) -> String {
     let entries = [
-        (demo_status_session(SessionStatus::NeedsInput, ApplyState::Idle), "needs input"),
-        (demo_status_session(SessionStatus::Failed, ApplyState::Idle), "failed"),
-        (demo_status_session(SessionStatus::UnknownRecovered, ApplyState::Idle), "recovered"),
-        (demo_status_session(SessionStatus::Exited, ApplyState::Applied), "applied"),
-        (demo_status_session(SessionStatus::Running, ApplyState::Idle), "running"),
-        (demo_status_session(SessionStatus::Exited, ApplyState::Idle), "exited"),
+        (
+            demo_status_session(SessionStatus::Running, ApplyState::Idle, AttentionLevel::Action),
+            "needs input",
+        ),
+        (
+            demo_status_session(SessionStatus::Failed, ApplyState::Idle, AttentionLevel::Info),
+            "failed",
+        ),
+        (
+            demo_status_session(
+                SessionStatus::UnknownRecovered,
+                ApplyState::Idle,
+                AttentionLevel::Info,
+            ),
+            "recovered",
+        ),
+        (
+            demo_status_session(SessionStatus::Running, ApplyState::Applied, AttentionLevel::Info),
+            "applied",
+        ),
+        (
+            demo_status_session(SessionStatus::Running, ApplyState::Idle, AttentionLevel::Info),
+            "running",
+        ),
+        (
+            demo_status_session(SessionStatus::Exited, ApplyState::Idle, AttentionLevel::Info),
+            "exited",
+        ),
     ];
     let max_chars = width.saturating_sub(1).max(1);
     let mut line = "  ".to_string();
@@ -2189,7 +2220,11 @@ fn render_host_picker_legend_row(width: usize, sessions: &[SessionRecord]) -> St
     line
 }
 
-fn demo_status_session(status: SessionStatus, apply_state: ApplyState) -> SessionRecord {
+fn demo_status_session(
+    status: SessionStatus,
+    apply_state: ApplyState,
+    attention: AttentionLevel,
+) -> SessionRecord {
     SessionRecord {
         session_id: String::new(),
         thread_id: None,
@@ -2210,7 +2245,7 @@ fn demo_status_session(status: SessionStatus, apply_state: ApplyState) -> Sessio
         pid: None,
         exit_code: None,
         error: None,
-        attention: agentd_shared::session::AttentionLevel::Info,
+        attention,
         attention_summary: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
@@ -2705,8 +2740,8 @@ mod tests {
             session_icon(&demo_with(
                 "alpha",
                 "repo-a",
-                SessionStatus::NeedsInput,
-                IntegrationState::Clean
+                SessionStatus::Running,
+                IntegrationState::Blocked
             )),
             "◦"
         );
@@ -2735,7 +2770,7 @@ mod tests {
                 SessionStatus::Running,
                 IntegrationState::Applied
             )),
-            "●"
+            "✔"
         );
         assert_eq!(
             session_icon(&demo_with(
@@ -2781,8 +2816,8 @@ mod tests {
             session_icon_color(&demo_with(
                 "alpha",
                 "repo-a",
-                SessionStatus::NeedsInput,
-                IntegrationState::Clean
+                SessionStatus::Running,
+                IntegrationState::Blocked
             )),
             ratatui::style::Color::Yellow
         );
@@ -2873,7 +2908,7 @@ mod tests {
         assert!(review.contains("⧖"));
         assert!(failed.contains("✖"));
         let needs_input = render_host_picker_session_row(
-            &demo_with("alpha", "repo-a", SessionStatus::NeedsInput, IntegrationState::Clean),
+            &demo_with("alpha", "repo-a", SessionStatus::Running, IntegrationState::Blocked),
             120,
             false,
         );
@@ -2885,8 +2920,8 @@ mod tests {
         let rendered = render_host_picker_legend_row(
             200,
             &[
-                demo_with("alpha", "repo-a", SessionStatus::NeedsInput, IntegrationState::Clean),
-                demo_with("beta", "repo-b", SessionStatus::Exited, IntegrationState::Applied),
+                demo_with("alpha", "repo-a", SessionStatus::Running, IntegrationState::Blocked),
+                demo_with("beta", "repo-b", SessionStatus::Running, IntegrationState::Applied),
                 demo_with(
                     "delta",
                     "repo-d",
@@ -2948,7 +2983,7 @@ mod tests {
     fn session_list_prefers_applied_label_and_sorts_with_shared_order() {
         let running = demo("running", "repo-a");
         let applied =
-            demo_with("applied", "repo-b", SessionStatus::Exited, IntegrationState::Applied);
+            demo_with("applied", "repo-b", SessionStatus::Running, IntegrationState::Applied);
         let rendered = strip_ansi(&render_session_list_lines(&[running, applied], 120).join("\n"));
 
         assert!(rendered.contains("✔ applied"));
@@ -2956,14 +2991,14 @@ mod tests {
     }
 
     #[test]
-    fn host_picker_uses_running_icon_for_live_applied_sessions() {
+    fn host_picker_uses_applied_icon_for_live_applied_sessions() {
         let session =
             demo_with("alpha", "repo-a", SessionStatus::Running, IntegrationState::Applied);
         let rendered = render_host_picker_session_row(&session, 120, false);
 
         assert!(rendered.contains(HOST_PICKER_STATUS_GREEN_FG));
-        assert!(rendered.contains("●"));
-        assert!(!rendered.contains("✔"));
+        assert!(rendered.contains("✔"));
+        assert!(!rendered.contains("●"));
     }
 
     #[test]
@@ -3000,7 +3035,7 @@ mod tests {
     fn session_list_does_not_render_legend() {
         let rendered = render_session_list_lines(
             &[
-                demo_with("alpha", "repo-a", SessionStatus::NeedsInput, IntegrationState::Clean),
+                demo_with("alpha", "repo-a", SessionStatus::Running, IntegrationState::Blocked),
                 demo_with(
                     "beta",
                     "repo-b",
@@ -3267,6 +3302,10 @@ mod tests {
             | IntegrationState::Blocked
             | IntegrationState::Conflicted => (ApplyState::Idle, true),
         };
+        let attention = match integration_state {
+            IntegrationState::Blocked => AttentionLevel::Action,
+            _ => AttentionLevel::Info,
+        };
         let now = Utc::now();
         SessionRecord {
             session_id: session_id.to_string(),
@@ -3288,7 +3327,7 @@ mod tests {
             pid: Some(123),
             exit_code: None,
             error: None,
-            attention: AttentionLevel::Info,
+            attention,
             attention_summary: None,
             created_at: now,
             updated_at: now,
