@@ -145,7 +145,12 @@ impl Database {
         Ok(())
     }
 
-    pub fn mark_exited(&self, session_id: &str, exit_code: Option<i32>) -> Result<()> {
+    pub fn mark_exited(
+        &self,
+        session_id: &str,
+        exit_code: Option<i32>,
+        apply_state: ApplyState,
+    ) -> Result<()> {
         let conn = self.connect()?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
@@ -163,7 +168,7 @@ impl Database {
                 session_id,
                 status_to_str(SessionStatus::Exited),
                 exit_code,
-                apply_state_to_str(ApplyState::Idle),
+                apply_state_to_str(apply_state),
                 attention_to_str(AttentionLevel::Notice),
                 match exit_code {
                     Some(code) => format!("finished (exit {code})"),

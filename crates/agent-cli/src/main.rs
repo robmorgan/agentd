@@ -51,9 +51,7 @@ use agentd_shared::{
     },
 };
 
-use crate::local::{
-    LocalStore, normalize_degraded_session, remove_session_artifacts,
-};
+use crate::local::{LocalStore, normalize_degraded_session, remove_session_artifacts};
 
 const AGENTD_ATTACH_ENTER_SEQUENCE: &[u8] = b"\x1b[>1u";
 const AGENTD_ATTACH_RESTORE_SEQUENCE: &[u8] =
@@ -476,8 +474,11 @@ async fn main() -> Result<()> {
                 print_degraded_notice(&reason);
             }
             let store = LocalStore::open(&paths)?;
-            let sessions =
-                store.list_sessions()?.into_iter().map(normalize_degraded_session).collect::<Vec<_>>();
+            let sessions = store
+                .list_sessions()?
+                .into_iter()
+                .map(normalize_degraded_session)
+                .collect::<Vec<_>>();
             print_sessions(&sessions);
         }
         (Some(Command::Attachments { session_id }), ExecutionMode::Daemon) => {
@@ -1134,7 +1135,7 @@ async fn attach_session_once(
 
     title_guard.set_session(session_id)?;
     eprintln!(
-        "attached to {session_id} ({attach_id}); Ctrl-\\\\ detaches, Ctrl-[/Ctrl-] switch sessions"
+        "attached to {session_id} ({attach_id}); Ctrl-\\\\ detaches, Ctrl-[/Ctrl-] switch running sessions"
     );
     let _terminal = AttachTerminalGuard::enter()?;
     let raw_input = AttachRawInput::new()?;
@@ -1293,7 +1294,7 @@ async fn adjacent_live_session_id(
     let sessions = daemon_list_sessions(paths)
         .await?
         .into_iter()
-        .filter(runtime::session_accepts_attach)
+        .filter(|session| session.status == SessionStatus::Running)
         .collect::<Vec<_>>();
     let ordered = runtime::ordered_sessions(&sessions);
 
@@ -2420,19 +2421,18 @@ command = "claude"
     #[test]
     fn adjacent_session_selection_wraps_in_both_directions() {
         let sessions = vec![
-            demo_session("needs-input", SessionStatus::NeedsInput, false, 1),
             demo_session("running", SessionStatus::Running, true, 2),
             demo_session("idle", SessionStatus::Running, false, 3),
         ];
         let sessions = runtime::ordered_sessions(&sessions);
 
         assert_eq!(
-            adjacent_live_session_id_in(&sessions, "needs-input", AttachSessionDirection::Previous),
+            adjacent_live_session_id_in(&sessions, "running", AttachSessionDirection::Previous),
             Some("idle".to_string())
         );
         assert_eq!(
             adjacent_live_session_id_in(&sessions, "idle", AttachSessionDirection::Next),
-            Some("needs-input".to_string())
+            Some("running".to_string())
         );
     }
 
@@ -2468,11 +2468,15 @@ command = "claude"
             demo_session("pending", SessionStatus::Running, true, 2),
             demo_session("needs-input", SessionStatus::NeedsInput, false, 3),
         ];
+        let sessions = sessions
+            .into_iter()
+            .filter(|session| session.status == SessionStatus::Running)
+            .collect::<Vec<_>>();
         let sessions = runtime::ordered_sessions(&sessions);
 
         assert_eq!(
             sessions.iter().map(|session| session.session_id.as_str()).collect::<Vec<_>>(),
-            vec!["needs-input", "pending", "running"]
+            vec!["pending", "running"]
         );
         assert_eq!(
             adjacent_live_session_id_in(&sessions, "pending", AttachSessionDirection::Next),
