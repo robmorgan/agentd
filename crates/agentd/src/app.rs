@@ -1106,8 +1106,7 @@ fn ensure_session_not_running(session: &SessionRecord) -> Result<()> {
 }
 
 fn accepts_live_io(session: &SessionRecord) -> bool {
-    matches!(session.status, SessionStatus::Running | SessionStatus::NeedsInput)
-        && process_exists(session.pid)
+    session.status == SessionStatus::Running && process_exists(session.pid)
 }
 
 fn ensure_not_mergeable(session: &SessionRecord, action: &str) -> Result<()> {

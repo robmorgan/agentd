@@ -436,19 +436,18 @@ async fn ended_session_response(state: &AppState, session_id: &str) -> Result<Op
 
 fn session_ended_response(session: &SessionRecord) -> Option<Response> {
     match session.status {
-        SessionStatus::NeedsInput
-        | SessionStatus::Exited
-        | SessionStatus::Failed
-        | SessionStatus::UnknownRecovered => Some(Response::SessionEnded {
-            session_id: session.session_id.clone(),
-            status: session.status,
-            apply_state: session.apply_state,
-            has_commits: session.has_commits,
-            branch: session.branch.clone(),
-            worktree: session.worktree.clone(),
-            exit_code: session.exit_code,
-            error: session.error.clone(),
-        }),
+        SessionStatus::Exited | SessionStatus::Failed | SessionStatus::UnknownRecovered => {
+            Some(Response::SessionEnded {
+                session_id: session.session_id.clone(),
+                status: session.status,
+                apply_state: session.apply_state,
+                has_commits: session.has_commits,
+                branch: session.branch.clone(),
+                worktree: session.worktree.clone(),
+                exit_code: session.exit_code,
+                error: session.error.clone(),
+            })
+        }
         SessionStatus::Creating | SessionStatus::Running => None,
     }
 }

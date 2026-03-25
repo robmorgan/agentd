@@ -117,7 +117,7 @@ pub fn normalize_session(session: SessionRecord) -> SessionRecord {
 
 pub fn normalize_degraded_session(session: SessionRecord) -> SessionRecord {
     match session.status {
-        SessionStatus::Running | SessionStatus::NeedsInput => {
+        SessionStatus::Running => {
             let mut session = session;
             session.status = SessionStatus::UnknownRecovered;
             session
@@ -277,7 +277,6 @@ fn status_to_str(status: SessionStatus) -> &'static str {
     match status {
         SessionStatus::Creating => "creating",
         SessionStatus::Running => "running",
-        SessionStatus::NeedsInput => "needs_input",
         SessionStatus::Exited => "exited",
         SessionStatus::Failed => "failed",
         SessionStatus::UnknownRecovered => "unknown_recovered",
@@ -289,7 +288,6 @@ fn str_to_status(value: &str) -> std::result::Result<SessionStatus, std::io::Err
         "creating" => Ok(SessionStatus::Creating),
         "running" => Ok(SessionStatus::Running),
         "paused" => Ok(SessionStatus::UnknownRecovered),
-        "needs_input" => Ok(SessionStatus::NeedsInput),
         "exited" => Ok(SessionStatus::Exited),
         "failed" => Ok(SessionStatus::Failed),
         "unknown_recovered" => Ok(SessionStatus::UnknownRecovered),
@@ -619,14 +617,6 @@ mod tests {
     #[test]
     fn degraded_mode_normalizes_running_session_to_recovered() {
         let session = demo_session("/tmp/repo", "/tmp/worktree", "agent/demo", false, false);
-        let normalized = normalize_degraded_session(session);
-        assert_eq!(normalized.status, SessionStatus::UnknownRecovered);
-    }
-
-    #[test]
-    fn degraded_mode_normalizes_needs_input_session_to_recovered() {
-        let mut session = demo_session("/tmp/repo", "/tmp/worktree", "agent/demo", false, false);
-        session.status = SessionStatus::NeedsInput;
         let normalized = normalize_degraded_session(session);
         assert_eq!(normalized.status, SessionStatus::UnknownRecovered);
     }

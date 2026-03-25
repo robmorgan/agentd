@@ -9,7 +9,6 @@ pub const SESSION_NAME_RULES: &str = "use 1-64 lowercase letters, numbers, and s
 pub enum SessionStatus {
     Creating,
     Running,
-    NeedsInput,
     Exited,
     Failed,
     UnknownRecovered,

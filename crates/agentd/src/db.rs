@@ -324,7 +324,6 @@ fn status_to_str(status: SessionStatus) -> &'static str {
     match status {
         SessionStatus::Creating => "creating",
         SessionStatus::Running => "running",
-        SessionStatus::NeedsInput => "needs_input",
         SessionStatus::Exited => "exited",
         SessionStatus::Failed => "failed",
         SessionStatus::UnknownRecovered => "unknown_recovered",
@@ -336,7 +335,6 @@ fn str_to_status(value: &str) -> std::result::Result<SessionStatus, std::io::Err
         "creating" => Ok(SessionStatus::Creating),
         "running" => Ok(SessionStatus::Running),
         "paused" => Ok(SessionStatus::UnknownRecovered),
-        "needs_input" => Ok(SessionStatus::NeedsInput),
         "exited" => Ok(SessionStatus::Exited),
         "failed" => Ok(SessionStatus::Failed),
         "unknown_recovered" => Ok(SessionStatus::UnknownRecovered),

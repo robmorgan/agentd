@@ -48,7 +48,7 @@ agent ls
 
 NAME                 AGENT    STATUS      ELAPSED   TOKENS      COST
 ● fix-tests          codex    running     12m       2.3k/900    $0.18
-⚠ dependency-bump    claude   blocked     4m        800/120     $0.07
+⚠ dependency-bump    claude   running     4m        800/120     $0.07
 ✔ docs-readme        codex    completed   6m        1.1k/420    $0.05
 ```
 
@@ -96,7 +96,7 @@ Run the `agent` command without any arguments to open the TUI.
 
 `agentd` introduces three core primitives.
 
-- **Tasks.** A long-running unit of work. A task may spawn one or more agents and has a lifecycle (running, blocked, completed, failed).
+- **Tasks.** A long-running unit of work. A task may spawn one or more agents and has a lifecycle (running, completed, failed).
 - **Threads.** A sequence of reasoning associated with a task. Threads capture prompts, tool calls, intermediate outputs, and final results.
 - **Artifacts.** Outputs produced by agents, such as commits, files, patches, test results, or screenshots.
 
