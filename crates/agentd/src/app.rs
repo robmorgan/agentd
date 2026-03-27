@@ -398,6 +398,8 @@ impl AppState {
         session_id: &str,
         cols: u16,
         rows: u16,
+        pixel_width: u16,
+        pixel_height: u16,
     ) -> Result<()> {
         let session = self
             .get_session(session_id)
@@ -409,7 +411,7 @@ impl AppState {
             .runtimes
             .get(session_id)
             .ok_or_else(|| anyhow!("session `{session_id}` does not have a live PTY"))?;
-        runtime.resize(cols, rows)
+        runtime.resize(TerminalGeometry { cols, rows, pixel_width, pixel_height })
     }
 
     pub async fn attach_session(
@@ -418,6 +420,8 @@ impl AppState {
         kind: AttachmentKind,
         cols: u16,
         rows: u16,
+        pixel_width: u16,
+        pixel_height: u16,
     ) -> Result<(
         AttachmentHandle,
         AttachmentRecord,
@@ -435,8 +439,11 @@ impl AppState {
             .runtimes
             .get(session_id)
             .ok_or_else(|| anyhow!("session `{session_id}` does not have a live PTY"))?;
-        let (handle, attachment, snapshot, receiver, control_rx) =
-            runtime.attach(session_id, kind, cols, rows)?;
+        let (handle, attachment, snapshot, receiver, control_rx) = runtime.attach(
+            session_id,
+            kind,
+            TerminalGeometry { cols, rows, pixel_width, pixel_height },
+        )?;
         Ok((handle, attachment, snapshot, receiver, control_rx))
     }
 
@@ -668,6 +675,41 @@ struct SessionRuntime {
     output_tx: broadcast::Sender<Vec<u8>>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TerminalGeometry {
+    cols: u16,
+    rows: u16,
+    pixel_width: u16,
+    pixel_height: u16,
+}
+
+impl TerminalGeometry {
+    fn cell_width_px(self) -> u32 {
+        if self.cols == 0 || self.pixel_width == 0 {
+            0
+        } else {
+            u32::from(self.pixel_width) / u32::from(self.cols)
+        }
+    }
+
+    fn cell_height_px(self) -> u32 {
+        if self.rows == 0 || self.pixel_height == 0 {
+            0
+        } else {
+            u32::from(self.pixel_height) / u32::from(self.rows)
+        }
+    }
+
+    fn into_pty_size(self) -> PtySize {
+        PtySize {
+            rows: self.rows,
+            cols: self.cols,
+            pixel_width: self.pixel_width,
+            pixel_height: self.pixel_height,
+        }
+    }
+}
+
 impl SessionRuntime {
     fn new(
         master: Box<dyn MasterPty + Send>,
@@ -682,6 +724,12 @@ impl SessionRuntime {
             state: Mutex::new(SessionRuntimeState {
                 terminal_state,
                 has_client_dimensions: false,
+                geometry: TerminalGeometry {
+                    cols: DEFAULT_PTY_COLS,
+                    rows: DEFAULT_PTY_ROWS,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
                 next_attach_ordinal: 1,
                 attachments: HashMap::new(),
             }),
@@ -696,19 +744,30 @@ impl SessionRuntime {
         Ok(())
     }
 
-    fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+    fn resize(&self, geometry: TerminalGeometry) -> Result<()> {
         let master = self.master.lock().map_err(|_| anyhow!("PTY master poisoned"))?;
-        master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
+        master.resize(geometry.into_pty_size())?;
         drop(master);
         let mut state = self.state.lock().map_err(|_| anyhow!("session runtime state poisoned"))?;
-        state.terminal_state.resize(cols, rows)?;
+        state.terminal_state.resize(
+            geometry.cols,
+            geometry.rows,
+            geometry.cell_width_px(),
+            geometry.cell_height_px(),
+        )?;
         state.has_client_dimensions = true;
+        state.geometry = geometry;
         Ok(())
     }
 
     fn publish_output(&self, data: &[u8]) -> Result<()> {
         let mut state = self.state.lock().map_err(|_| anyhow!("session runtime state poisoned"))?;
-        state.terminal_state.feed(data)?;
+        let effects_enabled = !state.has_live_attach_terminal();
+        let responses = state.terminal_state.feed(data, effects_enabled)?;
+        drop(state);
+        if !responses.is_empty() {
+            self.write_input(&responses)?;
+        }
         let _ = self.output_tx.send(data.to_vec());
         Ok(())
     }
@@ -725,8 +784,7 @@ impl SessionRuntime {
         self: &Arc<Self>,
         session_id: &str,
         kind: AttachmentKind,
-        cols: u16,
-        rows: u16,
+        geometry: TerminalGeometry,
     ) -> Result<(
         AttachmentHandle,
         AttachmentRecord,
@@ -746,10 +804,10 @@ impl SessionRuntime {
                     self.state.lock().map_err(|_| anyhow!("session runtime state poisoned"))?;
                 state.terminal_state.vt_snapshot()?
             };
-            self.resize(cols, rows)?;
+            self.resize(geometry)?;
             snapshot
         } else {
-            self.resize(cols, rows)?;
+            self.resize(geometry)?;
             let mut state =
                 self.state.lock().map_err(|_| anyhow!("session runtime state poisoned"))?;
             state.terminal_state.vt_snapshot()?
@@ -819,8 +877,15 @@ impl SessionRuntime {
 struct SessionRuntimeState {
     terminal_state: Box<dyn TerminalStateEngine>,
     has_client_dimensions: bool,
+    geometry: TerminalGeometry,
     next_attach_ordinal: u64,
     attachments: HashMap<String, RuntimeAttachment>,
+}
+
+impl SessionRuntimeState {
+    fn has_live_attach_terminal(&self) -> bool {
+        self.attachments.values().any(|attachment| attachment.kind == AttachmentKind::Attach)
+    }
 }
 
 struct RuntimeAttachment {
@@ -1192,7 +1257,7 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachControl, SessionRuntime, ensure_applyable, finalize_session_exit,
+        AttachControl, SessionRuntime, TerminalGeometry, ensure_applyable, finalize_session_exit,
         manual_accept_conflict_summary, refresh_commit_state, shell_quote,
     };
     use crate::app::SessionRuntimeRegistry;
@@ -1222,11 +1287,17 @@ mod tests {
     struct StubTerminalState;
 
     impl TerminalStateEngine for StubTerminalState {
-        fn feed(&mut self, _data: &[u8]) -> Result<()> {
-            Ok(())
+        fn feed(&mut self, _data: &[u8], _effects_enabled: bool) -> Result<Vec<u8>> {
+            Ok(Vec::new())
         }
 
-        fn resize(&mut self, _cols: u16, _rows: u16) -> Result<()> {
+        fn resize(
+            &mut self,
+            _cols: u16,
+            _rows: u16,
+            _cell_width_px: u32,
+            _cell_height_px: u32,
+        ) -> Result<()> {
             Ok(())
         }
 
@@ -1289,11 +1360,18 @@ mod tests {
     }
 
     impl TerminalStateEngine for RecordingTerminalState {
-        fn feed(&mut self, _data: &[u8]) -> Result<()> {
-            Ok(())
+        fn feed(&mut self, _data: &[u8], effects_enabled: bool) -> Result<Vec<u8>> {
+            self.ops.events.lock().unwrap().push(format!("feed_effects:{effects_enabled}"));
+            Ok(Vec::new())
         }
 
-        fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        fn resize(
+            &mut self,
+            cols: u16,
+            rows: u16,
+            _cell_width_px: u32,
+            _cell_height_px: u32,
+        ) -> Result<()> {
             self.ops.events.lock().unwrap().push(format!("terminal_resize:{cols}x{rows}"));
             Ok(())
         }
@@ -1351,6 +1429,60 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct RecordingWriter {
+        data: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.data.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ReplyTerminalState {
+        reply: Vec<u8>,
+        effects_log: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl TerminalStateEngine for ReplyTerminalState {
+        fn feed(&mut self, _data: &[u8], effects_enabled: bool) -> Result<Vec<u8>> {
+            self.effects_log.lock().unwrap().push(effects_enabled);
+            if effects_enabled { Ok(self.reply.clone()) } else { Ok(Vec::new()) }
+        }
+
+        fn resize(
+            &mut self,
+            _cols: u16,
+            _rows: u16,
+            _cell_width_px: u32,
+            _cell_height_px: u32,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn vt_snapshot(&mut self) -> Result<Vec<u8>> {
+            Ok(b"snapshot".to_vec())
+        }
+
+        fn format_plain(&mut self) -> Result<String> {
+            Ok("plain".to_string())
+        }
+
+        fn format_vt(&mut self) -> Result<String> {
+            Ok("vt".to_string())
+        }
+    }
+
+    fn geometry(cols: u16, rows: u16) -> TerminalGeometry {
+        TerminalGeometry { cols, rows, pixel_width: 0, pixel_height: 0 }
+    }
+
     #[test]
     fn request_detach_requires_active_attacher() {
         let runtime = SessionRuntime::new(
@@ -1372,7 +1504,7 @@ mod tests {
             8,
         ));
         let (_handle, attachment, snapshot, _output_rx, mut control_rx) =
-            runtime.attach("demo", AttachmentKind::Attach, 120, 48).unwrap();
+            runtime.attach("demo", AttachmentKind::Attach, geometry(120, 48)).unwrap();
         assert_eq!(snapshot, b"snapshot".to_vec());
 
         runtime.request_detach(&attachment.attach_id).unwrap();
@@ -1390,9 +1522,9 @@ mod tests {
             8,
         ));
         let (_first_handle, first, _snapshot, _first_output, _first_control) =
-            runtime.attach("demo", AttachmentKind::Attach, 120, 48).unwrap();
+            runtime.attach("demo", AttachmentKind::Attach, geometry(120, 48)).unwrap();
         let (_second_handle, second, _snapshot, _second_output, _second_control) =
-            runtime.attach("demo", AttachmentKind::Tui, 120, 48).unwrap();
+            runtime.attach("demo", AttachmentKind::Tui, geometry(120, 48)).unwrap();
 
         assert_ne!(first.attach_id, second.attach_id);
         assert_eq!(runtime.list_attachments("demo").unwrap().len(), 2);
@@ -1408,7 +1540,7 @@ mod tests {
             8,
         ));
 
-        let _ = runtime.attach("demo", AttachmentKind::Attach, 120, 48).unwrap();
+        let _ = runtime.attach("demo", AttachmentKind::Attach, geometry(120, 48)).unwrap();
 
         let events = ops.events.lock().unwrap().clone();
         assert_eq!(
@@ -1431,10 +1563,10 @@ mod tests {
             8,
         ));
 
-        let _ = runtime.attach("demo", AttachmentKind::Attach, 120, 48).unwrap();
+        let _ = runtime.attach("demo", AttachmentKind::Attach, geometry(120, 48)).unwrap();
         ops.events.lock().unwrap().clear();
 
-        let _ = runtime.attach("demo", AttachmentKind::Attach, 160, 50).unwrap();
+        let _ = runtime.attach("demo", AttachmentKind::Attach, geometry(160, 50)).unwrap();
 
         let events = ops.events.lock().unwrap().clone();
         assert_eq!(
@@ -1460,6 +1592,68 @@ mod tests {
 
         assert_eq!(history.plain, "plain");
         assert_eq!(history.vt, "vt");
+    }
+
+    #[test]
+    fn detached_runtime_writes_terminal_effect_replies_back_to_pty() {
+        let writer_data = Arc::new(Mutex::new(Vec::new()));
+        let effects_log = Arc::new(Mutex::new(Vec::new()));
+        let runtime = SessionRuntime::new(
+            Box::new(StubMasterPty),
+            Box::new(RecordingWriter { data: writer_data.clone() }),
+            Box::new(ReplyTerminalState {
+                reply: b"\x1b[8;24;80t".to_vec(),
+                effects_log: effects_log.clone(),
+            }),
+            8,
+        );
+
+        runtime.publish_output(b"\x1b[18t").unwrap();
+
+        assert_eq!(writer_data.lock().unwrap().as_slice(), b"\x1b[8;24;80t");
+        assert_eq!(effects_log.lock().unwrap().as_slice(), &[true]);
+    }
+
+    #[test]
+    fn attached_terminal_suppresses_daemon_generated_replies() {
+        let writer_data = Arc::new(Mutex::new(Vec::new()));
+        let effects_log = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Arc::new(SessionRuntime::new(
+            Box::new(StubMasterPty),
+            Box::new(RecordingWriter { data: writer_data.clone() }),
+            Box::new(ReplyTerminalState {
+                reply: b"\x1b[?7;1$y".to_vec(),
+                effects_log: effects_log.clone(),
+            }),
+            8,
+        ));
+        let _handle = runtime.attach("demo", AttachmentKind::Attach, geometry(120, 48)).unwrap();
+
+        runtime.publish_output(b"\x1b[?7$p").unwrap();
+
+        assert!(writer_data.lock().unwrap().is_empty());
+        assert_eq!(effects_log.lock().unwrap().as_slice(), &[false]);
+    }
+
+    #[test]
+    fn tui_attachment_does_not_suppress_daemon_generated_replies() {
+        let writer_data = Arc::new(Mutex::new(Vec::new()));
+        let effects_log = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Arc::new(SessionRuntime::new(
+            Box::new(StubMasterPty),
+            Box::new(RecordingWriter { data: writer_data.clone() }),
+            Box::new(ReplyTerminalState {
+                reply: b"\x1b[8;24;80t".to_vec(),
+                effects_log: effects_log.clone(),
+            }),
+            8,
+        ));
+        let _handle = runtime.attach("demo", AttachmentKind::Tui, geometry(120, 48)).unwrap();
+
+        runtime.publish_output(b"\x1b[18t").unwrap();
+
+        assert_eq!(writer_data.lock().unwrap().as_slice(), b"\x1b[8;24;80t");
+        assert_eq!(effects_log.lock().unwrap().as_slice(), &[true]);
     }
 
     #[test]

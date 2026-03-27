@@ -21,8 +21,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 use libc::{
-    _POSIX_VDISABLE, O_NONBLOCK, TCSAFLUSH, TCSANOW, VLNEXT, VMIN, VQUIT, VTIME, cfmakeraw, fcntl,
-    tcgetattr, tcsetattr, termios,
+    _POSIX_VDISABLE, O_NONBLOCK, TCSAFLUSH, TCSANOW, TIOCGWINSZ, VLNEXT, VMIN, VQUIT, VTIME,
+    cfmakeraw, fcntl, tcgetattr, tcsetattr, termios, winsize,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use tokio::{
@@ -1023,21 +1023,45 @@ pub(crate) enum AttachHandshake {
     SessionEnded(SessionEndSummary),
 }
 
-pub(crate) fn current_terminal_size() -> (u16, u16) {
-    crossterm::terminal::size().unwrap_or((80, 24))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AttachGeometry {
+    cols: u16,
+    rows: u16,
+    pixel_width: u16,
+    pixel_height: u16,
+}
+
+pub(crate) fn current_terminal_geometry() -> AttachGeometry {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let mut geometry = AttachGeometry { cols, rows, pixel_width: 0, pixel_height: 0 };
+    let fd = std::io::stdin().as_raw_fd();
+    let mut winsize = MaybeUninit::<winsize>::zeroed();
+    let result = unsafe { libc::ioctl(fd, TIOCGWINSZ, winsize.as_mut_ptr()) };
+    if result == 0 {
+        let winsize = unsafe { winsize.assume_init() };
+        geometry.pixel_width = winsize.ws_xpixel;
+        geometry.pixel_height = winsize.ws_ypixel;
+    }
+    geometry
 }
 
 pub(crate) async fn connect_attached_session(
     paths: &AppPaths,
     session_id: &str,
     kind: AttachmentKind,
-    cols: u16,
-    rows: u16,
+    geometry: AttachGeometry,
 ) -> Result<AttachHandshake> {
     let mut stream = try_connect(paths).await?;
     write_request(
         &mut stream,
-        &Request::AttachSession { session_id: session_id.to_string(), kind, cols, rows },
+        &Request::AttachSession {
+            session_id: session_id.to_string(),
+            kind,
+            cols: geometry.cols,
+            rows: geometry.rows,
+            pixel_width: geometry.pixel_width,
+            pixel_height: geometry.pixel_height,
+        },
     )
     .await?;
 
@@ -1085,16 +1109,20 @@ async fn attach_session_once(
     session_id: &str,
     title_guard: &mut AttachTitleGuard,
 ) -> Result<AttachOutcome> {
-    let (cols, rows) = current_terminal_size();
-    let attached =
-        match connect_attached_session(paths, session_id, AttachmentKind::Attach, cols, rows)
-            .await?
-        {
-            AttachHandshake::Attached(attached) => attached,
-            AttachHandshake::SessionEnded(summary) => {
-                return Ok(AttachOutcome::SessionEnded(summary));
-            }
-        };
+    let geometry = current_terminal_geometry();
+    let attached = match connect_attached_session(
+        paths,
+        session_id,
+        AttachmentKind::Attach,
+        geometry,
+    )
+    .await?
+    {
+        AttachHandshake::Attached(attached) => attached,
+        AttachHandshake::SessionEnded(summary) => {
+            return Ok(AttachOutcome::SessionEnded(summary));
+        }
+    };
     let AttachedSessionStream { attach_id, snapshot, mut reader, mut write_half } = attached;
 
     title_guard.set_session(session_id)?;
@@ -1154,8 +1182,7 @@ async fn attach_session_once(
                 if resize.is_none() {
                     break;
                 }
-                let (cols, rows) = current_terminal_size();
-                send_attach_resize(&mut write_half, cols, rows).await?;
+                send_attach_resize(&mut write_half, current_terminal_geometry()).await?;
             }
             response = read_response(&mut reader) => {
                 let Some(response) = response? else {
@@ -1205,10 +1232,18 @@ async fn attach_session_once(
 
 async fn send_attach_resize(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
-    cols: u16,
-    rows: u16,
+    geometry: AttachGeometry,
 ) -> Result<()> {
-    write_request(write_half, &Request::AttachResize { cols, rows }).await
+    write_request(
+        write_half,
+        &Request::AttachResize {
+            cols: geometry.cols,
+            rows: geometry.rows,
+            pixel_width: geometry.pixel_width,
+            pixel_height: geometry.pixel_height,
+        },
+    )
+    .await
 }
 
 fn write_session_snapshot(snapshot: &[u8]) -> Result<()> {

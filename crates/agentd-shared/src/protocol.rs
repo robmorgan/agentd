@@ -8,7 +8,7 @@ use crate::session::{
     IntegrationPolicy, SessionDiff, SessionMode, SessionRecord, SessionStatus, WorktreeRecord,
 };
 
-pub const PROTOCOL_VERSION: u16 = 28;
+pub const PROTOCOL_VERSION: u16 = 29;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
@@ -80,10 +80,14 @@ pub enum Request {
         kind: AttachmentKind,
         cols: u16,
         rows: u16,
+        pixel_width: u16,
+        pixel_height: u16,
     },
     AttachResize {
         cols: u16,
         rows: u16,
+        pixel_width: u16,
+        pixel_height: u16,
     },
     DetachSession {
         session_id: String,
@@ -469,16 +473,20 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             put_bool(&mut payload, *remove);
             MessageKind::KillSessionRequest
         }
-        Request::AttachSession { session_id, kind, cols, rows } => {
+        Request::AttachSession { session_id, kind, cols, rows, pixel_width, pixel_height } => {
             put_string(&mut payload, session_id)?;
             put_attachment_kind(&mut payload, *kind);
-            payload.extend_from_slice(&cols.to_le_bytes());
-            payload.extend_from_slice(&rows.to_le_bytes());
+            put_u16(&mut payload, *cols);
+            put_u16(&mut payload, *rows);
+            put_u16(&mut payload, *pixel_width);
+            put_u16(&mut payload, *pixel_height);
             MessageKind::AttachSessionRequest
         }
-        Request::AttachResize { cols, rows } => {
-            payload.extend_from_slice(&cols.to_le_bytes());
-            payload.extend_from_slice(&rows.to_le_bytes());
+        Request::AttachResize { cols, rows, pixel_width, pixel_height } => {
+            put_u16(&mut payload, *cols);
+            put_u16(&mut payload, *rows);
+            put_u16(&mut payload, *pixel_width);
+            put_u16(&mut payload, *pixel_height);
             MessageKind::AttachResizeRequest
         }
         Request::DetachSession { session_id, all } => {
@@ -563,10 +571,15 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
             kind: cursor.take_attachment_kind()?,
             cols: cursor.take_u16()?,
             rows: cursor.take_u16()?,
+            pixel_width: cursor.take_u16()?,
+            pixel_height: cursor.take_u16()?,
         },
-        MessageKind::AttachResizeRequest => {
-            Request::AttachResize { cols: cursor.take_u16()?, rows: cursor.take_u16()? }
-        }
+        MessageKind::AttachResizeRequest => Request::AttachResize {
+            cols: cursor.take_u16()?,
+            rows: cursor.take_u16()?,
+            pixel_width: cursor.take_u16()?,
+            pixel_height: cursor.take_u16()?,
+        },
         MessageKind::DetachSessionRequest => {
             Request::DetachSession { session_id: cursor.take_string()?, all: cursor.take_bool()? }
         }
@@ -1024,6 +1037,10 @@ fn put_bool(buf: &mut Vec<u8>, value: bool) {
     buf.push(u8::from(value));
 }
 
+fn put_u16(buf: &mut Vec<u8>, value: u16) {
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
 fn put_string(buf: &mut Vec<u8>, value: &str) -> Result<()> {
     put_bytes(buf, value.as_bytes())
 }
@@ -1290,7 +1307,8 @@ mod tests {
 
     #[test]
     fn attach_resize_round_trips() {
-        let request = Request::AttachResize { cols: 120, rows: 48 };
+        let request =
+            Request::AttachResize { cols: 120, rows: 48, pixel_width: 960, pixel_height: 768 };
         let (kind, payload) = encode_request(&request).unwrap();
         let decoded = decode_request(kind, &payload).unwrap();
         assert_eq!(decoded, request);
@@ -1322,6 +1340,8 @@ mod tests {
             kind: AttachmentKind::Tui,
             cols: 120,
             rows: 48,
+            pixel_width: 960,
+            pixel_height: 768,
         };
         let (kind, payload) = encode_request(&request).unwrap();
         let decoded = decode_request(kind, &payload).unwrap();

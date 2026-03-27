@@ -151,8 +151,26 @@ async fn handle_connection(
                 }
             }
         }
-        IncomingRequest::Standard(Request::AttachSession { session_id, kind, cols, rows }) => {
-            attach_session(&state, &session_id, kind, cols, rows, &mut reader, &mut writer).await?;
+        IncomingRequest::Standard(Request::AttachSession {
+            session_id,
+            kind,
+            cols,
+            rows,
+            pixel_width,
+            pixel_height,
+        }) => {
+            attach_session(
+                &state,
+                &session_id,
+                kind,
+                cols,
+                rows,
+                pixel_width,
+                pixel_height,
+                &mut reader,
+                &mut writer,
+            )
+            .await?;
         }
         IncomingRequest::Standard(Request::DetachSession { session_id, all }) => {
             match state.detach_session(&session_id, all).await {
@@ -335,11 +353,13 @@ async fn attach_session(
     kind: AttachmentKind,
     cols: u16,
     rows: u16,
+    pixel_width: u16,
+    pixel_height: u16,
     reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: &mut OwnedWriteHalf,
 ) -> Result<()> {
     let (_handle, attachment, snapshot, mut output_rx, mut control_rx) =
-        match state.attach_session(session_id, kind, cols, rows).await {
+        match state.attach_session(session_id, kind, cols, rows, pixel_width, pixel_height).await {
             Ok(attached) => attached,
             Err(err) => {
                 let response = match ended_session_response(state, session_id).await? {
@@ -383,8 +403,17 @@ async fn attach_session(
                     break;
                 };
                 match request {
-                    Request::AttachResize { cols, rows } => {
-                        if let Err(err) = state.resize_attached_session(session_id, cols, rows).await {
+                    Request::AttachResize { cols, rows, pixel_width, pixel_height } => {
+                        if let Err(err) = state
+                            .resize_attached_session(
+                                session_id,
+                                cols,
+                                rows,
+                                pixel_width,
+                                pixel_height,
+                            )
+                            .await
+                        {
                             final_response = Some(match ended_session_response(state, session_id).await? {
                                 Some(response) => response,
                                 None => Response::Error {
