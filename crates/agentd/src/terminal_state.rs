@@ -5,8 +5,14 @@ use anyhow::{Result, anyhow, bail};
 const GHOSTTY_SUCCESS: i32 = 0;
 
 pub trait TerminalStateEngine: Send {
-    fn feed(&mut self, data: &[u8]) -> Result<()>;
-    fn resize(&mut self, cols: u16, rows: u16) -> Result<()>;
+    fn feed(&mut self, data: &[u8], effects_enabled: bool) -> Result<Vec<u8>>;
+    fn resize(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    ) -> Result<()>;
     fn vt_snapshot(&mut self) -> Result<Vec<u8>>;
     fn format_plain(&mut self) -> Result<String>;
     fn format_vt(&mut self) -> Result<String>;
@@ -16,6 +22,13 @@ pub struct GhosttyTerminalState {
     terminal: GhosttyTerminal,
     plain_formatter: GhosttyFormatter,
     vt_formatter: GhosttyFormatter,
+    userdata: Box<GhosttyUserData>,
+}
+
+struct GhosttyUserData {
+    effects_enabled: bool,
+    pending_write: Vec<u8>,
+    size: GhosttySizeReportSize,
 }
 
 impl GhosttyTerminalState {
@@ -29,6 +42,17 @@ impl GhosttyTerminalState {
             )
         };
         ensure_success(result, "ghostty_terminal_new")?;
+
+        let mut userdata = Box::new(GhosttyUserData {
+            effects_enabled: false,
+            pending_write: Vec::new(),
+            size: GhosttySizeReportSize { rows, columns: cols, cell_width: 0, cell_height: 0 },
+        });
+
+        if let Err(err) = configure_effects(terminal, &mut userdata) {
+            unsafe { ghostty_terminal_free(terminal) };
+            return Err(err);
+        }
 
         let plain_formatter = match new_formatter(terminal, GhosttyFormatterFormat::Plain) {
             Ok(formatter) => formatter,
@@ -48,18 +72,35 @@ impl GhosttyTerminalState {
             }
         };
 
-        Ok(Self { terminal, plain_formatter, vt_formatter })
+        Ok(Self { terminal, plain_formatter, vt_formatter, userdata })
     }
 }
 
 impl TerminalStateEngine for GhosttyTerminalState {
-    fn feed(&mut self, data: &[u8]) -> Result<()> {
+    fn feed(&mut self, data: &[u8], effects_enabled: bool) -> Result<Vec<u8>> {
+        self.userdata.effects_enabled = effects_enabled;
+        self.userdata.pending_write.clear();
         unsafe { ghostty_terminal_vt_write(self.terminal, data.as_ptr(), data.len()) };
-        Ok(())
+        self.userdata.effects_enabled = false;
+        Ok(std::mem::take(&mut self.userdata.pending_write))
     }
 
-    fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
-        let result = unsafe { ghostty_terminal_resize(self.terminal, cols, rows) };
+    fn resize(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    ) -> Result<()> {
+        self.userdata.size = GhosttySizeReportSize {
+            rows,
+            columns: cols,
+            cell_width: cell_width_px,
+            cell_height: cell_height_px,
+        };
+        let result = unsafe {
+            ghostty_terminal_resize(self.terminal, cols, rows, cell_width_px, cell_height_px)
+        };
         ensure_success(result, "ghostty_terminal_resize")
     }
 
@@ -84,6 +125,70 @@ impl Drop for GhosttyTerminalState {
             ghostty_terminal_free(self.terminal);
         }
     }
+}
+
+fn configure_effects(terminal: GhosttyTerminal, userdata: &mut GhosttyUserData) -> Result<()> {
+    let userdata_ptr = (userdata as *mut GhosttyUserData).cast::<c_void>();
+    let write_pty: GhosttyTerminalWritePtyFn = ghostty_write_pty;
+    let size_callback: GhosttyTerminalSizeFn = ghostty_size_callback;
+
+    let result = unsafe {
+        ghostty_terminal_set(terminal, GhosttyTerminalOption::Userdata, userdata_ptr.cast())
+    };
+    ensure_success(result, "ghostty_terminal_set(userdata)")?;
+
+    let result = unsafe {
+        ghostty_terminal_set(
+            terminal,
+            GhosttyTerminalOption::WritePty,
+            write_pty as usize as *const c_void,
+        )
+    };
+    ensure_success(result, "ghostty_terminal_set(write_pty)")?;
+
+    let result = unsafe {
+        ghostty_terminal_set(
+            terminal,
+            GhosttyTerminalOption::Size,
+            size_callback as usize as *const c_void,
+        )
+    };
+    ensure_success(result, "ghostty_terminal_set(size)")?;
+
+    Ok(())
+}
+
+extern "C" fn ghostty_write_pty(
+    _terminal: GhosttyTerminal,
+    userdata: *mut c_void,
+    data: *const u8,
+    len: usize,
+) {
+    if userdata.is_null() || data.is_null() || len == 0 {
+        return;
+    }
+    let userdata = unsafe { &mut *userdata.cast::<GhosttyUserData>() };
+    if !userdata.effects_enabled {
+        return;
+    }
+    let bytes = unsafe { slice::from_raw_parts(data, len) };
+    userdata.pending_write.extend_from_slice(bytes);
+}
+
+extern "C" fn ghostty_size_callback(
+    _terminal: GhosttyTerminal,
+    userdata: *mut c_void,
+    out_size: *mut GhosttySizeReportSize,
+) -> bool {
+    if userdata.is_null() || out_size.is_null() {
+        return false;
+    }
+    let userdata = unsafe { &mut *userdata.cast::<GhosttyUserData>() };
+    if !userdata.effects_enabled {
+        return false;
+    }
+    unsafe { *out_size = userdata.size };
+    true
 }
 
 fn new_formatter(
@@ -137,7 +242,7 @@ fn format_terminal(formatter: GhosttyFormatter) -> Result<Vec<u8>> {
     }
 
     let bytes = unsafe { slice::from_raw_parts(ptr, len) }.to_vec();
-    unsafe { libc_free(ptr.cast()) };
+    unsafe { ghostty_free(ptr::null(), ptr, len) };
     Ok(bytes)
 }
 
@@ -152,6 +257,7 @@ fn ensure_success(result: i32, operation: &str) -> Result<()> {
         -1 => "out of memory",
         -2 => "invalid value",
         -3 => "out of space",
+        -4 => "no value",
         _ => "unknown error",
     };
     Err(anyhow!("{operation} failed: {message} ({result})"))
@@ -160,12 +266,24 @@ fn ensure_success(result: i32, operation: &str) -> Result<()> {
 type GhosttyTerminal = *mut c_void;
 type GhosttyFormatter = *mut c_void;
 type GhosttyAllocator = c_void;
+type GhosttyTerminalWritePtyFn = extern "C" fn(GhosttyTerminal, *mut c_void, *const u8, usize);
+type GhosttyTerminalSizeFn =
+    extern "C" fn(GhosttyTerminal, *mut c_void, *mut GhosttySizeReportSize) -> bool;
 
 #[repr(C)]
 struct GhosttyTerminalOptions {
     cols: u16,
     rows: u16,
     max_scrollback: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GhosttySizeReportSize {
+    rows: u16,
+    columns: u16,
+    cell_width: u32,
+    cell_height: u32,
 }
 
 #[repr(C)]
@@ -200,6 +318,13 @@ struct GhosttyFormatterTerminalOptions {
     extra: GhosttyFormatterTerminalExtra,
 }
 
+#[repr(C)]
+enum GhosttyTerminalOption {
+    Userdata = 0,
+    WritePty = 1,
+    Size = 6,
+}
+
 #[allow(dead_code)]
 #[repr(C)]
 enum GhosttyFormatterFormat {
@@ -216,7 +341,18 @@ unsafe extern "C" {
     ) -> i32;
     fn ghostty_terminal_free(terminal: GhosttyTerminal);
     fn ghostty_terminal_vt_write(terminal: GhosttyTerminal, data: *const u8, len: usize);
-    fn ghostty_terminal_resize(terminal: GhosttyTerminal, cols: u16, rows: u16) -> i32;
+    fn ghostty_terminal_resize(
+        terminal: GhosttyTerminal,
+        cols: u16,
+        rows: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    ) -> i32;
+    fn ghostty_terminal_set(
+        terminal: GhosttyTerminal,
+        option: GhosttyTerminalOption,
+        value: *const c_void,
+    ) -> i32;
 
     fn ghostty_formatter_terminal_new(
         allocator: *const GhosttyAllocator,
@@ -231,12 +367,32 @@ unsafe extern "C" {
         out_len: *mut usize,
     ) -> i32;
     fn ghostty_formatter_free(formatter: GhosttyFormatter);
-
-    fn free(ptr: *mut c_void);
+    fn ghostty_free(allocator: *const GhosttyAllocator, ptr: *mut u8, len: usize);
 }
 
-unsafe fn libc_free(ptr: *mut c_void) {
-    if !ptr.is_null() {
-        unsafe { free(ptr) };
+#[cfg(test)]
+mod tests {
+    use super::{GhosttyTerminalState, TerminalStateEngine};
+
+    #[test]
+    fn feed_returns_mode_query_response_when_effects_enabled() {
+        let mut state = GhosttyTerminalState::new(80, 24, 0).unwrap();
+        let response = state.feed(b"\x1b[?7$p", true).unwrap();
+        assert_eq!(response, b"\x1b[?7;1$y");
+    }
+
+    #[test]
+    fn feed_returns_size_query_response_when_effects_enabled() {
+        let mut state = GhosttyTerminalState::new(80, 24, 0).unwrap();
+        state.resize(80, 24, 8, 16).unwrap();
+        let response = state.feed(b"\x1b[18t", true).unwrap();
+        assert_eq!(response, b"\x1b[8;24;80t");
+    }
+
+    #[test]
+    fn feed_suppresses_effects_when_disabled() {
+        let mut state = GhosttyTerminalState::new(80, 24, 0).unwrap();
+        let response = state.feed(b"\x1b[?7$p", false).unwrap();
+        assert!(response.is_empty());
     }
 }
