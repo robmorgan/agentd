@@ -179,6 +179,24 @@ fn configured_default_agent(paths: &AppPaths) -> Result<String> {
     Ok(config.default_agent_name(paths)?.to_string())
 }
 
+fn ordered_create_agents(mut names: Vec<String>, default_agent: Option<&str>) -> Vec<String> {
+    let Some(default_agent) = default_agent else {
+        return names;
+    };
+    let Some(index) = names.iter().position(|agent| agent == default_agent) else {
+        return names;
+    };
+    if index > 0 {
+        let default = names.remove(index);
+        names.insert(0, default);
+    }
+    names
+}
+
+fn create_agent_label(agent: &str, default_agent: Option<&str>) -> String {
+    if default_agent == Some(agent) { format!("{agent} (Default)") } else { agent.to_string() }
+}
+
 pub async fn pick_session(paths: &AppPaths) -> Result<Option<String>> {
     let _raw_mode = RawModeGuard::new()?;
     let _screen = PickerScreenGuard::enter()?;
@@ -287,6 +305,7 @@ pub(crate) fn render_session_list_lines(sessions: &[SessionRecord], width: usize
 struct SessionPicker {
     paths: AppPaths,
     sessions: Vec<SessionRecord>,
+    default_agent: Option<String>,
     create_agents: Vec<String>,
     composer: PickerComposer,
     mode: PickerMode,
@@ -344,11 +363,15 @@ struct PickerComposer {
 
 impl SessionPicker {
     fn new(paths: AppPaths) -> Self {
-        let create_agents =
-            configured_agent_names(&paths).unwrap_or_else(|_| vec!["codex".to_string()]);
+        let default_agent = configured_default_agent(&paths).ok();
+        let create_agents = ordered_create_agents(
+            configured_agent_names(&paths).unwrap_or_else(|_| vec!["codex".to_string()]),
+            default_agent.as_deref(),
+        );
         Self {
             paths,
             sessions: Vec::new(),
+            default_agent,
             create_agents,
             composer: PickerComposer { query: String::new(), selected: 0 },
             mode: PickerMode::Browse,
@@ -704,7 +727,11 @@ impl SessionPicker {
             false,
         ));
         for (index, agent) in self.create_agents.iter().enumerate() {
-            let label = format!("{}. {}", index + 1, agent);
+            let label = format!(
+                "{}. {}",
+                index + 1,
+                create_agent_label(agent, self.default_agent.as_deref())
+            );
             lines.push(style_host_picker_menu_line(&label, width, index == selected));
         }
         lines.push(style_host_picker_background_row(width));
@@ -897,7 +924,11 @@ impl SessionPicker {
     }
 
     fn refresh_agent_names(&mut self) -> Result<()> {
-        self.create_agents = configured_agent_names(&self.paths)?;
+        self.default_agent = configured_default_agent(&self.paths).ok();
+        self.create_agents = ordered_create_agents(
+            configured_agent_names(&self.paths)?,
+            self.default_agent.as_deref(),
+        );
         if self.create_agents.is_empty() {
             self.toast = Some(PickerToast::notice(
                 "no configured agents found; falling back to codex".to_string(),
@@ -958,9 +989,12 @@ impl SessionPicker {
     }
 
     fn default_create_agent_selection(&self) -> usize {
-        let default_agent =
-            configured_default_agent(&self.paths).unwrap_or_else(|_| "codex".to_string());
-        self.create_agents.iter().position(|agent| agent == &default_agent).unwrap_or(0)
+        self.default_agent
+            .as_deref()
+            .and_then(|default_agent| {
+                self.create_agents.iter().position(|agent| agent == default_agent)
+            })
+            .unwrap_or(0)
     }
 
     fn action_index(&self, session_id: &str, action: SessionAction) -> usize {
@@ -2244,8 +2278,8 @@ mod tests {
         HOST_PICKER_STATUS_BLUE_FG, HOST_PICKER_STATUS_GREEN_FG, HOST_PICKER_STATUS_RED_FG,
         HOST_PICKER_TEXT_FG, OverlayMode, OverlayOutcome, PickerComposer, PickerMode, PickerRow,
         PickerToast, SessionAction, SessionPicker, configured_agent_names, fit_host_picker_line,
-        format_merge_failure_toast, ordered_sessions, pending_changes_marker,
-        render_host_picker_create_row, render_host_picker_legend_row,
+        format_merge_failure_toast, ordered_create_agents, ordered_sessions,
+        pending_changes_marker, render_host_picker_create_row, render_host_picker_legend_row,
         render_host_picker_session_row, render_host_picker_title_line,
         render_host_picker_toast_line, render_session_list_header_content,
         render_session_list_header_row, render_session_list_lines, sanitize_picker_message,
@@ -2428,6 +2462,7 @@ mod tests {
         let picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![demo("alpha", "repo-a")],
+            default_agent: Some("codex".to_string()),
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::Browse,
@@ -2449,6 +2484,7 @@ mod tests {
         let picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![session],
+            default_agent: Some("codex".to_string()),
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::Browse,
@@ -2468,6 +2504,7 @@ mod tests {
         let picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![session],
+            default_agent: Some("codex".to_string()),
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::Browse,
@@ -2489,6 +2526,7 @@ mod tests {
         let picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![session],
+            default_agent: Some("codex".to_string()),
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::Browse,
@@ -2513,6 +2551,7 @@ mod tests {
         let mut picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![demo("alpha", "repo-a")],
+            default_agent: Some("codex".to_string()),
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::SessionActions { session_id: "alpha".to_string(), selected: 9 },
@@ -2534,6 +2573,7 @@ mod tests {
         let mut picker = SessionPicker {
             paths: test_paths(),
             sessions: Vec::new(),
+            default_agent: Some("codex".to_string()),
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::DeleteConfirm { session_id: "missing".to_string(), selected: 1 },
@@ -2552,6 +2592,7 @@ mod tests {
         let picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![demo("alpha", "repo-a"), demo("beta", "repo-b")],
+            default_agent: Some("codex".to_string()),
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::SessionActions { session_id: "alpha".to_string(), selected: 0 },
@@ -2574,6 +2615,7 @@ mod tests {
         let picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![demo("alpha", "repo-a")],
+            default_agent: Some("codex".to_string()),
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::DeleteConfirm { session_id: "alpha".to_string(), selected: 1 },
@@ -2594,6 +2636,7 @@ mod tests {
         let picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![demo("alpha", "repo-a")],
+            default_agent: Some("codex".to_string()),
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::Browse,
@@ -2618,6 +2661,7 @@ mod tests {
         let mut picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![demo("alpha", "repo-a")],
+            default_agent: Some("codex".to_string()),
             create_agents: vec!["codex".to_string(), "claude".to_string()],
             composer: default_composer(),
             mode: PickerMode::Browse,
@@ -2636,6 +2680,7 @@ mod tests {
         let mut picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![demo("alpha", "repo-a")],
+            default_agent: Some("codex".to_string()),
             create_agents: vec!["codex".to_string(), "claude".to_string()],
             composer: default_composer(),
             mode: PickerMode::CreateAgentSelect { selected: 9 },
@@ -2648,7 +2693,7 @@ mod tests {
         let rendered = picker.render_lines(120, true).join("\n");
 
         assert_eq!(picker.mode, PickerMode::CreateAgentSelect { selected: 1 });
-        assert!(rendered.contains("1. codex"));
+        assert!(rendered.contains("1. codex (Default)"));
         assert!(rendered.contains("› 2. claude"));
         assert!(!rendered.contains("alpha  repo-a"));
     }
@@ -2657,6 +2702,26 @@ mod tests {
     fn configured_agent_names_use_default_config_order() {
         let names = configured_agent_names(&test_paths()).unwrap();
         assert_eq!(names, vec!["codex".to_string(), "claude".to_string()]);
+    }
+
+    #[test]
+    fn ordered_create_agents_moves_default_to_front_and_preserves_other_order() {
+        let names = ordered_create_agents(
+            vec!["codex".to_string(), "claude".to_string(), "zed".to_string()],
+            Some("claude"),
+        );
+
+        assert_eq!(names, vec!["claude".to_string(), "codex".to_string(), "zed".to_string()]);
+    }
+
+    #[test]
+    fn ordered_create_agents_keeps_order_when_default_is_missing() {
+        let names = ordered_create_agents(
+            vec!["codex".to_string(), "claude".to_string(), "zed".to_string()],
+            None,
+        );
+
+        assert_eq!(names, vec!["codex".to_string(), "claude".to_string(), "zed".to_string()]);
     }
 
     #[test]
@@ -3014,6 +3079,7 @@ mod tests {
         let picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![demo("alpha", "repo-a")],
+            default_agent: Some("codex".to_string()),
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::CreateAgentSelect { selected: 0 },
@@ -3099,6 +3165,7 @@ mod tests {
         let picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![demo("alpha", "repo-a")],
+            default_agent: Some("codex".to_string()),
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::DiffView { session_id: "alpha".to_string() },
@@ -3149,6 +3216,7 @@ mod tests {
         let picker = SessionPicker {
             paths: test_paths(),
             sessions: vec![demo("alpha", "repo-a")],
+            default_agent: Some("codex".to_string()),
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::Browse,
