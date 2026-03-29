@@ -76,26 +76,28 @@ impl Database {
         Ok(())
     }
 
-    pub fn mark_running(&self, session_id: &str, pid: u32) -> Result<()> {
+    pub fn mark_running(&self, session_id: &str, worker_pid: u32, agent_pid: u32) -> Result<()> {
         let conn = self.connect()?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE sessions
              SET status = ?2,
                  integration_state = ?3,
-                 pid = ?4,
+                 worker_pid = ?4,
+                 agent_pid = ?5,
                  exit_code = NULL,
                  error = NULL,
-                 attention = ?5,
-                 attention_summary = ?6,
-                 updated_at = ?7,
+                 attention = ?6,
+                 attention_summary = ?7,
+                 updated_at = ?8,
                  exited_at = NULL
              WHERE session_id = ?1",
             params![
                 session_id,
                 status_to_str(SessionStatus::Running),
                 apply_state_to_str(ApplyState::Idle),
-                pid,
+                worker_pid,
+                agent_pid,
                 attention_to_str(AttentionLevel::Info),
                 "running",
                 now,
@@ -110,7 +112,8 @@ impl Database {
         conn.execute(
             "UPDATE sessions
              SET status = ?2,
-                 pid = NULL,
+                 worker_pid = NULL,
+                 agent_pid = NULL,
                  error = ?3,
                  attention = ?4,
                  attention_summary = ?3,
@@ -138,7 +141,8 @@ impl Database {
         conn.execute(
             "UPDATE sessions
              SET status = ?2,
-                 pid = NULL,
+                 worker_pid = NULL,
+                 agent_pid = NULL,
                  exit_code = ?3,
                  integration_state = ?4,
                  attention = ?5,
@@ -168,7 +172,8 @@ impl Database {
         conn.execute(
             "UPDATE sessions
              SET status = ?2,
-                 pid = NULL,
+                 worker_pid = NULL,
+                 agent_pid = NULL,
                  attention = ?3,
                  attention_summary = ?4,
                  updated_at = ?5
@@ -215,7 +220,7 @@ impl Database {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT session_id, agent, model, mode, workspace, repo_path, repo_name, base_branch, branch,
-                    worktree, status, integration_policy, integration_state, pid, exit_code, error, attention, attention_summary,
+                    worktree, status, integration_policy, integration_state, worker_pid, agent_pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
             params![session_id],
@@ -229,7 +234,7 @@ impl Database {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT session_id, agent, model, mode, workspace, repo_path, repo_name, base_branch, branch,
-                    worktree, status, integration_policy, integration_state, pid, exit_code, error, attention, attention_summary,
+                    worktree, status, integration_policy, integration_state, worker_pid, agent_pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
         )?;
@@ -285,20 +290,21 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         ahead_count: 0,
         has_commits: false,
         has_pending_changes: false,
-        pid: row.get::<_, Option<u32>>(13)?,
-        exit_code: row.get(14)?,
-        error: row.get(15)?,
-        attention: str_to_attention(&row.get::<_, String>(16)?).map_err(|err| {
+        worker_pid: row.get::<_, Option<u32>>(13)?,
+        agent_pid: row.get::<_, Option<u32>>(14)?,
+        exit_code: row.get(15)?,
+        error: row.get(16)?,
+        attention: str_to_attention(&row.get::<_, String>(17)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                16,
+                17,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        attention_summary: row.get(17)?,
-        created_at: parse_time(row.get::<_, String>(18)?)?,
-        updated_at: parse_time(row.get::<_, String>(19)?)?,
-        exited_at: row.get::<_, Option<String>>(20)?.map(parse_time).transpose()?,
+        attention_summary: row.get(18)?,
+        created_at: parse_time(row.get::<_, String>(19)?)?,
+        updated_at: parse_time(row.get::<_, String>(20)?)?,
+        exited_at: row.get::<_, Option<String>>(21)?.map(parse_time).transpose()?,
     })
 }
 
@@ -421,6 +427,7 @@ mod tests {
             database: root.join("state.db"),
             config: root.join("config.toml"),
             logs_dir: root.join("logs"),
+            sessions_dir: root.join("sessions"),
             worktrees_dir: root.join("worktrees"),
             root,
         }

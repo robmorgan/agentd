@@ -103,11 +103,11 @@ impl LocalStore {
 }
 
 pub fn session_is_running(session: &SessionRecord) -> bool {
-    session.status == SessionStatus::Running && process_exists(session.pid)
+    session.status == SessionStatus::Running && process_exists(session.worker_pid)
 }
 
 pub fn normalize_session(session: SessionRecord) -> SessionRecord {
-    if session.status == SessionStatus::Running && !process_exists(session.pid) {
+    if session.status == SessionStatus::Running && !process_exists(session.worker_pid) {
         let mut session = session;
         session.status = SessionStatus::UnknownRecovered;
         return session;
@@ -203,20 +203,21 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         ahead_count: 0,
         has_commits: false,
         has_pending_changes: false,
-        pid: row.get::<_, Option<u32>>(13)?,
-        exit_code: row.get(14)?,
-        error: row.get(15)?,
-        attention: str_to_attention(&row.get::<_, String>(16)?).map_err(|err| {
+        worker_pid: row.get::<_, Option<u32>>(13)?,
+        agent_pid: row.get::<_, Option<u32>>(14)?,
+        exit_code: row.get(15)?,
+        error: row.get(16)?,
+        attention: str_to_attention(&row.get::<_, String>(17)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
-                16,
+                17,
                 rusqlite::types::Type::Text,
                 Box::new(err),
             )
         })?,
-        attention_summary: row.get(17)?,
-        created_at: parse_time(row.get::<_, String>(18)?)?,
-        updated_at: parse_time(row.get::<_, String>(19)?)?,
-        exited_at: row.get::<_, Option<String>>(20)?.map(parse_time).transpose()?,
+        attention_summary: row.get(18)?,
+        created_at: parse_time(row.get::<_, String>(19)?)?,
+        updated_at: parse_time(row.get::<_, String>(20)?)?,
+        exited_at: row.get::<_, Option<String>>(21)?.map(parse_time).transpose()?,
     })
 }
 
@@ -445,6 +446,7 @@ mod tests {
             database: root.join("state.db"),
             config: root.join("config.toml"),
             logs_dir: root.join("logs"),
+            sessions_dir: root.join("sessions"),
             worktrees_dir: root.join("worktrees"),
             root,
         }
@@ -538,7 +540,8 @@ mod tests {
             ahead_count: if has_commits { 1 } else { 0 },
             has_commits,
             has_pending_changes,
-            pid: Some(1),
+            worker_pid: Some(1),
+            agent_pid: Some(2),
             exit_code: None,
             error: None,
             attention: AttentionLevel::Info,

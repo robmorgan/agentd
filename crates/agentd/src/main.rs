@@ -2,6 +2,7 @@ mod app;
 mod db;
 mod git;
 mod ids;
+mod session_worker;
 mod server;
 mod terminal_state;
 
@@ -11,7 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
 
 use agentd_shared::{paths::AppPaths, session::SessionStatus};
@@ -31,7 +32,29 @@ enum Command {
         #[arg(long)]
         daemonize: bool,
     },
+    #[command(hide = true)]
+    SessionWorker(SessionWorkerArgs),
     Upgrade,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct SessionWorkerArgs {
+    #[arg(long)]
+    pub session_id: String,
+    #[arg(long)]
+    pub repo_root: String,
+    #[arg(long)]
+    pub worktree: String,
+    #[arg(long)]
+    pub branch: String,
+    #[arg(long)]
+    pub agent_name: String,
+    #[arg(long)]
+    pub command: String,
+    #[arg(long)]
+    pub model: Option<String>,
+    #[arg(long = "arg")]
+    pub args: Vec<String>,
 }
 
 #[tokio::main]
@@ -45,6 +68,7 @@ async fn main() -> Result<()> {
                 server::serve().await
             }
         }
+        Command::SessionWorker(args) => session_worker::run(args).await,
         Command::Upgrade => upgrade_daemon().await,
     }
 }
@@ -70,7 +94,7 @@ async fn upgrade_daemon() -> Result<()> {
         .list_sessions()?
         .into_iter()
         .filter(|session| session.status == SessionStatus::Running)
-        .filter(|session| process_exists(session.pid))
+        .filter(|session| process_exists(session.worker_pid))
         .collect::<Vec<_>>();
 
     if !running_sessions.is_empty() {

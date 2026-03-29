@@ -8,7 +8,7 @@ use crate::session::{
     IntegrationPolicy, SessionDiff, SessionMode, SessionRecord, SessionStatus, WorktreeRecord,
 };
 
-pub const PROTOCOL_VERSION: u16 = 30;
+pub const PROTOCOL_VERSION: u16 = 31;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
@@ -74,6 +74,9 @@ pub enum Request {
     KillSession {
         session_id: String,
         remove: bool,
+    },
+    ResolveSessionRuntime {
+        session_id: String,
     },
     AttachSession {
         session_id: String,
@@ -145,6 +148,9 @@ pub enum Response {
         removed: bool,
         was_running: bool,
     },
+    RuntimeEndpoint {
+        socket_path: String,
+    },
     Attached {
         attach_id: String,
         snapshot: Vec<u8>,
@@ -203,6 +209,7 @@ enum MessageKind {
     CreateWorktreeRequest = 4,
     CleanupWorktreeRequest = 5,
     KillSessionRequest = 6,
+    ResolveSessionRuntimeRequest = 25,
     AttachSessionRequest = 7,
     AttachInputRequest = 8,
     AttachSnapshotRequest = 24,
@@ -221,6 +228,7 @@ enum MessageKind {
     DaemonInfoResponse = 101,
     CreateSessionResponse = 102,
     KillSessionResponse = 103,
+    RuntimeEndpointResponse = 120,
     AttachedResponse = 104,
     AttachSnapshotResponse = 119,
     SessionEndedResponse = 117,
@@ -247,6 +255,7 @@ impl MessageKind {
             4 => Self::CreateWorktreeRequest,
             5 => Self::CleanupWorktreeRequest,
             6 => Self::KillSessionRequest,
+            25 => Self::ResolveSessionRuntimeRequest,
             7 => Self::AttachSessionRequest,
             8 => Self::AttachInputRequest,
             24 => Self::AttachSnapshotRequest,
@@ -265,6 +274,7 @@ impl MessageKind {
             101 => Self::DaemonInfoResponse,
             102 => Self::CreateSessionResponse,
             103 => Self::KillSessionResponse,
+            120 => Self::RuntimeEndpointResponse,
             104 => Self::AttachedResponse,
             119 => Self::AttachSnapshotResponse,
             117 => Self::SessionEndedResponse,
@@ -481,6 +491,10 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             put_bool(&mut payload, *remove);
             MessageKind::KillSessionRequest
         }
+        Request::ResolveSessionRuntime { session_id } => {
+            put_string(&mut payload, session_id)?;
+            MessageKind::ResolveSessionRuntimeRequest
+        }
         Request::AttachSession { session_id, kind, cols, rows, pixel_width, pixel_height } => {
             put_string(&mut payload, session_id)?;
             put_attachment_kind(&mut payload, *kind);
@@ -575,6 +589,9 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
         MessageKind::KillSessionRequest => {
             Request::KillSession { session_id: cursor.take_string()?, remove: cursor.take_bool()? }
         }
+        MessageKind::ResolveSessionRuntimeRequest => {
+            Request::ResolveSessionRuntime { session_id: cursor.take_string()? }
+        }
         MessageKind::AttachSessionRequest => Request::AttachSession {
             session_id: cursor.take_string()?,
             kind: cursor.take_attachment_kind()?,
@@ -646,6 +663,10 @@ fn encode_response(response: &Response) -> Result<(MessageKind, Vec<u8>)> {
             put_bool(&mut payload, *removed);
             put_bool(&mut payload, *was_running);
             MessageKind::KillSessionResponse
+        }
+        Response::RuntimeEndpoint { socket_path } => {
+            put_string(&mut payload, socket_path)?;
+            MessageKind::RuntimeEndpointResponse
         }
         Response::Attached { attach_id, snapshot } => {
             put_string(&mut payload, attach_id)?;
@@ -736,6 +757,9 @@ fn decode_response(kind: MessageKind, payload: &[u8]) -> Result<Response> {
         }
         MessageKind::KillSessionResponse => {
             Response::KillSession { removed: cursor.take_bool()?, was_running: cursor.take_bool()? }
+        }
+        MessageKind::RuntimeEndpointResponse => {
+            Response::RuntimeEndpoint { socket_path: cursor.take_string()? }
         }
         MessageKind::AttachedResponse => {
             Response::Attached { attach_id: cursor.take_string()?, snapshot: cursor.take_bytes()? }
@@ -981,7 +1005,8 @@ fn put_session_record(buf: &mut Vec<u8>, session: &SessionRecord) -> Result<()> 
     put_u32(buf, session.ahead_count);
     put_bool(buf, session.has_commits);
     put_bool(buf, session.has_pending_changes);
-    put_optional_u32(buf, session.pid);
+    put_optional_u32(buf, session.worker_pid);
+    put_optional_u32(buf, session.agent_pid);
     put_optional_i32(buf, session.exit_code);
     put_optional_string(buf, session.error.as_deref())?;
     put_attention_level(buf, session.attention);
@@ -1244,7 +1269,8 @@ impl<'a> Cursor<'a> {
             ahead_count: self.take_u32()?,
             has_commits: self.take_bool()?,
             has_pending_changes: self.take_bool()?,
-            pid: self.take_optional_u32()?,
+            worker_pid: self.take_optional_u32()?,
+            agent_pid: self.take_optional_u32()?,
             exit_code: self.take_optional_i32()?,
             error: self.take_optional_string()?,
             attention: self.take_attention_level()?,
@@ -1477,7 +1503,8 @@ mod tests {
                 ahead_count: 0,
                 has_commits: false,
                 has_pending_changes: false,
-                pid: Some(123),
+                worker_pid: Some(123),
+                agent_pid: Some(456),
                 exit_code: None,
                 error: None,
                 attention: AttentionLevel::Info,

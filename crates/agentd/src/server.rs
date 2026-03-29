@@ -1,10 +1,10 @@
 use std::{io, path::Path};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::{
-    io::BufReader,
+    io::{AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream, unix::OwnedWriteHalf},
-    sync::{broadcast, watch},
+    sync::watch,
 };
 
 use agentd_shared::{
@@ -12,8 +12,8 @@ use agentd_shared::{
     paths::AppPaths,
     protocol::{
         DaemonInfo, DaemonManagementRequest, DaemonManagementResponse, DaemonManagementStatus,
-        IncomingRequest, PROTOCOL_VERSION, Request, Response, read_incoming_request, read_request,
-        write_daemon_management_response, write_response,
+        IncomingRequest, PROTOCOL_VERSION, Request, Response, read_incoming_request, read_response,
+        write_daemon_management_response, write_request, write_response,
     },
     session::AttachmentKind,
     session::{SessionRecord, SessionStatus},
@@ -151,6 +151,17 @@ async fn handle_connection(
                 }
             }
         }
+        IncomingRequest::Standard(Request::ResolveSessionRuntime { session_id }) => {
+            match runtime_socket_for(&state, &session_id).await {
+                Ok(socket_path) => {
+                    send_response(&mut writer, &Response::RuntimeEndpoint { socket_path }).await?
+                }
+                Err(err) => {
+                    send_response(&mut writer, &Response::Error { message: err.to_string() })
+                        .await?
+                }
+            }
+        }
         IncomingRequest::Standard(Request::AttachSession {
             session_id,
             kind,
@@ -160,7 +171,7 @@ async fn handle_connection(
             pixel_height,
         }) => {
             attach_session(
-                &state,
+                &state.paths,
                 &session_id,
                 kind,
                 cols,
@@ -183,22 +194,22 @@ async fn handle_connection(
             .await?;
         }
         IncomingRequest::Standard(Request::DetachSession { session_id, all }) => {
-            match state.detach_session(&session_id, all).await {
-                Ok(()) => send_response(&mut writer, &Response::Ok).await?,
-                Err(err) => {
-                    send_response(&mut writer, &Response::Error { message: err.to_string() })
-                        .await?
-                }
-            }
+            proxy_runtime_request(
+                &state.paths,
+                &session_id,
+                &Request::DetachSession { session_id: session_id.clone(), all },
+                &mut writer,
+            )
+            .await?;
         }
         IncomingRequest::Standard(Request::DetachAttachment { session_id, attach_id }) => {
-            match state.detach_attachment(&session_id, &attach_id).await {
-                Ok(()) => send_response(&mut writer, &Response::Ok).await?,
-                Err(err) => {
-                    send_response(&mut writer, &Response::Error { message: err.to_string() })
-                        .await?
-                }
-            }
+            proxy_runtime_request(
+                &state.paths,
+                &session_id,
+                &Request::DetachAttachment { session_id: session_id.clone(), attach_id },
+                &mut writer,
+            )
+            .await?;
         }
         IncomingRequest::Standard(Request::AttachInput { .. }) => {
             send_response(
@@ -219,13 +230,9 @@ async fn handle_connection(
             .await?;
         }
         IncomingRequest::Standard(Request::SendInput { session_id, data, source_session_id }) => {
-            match state.send_input(&session_id, data, source_session_id).await {
-                Ok(()) => send_response(&mut writer, &Response::InputAccepted).await?,
-                Err(err) => {
-                    send_response(&mut writer, &Response::Error { message: err.to_string() })
-                        .await?
-                }
-            }
+            let request =
+                Request::SendInput { session_id: session_id.clone(), data, source_session_id };
+            proxy_runtime_request(&state.paths, &session_id, &request, &mut writer).await?;
         }
         IncomingRequest::Standard(Request::ApplySession { session_id }) => {
             match state.apply_session(&session_id).await {
@@ -284,22 +291,30 @@ async fn handle_connection(
             send_response(&mut writer, &Response::Sessions { sessions }).await?;
         }
         IncomingRequest::Standard(Request::ListAttachments { session_id }) => {
-            match state.list_attachments(&session_id).await {
-                Ok(attachments) => {
-                    send_response(&mut writer, &Response::Attachments { attachments }).await?
-                }
-                Err(err) => {
-                    send_response(&mut writer, &Response::Error { message: err.to_string() })
-                        .await?
-                }
-            }
+            proxy_runtime_request(
+                &state.paths,
+                &session_id,
+                &Request::ListAttachments { session_id: session_id.clone() },
+                &mut writer,
+            )
+            .await?;
         }
         IncomingRequest::Standard(Request::GetHistory { session_id, vt }) => {
-            match state.get_history(&session_id, vt).await {
-                Ok(data) => send_response(&mut writer, &Response::History { data }).await?,
-                Err(err) => {
-                    send_response(&mut writer, &Response::Error { message: err.to_string() })
-                        .await?
+            if connect_runtime_stream(&state.paths, &session_id).await.is_ok() {
+                proxy_runtime_request(
+                    &state.paths,
+                    &session_id,
+                    &Request::GetHistory { session_id: session_id.clone(), vt },
+                    &mut writer,
+                )
+                .await?;
+            } else {
+                match state.get_history(&session_id, vt).await {
+                    Ok(data) => send_response(&mut writer, &Response::History { data }).await?,
+                    Err(err) => {
+                        send_response(&mut writer, &Response::Error { message: err.to_string() })
+                            .await?
+                    }
                 }
             }
         }
@@ -358,7 +373,7 @@ async fn handle_daemon_management_request(
 }
 
 async fn attach_session(
-    state: &AppState,
+    paths: &agentd_shared::paths::AppPaths,
     session_id: &str,
     kind: AttachmentKind,
     cols: u16,
@@ -368,113 +383,64 @@ async fn attach_session(
     reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: &mut OwnedWriteHalf,
 ) -> Result<()> {
-    let (_handle, attachment, snapshot, mut output_rx, mut control_rx) =
-        match state.attach_session(session_id, kind, cols, rows, pixel_width, pixel_height).await {
-            Ok(attached) => attached,
-            Err(err) => {
-                let response = match ended_session_response(state, session_id).await? {
-                    Some(response) => response,
-                    None => Response::Error { message: err.to_string() },
-                };
-                send_response(writer, &response).await?;
-                return Ok(());
-            }
-        };
-
-    send_response(writer, &Response::Attached { attach_id: attachment.attach_id, snapshot })
-        .await?;
-    let mut final_response = Some(Response::EndOfStream);
-
-    loop {
-        tokio::select! {
-            output = output_rx.recv() => match output {
-                Ok(data) => {
-                    send_response(
-                        writer,
-                        &Response::PtyOutput { data },
-                    )
-                    .await?
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => {
-                    final_response = end_of_attach_response(state, session_id).await?;
-                    break;
-                }
-            },
-            control = control_rx.recv() => match control {
-                Some(crate::app::AttachControl::Detach) => break,
-                None => {
-                    final_response = end_of_attach_response(state, session_id).await?;
-                    break;
-                }
-            },
-            request = read_request(reader) => {
-                let Some(request) = request? else {
-                    break;
-                };
-                match request {
-                    Request::AttachResize { cols, rows, pixel_width, pixel_height } => {
-                        if let Err(err) = state
-                            .resize_attached_session(
-                                session_id,
-                                cols,
-                                rows,
-                                pixel_width,
-                                pixel_height,
-                            )
-                            .await
-                        {
-                            final_response = Some(match ended_session_response(state, session_id).await? {
-                                Some(response) => response,
-                                None => Response::Error {
-                                    message: err.to_string(),
-                                },
-                            });
-                            break;
-                        }
-                    }
-                    Request::AttachInput { data } => {
-                        if let Err(err) = state.write_attached_input(session_id, data).await {
-                            final_response = Some(match ended_session_response(state, session_id).await? {
-                                Some(response) => response,
-                                None => Response::Error {
-                                    message: err.to_string(),
-                                },
-                            });
-                            break;
-                        }
-                    }
-                    Request::AttachSnapshot => {
-                        match state.snapshot_attached_session(session_id).await {
-                            Ok(snapshot) => {
-                                send_response(writer, &Response::AttachSnapshot { snapshot }).await?;
-                            }
-                            Err(err) => {
-                                final_response = Some(match ended_session_response(state, session_id).await? {
-                                    Some(response) => response,
-                                    None => Response::Error {
-                                        message: err.to_string(),
-                                    },
-                                });
-                                break;
-                            }
-                        }
-                    }
-                    other => {
-                        final_response = Some(Response::Error {
-                            message: format!("unexpected request during attach: {other:?}"),
-                        });
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(response) = final_response {
-        send_response(writer, &response).await?;
-    }
+    let mut runtime = connect_runtime_stream(paths, session_id).await?;
+    write_request(
+        &mut runtime,
+        &Request::AttachSession {
+            session_id: session_id.to_string(),
+            kind,
+            cols,
+            rows,
+            pixel_width,
+            pixel_height,
+        },
+    )
+    .await?;
+    let (mut runtime_reader, mut runtime_writer) = runtime.into_split();
+    let client_to_runtime = tokio::io::copy(reader, &mut runtime_writer);
+    let runtime_to_client = tokio::io::copy(&mut runtime_reader, writer);
+    let _ = tokio::try_join!(client_to_runtime, runtime_to_client)?;
+    let _ = writer.shutdown().await;
     Ok(())
+}
+
+async fn runtime_socket_for(state: &AppState, session_id: &str) -> Result<String> {
+    let session = state
+        .get_session(session_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session `{session_id}` not found"))?;
+    if session.status != SessionStatus::Running {
+        bail!("session `{session_id}` is not running");
+    }
+    let socket_path = state.paths.session_socket_path(session_id);
+    if !socket_path.exists() {
+        bail!("session `{session_id}` does not have a live runtime socket");
+    }
+    Ok(socket_path.to_string())
+}
+
+async fn connect_runtime_stream(
+    paths: &agentd_shared::paths::AppPaths,
+    session_id: &str,
+) -> Result<UnixStream> {
+    UnixStream::connect(paths.session_socket_path(session_id).as_std_path())
+        .await
+        .with_context(|| format!("failed to connect to runtime for session `{session_id}`"))
+}
+
+async fn proxy_runtime_request(
+    paths: &agentd_shared::paths::AppPaths,
+    session_id: &str,
+    request: &Request,
+    writer: &mut OwnedWriteHalf,
+) -> Result<()> {
+    let mut stream = connect_runtime_stream(paths, session_id).await?;
+    write_request(&mut stream, request).await?;
+    let mut reader = BufReader::new(stream);
+    let Some(response) = read_response(&mut reader).await? else {
+        bail!("session runtime closed the connection");
+    };
+    send_response(writer, &response).await
 }
 
 async fn end_of_attach_response(state: &AppState, session_id: &str) -> Result<Option<Response>> {
@@ -543,7 +509,8 @@ mod tests {
             ahead_count: 0,
             has_commits: false,
             has_pending_changes: false,
-            pid: Some(123),
+            worker_pid: Some(123),
+            agent_pid: Some(456),
             exit_code: Some(0),
             error: None,
             attention: AttentionLevel::Info,

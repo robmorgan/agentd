@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     io::{Read, Write},
-    sync::{Arc, Mutex, mpsc as std_mpsc},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -14,7 +14,7 @@ use nix::{
     sys::signal::{Signal, kill},
     unistd::Pid,
 };
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use tokio::sync::mpsc;
 use tokio::{sync::broadcast, task};
 
@@ -33,7 +33,7 @@ use crate::{
     db::{Database, NewSession},
     git,
     ids::generate_session_id,
-    terminal_state::{GhosttyTerminalState, TerminalStateEngine},
+    terminal_state::TerminalStateEngine,
 };
 
 #[derive(Clone)]
@@ -158,7 +158,7 @@ impl AppState {
     pub async fn reconcile_sessions(&self) -> Result<()> {
         let sessions = self.list_sessions().await?;
         for session in sessions {
-            if accepts_live_io(&session) {
+            if session.status == SessionStatus::Running && !process_exists(session.worker_pid) {
                 let db = self.db.clone();
                 let session_id = session.session_id.clone();
                 task::spawn_blocking(move || db.mark_unknown_recovered(&session_id)).await??;
@@ -241,13 +241,13 @@ impl AppState {
                 .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
 
             let was_running =
-                session.status == SessionStatus::Running && process_exists(session.pid);
+                session.status == SessionStatus::Running && process_exists(session.worker_pid);
             if !was_running && !remove {
                 bail!("session `{session_id}` is not running");
             }
 
             if was_running {
-                terminate_session_process(&session_id, session.pid)?;
+                terminate_session_process(&session_id, session.worker_pid)?;
                 let _ = db.mark_exited(&session_id, None, ApplyState::Idle);
             }
 
@@ -476,6 +476,13 @@ impl AppState {
             return Ok(if vt { history.vt } else { history.plain });
         }
 
+        let log_path =
+            if vt { self.paths.log_path(session_id) } else { self.paths.rendered_log_path(session_id) };
+        if log_path.exists() {
+            return std::fs::read_to_string(log_path.as_std_path())
+                .with_context(|| format!("failed to read {}", log_path));
+        }
+
         bail!(
             "history for session `{}` is not available; it is only retained until the daemon restarts",
             session.session_id
@@ -553,72 +560,72 @@ fn start_session_runtime(
     paths: &AppPaths,
     db: &Database,
     config: &Config,
-    runtimes: &SessionRuntimeRegistry,
+    _runtimes: &SessionRuntimeRegistry,
     request: SessionStartRequest<'_>,
 ) -> Result<()> {
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: DEFAULT_PTY_ROWS,
-            cols: DEFAULT_PTY_COLS,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .context("failed to allocate PTY")?;
-
-    let mut command = CommandBuilder::new(&request.launch.command);
-    configure_spawn_command(&mut command, &request, config)?;
-    command.cwd(request.worktree);
-    for (key, value) in std::env::vars() {
-        command.env(&key, &value);
+    let current_exe = std::env::current_exe().context("failed to resolve agentd executable")?;
+    let mut launch_args = request.launch.args.clone();
+    if let Some(model) = request.model
+        && let Some(flag) = config
+            .agents
+            .get(&request.launch.agent_name)
+            .and_then(|agent| agent.model_flag.as_deref())
+    {
+        launch_args.push(flag.to_string());
+        launch_args.push(model.to_string());
     }
-    command.env("AGENTD_SESSION_ID", request.session_id);
-    command.env("AGENTD_SESSION_NAME", request.session_id);
-    command.env("AGENTD_SOCKET", paths.socket.as_str());
-    command.env("AGENTD_WORKSPACE", request.repo_root);
-    command.env("AGENTD_WORKTREE", request.worktree);
-    command.env("AGENTD_BRANCH", request.branch);
 
-    let mut child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(|err| anyhow!(err).context("failed to spawn agent process"))?;
+    let mut command = std::process::Command::new(current_exe);
+    command
+        .arg("session-worker")
+        .arg("--session-id")
+        .arg(request.session_id)
+        .arg("--repo-root")
+        .arg(request.repo_root)
+        .arg("--worktree")
+        .arg(request.worktree)
+        .arg("--branch")
+        .arg(request.branch)
+        .arg("--agent-name")
+        .arg(&request.launch.agent_name)
+        .arg("--command")
+        .arg(&request.launch.command)
+        .env("AGENTD_DIR", paths.root.as_str())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(model) = request.model {
+        command.arg("--model").arg(model);
+    }
+    for arg in launch_args {
+        command.arg("--arg").arg(arg);
+    }
 
-    let pid = child.process_id().map(|value| value as u32).unwrap_or(0);
-    db.mark_running(request.session_id, pid)?;
+    command
+        .spawn()
+        .context("failed to spawn session worker")?;
 
-    let reader = pair.master.try_clone_reader().context("failed to clone PTY reader")?;
-    let writer = pair.master.take_writer().context("failed to clone PTY writer")?;
-    let terminal_state =
-        GhosttyTerminalState::new(DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS, MAX_SCROLLBACK_BYTES)
-            .context("failed to initialize libghostty-vt state")?;
-    let runtime = runtimes.insert(
-        request.session_id.to_string(),
-        SessionRuntime::new(pair.master, writer, Box::new(terminal_state), OUTPUT_BUFFER_CAPACITY),
-    );
-    let writer_db = db.clone();
-    let writer_session_id = request.session_id.to_string();
-    let writer_runtime = runtime.clone();
-    let (writer_done_tx, writer_done_rx) = std_mpsc::channel();
-    std::thread::spawn(move || {
-        let result = pump_pty(reader, &writer_runtime);
-        if let Err(err) = result {
-            let _ = record_session_failure(&writer_db, &writer_session_id, err.to_string());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let session =
+            db.get_session(request.session_id)?.ok_or_else(|| anyhow!("session missing after worker spawn"))?;
+        if session.status == SessionStatus::Running
+            && session.worker_pid.is_some()
+            && paths.session_socket_path(request.session_id).exists()
+        {
+            break;
         }
-        let _ = writer_done_tx.send(());
-    });
-
-    let exit_db = db.clone();
-    let exit_session_id = request.session_id.to_string();
-    let exit_runtimes = runtimes.clone();
-    std::thread::spawn(move || {
-        let status = child.wait();
-        let code = status.ok().map(|value| value.exit_code() as i32);
-        exit_runtimes.freeze_history(&exit_session_id);
-        exit_runtimes.remove(&exit_session_id);
-        let _ = writer_done_rx.recv();
-        let _ = finalize_session_exit(&exit_db, &exit_session_id, code);
-    });
+        if matches!(session.status, SessionStatus::Failed | SessionStatus::Exited) {
+            bail!(
+                "{}",
+                session.error.unwrap_or_else(|| "session worker exited before becoming ready".to_string())
+            );
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for session worker to start");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     Ok(())
 }
@@ -1194,7 +1201,7 @@ fn ensure_session_not_running(session: &SessionRecord) -> Result<()> {
 }
 
 fn accepts_live_io(session: &SessionRecord) -> bool {
-    session.status == SessionStatus::Running && process_exists(session.pid)
+    session.status == SessionStatus::Running && process_exists(session.worker_pid)
 }
 
 fn ensure_not_mergeable(session: &SessionRecord, action: &str) -> Result<()> {
@@ -1886,7 +1893,8 @@ mod tests {
             ahead_count: 1,
             has_commits: true,
             has_pending_changes: true,
-            pid: None,
+            worker_pid: None,
+            agent_pid: None,
             exit_code: Some(0),
             error: None,
             attention: agentd_shared::session::AttentionLevel::Notice,
@@ -1957,6 +1965,7 @@ mod tests {
             database: root.join("state.db"),
             config: root.join("config.toml"),
             logs_dir: root.join("logs"),
+            sessions_dir: root.join("sessions"),
             worktrees_dir: root.join("worktrees"),
             root,
         }

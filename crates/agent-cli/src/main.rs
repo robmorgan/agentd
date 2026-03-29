@@ -978,7 +978,7 @@ fn local_kill(paths: &AppPaths, session_id: &str, remove: bool) -> Result<()> {
     }
 
     if was_running {
-        local::terminate_session_process(session_id, session.pid)?;
+        local::terminate_session_process(session_id, session.worker_pid)?;
         store.mark_exited(session_id, None)?;
     } else if session.status == SessionStatus::Running {
         store.mark_unknown_recovered(session_id)?;
@@ -1534,8 +1534,11 @@ fn print_session(session: &SessionRecord) {
     println!("base_branch: {}", session.base_branch);
     println!("branch: {}", session.branch);
     println!("worktree: {}", session.worktree);
-    if let Some(pid) = session.pid {
-        println!("pid: {pid}");
+    if let Some(worker_pid) = session.worker_pid {
+        println!("worker_pid: {worker_pid}");
+    }
+    if let Some(agent_pid) = session.agent_pid {
+        println!("agent_pid: {agent_pid}");
     }
     if let Some(exit_code) = session.exit_code {
         println!("exit_code: {exit_code}");
@@ -2787,7 +2790,8 @@ command = "claude"
             ahead_count: if has_pending_changes { 1 } else { 0 },
             has_commits: has_pending_changes,
             has_pending_changes,
-            pid: Some(123),
+            worker_pid: Some(123),
+            agent_pid: Some(456),
             exit_code: None,
             error: None,
             attention,
@@ -2808,6 +2812,7 @@ command = "claude"
             database: root.join("state.db"),
             config: root.join("config.toml"),
             logs_dir: root.join("logs"),
+            sessions_dir: root.join("sessions"),
             worktrees_dir: root.join("worktrees"),
             root,
         }

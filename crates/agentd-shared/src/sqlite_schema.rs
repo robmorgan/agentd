@@ -1,7 +1,7 @@
 use anyhow::{Result, bail, ensure};
 use rusqlite::Connection;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 6;
+pub const CURRENT_SCHEMA_VERSION: i32 = 7;
 const EXPECTED_SESSIONS_COLUMNS: &[&str] = &[
     "session_id",
     "agent",
@@ -15,7 +15,8 @@ const EXPECTED_SESSIONS_COLUMNS: &[&str] = &[
     "worktree",
     "status",
     "integration_policy",
-    "pid",
+    "worker_pid",
+    "agent_pid",
     "exit_code",
     "error",
     "integration_state",
@@ -78,6 +79,7 @@ fn ensure_supported_schema(conn: &Connection, schema_version: i32) -> Result<()>
 fn migrate_schema(_conn: &Connection, schema_version: i32) -> Result<()> {
     match schema_version {
         CURRENT_SCHEMA_VERSION => Ok(()),
+        6 => migrate_v6_to_v7(_conn),
         other => bail!(
             "unsupported state database schema version {other}; expected {CURRENT_SCHEMA_VERSION}. Remove or migrate the runtime root."
         ),
@@ -100,7 +102,8 @@ fn create_schema(conn: &Connection) -> Result<()> {
             worktree TEXT NOT NULL,
             status TEXT NOT NULL CHECK (status IN ('creating', 'running', 'exited', 'failed', 'unknown_recovered')),
             integration_policy TEXT NOT NULL CHECK (integration_policy IN ('manual_review', 'auto_apply_safe')),
-            pid INTEGER,
+            worker_pid INTEGER,
+            agent_pid INTEGER,
             exit_code INTEGER,
             error TEXT,
             integration_state TEXT NOT NULL CHECK (integration_state IN ('idle', 'auto_applying', 'applied', 'discarded')),
@@ -110,7 +113,52 @@ fn create_schema(conn: &Connection) -> Result<()> {
             updated_at TEXT NOT NULL,
             exited_at TEXT
         );
-        PRAGMA user_version = 6;
+        PRAGMA user_version = 7;
+        ",
+    )?;
+    Ok(())
+}
+
+fn migrate_v6_to_v7(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        ALTER TABLE sessions RENAME TO sessions_v6;
+        CREATE TABLE sessions (
+            session_id TEXT PRIMARY KEY,
+            agent TEXT NOT NULL,
+            model TEXT,
+            mode TEXT NOT NULL CHECK (mode IN ('execute', 'plan')),
+            workspace TEXT NOT NULL,
+            repo_path TEXT NOT NULL,
+            repo_name TEXT NOT NULL,
+            base_branch TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            worktree TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('creating', 'running', 'exited', 'failed', 'unknown_recovered')),
+            integration_policy TEXT NOT NULL CHECK (integration_policy IN ('manual_review', 'auto_apply_safe')),
+            worker_pid INTEGER,
+            agent_pid INTEGER,
+            exit_code INTEGER,
+            error TEXT,
+            integration_state TEXT NOT NULL CHECK (integration_state IN ('idle', 'auto_applying', 'applied', 'discarded')),
+            attention TEXT NOT NULL CHECK (attention IN ('info', 'notice', 'action')),
+            attention_summary TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            exited_at TEXT
+        );
+        INSERT INTO sessions (
+            session_id, agent, model, mode, workspace, repo_path, repo_name, base_branch, branch, worktree,
+            status, integration_policy, worker_pid, agent_pid, exit_code, error, integration_state,
+            attention, attention_summary, created_at, updated_at, exited_at
+        )
+        SELECT
+            session_id, agent, model, mode, workspace, repo_path, repo_name, base_branch, branch, worktree,
+            status, integration_policy, NULL, pid, exit_code, error, integration_state,
+            attention, attention_summary, created_at, updated_at, exited_at
+        FROM sessions_v6;
+        DROP TABLE sessions_v6;
+        PRAGMA user_version = 7;
         ",
     )?;
     Ok(())

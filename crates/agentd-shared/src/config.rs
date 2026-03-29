@@ -134,6 +134,7 @@ mod tests {
             database: root.join("state.db"),
             config: root.join("config.toml"),
             logs_dir: root.join("logs"),
+            sessions_dir: root.join("sessions"),
             worktrees_dir: root.join("worktrees"),
             root,
         }
