@@ -17,9 +17,11 @@ use clap::{
     },
 };
 use crossterm::{
+    event::EventStream,
     style::{Attribute as CrosAttribute, Color as CrosColor, Stylize},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
+use futures::StreamExt;
 use libc::{
     _POSIX_VDISABLE, O_NONBLOCK, TCSAFLUSH, TCSANOW, TIOCGWINSZ, VLNEXT, VMIN, VQUIT, VTIME,
     cfmakeraw, fcntl, tcgetattr, tcsetattr, termios, winsize,
@@ -1127,7 +1129,7 @@ async fn attach_session_once(
 
     title_guard.set_session(session_id)?;
     eprintln!(
-        "attached to {session_id} ({attach_id}); Ctrl-\\\\ detaches, Ctrl-[/Ctrl-] switch running sessions"
+        "attached to {session_id} ({attach_id}); Ctrl-B overlay, Ctrl-\\\\ detaches, Ctrl-[/Ctrl-] switch running sessions"
     );
     let _terminal = AttachTerminalGuard::enter()?;
     let raw_input = AttachRawInput::new()?;
@@ -1135,79 +1137,64 @@ async fn attach_session_once(
         signal(SignalKind::window_change()).context("failed to watch terminal resize")?;
     write_session_snapshot(&snapshot)?;
     let mut input_parser = AttachInputParser::default();
+    let mut overlay: Option<runtime::AttachOverlay> = None;
+    let mut overlay_events: Option<EventStream> = None;
 
     loop {
-        tokio::select! {
-            chunk = raw_input.read_chunk() => {
-                let Some(chunk) = chunk? else {
-                    break;
-                };
-                for action in input_parser.push_bytes(&chunk) {
-                    match action {
-                        AttachInputAction::Data(data) => {
-                            write_request(&mut write_half, &Request::AttachInput { data }).await?;
+        if let Some(active_overlay) = overlay.as_mut() {
+            active_overlay.draw()?;
+            let event_stream = overlay_events
+                .as_mut()
+                .expect("overlay event stream should exist while overlay is active");
+            tokio::select! {
+                maybe_event = event_stream.next() => {
+                    let Some(event) = maybe_event.transpose().context("failed to read overlay input")? else {
+                        break;
+                    };
+                    if let Some(outcome) = active_overlay.handle_event(event).await? {
+                        match outcome {
+                            runtime::OverlayOutcome::Close => match refresh_attach_snapshot(&mut reader, &mut write_half).await? {
+                                AttachOverlayClose::Restored(snapshot) => {
+                                    write_session_snapshot(&snapshot)?;
+                                    overlay = None;
+                                    overlay_events = None;
+                                }
+                                AttachOverlayClose::SwitchSession(target_session_id) => {
+                                    drop(write_half);
+                                    return Ok(AttachOutcome::SwitchSession(target_session_id));
+                                }
+                                AttachOverlayClose::SessionEnded(summary) => {
+                                    drop(write_half);
+                                    return Ok(AttachOutcome::SessionEnded(summary));
+                                }
+                            },
+                            runtime::OverlayOutcome::ForwardInput(data) => {
+                                write_request(&mut write_half, &Request::AttachInput { data }).await?;
+                            }
+                            runtime::OverlayOutcome::SwitchSession(target_session_id) => {
+                                drop(write_half);
+                                return Ok(AttachOutcome::SwitchSession(target_session_id));
+                            }
                         }
-                        AttachInputAction::Detach => {
+                    }
+                }
+                resize = resize_signal.recv() => {
+                    if resize.is_none() {
+                        break;
+                    }
+                    send_attach_resize(&mut write_half, current_terminal_geometry()).await?;
+                }
+                response = read_response(&mut reader) => {
+                    let Some(response) = response? else {
+                        break;
+                    };
+                    match response {
+                        Response::PtyOutput { .. } => {}
+                        Response::SwitchSession { session_id } => {
                             drop(write_half);
-                            return Ok(AttachOutcome::Detached);
+                            return Ok(AttachOutcome::SwitchSession(session_id));
                         }
-                        AttachInputAction::PreviousSession => {
-                            if let Some(target_session_id) = adjacent_live_session_id(
-                                paths,
-                                session_id,
-                                AttachSessionDirection::Previous,
-                            )
-                            .await?
-                            {
-                                drop(write_half);
-                                return Ok(AttachOutcome::SwitchSession(target_session_id));
-                            }
-                        }
-                        AttachInputAction::NextSession => {
-                            if let Some(target_session_id) = adjacent_live_session_id(
-                                paths,
-                                session_id,
-                                AttachSessionDirection::Next,
-                            )
-                            .await?
-                            {
-                                drop(write_half);
-                                return Ok(AttachOutcome::SwitchSession(target_session_id));
-                            }
-                        }
-                    }
-                }
-            }
-            resize = resize_signal.recv() => {
-                if resize.is_none() {
-                    break;
-                }
-                send_attach_resize(&mut write_half, current_terminal_geometry()).await?;
-            }
-            response = read_response(&mut reader) => {
-                let Some(response) = response? else {
-                    break;
-                };
-                match response {
-                    Response::PtyOutput { data } => {
-                        write_attach_bytes(&data)?;
-                    }
-                    Response::SwitchSession { session_id } => {
-                        drop(write_half);
-                        return Ok(AttachOutcome::SwitchSession(session_id));
-                    }
-                    Response::SessionEnded {
-                        session_id,
-                        status,
-                        apply_state,
-                        has_commits,
-                        branch,
-                        worktree,
-                        exit_code,
-                        error,
-                    } => {
-                        drop(write_half);
-                        return Ok(AttachOutcome::SessionEnded(SessionEndSummary {
+                        Response::SessionEnded {
                             session_id,
                             status,
                             apply_state,
@@ -1216,11 +1203,127 @@ async fn attach_session_once(
                             worktree,
                             exit_code,
                             error,
-                        }));
+                        } => {
+                            drop(write_half);
+                            return Ok(AttachOutcome::SessionEnded(SessionEndSummary {
+                                session_id,
+                                status,
+                                apply_state,
+                                has_commits,
+                                branch,
+                                worktree,
+                                exit_code,
+                                error,
+                            }));
+                        }
+                        Response::AttachSnapshot { .. } => {
+                            bail!("unexpected attach snapshot response outside overlay restore");
+                        }
+                        Response::EndOfStream => break,
+                        Response::Error { message } => bail!(message),
+                        other => bail!("unexpected response: {:?}", other),
                     }
-                    Response::EndOfStream => break,
-                    Response::Error { message } => bail!(message),
-                    other => bail!("unexpected response: {:?}", other),
+                }
+            }
+        } else {
+            tokio::select! {
+                chunk = raw_input.read_chunk() => {
+                    let Some(chunk) = chunk? else {
+                        break;
+                    };
+                    for action in input_parser.push_bytes(&chunk) {
+                        match action {
+                            AttachInputAction::Data(data) => {
+                                write_request(&mut write_half, &Request::AttachInput { data }).await?;
+                            }
+                            AttachInputAction::Detach => {
+                                drop(write_half);
+                                return Ok(AttachOutcome::Detached);
+                            }
+                            AttachInputAction::OpenOverlay => {
+                                let mut new_overlay = runtime::AttachOverlay::new(
+                                    paths.clone(),
+                                    session_id.to_string(),
+                                );
+                                new_overlay.open().await?;
+                                overlay_events = Some(EventStream::new());
+                                overlay = Some(new_overlay);
+                                break;
+                            }
+                            AttachInputAction::PreviousSession => {
+                                if let Some(target_session_id) = adjacent_live_session_id(
+                                    paths,
+                                    session_id,
+                                    AttachSessionDirection::Previous,
+                                )
+                                .await?
+                                {
+                                    drop(write_half);
+                                    return Ok(AttachOutcome::SwitchSession(target_session_id));
+                                }
+                            }
+                            AttachInputAction::NextSession => {
+                                if let Some(target_session_id) = adjacent_live_session_id(
+                                    paths,
+                                    session_id,
+                                    AttachSessionDirection::Next,
+                                )
+                                .await?
+                                {
+                                    drop(write_half);
+                                    return Ok(AttachOutcome::SwitchSession(target_session_id));
+                                }
+                            }
+                        }
+                    }
+                }
+                resize = resize_signal.recv() => {
+                    if resize.is_none() {
+                        break;
+                    }
+                    send_attach_resize(&mut write_half, current_terminal_geometry()).await?;
+                }
+                response = read_response(&mut reader) => {
+                    let Some(response) = response? else {
+                        break;
+                    };
+                    match response {
+                        Response::PtyOutput { data } => {
+                            write_attach_bytes(&data)?;
+                        }
+                        Response::SwitchSession { session_id } => {
+                            drop(write_half);
+                            return Ok(AttachOutcome::SwitchSession(session_id));
+                        }
+                        Response::SessionEnded {
+                            session_id,
+                            status,
+                            apply_state,
+                            has_commits,
+                            branch,
+                            worktree,
+                            exit_code,
+                            error,
+                        } => {
+                            drop(write_half);
+                            return Ok(AttachOutcome::SessionEnded(SessionEndSummary {
+                                session_id,
+                                status,
+                                apply_state,
+                                has_commits,
+                                branch,
+                                worktree,
+                                exit_code,
+                                error,
+                            }));
+                        }
+                        Response::AttachSnapshot { .. } => {
+                            bail!("unexpected attach snapshot response during passthrough");
+                        }
+                        Response::EndOfStream => break,
+                        Response::Error { message } => bail!(message),
+                        other => bail!("unexpected response: {:?}", other),
+                    }
                 }
             }
         }
@@ -1228,6 +1331,57 @@ async fn attach_session_once(
 
     drop(write_half);
     Ok(AttachOutcome::Detached)
+}
+
+enum AttachOverlayClose {
+    Restored(Vec<u8>),
+    SwitchSession(String),
+    SessionEnded(SessionEndSummary),
+}
+
+async fn refresh_attach_snapshot(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+) -> Result<AttachOverlayClose> {
+    write_request(write_half, &Request::AttachSnapshot).await?;
+    loop {
+        let Some(response) = read_response(reader).await? else {
+            bail!("agentd closed the attach connection");
+        };
+        match response {
+            Response::AttachSnapshot { snapshot } => {
+                return Ok(AttachOverlayClose::Restored(snapshot));
+            }
+            Response::PtyOutput { .. } => {}
+            Response::SwitchSession { session_id } => {
+                return Ok(AttachOverlayClose::SwitchSession(session_id));
+            }
+            Response::SessionEnded {
+                session_id,
+                status,
+                apply_state,
+                has_commits,
+                branch,
+                worktree,
+                exit_code,
+                error,
+            } => {
+                return Ok(AttachOverlayClose::SessionEnded(SessionEndSummary {
+                    session_id,
+                    status,
+                    apply_state,
+                    has_commits,
+                    branch,
+                    worktree,
+                    exit_code,
+                    error,
+                }));
+            }
+            Response::EndOfStream => bail!("attach stream ended while restoring snapshot"),
+            Response::Error { message } => bail!(message),
+            other => bail!("unexpected response while restoring attach snapshot: {other:?}"),
+        }
+    }
 }
 
 async fn send_attach_resize(
@@ -1458,6 +1612,7 @@ fn print_kill_result(session_id: &str, was_running: bool, removed: bool) {
 }
 
 const ATTACH_DETACH_BYTE: u8 = 0x1c;
+const ATTACH_OVERLAY_BYTE: u8 = 0x02;
 const ATTACH_NEXT_SESSION_BYTE: u8 = 0x1d;
 const ATTACH_PREVIOUS_SESSION_CODEPOINT: u32 = 91;
 const ATTACH_DETACH_CODEPOINT: u32 = 92;
@@ -1467,6 +1622,7 @@ const ATTACH_NEXT_SESSION_CODEPOINT: u32 = 93;
 enum AttachInputAction {
     Data(Vec<u8>),
     Detach,
+    OpenOverlay,
     PreviousSession,
     NextSession,
 }
@@ -1502,6 +1658,10 @@ impl AttachInputParser {
             }
 
             match input[index] {
+                ATTACH_OVERLAY_BYTE => {
+                    flush_attach_bytes(&mut actions, &mut forwarded);
+                    actions.push(AttachInputAction::OpenOverlay);
+                }
                 ATTACH_DETACH_BYTE => {
                     flush_attach_bytes(&mut actions, &mut forwarded);
                     actions.push(AttachInputAction::Detach);
@@ -1948,13 +2108,13 @@ mod tests {
 
     use super::{
         AGENTD_ATTACH_ENTER_SEQUENCE, AGENTD_ATTACH_EXIT_TITLE, AGENTD_ATTACH_RESTORE_SEQUENCE,
-        ATTACH_DETACH_BYTE, ATTACH_NEXT_SESSION_BYTE, AttachInputAction, AttachInputParser,
-        AttachSessionDirection, Cli, Command, DaemonCommand, DegradedNoticeCommand,
-        SessionEndSummary, adjacent_live_session_id_in, attach_startup_bytes, bail_daemon_command,
-        clear_stale_daemon_state, cli_command, cli_styles, format_attach_title,
-        format_session_end_summary, render_diff_text, resolve_detach_session_id,
-        resolve_merge_session_id, resolve_new_session_options, should_colorize_diff_output,
-        should_print_degraded_notice, terminal_title_bytes,
+        ATTACH_DETACH_BYTE, ATTACH_NEXT_SESSION_BYTE, ATTACH_OVERLAY_BYTE, AttachInputAction,
+        AttachInputParser, AttachSessionDirection, Cli, Command, DaemonCommand,
+        DegradedNoticeCommand, SessionEndSummary, adjacent_live_session_id_in,
+        attach_startup_bytes, bail_daemon_command, clear_stale_daemon_state, cli_command,
+        cli_styles, format_attach_title, format_session_end_summary, render_diff_text,
+        resolve_detach_session_id, resolve_merge_session_id, resolve_new_session_options,
+        should_colorize_diff_output, should_print_degraded_notice, terminal_title_bytes,
     };
     use agentd_shared::session::{
         ApplyState, AttentionLevel, IntegrationPolicy, SessionMode, SessionRecord, SessionStatus,
@@ -2346,6 +2506,12 @@ command = "claude"
     fn attach_parser_switches_to_next_session_on_kitty_ctrl_right_bracket() {
         let mut parser = AttachInputParser::default();
         assert_eq!(parser.push_bytes(b"\x1b[93;5u"), vec![AttachInputAction::NextSession]);
+    }
+
+    #[test]
+    fn attach_parser_opens_overlay_on_ctrl_b_byte() {
+        let mut parser = AttachInputParser::default();
+        assert_eq!(parser.push_bytes(&[ATTACH_OVERLAY_BYTE]), vec![AttachInputAction::OpenOverlay]);
     }
 
     #[test]

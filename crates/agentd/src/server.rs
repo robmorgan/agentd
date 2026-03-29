@@ -172,6 +172,16 @@ async fn handle_connection(
             )
             .await?;
         }
+        IncomingRequest::Standard(Request::AttachSnapshot) => {
+            send_response(
+                &mut writer,
+                &Response::Error {
+                    message: "attach snapshot requests are only valid during an active attach"
+                        .to_string(),
+                },
+            )
+            .await?;
+        }
         IncomingRequest::Standard(Request::DetachSession { session_id, all }) => {
             match state.detach_session(&session_id, all).await {
                 Ok(()) => send_response(&mut writer, &Response::Ok).await?,
@@ -432,6 +442,22 @@ async fn attach_session(
                                 },
                             });
                             break;
+                        }
+                    }
+                    Request::AttachSnapshot => {
+                        match state.snapshot_attached_session(session_id).await {
+                            Ok(snapshot) => {
+                                send_response(writer, &Response::AttachSnapshot { snapshot }).await?;
+                            }
+                            Err(err) => {
+                                final_response = Some(match ended_session_response(state, session_id).await? {
+                                    Some(response) => response,
+                                    None => Response::Error {
+                                        message: err.to_string(),
+                                    },
+                                });
+                                break;
+                            }
                         }
                     }
                     other => {

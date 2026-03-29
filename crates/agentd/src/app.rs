@@ -482,6 +482,20 @@ impl AppState {
         )
     }
 
+    pub async fn snapshot_attached_session(&self, session_id: &str) -> Result<Vec<u8>> {
+        let session = self
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+        ensure_session_running(&session)?;
+
+        let runtime = self
+            .runtimes
+            .get(session_id)
+            .ok_or_else(|| anyhow!("session `{session_id}` does not have a live PTY"))?;
+        runtime.snapshot()
+    }
+
     pub async fn detach_session(&self, session_id: &str, all: bool) -> Result<()> {
         let session = self
             .get_session(session_id)
@@ -778,6 +792,11 @@ impl SessionRuntime {
             plain: state.terminal_state.format_plain()?,
             vt: state.terminal_state.format_vt()?,
         })
+    }
+
+    fn snapshot(&self) -> Result<Vec<u8>> {
+        let mut state = self.state.lock().map_err(|_| anyhow!("session runtime state poisoned"))?;
+        state.terminal_state.vt_snapshot()
     }
 
     fn attach(

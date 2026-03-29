@@ -8,7 +8,7 @@ use crate::session::{
     IntegrationPolicy, SessionDiff, SessionMode, SessionRecord, SessionStatus, WorktreeRecord,
 };
 
-pub const PROTOCOL_VERSION: u16 = 29;
+pub const PROTOCOL_VERSION: u16 = 30;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
@@ -100,6 +100,7 @@ pub enum Request {
     AttachInput {
         data: Vec<u8>,
     },
+    AttachSnapshot,
     SendInput {
         session_id: String,
         data: Vec<u8>,
@@ -146,6 +147,9 @@ pub enum Response {
     },
     Attached {
         attach_id: String,
+        snapshot: Vec<u8>,
+    },
+    AttachSnapshot {
         snapshot: Vec<u8>,
     },
     SessionEnded {
@@ -201,6 +205,7 @@ enum MessageKind {
     KillSessionRequest = 6,
     AttachSessionRequest = 7,
     AttachInputRequest = 8,
+    AttachSnapshotRequest = 24,
     SendInputRequest = 9,
     ListAttachmentsRequest = 22,
     DetachAttachmentRequest = 23,
@@ -217,6 +222,7 @@ enum MessageKind {
     CreateSessionResponse = 102,
     KillSessionResponse = 103,
     AttachedResponse = 104,
+    AttachSnapshotResponse = 119,
     SessionEndedResponse = 117,
     AttachmentsResponse = 118,
     InputAcceptedResponse = 105,
@@ -243,6 +249,7 @@ impl MessageKind {
             6 => Self::KillSessionRequest,
             7 => Self::AttachSessionRequest,
             8 => Self::AttachInputRequest,
+            24 => Self::AttachSnapshotRequest,
             9 => Self::SendInputRequest,
             22 => Self::ListAttachmentsRequest,
             23 => Self::DetachAttachmentRequest,
@@ -259,6 +266,7 @@ impl MessageKind {
             102 => Self::CreateSessionResponse,
             103 => Self::KillSessionResponse,
             104 => Self::AttachedResponse,
+            119 => Self::AttachSnapshotResponse,
             117 => Self::SessionEndedResponse,
             118 => Self::AttachmentsResponse,
             105 => Self::InputAcceptedResponse,
@@ -503,6 +511,7 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             put_bytes(&mut payload, data)?;
             MessageKind::AttachInputRequest
         }
+        Request::AttachSnapshot => MessageKind::AttachSnapshotRequest,
         Request::SendInput { session_id, data, source_session_id } => {
             put_string(&mut payload, session_id)?;
             put_bytes(&mut payload, data)?;
@@ -588,6 +597,7 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
             attach_id: cursor.take_string()?,
         },
         MessageKind::AttachInputRequest => Request::AttachInput { data: cursor.take_bytes()? },
+        MessageKind::AttachSnapshotRequest => Request::AttachSnapshot,
         MessageKind::SendInputRequest => Request::SendInput {
             session_id: cursor.take_string()?,
             data: cursor.take_bytes()?,
@@ -641,6 +651,10 @@ fn encode_response(response: &Response) -> Result<(MessageKind, Vec<u8>)> {
             put_string(&mut payload, attach_id)?;
             put_bytes(&mut payload, snapshot)?;
             MessageKind::AttachedResponse
+        }
+        Response::AttachSnapshot { snapshot } => {
+            put_bytes(&mut payload, snapshot)?;
+            MessageKind::AttachSnapshotResponse
         }
         Response::SessionEnded {
             session_id,
@@ -725,6 +739,9 @@ fn decode_response(kind: MessageKind, payload: &[u8]) -> Result<Response> {
         }
         MessageKind::AttachedResponse => {
             Response::Attached { attach_id: cursor.take_string()?, snapshot: cursor.take_bytes()? }
+        }
+        MessageKind::AttachSnapshotResponse => {
+            Response::AttachSnapshot { snapshot: cursor.take_bytes()? }
         }
         MessageKind::SessionEndedResponse => Response::SessionEnded {
             session_id: cursor.take_string()?,
@@ -1315,6 +1332,14 @@ mod tests {
     }
 
     #[test]
+    fn attach_snapshot_request_round_trips() {
+        let request = Request::AttachSnapshot;
+        let (kind, payload) = encode_request(&request).unwrap();
+        let decoded = decode_request(kind, &payload).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
     fn switch_attached_session_round_trips() {
         let request = Request::SwitchAttachedSession {
             source_session_id: "source".to_string(),
@@ -1401,6 +1426,14 @@ mod tests {
     fn response_round_trips_snapshot_bytes() {
         let response =
             Response::Attached { attach_id: "attach-1".to_string(), snapshot: vec![0, 1, 2, 3, 4] };
+        let (kind, payload) = encode_response(&response).unwrap();
+        let decoded = decode_response(kind, &payload).unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn attach_snapshot_response_round_trips() {
+        let response = Response::AttachSnapshot { snapshot: vec![4, 3, 2, 1] };
         let (kind, payload) = encode_response(&response).unwrap();
         let decoded = decode_response(kind, &payload).unwrap();
         assert_eq!(decoded, response);

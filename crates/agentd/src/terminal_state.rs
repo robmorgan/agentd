@@ -139,8 +139,9 @@ impl GhosttyTerminalState {
 
     fn encode_wraparound_mode_report(&self) -> Result<Vec<u8>> {
         let mut enabled = false;
-        let result =
-            unsafe { ghostty_terminal_mode_get(self.terminal, GHOSTTY_MODE_WRAPAROUND, &mut enabled) };
+        let result = unsafe {
+            ghostty_terminal_mode_get(self.terminal, GHOSTTY_MODE_WRAPAROUND, &mut enabled)
+        };
         ensure_success(result, "ghostty_terminal_mode_get(wraparound)")?;
         let state =
             if enabled { GhosttyModeReportState::Set } else { GhosttyModeReportState::Reset };
@@ -352,11 +353,7 @@ unsafe extern "C" {
     ) -> i32;
     fn ghostty_terminal_free(terminal: GhosttyTerminal);
     fn ghostty_terminal_vt_write(terminal: GhosttyTerminal, data: *const u8, len: usize);
-    fn ghostty_terminal_resize(
-        terminal: GhosttyTerminal,
-        cols: u16,
-        rows: u16,
-    ) -> i32;
+    fn ghostty_terminal_resize(terminal: GhosttyTerminal, cols: u16, rows: u16) -> i32;
     fn ghostty_terminal_mode_get(
         terminal: GhosttyTerminal,
         mode: GhosttyMode,
