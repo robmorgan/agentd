@@ -390,25 +390,13 @@ async fn main() -> Result<()> {
         }
         (Some(Command::Merge { session_id }), ExecutionMode::Daemon) => {
             let session_id = resolve_merge_session_id(session_id)?;
-            let response =
-                send_request(&paths, &Request::ApplySession { session_id: session_id.clone() })
-                    .await?;
-            match response {
-                Response::Session { session } => print_session(&session),
-                Response::Error { message } => bail!(message),
-                other => bail!("unexpected response: {:?}", other),
-            }
+            apply_session_with_user_output(&paths, session_id).await?;
         }
         (Some(Command::Merge { .. }), ExecutionMode::Local(reason)) => {
             bail_daemon_command(&reason, "agent merge")?;
         }
         (Some(Command::Accept { session_id }), ExecutionMode::Daemon) => {
-            let response = send_request(&paths, &Request::ApplySession { session_id }).await?;
-            match response {
-                Response::Session { session } => print_session(&session),
-                Response::Error { message } => bail!(message),
-                other => bail!("unexpected response: {:?}", other),
-            }
+            apply_session_with_user_output(&paths, session_id).await?;
         }
         (Some(Command::Accept { .. }), ExecutionMode::Local(reason)) => {
             bail_daemon_command(&reason, "agent accept")?;
@@ -1548,6 +1536,57 @@ fn print_session(session: &SessionRecord) {
     }
 }
 
+async fn apply_session_with_user_output(paths: &AppPaths, session_id: String) -> Result<()> {
+    let merge_session = get_session(paths, session_id.clone()).await?;
+    println!("{}", format_merge_progress(&merge_session));
+
+    let response = send_request(paths, &Request::ApplySession { session_id }).await?;
+    match response {
+        Response::Session { session } => {
+            print_merge_result(&session);
+            Ok(())
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {:?}", other),
+    }
+}
+
+async fn get_session(paths: &AppPaths, session_id: String) -> Result<SessionRecord> {
+    let response = send_request(paths, &Request::GetSession { session_id }).await?;
+    match response {
+        Response::Session { session } => Ok(session),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected response: {:?}", other),
+    }
+}
+
+fn print_merge_result(session: &SessionRecord) {
+    match format_merge_result(session) {
+        Some(output) => println!("{output}"),
+        None => print_session(session),
+    }
+}
+
+fn format_merge_progress(session: &SessionRecord) -> String {
+    format!("⟳ Merging {} → {}...", session.session_id, session.base_branch)
+}
+
+fn format_merge_result(session: &SessionRecord) -> Option<String> {
+    if session.apply_state != ApplyState::Applied {
+        return None;
+    }
+
+    let summary = session.attention_summary.as_deref()?.trim();
+    if summary.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "✔ Merge complete\n  {summary}\n  Target branch: {}\n  Source branch: {}",
+        session.base_branch, session.branch
+    ))
+}
+
 fn print_worktree(worktree: &WorktreeRecord) {
     println!("name: {}", worktree.session_id);
     println!("repo_path: {}", worktree.repo_path);
@@ -2115,7 +2154,8 @@ mod tests {
         AttachInputParser, AttachSessionDirection, Cli, Command, DaemonCommand,
         DegradedNoticeCommand, SessionEndSummary, adjacent_live_session_id_in,
         attach_startup_bytes, bail_daemon_command, clear_stale_daemon_state, cli_command,
-        cli_styles, format_attach_title, format_session_end_summary, render_diff_text,
+        cli_styles, format_attach_title, format_merge_progress, format_merge_result,
+        format_session_end_summary, render_diff_text,
         resolve_detach_session_id, resolve_merge_session_id, resolve_new_session_options,
         should_colorize_diff_output, should_print_degraded_notice, terminal_title_bytes,
     };
@@ -2740,6 +2780,51 @@ command = "claude"
             error: None,
         };
         assert!(format_session_end_summary(&summary).contains("merged"));
+    }
+
+    #[test]
+    fn format_merge_progress_reports_session_and_base_branch() {
+        let session = demo_session("demo", SessionStatus::Exited, false, 1, AttentionLevel::Info);
+        assert_eq!(format_merge_progress(&session), "⟳ Merging demo → main...");
+    }
+
+    #[test]
+    fn format_merge_result_reports_merge_summary_and_branches() {
+        let mut session =
+            demo_session("demo", SessionStatus::Exited, false, 1, AttentionLevel::Info);
+        session.apply_state = ApplyState::Applied;
+        session.attention_summary = Some("changes merged into main".to_string());
+
+        assert_eq!(
+            format_merge_result(&session).as_deref(),
+            Some(
+                "✔ Merge complete\n  changes merged into main\n  Target branch: main\n  Source branch: agent/demo"
+            )
+        );
+    }
+
+    #[test]
+    fn format_merge_result_reports_noop_merge_summary() {
+        let mut session =
+            demo_session("demo", SessionStatus::Exited, false, 1, AttentionLevel::Info);
+        session.apply_state = ApplyState::Applied;
+        session.attention_summary = Some("changes already present on base branch".to_string());
+
+        assert_eq!(
+            format_merge_result(&session).as_deref(),
+            Some(
+                "✔ Merge complete\n  changes already present on base branch\n  Target branch: main\n  Source branch: agent/demo"
+            )
+        );
+    }
+
+    #[test]
+    fn format_merge_result_falls_back_without_attention_summary() {
+        let mut session =
+            demo_session("demo", SessionStatus::Exited, false, 1, AttentionLevel::Info);
+        session.apply_state = ApplyState::Applied;
+
+        assert_eq!(format_merge_result(&session), None);
     }
 
     #[test]
