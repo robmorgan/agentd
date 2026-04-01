@@ -65,7 +65,6 @@ struct PaletteItem {
 #[derive(Debug, PartialEq, Eq)]
 pub enum OverlayOutcome {
     Close,
-    ForwardInput(Vec<u8>),
     SwitchSession(String),
 }
 
@@ -1530,9 +1529,6 @@ impl AttachOverlay {
         let items = filtered_palette_items(&self.palette_query);
         match key.code {
             KeyCode::Esc => return Ok(Some(OverlayOutcome::Close)),
-            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return Ok(Some(OverlayOutcome::ForwardInput(b"\x19".to_vec())));
-            }
             KeyCode::Enter => {
                 if let Some(item) = items.get(self.palette_selected) {
                     return self.run_command(item.command).await;
@@ -2431,7 +2427,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_overlay_ctrl_y_forwards_literal_byte() {
+    fn attach_overlay_ctrl_y_is_ignored_in_palette() {
         let mut overlay = AttachOverlay::new(test_paths(), "alpha".to_string());
         overlay.mode = OverlayMode::Palette;
 
@@ -2439,7 +2435,7 @@ mod tests {
             block_on(overlay.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)))
                 .unwrap();
 
-        assert_eq!(outcome, Some(OverlayOutcome::ForwardInput(b"\x19".to_vec())));
+        assert_eq!(outcome, None);
     }
 
     #[test]

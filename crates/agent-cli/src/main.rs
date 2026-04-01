@@ -1156,9 +1156,6 @@ async fn attach_session_once(
                                     return Ok(AttachOutcome::SessionEnded(summary));
                                 }
                             },
-                            runtime::OverlayOutcome::ForwardInput(data) => {
-                                write_request(&mut write_half, &Request::AttachInput { data }).await?;
-                            }
                             runtime::OverlayOutcome::SwitchSession(target_session_id) => {
                                 drop(write_half);
                                 return Ok(AttachOutcome::SwitchSession(target_session_id));
