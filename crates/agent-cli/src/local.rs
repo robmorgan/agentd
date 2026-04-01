@@ -36,7 +36,7 @@ impl LocalStore {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT session_id, agent, model, mode, workspace, repo_path, repo_name, base_branch, branch,
-                    worktree, status, integration_policy, integration_state, pid, exit_code, error, attention, attention_summary,
+                    worktree, status, integration_policy, integration_state, worker_pid, agent_pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions ORDER BY created_at DESC",
         )?;
@@ -50,7 +50,7 @@ impl LocalStore {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT session_id, agent, model, mode, workspace, repo_path, repo_name, base_branch, branch,
-                    worktree, status, integration_policy, integration_state, pid, exit_code, error, attention, attention_summary,
+                    worktree, status, integration_policy, integration_state, worker_pid, agent_pid, exit_code, error, attention, attention_summary,
                     created_at, updated_at, exited_at
              FROM sessions WHERE session_id = ?1",
             params![session_id],
