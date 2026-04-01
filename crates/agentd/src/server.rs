@@ -139,8 +139,8 @@ async fn handle_connection(
                 }
             }
         }
-        IncomingRequest::Standard(Request::KillSession { session_id, remove }) => {
-            match state.kill_session(&session_id, remove).await {
+        IncomingRequest::Standard(Request::KillSession { session_id, remove, force }) => {
+            match state.kill_session(&session_id, remove, force).await {
                 Ok((removed, was_running)) => {
                     send_response(&mut writer, &Response::KillSession { removed, was_running })
                         .await?

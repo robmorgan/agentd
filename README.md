@@ -84,7 +84,13 @@ Stop a task:
 agent kill fix-tests
 ```
 
-And explicitly cleanup any artifacts and worktrees:
+Remove a session and clean up its artifacts:
+
+```sh
+agent rm fix-tests
+```
+
+Or use the compatibility form:
 
 ```sh
 agent kill --rm fix-tests

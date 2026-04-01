@@ -156,8 +156,30 @@ pub fn process_exists(pid: Option<u32>) -> bool {
     kill(Pid::from_raw(pid as i32), None).is_ok()
 }
 
-pub fn remove_session_artifacts(paths: &AppPaths, session: &SessionRecord) -> Result<()> {
+pub fn ensure_removable(session: &SessionRecord, force: bool) -> Result<()> {
+    if branch_has_committed_diff(&session.repo_path, &session.base_branch, &session.branch)?
+        && !force
+    {
+        bail!(
+            "session `{}` branch `{}` differs from `{}`; use `agent diff {}` and `agent merge {}` first, or rerun with `--force` to remove it anyway",
+            session.session_id,
+            session.branch,
+            session.base_branch,
+            session.session_id,
+            session.session_id,
+        );
+    }
+    ensure_branch_not_checked_out_elsewhere(session)?;
+    Ok(())
+}
+
+pub fn remove_session_artifacts(
+    paths: &AppPaths,
+    session: &SessionRecord,
+    force: bool,
+) -> Result<()> {
     remove_worktree_if_present(session)?;
+    remove_branch_if_present(session, force)?;
     remove_log_if_present(paths, session)?;
     Ok(())
 }
@@ -272,6 +294,24 @@ fn branch_ahead_count(repo_path: &str, base_branch: &str, branch: &str) -> Resul
     }
 
     Ok(String::from_utf8(output.stdout)?.trim().parse::<u32>().unwrap_or(0))
+}
+
+fn branch_has_committed_diff(repo_path: &str, base_branch: &str, branch: &str) -> Result<bool> {
+    if !branch_exists(repo_path, branch)? {
+        return Ok(false);
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["diff", "--stat", &format!("{base_branch}...{branch}")])
+        .output()
+        .with_context(|| format!("failed to inspect branch diff for {branch}"))?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+
+    Ok(!String::from_utf8(output.stdout)?.trim().is_empty())
 }
 
 fn parse_time(value: String) -> rusqlite::Result<DateTime<Utc>> {
@@ -406,6 +446,86 @@ fn remove_worktree_if_present(session: &SessionRecord) -> Result<()> {
     Ok(())
 }
 
+fn remove_branch_if_present(session: &SessionRecord, force: bool) -> Result<()> {
+    if !branch_exists(&session.repo_path, &session.branch)? {
+        return Ok(());
+    }
+
+    let delete_flag = if force { "-D" } else { "-d" };
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&session.repo_path)
+        .args(["branch", delete_flag, &session.branch])
+        .output()
+        .with_context(|| format!("failed to remove branch {}", session.branch))?;
+    if !output.status.success() {
+        bail!(
+            "failed to remove branch {}: {}",
+            session.branch,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(())
+}
+
+fn branch_exists(repo_path: &str, branch: &str) -> Result<bool> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["show-ref", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .status()
+        .with_context(|| format!("failed to inspect branch {branch}"))?;
+    Ok(status.success())
+}
+
+fn ensure_branch_not_checked_out_elsewhere(session: &SessionRecord) -> Result<()> {
+    if !branch_exists(&session.repo_path, &session.branch)? {
+        return Ok(());
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&session.repo_path)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .with_context(|| format!("failed to inspect worktrees for {}", session.repo_path))?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+
+    let branch_ref = format!("refs/heads/{}", session.branch);
+    let session_worktree = normalize_worktree_path(session.worktree.as_str());
+    let mut current_worktree: Option<&str> = None;
+    for line in String::from_utf8(output.stdout)?.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current_worktree = Some(path);
+            continue;
+        }
+        if let Some(branch) = line.strip_prefix("branch ")
+            && branch == branch_ref
+            && current_worktree.map(normalize_worktree_path) != Some(session_worktree.clone())
+        {
+            bail!(
+                "session `{}` branch `{}` is checked out in another worktree at {}; remove that worktree first",
+                session.session_id,
+                session.branch,
+                current_worktree.unwrap_or("<unknown>"),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn normalize_worktree_path(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .ok()
+        .and_then(|path| path.into_os_string().into_string().ok())
+        .unwrap_or_else(|| path.to_string())
+}
+
 fn remove_log_if_present(paths: &AppPaths, session: &SessionRecord) -> Result<()> {
     for log_path in
         [paths.log_path(&session.session_id), paths.rendered_log_path(&session.session_id)]
@@ -421,7 +541,10 @@ fn remove_log_if_present(paths: &AppPaths, session: &SessionRecord) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalStore, normalize_degraded_session, refresh_commit_state};
+    use super::{
+        ensure_removable, normalize_degraded_session, refresh_commit_state,
+        remove_session_artifacts,
+    };
     use agentd_shared::{
         paths::AppPaths,
         session::{
@@ -430,7 +553,6 @@ mod tests {
         },
     };
     use chrono::Utc;
-    use rusqlite::params;
     use std::{
         fs,
         process::Command,
@@ -489,6 +611,57 @@ mod tests {
 
         assert!(session.has_commits);
         assert!(session.has_pending_changes);
+    }
+
+    #[test]
+    fn ensure_removable_requires_force_when_branch_differs() {
+        let repo = init_git_repo("remove-needs-force");
+        run_git(repo.as_str(), &["checkout", "-b", "agent/demo"]);
+        fs::write(repo.join("README.md"), "committed\n").unwrap();
+        run_git(repo.as_str(), &["add", "README.md"]);
+        run_git(repo.as_str(), &["commit", "-m", "session change"]);
+
+        let session = refresh_commit_state(demo_session(
+            repo.as_str(),
+            repo.as_str(),
+            "agent/demo",
+            false,
+            false,
+        ))
+        .unwrap();
+
+        let err = ensure_removable(&session, false).unwrap_err().to_string();
+        assert!(err.contains("rerun with `--force`"));
+    }
+
+    #[test]
+    fn remove_session_artifacts_deletes_branch_when_merged() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let repo = init_git_repo("remove-clean-branch");
+        let worktree = paths.root.join("remove-clean-branch-worktree");
+        run_git(repo.as_str(), &["worktree", "add", "-b", "agent/demo", worktree.as_str(), "main"]);
+        fs::write(worktree.join("README.md"), "committed\n").unwrap();
+        run_git(worktree.as_str(), &["add", "README.md"]);
+        run_git(worktree.as_str(), &["commit", "-m", "session change"]);
+        run_git(repo.as_str(), &["merge", "--ff-only", "agent/demo"]);
+
+        let session = refresh_commit_state(demo_session(
+            repo.as_str(),
+            worktree.as_str(),
+            "agent/demo",
+            false,
+            false,
+        ))
+        .unwrap();
+
+        remove_session_artifacts(&paths, &session, false).unwrap();
+
+        let output = Command::new("git")
+            .args(["-C", repo.as_str(), "show-ref", "--verify", "--quiet", "refs/heads/agent/demo"])
+            .status()
+            .unwrap();
+        assert!(!output.success());
     }
 
     fn init_git_repo(name: &str) -> camino::Utf8PathBuf {

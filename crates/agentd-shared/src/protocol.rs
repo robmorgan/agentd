@@ -8,7 +8,7 @@ use crate::session::{
     IntegrationPolicy, SessionDiff, SessionMode, SessionRecord, SessionStatus, WorktreeRecord,
 };
 
-pub const PROTOCOL_VERSION: u16 = 31;
+pub const PROTOCOL_VERSION: u16 = 32;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
 const FRAME_MAGIC: u32 = 0x4147_4450;
@@ -74,6 +74,7 @@ pub enum Request {
     KillSession {
         session_id: String,
         remove: bool,
+        force: bool,
     },
     ResolveSessionRuntime {
         session_id: String,
@@ -486,9 +487,10 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             put_string(&mut payload, session_id)?;
             MessageKind::CleanupWorktreeRequest
         }
-        Request::KillSession { session_id, remove } => {
+        Request::KillSession { session_id, remove, force } => {
             put_string(&mut payload, session_id)?;
             put_bool(&mut payload, *remove);
+            put_bool(&mut payload, *force);
             MessageKind::KillSessionRequest
         }
         Request::ResolveSessionRuntime { session_id } => {
@@ -586,9 +588,11 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
         MessageKind::CleanupWorktreeRequest => {
             Request::CleanupWorktree { session_id: cursor.take_string()? }
         }
-        MessageKind::KillSessionRequest => {
-            Request::KillSession { session_id: cursor.take_string()?, remove: cursor.take_bool()? }
-        }
+        MessageKind::KillSessionRequest => Request::KillSession {
+            session_id: cursor.take_string()?,
+            remove: cursor.take_bool()?,
+            force: cursor.take_bool()?,
+        },
         MessageKind::ResolveSessionRuntimeRequest => {
             Request::ResolveSessionRuntime { session_id: cursor.take_string()? }
         }
@@ -1443,6 +1447,15 @@ mod tests {
     #[test]
     fn discard_session_round_trips() {
         let request = Request::DiscardSession { session_id: "demo".to_string(), force: true };
+        let (kind, payload) = encode_request(&request).unwrap();
+        let decoded = decode_request(kind, &payload).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn kill_session_round_trips_with_force() {
+        let request =
+            Request::KillSession { session_id: "demo".to_string(), remove: true, force: true };
         let (kind, payload) = encode_request(&request).unwrap();
         let decoded = decode_request(kind, &payload).unwrap();
         assert_eq!(decoded, request);

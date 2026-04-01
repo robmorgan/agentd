@@ -1077,7 +1077,11 @@ impl SessionPicker {
     async fn remove_session(&mut self, session_id: &str) -> Result<()> {
         let response = send_request(
             &self.paths,
-            &Request::KillSession { session_id: session_id.to_string(), remove: true },
+            &Request::KillSession {
+                session_id: session_id.to_string(),
+                remove: true,
+                force: false,
+            },
         )
         .await?;
         match response {

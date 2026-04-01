@@ -157,11 +157,19 @@ enum Command {
     Kill {
         #[arg(long)]
         rm: bool,
+        #[arg(short, long)]
+        force: bool,
         session_id: String,
     },
-    #[command(about = "Attach to a live session PTY", display_order = 3)]
+    #[command(about = "Stop and remove a session", display_order = 3)]
+    Rm {
+        #[arg(short, long)]
+        force: bool,
+        session_id: String,
+    },
+    #[command(about = "Attach to a live session PTY", display_order = 4)]
     Attach { session_id: String },
-    #[command(about = "Detach one or more attached clients", display_order = 4)]
+    #[command(about = "Detach one or more attached clients", display_order = 5)]
     Detach {
         session_id: Option<String>,
         #[arg(long)]
@@ -169,7 +177,7 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
-    #[command(about = "Send background input to a live session", display_order = 5)]
+    #[command(about = "Send background input to a live session", display_order = 6)]
     SendInput {
         session_id: String,
         #[arg(long)]
@@ -182,17 +190,17 @@ enum Command {
         )]
         data: Vec<String>,
     },
-    #[command(about = "Merge a session branch back to the base branch", display_order = 6)]
+    #[command(about = "Merge a session branch back to the base branch", display_order = 7)]
     Merge { session_id: Option<String> },
-    #[command(about = "Compatibility alias for `agent merge`", display_order = 7, hide = true)]
+    #[command(about = "Compatibility alias for `agent merge`", display_order = 8, hide = true)]
     Accept { session_id: String },
-    #[command(about = "Discard a session's worktree and changes", display_order = 8)]
+    #[command(about = "Discard a session's worktree and changes", display_order = 9)]
     Discard {
         session_id: String,
         #[arg(long)]
         force: bool,
     },
-    #[command(about = "Print captured session history", display_order = 9)]
+    #[command(about = "Print captured session history", display_order = 10)]
     History {
         session_id: String,
         #[arg(long)]
@@ -202,21 +210,21 @@ enum Command {
         visible_alias = "ls",
         alias = "sessions",
         about = "List known sessions",
-        display_order = 10
+        display_order = 11
     )]
     List,
-    #[command(about = "Show currently attached clients for a session", display_order = 11)]
+    #[command(about = "Show currently attached clients for a session", display_order = 12)]
     Attachments { session_id: String },
-    #[command(about = "Show detailed session status", display_order = 12)]
+    #[command(about = "Show detailed session status", display_order = 13)]
     Status { session_id: String },
-    #[command(about = "Show the session diff against its base branch", display_order = 13)]
+    #[command(about = "Show the session diff against its base branch", display_order = 14)]
     Diff { session_id: String },
-    #[command(about = "Create or clean up session worktrees", display_order = 14)]
+    #[command(about = "Create or clean up session worktrees", display_order = 15)]
     Worktree {
         #[command(subcommand)]
         command: WorktreeCommand,
     },
-    #[command(about = "Inspect or control the local agent daemon", display_order = 15)]
+    #[command(about = "Inspect or control the local agent daemon", display_order = 16)]
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -310,10 +318,13 @@ async fn main() -> Result<()> {
         (Some(Command::New { .. }), ExecutionMode::Local(reason)) => {
             bail_live_command(&reason)?;
         }
-        (Some(Command::Kill { rm, session_id }), ExecutionMode::Daemon) => {
+        (Some(Command::Kill { rm, force, session_id }), ExecutionMode::Daemon) => {
+            if force && !rm {
+                bail!("`--force` requires `--rm`");
+            }
             let response = send_request(
                 &paths,
-                &Request::KillSession { session_id: session_id.clone(), remove: rm },
+                &Request::KillSession { session_id: session_id.clone(), remove: rm, force },
             )
             .await?;
 
@@ -325,11 +336,35 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Some(Command::Kill { rm, session_id }), ExecutionMode::Local(reason)) => {
+        (Some(Command::Kill { rm, force, session_id }), ExecutionMode::Local(reason)) => {
+            if force && !rm {
+                bail!("`--force` requires `--rm`");
+            }
             if should_print_degraded_notice(DegradedNoticeCommand::Kill, &reason) {
                 print_degraded_notice(&reason);
             }
-            local_kill(&paths, &session_id, rm)?;
+            local_kill(&paths, &session_id, rm, force)?;
+        }
+        (Some(Command::Rm { force, session_id }), ExecutionMode::Daemon) => {
+            let response = send_request(
+                &paths,
+                &Request::KillSession { session_id: session_id.clone(), remove: true, force },
+            )
+            .await?;
+
+            match response {
+                Response::KillSession { removed, was_running } => {
+                    print_kill_result(&session_id, was_running, removed)
+                }
+                Response::Error { message } => bail!(message),
+                other => bail!("unexpected response: {:?}", other),
+            }
+        }
+        (Some(Command::Rm { force, session_id }), ExecutionMode::Local(reason)) => {
+            if should_print_degraded_notice(DegradedNoticeCommand::Kill, &reason) {
+                print_degraded_notice(&reason);
+            }
+            local_kill(&paths, &session_id, true, force)?;
         }
         (Some(Command::Attach { session_id }), ExecutionMode::Daemon) => {
             attach_session(&paths, &session_id).await?;
@@ -574,7 +609,10 @@ async fn resolve_execution_mode(
 }
 
 fn command_supports_local_mode(command: Option<&Command>) -> bool {
-    matches!(command, Some(Command::Kill { .. } | Command::List | Command::Status { .. }))
+    matches!(
+        command,
+        Some(Command::Kill { .. } | Command::Rm { .. } | Command::List | Command::Status { .. })
+    )
 }
 
 async fn degraded_mode_reason(paths: &AppPaths) -> Result<Option<String>> {
@@ -951,12 +989,16 @@ async fn print_history(paths: &AppPaths, session_id: &str, vt: bool) -> Result<(
     }
 }
 
-fn local_kill(paths: &AppPaths, session_id: &str, remove: bool) -> Result<()> {
+fn local_kill(paths: &AppPaths, session_id: &str, remove: bool, force: bool) -> Result<()> {
     let store = LocalStore::open(paths)?;
     let session = store
         .get_session(session_id)?
         .ok_or_else(|| anyhow::anyhow!("session `{session_id}` not found"))?;
     let was_running = local::session_is_running(&session);
+
+    if remove {
+        local::ensure_removable(&session, force)?;
+    }
 
     if !was_running && !remove {
         if session.status == SessionStatus::Running {
@@ -973,12 +1015,7 @@ fn local_kill(paths: &AppPaths, session_id: &str, remove: bool) -> Result<()> {
     }
 
     if remove {
-        if session.has_commits {
-            bail!(
-                "session `{session_id}` has committed changes; use `agent diff {session_id}` and `agent merge {session_id}` before removing it, or reconnect to the daemon and run `agent discard {session_id}`"
-            );
-        }
-        remove_session_artifacts(paths, &session)?;
+        remove_session_artifacts(paths, &session, force)?;
         store.delete_session(session_id)?;
     }
 
@@ -2115,7 +2152,7 @@ async fn daemon_get_session(paths: &AppPaths, session_id: &str) -> Result<Sessio
 async fn kill_session(paths: &AppPaths, session_id: &str) -> Result<()> {
     let response = send_request(
         paths,
-        &Request::KillSession { session_id: session_id.to_string(), remove: false },
+        &Request::KillSession { session_id: session_id.to_string(), remove: false, force: false },
     )
     .await?;
     match response {
@@ -2151,12 +2188,11 @@ mod tests {
     use super::{
         AGENTD_ATTACH_ENTER_SEQUENCE, AGENTD_ATTACH_EXIT_TITLE, AGENTD_ATTACH_RESTORE_SEQUENCE,
         ATTACH_DETACH_BYTE, ATTACH_NEXT_SESSION_BYTE, ATTACH_OVERLAY_BYTE,
-        ATTACH_OVERLAY_LEGACY_BYTE, AttachInputAction,
-        AttachInputParser, AttachSessionDirection, Cli, Command, DaemonCommand,
-        DegradedNoticeCommand, SessionEndSummary, adjacent_live_session_id_in,
-        attach_startup_bytes, bail_daemon_command, clear_stale_daemon_state, cli_command,
-        cli_styles, format_attach_title, format_merge_progress, format_merge_result,
-        format_session_end_summary, render_diff_text,
+        ATTACH_OVERLAY_LEGACY_BYTE, AttachInputAction, AttachInputParser, AttachSessionDirection,
+        Cli, Command, DaemonCommand, DegradedNoticeCommand, SessionEndSummary,
+        adjacent_live_session_id_in, attach_startup_bytes, bail_daemon_command,
+        clear_stale_daemon_state, cli_command, cli_styles, format_attach_title,
+        format_merge_progress, format_merge_result, format_session_end_summary, render_diff_text,
         resolve_detach_session_id, resolve_merge_session_id, resolve_new_session_options,
         should_colorize_diff_output, should_print_degraded_notice, terminal_title_bytes,
     };
@@ -2280,6 +2316,31 @@ mod tests {
                 assert_eq!(name.as_deref(), Some("fix-failing-tests"));
                 assert!(workspace.is_none());
                 assert!(agent.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rm_command_parses_force_flag() {
+        let cli = Cli::try_parse_from(["agent", "rm", "--force", "demo"]).unwrap();
+        match cli.command {
+            Some(Command::Rm { force, session_id }) => {
+                assert!(force);
+                assert_eq!(session_id, "demo");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kill_command_parses_remove_and_force_flags() {
+        let cli = Cli::try_parse_from(["agent", "kill", "--rm", "--force", "demo"]).unwrap();
+        match cli.command {
+            Some(Command::Kill { rm, force, session_id }) => {
+                assert!(rm);
+                assert!(force);
+                assert_eq!(session_id, "demo");
             }
             other => panic!("unexpected command: {other:?}"),
         }

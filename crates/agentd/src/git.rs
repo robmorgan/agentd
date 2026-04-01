@@ -226,6 +226,74 @@ pub fn branch_has_committed_diff(
         .is_empty())
 }
 
+pub fn remove_branch(repo_root: &Utf8Path, branch: &str, force: bool) -> Result<()> {
+    if !branch_exists(repo_root, branch)? {
+        return Ok(());
+    }
+
+    let delete_flag = if force { "-D" } else { "-d" };
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root.as_str())
+        .args(["branch", delete_flag, branch])
+        .output()
+        .with_context(|| format!("failed to remove branch {branch}"))?;
+    if !output.status.success() {
+        bail!(
+            "failed to remove branch {branch}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(())
+}
+
+pub fn branch_checked_out_elsewhere(
+    repo_root: &Utf8Path,
+    branch: &str,
+    allowed_worktree: &Utf8Path,
+) -> Result<Option<Utf8PathBuf>> {
+    if !branch_exists(repo_root, branch)? {
+        return Ok(None);
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root.as_str())
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .with_context(|| format!("failed to inspect worktrees for {}", repo_root))?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+
+    let branch_ref = format!("refs/heads/{branch}");
+    let allowed_worktree = normalize_worktree_path(allowed_worktree);
+    let mut current_worktree: Option<Utf8PathBuf> = None;
+    for line in String::from_utf8(output.stdout)?.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current_worktree = Some(Utf8PathBuf::from(path));
+            continue;
+        }
+        if let Some(current_branch) = line.strip_prefix("branch ")
+            && current_branch == branch_ref
+            && current_worktree.as_ref().map(|path| normalize_worktree_path(path.as_path()))
+                != Some(allowed_worktree.clone())
+        {
+            return Ok(current_worktree);
+        }
+    }
+
+    Ok(None)
+}
+
+fn normalize_worktree_path(path: &Utf8Path) -> Utf8PathBuf {
+    std::fs::canonicalize(path.as_std_path())
+        .ok()
+        .and_then(|path| Utf8PathBuf::from_path_buf(path).ok())
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
 pub fn commit_all(worktree: &Utf8Path, message: &str) -> Result<()> {
     let add = Command::new("git")
         .arg("-C")

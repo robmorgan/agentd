@@ -97,18 +97,7 @@ pub async fn run(args: SessionWorkerArgs) -> Result<()> {
         let session_id = args.session_id.clone();
         let output_tx = output_tx.clone();
         let ended_tx = ended_tx.clone();
-        move || {
-            owner_loop(
-                db,
-                paths,
-                session_id,
-                master,
-                writer,
-                command_rx,
-                output_tx,
-                ended_tx,
-            )
-        }
+        move || owner_loop(db, paths, session_id, master, writer, command_rx, output_tx, ended_tx)
     });
 
     let command_tx_reader = command_tx.clone();
@@ -330,11 +319,16 @@ fn owner_loop(
                 let plain = state.history(false).unwrap_or_default();
                 let vt = state.history(true).unwrap_or_default();
                 fs::write(paths.rendered_log_path(&state.session_id).as_std_path(), &plain)
-                    .with_context(|| format!("failed to write rendered history for {}", state.session_id))?;
-                fs::write(paths.log_path(&state.session_id).as_std_path(), &vt)
-                    .with_context(|| format!("failed to write VT history for {}", state.session_id))?;
+                    .with_context(|| {
+                        format!("failed to write rendered history for {}", state.session_id)
+                    })?;
+                fs::write(paths.log_path(&state.session_id).as_std_path(), &vt).with_context(
+                    || format!("failed to write VT history for {}", state.session_id),
+                )?;
                 finalize_worker_exit(&db, &state.session_id, exit_code)?;
-                let session = db.get_session(&state.session_id)?.ok_or_else(|| anyhow!("missing session after worker exit"))?;
+                let session = db
+                    .get_session(&state.session_id)?
+                    .ok_or_else(|| anyhow!("missing session after worker exit"))?;
                 let _ = ended_tx.send(Some(SessionEnded {
                     status: session.status,
                     apply_state: session.apply_state,
@@ -388,7 +382,11 @@ impl OwnerState {
         Ok(())
     }
 
-    fn publish_output(&mut self, data: &[u8], output_tx: &broadcast::Sender<Vec<u8>>) -> Result<()> {
+    fn publish_output(
+        &mut self,
+        data: &[u8],
+        output_tx: &broadcast::Sender<Vec<u8>>,
+    ) -> Result<()> {
         self.terminal.vt_write(data);
         let writes = self.pending_writes.replace(Vec::new());
         if !self.has_live_attach_terminal() {
@@ -439,10 +437,8 @@ impl OwnerState {
             self.resize(geometry)?;
             self.snapshot()?
         };
-        self.attachments.insert(
-            attach_id.clone(),
-            OwnerAttachment { kind, connected_at, control_tx },
-        );
+        self.attachments
+            .insert(attach_id.clone(), OwnerAttachment { kind, connected_at, control_tx });
         Ok((attach_id, snapshot, connected_at))
     }
 
@@ -647,7 +643,10 @@ async fn serve_attach_connection(
     Ok(())
 }
 
-fn pump_pty(mut reader: Box<dyn Read + Send>, command_tx: &std_mpsc::Sender<OwnerCommand>) -> Result<()> {
+fn pump_pty(
+    mut reader: Box<dyn Read + Send>,
+    command_tx: &std_mpsc::Sender<OwnerCommand>,
+) -> Result<()> {
     let mut buffer = [0_u8; 8192];
     loop {
         let bytes_read = reader.read(&mut buffer)?;
@@ -680,7 +679,8 @@ fn finalize_worker_exit(db: &Database, session_id: &str, exit_code: Option<i32>)
 }
 
 fn terminate_process_group(session_id: &str, agent_pid: Option<u32>) -> Result<()> {
-    let pid = agent_pid.ok_or_else(|| anyhow!("session `{session_id}` has no recorded agent pid"))?;
+    let pid =
+        agent_pid.ok_or_else(|| anyhow!("session `{session_id}` has no recorded agent pid"))?;
     let pid = Pid::from_raw(pid as i32);
     match kill(pid, Some(Signal::SIGTERM)) {
         Ok(()) => Ok(()),

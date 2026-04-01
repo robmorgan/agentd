@@ -2,8 +2,8 @@ mod app;
 mod db;
 mod git;
 mod ids;
-mod session_worker;
 mod server;
+mod session_worker;
 mod terminal_state;
 
 use std::{

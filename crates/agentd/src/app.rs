@@ -230,7 +230,12 @@ impl AppState {
         .await?
     }
 
-    pub async fn kill_session(&self, session_id: &str, remove: bool) -> Result<(bool, bool)> {
+    pub async fn kill_session(
+        &self,
+        session_id: &str,
+        remove: bool,
+        force: bool,
+    ) -> Result<(bool, bool)> {
         let db = self.db.clone();
         let paths = self.paths.clone();
         let session_id = session_id.to_string();
@@ -239,6 +244,11 @@ impl AppState {
             let session = db
                 .get_session(&session_id)?
                 .ok_or_else(|| anyhow!("session `{session_id}` not found"))?;
+
+            let session = refresh_commit_state(&db, session)?;
+            if remove {
+                ensure_removable(&session, force)?;
+            }
 
             let was_running =
                 session.status == SessionStatus::Running && process_exists(session.worker_pid);
@@ -252,9 +262,7 @@ impl AppState {
             }
 
             if remove {
-                let session = refresh_commit_state(&db, session)?;
-                ensure_not_mergeable(&session, "remove")?;
-                remove_session_artifacts(&paths, &session)?;
+                remove_session_artifacts(&paths, &session, force)?;
                 db.delete_session(&session_id)?;
             }
 
@@ -476,8 +484,11 @@ impl AppState {
             return Ok(if vt { history.vt } else { history.plain });
         }
 
-        let log_path =
-            if vt { self.paths.log_path(session_id) } else { self.paths.rendered_log_path(session_id) };
+        let log_path = if vt {
+            self.paths.log_path(session_id)
+        } else {
+            self.paths.rendered_log_path(session_id)
+        };
         if log_path.exists() {
             return std::fs::read_to_string(log_path.as_std_path())
                 .with_context(|| format!("failed to read {}", log_path));
@@ -601,14 +612,13 @@ fn start_session_runtime(
         command.arg("--arg").arg(arg);
     }
 
-    command
-        .spawn()
-        .context("failed to spawn session worker")?;
+    command.spawn().context("failed to spawn session worker")?;
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let session =
-            db.get_session(request.session_id)?.ok_or_else(|| anyhow!("session missing after worker spawn"))?;
+        let session = db
+            .get_session(request.session_id)?
+            .ok_or_else(|| anyhow!("session missing after worker spawn"))?;
         if session.status == SessionStatus::Running
             && session.worker_pid.is_some()
             && paths.session_socket_path(request.session_id).exists()
@@ -618,7 +628,9 @@ fn start_session_runtime(
         if matches!(session.status, SessionStatus::Failed | SessionStatus::Exited) {
             bail!(
                 "{}",
-                session.error.unwrap_or_else(|| "session worker exited before becoming ready".to_string())
+                session
+                    .error
+                    .unwrap_or_else(|| "session worker exited before becoming ready".to_string())
             );
         }
         if Instant::now() >= deadline {
@@ -1158,8 +1170,36 @@ fn process_exists(pid: Option<u32>) -> bool {
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
 }
 
-fn remove_session_artifacts(paths: &AppPaths, session: &SessionRecord) -> Result<()> {
+fn ensure_removable(session: &SessionRecord, force: bool) -> Result<()> {
+    let repo_root = Utf8PathBuf::from(session.repo_path.clone());
+    let worktree = Utf8PathBuf::from(session.worktree.clone());
+    if git::branch_has_committed_diff(&repo_root, &session.base_branch, &session.branch)? && !force
+    {
+        bail!(
+            "session `{}` branch `{}` differs from `{}`; use `agent diff {}` and `agent merge {}` first, or rerun with `--force` to remove it anyway",
+            session.session_id,
+            session.branch,
+            session.base_branch,
+            session.session_id,
+            session.session_id,
+        );
+    }
+
+    if let Some(path) = git::branch_checked_out_elsewhere(&repo_root, &session.branch, &worktree)? {
+        bail!(
+            "session `{}` branch `{}` is checked out in another worktree at {}; remove that worktree first",
+            session.session_id,
+            session.branch,
+            path,
+        );
+    }
+
+    Ok(())
+}
+
+fn remove_session_artifacts(paths: &AppPaths, session: &SessionRecord, force: bool) -> Result<()> {
     remove_worktree_if_present(session)?;
+    remove_branch_if_present(session, force)?;
     remove_log_if_present(paths, session)?;
     Ok(())
 }
@@ -1171,6 +1211,11 @@ fn remove_worktree_if_present(session: &SessionRecord) -> Result<()> {
         git::remove_worktree(&repo_root, &worktree)?;
     }
     Ok(())
+}
+
+fn remove_branch_if_present(session: &SessionRecord, force: bool) -> Result<()> {
+    let repo_root = Utf8PathBuf::from(session.repo_path.clone());
+    git::remove_branch(&repo_root, &session.branch, force)
 }
 
 fn remove_log_if_present(paths: &AppPaths, session: &SessionRecord) -> Result<()> {
@@ -1283,13 +1328,14 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachControl, SessionRuntime, TerminalGeometry, ensure_applyable, finalize_session_exit,
-        manual_accept_conflict_summary, refresh_commit_state, shell_quote,
+        AppState, AttachControl, SessionRuntime, TerminalGeometry, ensure_applyable,
+        finalize_session_exit, manual_accept_conflict_summary, refresh_commit_state, shell_quote,
     };
     use crate::app::SessionRuntimeRegistry;
     use crate::db::{Database, NewSession};
     use crate::terminal_state::TerminalStateEngine;
     use agentd_shared::{
+        config::Config,
         paths::AppPaths,
         session::{
             ApplyState, AttachmentKind, AttentionLevel, IntegrationPolicy, SessionMode,
@@ -1953,6 +1999,63 @@ mod tests {
     #[test]
     fn shell_quote_escapes_single_quotes() {
         assert_eq!(shell_quote("it's"), "'it'\"'\"'s'");
+    }
+
+    #[tokio::test]
+    async fn kill_session_remove_requires_force_when_branch_differs() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        let repo = paths.root.join("repo");
+        let worktree = paths.root.join("worktree");
+        init_git_repo(repo.as_str());
+        insert_session_with_worktree(&db, repo.as_str(), worktree.as_str(), "demo");
+        fs::write(worktree.join("README.md"), "updated\n").unwrap();
+        commit_all(worktree.as_str(), "session change");
+
+        let app = AppState::new(paths, db, Config::default());
+        let err = app.kill_session("demo", true, false).await.unwrap_err().to_string();
+        assert!(err.contains("rerun with `--force`"));
+    }
+
+    #[tokio::test]
+    async fn kill_session_remove_deletes_merged_branch() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let db = Database::open(&paths).unwrap();
+        let repo = paths.root.join("repo");
+        let worktree = paths.root.join("worktree");
+        init_git_repo(repo.as_str());
+        insert_session_with_worktree(&db, repo.as_str(), worktree.as_str(), "demo");
+        fs::write(worktree.join("README.md"), "updated\n").unwrap();
+        commit_all(worktree.as_str(), "session change");
+        assert!(
+            Command::new("git")
+                .args(["-C", repo.as_str(), "merge", "--ff-only", "agent/demo"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+
+        let app = AppState::new(paths.clone(), db.clone(), Config::default());
+        let result = app.kill_session("demo", true, false).await.unwrap();
+        assert_eq!(result, (true, false));
+        assert!(db.get_session("demo").unwrap().is_none());
+        assert!(
+            !Command::new("git")
+                .args([
+                    "-C",
+                    repo.as_str(),
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/agent/demo"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     fn test_paths() -> AppPaths {
