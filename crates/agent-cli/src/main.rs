@@ -1117,7 +1117,7 @@ async fn attach_session_once(
 
     title_guard.set_session(session_id)?;
     eprintln!(
-        "attached to {session_id} ({attach_id}); Ctrl-B overlay, Ctrl-\\\\ detaches, Ctrl-[/Ctrl-] switch running sessions"
+        "attached to {session_id} ({attach_id}); Ctrl-Y overlay, Ctrl-\\\\ detaches, Ctrl-[/Ctrl-] switch running sessions"
     );
     let _terminal = AttachTerminalGuard::enter()?;
     let raw_input = AttachRawInput::new()?;
@@ -1654,8 +1654,10 @@ fn print_kill_result(session_id: &str, was_running: bool, removed: bool) {
 }
 
 const ATTACH_DETACH_BYTE: u8 = 0x1c;
-const ATTACH_OVERLAY_BYTE: u8 = 0x02;
+const ATTACH_OVERLAY_BYTE: u8 = 0x19;
+const ATTACH_OVERLAY_LEGACY_BYTE: u8 = 0x02;
 const ATTACH_NEXT_SESSION_BYTE: u8 = 0x1d;
+const ATTACH_OVERLAY_CODEPOINT: u32 = 121;
 const ATTACH_PREVIOUS_SESSION_CODEPOINT: u32 = 91;
 const ATTACH_DETACH_CODEPOINT: u32 = 92;
 const ATTACH_NEXT_SESSION_CODEPOINT: u32 = 93;
@@ -1700,7 +1702,7 @@ impl AttachInputParser {
             }
 
             match input[index] {
-                ATTACH_OVERLAY_BYTE => {
+                ATTACH_OVERLAY_BYTE | ATTACH_OVERLAY_LEGACY_BYTE => {
                     flush_attach_bytes(&mut actions, &mut forwarded);
                     actions.push(AttachInputAction::OpenOverlay);
                 }
@@ -1735,6 +1737,7 @@ fn parse_attach_hotkey_csi_u(bytes: &[u8]) -> Option<AttachCsiUParse> {
     let mut index = 2;
     let key_code = parse_csi_u_decimal(bytes, &mut index)?;
     let action = match key_code {
+        ATTACH_OVERLAY_CODEPOINT => AttachInputAction::OpenOverlay,
         ATTACH_PREVIOUS_SESSION_CODEPOINT => AttachInputAction::PreviousSession,
         ATTACH_DETACH_CODEPOINT => AttachInputAction::Detach,
         ATTACH_NEXT_SESSION_CODEPOINT => AttachInputAction::NextSession,
@@ -2150,7 +2153,8 @@ mod tests {
 
     use super::{
         AGENTD_ATTACH_ENTER_SEQUENCE, AGENTD_ATTACH_EXIT_TITLE, AGENTD_ATTACH_RESTORE_SEQUENCE,
-        ATTACH_DETACH_BYTE, ATTACH_NEXT_SESSION_BYTE, ATTACH_OVERLAY_BYTE, AttachInputAction,
+        ATTACH_DETACH_BYTE, ATTACH_NEXT_SESSION_BYTE, ATTACH_OVERLAY_BYTE,
+        ATTACH_OVERLAY_LEGACY_BYTE, AttachInputAction,
         AttachInputParser, AttachSessionDirection, Cli, Command, DaemonCommand,
         DegradedNoticeCommand, SessionEndSummary, adjacent_live_session_id_in,
         attach_startup_bytes, bail_daemon_command, clear_stale_daemon_state, cli_command,
@@ -2552,9 +2556,24 @@ command = "claude"
     }
 
     #[test]
-    fn attach_parser_opens_overlay_on_ctrl_b_byte() {
+    fn attach_parser_opens_overlay_on_kitty_ctrl_y() {
+        let mut parser = AttachInputParser::default();
+        assert_eq!(parser.push_bytes(b"\x1b[121;5u"), vec![AttachInputAction::OpenOverlay]);
+    }
+
+    #[test]
+    fn attach_parser_opens_overlay_on_ctrl_y_byte() {
         let mut parser = AttachInputParser::default();
         assert_eq!(parser.push_bytes(&[ATTACH_OVERLAY_BYTE]), vec![AttachInputAction::OpenOverlay]);
+    }
+
+    #[test]
+    fn attach_parser_opens_overlay_on_legacy_ctrl_b_byte() {
+        let mut parser = AttachInputParser::default();
+        assert_eq!(
+            parser.push_bytes(&[ATTACH_OVERLAY_LEGACY_BYTE]),
+            vec![AttachInputAction::OpenOverlay]
+        );
     }
 
     #[test]

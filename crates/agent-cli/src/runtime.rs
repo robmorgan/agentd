@@ -1530,8 +1530,8 @@ impl AttachOverlay {
         let items = filtered_palette_items(&self.palette_query);
         match key.code {
             KeyCode::Esc => return Ok(Some(OverlayOutcome::Close)),
-            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return Ok(Some(OverlayOutcome::ForwardInput(vec![0x02])));
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(Some(OverlayOutcome::ForwardInput(b"\x19".to_vec())));
             }
             KeyCode::Enter => {
                 if let Some(item) = items.get(self.palette_selected) {
@@ -2431,15 +2431,15 @@ mod tests {
     }
 
     #[test]
-    fn attach_overlay_ctrl_b_forwards_literal_byte() {
+    fn attach_overlay_ctrl_y_forwards_literal_byte() {
         let mut overlay = AttachOverlay::new(test_paths(), "alpha".to_string());
         overlay.mode = OverlayMode::Palette;
 
         let outcome =
-            block_on(overlay.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)))
+            block_on(overlay.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)))
                 .unwrap();
 
-        assert_eq!(outcome, Some(OverlayOutcome::ForwardInput(vec![0x02])));
+        assert_eq!(outcome, Some(OverlayOutcome::ForwardInput(b"\x19".to_vec())));
     }
 
     #[test]
