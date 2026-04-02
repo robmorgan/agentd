@@ -31,15 +31,33 @@ Each task runs inside a managed session with:
 
 This allows developers to supervise agent work without constantly switching between terminal sessions.
 
+## Native Terminal First
+
+`agentd` works WITH your terminal. Ghostty, iTerm2, Kitty, WezTerm... you chose your terminal for
+a reason. `agentd` doesn't replace it.
+
+To view an agent: open a new tab, run `agent attach my-agent`. Or use the built-in TUI (`agent`
+with no args) for a quick overview of all sessions.
+
+What `agentd` manages that your terminal can't:
+
+* Daemon lifecycle: agents keep running after you disconnect
+* Attention signals: know when an agent needs you without watching it
+* Session metadata: persists across daemon restarts
+* Live reattach: reconnect to running sessions from any terminal
+* Vendor-neutral: Claude Code, Codex, any TTY-based agent
+
+Native scrollback, native search, native copy/paste. For free.
+
 ## Example
 
 Start a task:
 
 ```sh
-agent run --name fix-tests "fix failing tests in auth service"
+agent new fix-tests
 ```
 
-This creates a task, assigns a session, and starts the agent in a detached PTY.
+This creates a session, and starts the agent in an attached PTY.
 
 List running tasks:
 
@@ -124,7 +142,7 @@ Clients surface tasks based on attention instead of raw output.
 
 ![](/.github/_docs/architecture.png)
 
-`agentd` is not a terminal multiplexer. Terminal layout (splits, panes, tabs) should remain the responsibility of the host terminal or multiplexer. Instead, it focuses purely on agent runtime semantics.
+`agentd` focuses purely on agent runtime semantics:
 
 - durable PTY-backed agent sessions that outlive the client connection that started them
 - built-in Git worktree isolation under the resolved runtime root
