@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
 
-use agentd_shared::{paths::AppPaths, session::SessionStatus};
+use agentd_shared::{paths::AppPaths, process::process_exists, session::SessionStatus};
 
 use crate::db::Database;
 
@@ -172,16 +172,6 @@ async fn wait_for_new_daemon(paths: &AppPaths) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-}
-
-fn process_exists(pid: Option<u32>) -> bool {
-    let Some(pid) = pid else {
-        return false;
-    };
-    if pid == 0 {
-        return false;
-    }
-    kill(Pid::from_raw(pid as i32), None).is_ok()
 }
 
 fn send_signal(pid: Pid, signal: nix::sys::signal::Signal, name: &str) -> Result<()> {

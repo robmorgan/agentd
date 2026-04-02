@@ -6,6 +6,7 @@ use std::{
 
 use agentd_shared::{
     paths::AppPaths,
+    process::process_exists,
     session::{
         ApplyState, AttentionLevel, IntegrationPolicy, SessionMode, SessionRecord, SessionStatus,
     },
@@ -144,16 +145,6 @@ pub fn terminate_session_process(session_id: &str, pid: Option<u32>) -> Result<(
     }
 
     bail!("session `{session_id}` did not exit after SIGTERM and SIGKILL")
-}
-
-pub fn process_exists(pid: Option<u32>) -> bool {
-    let Some(pid) = pid else {
-        return false;
-    };
-    if pid == 0 {
-        return false;
-    }
-    kill(Pid::from_raw(pid as i32), None).is_ok()
 }
 
 pub fn ensure_removable(session: &SessionRecord, force: bool) -> Result<()> {
@@ -407,7 +398,11 @@ fn wait_for_exit(pid: Pid, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
         match kill(pid, None) {
-            Ok(()) => {}
+            Ok(()) => {
+                if !process_exists(Some(pid.as_raw() as u32)) {
+                    return true;
+                }
+            }
             Err(Errno::ESRCH) => return true,
             Err(_) => return false,
         }

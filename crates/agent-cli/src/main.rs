@@ -41,6 +41,7 @@ use agentd_shared::{
     config::Config,
     header::{AGENTD_PRIMARY_BLUE_RGB, agentd_header},
     paths::AppPaths,
+    process::process_exists,
     protocol::{
         DaemonInfo, DaemonManagementRequest, DaemonManagementResponse, DaemonManagementStatus,
         PROTOCOL_VERSION, Request, Response, read_daemon_management_response, read_response,
@@ -754,7 +755,7 @@ async fn spawn_daemon(paths: &AppPaths) -> Result<()> {
 fn clear_stale_daemon_state(paths: &AppPaths) -> Result<()> {
     let pid = read_daemon_pid(paths)?;
     if let Some(pid) = pid
-        && local::process_exists(Some(pid))
+        && process_exists(Some(pid))
     {
         if paths.socket.exists() {
             bail!("agentd is running (pid {pid}) but not responding; restart the daemon");

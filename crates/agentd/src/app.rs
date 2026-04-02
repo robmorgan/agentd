@@ -21,6 +21,7 @@ use tokio::{sync::broadcast, task};
 use agentd_shared::{
     config::Config,
     paths::AppPaths,
+    process::process_exists,
     session::{
         ApplyState, AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult,
         IntegrationPolicy, SESSION_NAME_RULES, SessionDiff, SessionMode, SessionRecord,
@@ -1148,7 +1149,11 @@ fn wait_for_exit(pid: Pid, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
         match kill(pid, None) {
-            Ok(()) => {}
+            Ok(()) => {
+                if !process_exists(Some(pid.as_raw() as u32)) {
+                    return true;
+                }
+            }
             Err(Errno::ESRCH) => return true,
             Err(_) => return false,
         }
@@ -1157,17 +1162,6 @@ fn wait_for_exit(pid: Pid, timeout: Duration) -> bool {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-}
-
-fn process_exists(pid: Option<u32>) -> bool {
-    let Some(pid) = pid else {
-        return false;
-    };
-    if pid == 0 {
-        return false;
-    }
-
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
 }
 
 fn ensure_removable(session: &SessionRecord, force: bool) -> Result<()> {
