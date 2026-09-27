@@ -104,3 +104,13 @@ In this way, `ghostty-vt` doesn't sit in the middle of an active terminal sessio
 the client receives so it can re-hydrate clients that connect to the session. This enables users to pick up where they
 left off as if they didn't disconnect from the terminal session at all. It also has the added benefit of being very
 fast, the only thing sitting in-between you and your PTY is a unix socket.
+
+## Go Port
+
+The server side is being ported to Go under `go/` (see `go/README.md`). The wire protocol,
+runtime root layout, and SQLite schema are shared byte-for-byte, so pieces can be swapped
+independently. Today the Go session worker is complete and the Rust daemon will spawn it
+instead of its own worker when `AGENTD_WORKER_BIN` points at `go/bin/agentd`. The Go
+worker uses `go.mitchellh.com/libghostty` for the shadow terminal, which tracks a newer
+`libghostty-vt` than `vendor/ghostty` and needs Zig 0.16, so it builds its own pinned
+checkout under `go/.build/`.

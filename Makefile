@@ -18,3 +18,11 @@ install: ensure-ghostty-lib
 
 test:
 	cargo test
+
+# Go port (see go/README.md). Requires Zig 0.16+ for libghostty-vt.
+.PHONY: go-build go-test
+go-build:
+	$(MAKE) -C go build
+
+go-test:
+	$(MAKE) -C go test
