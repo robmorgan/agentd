@@ -397,7 +397,15 @@ async fn attach_session(
     )
     .await?;
     let (mut runtime_reader, mut runtime_writer) = runtime.into_split();
-    let client_to_runtime = tokio::io::copy(reader, &mut runtime_writer);
+    let client_to_runtime = async {
+        // Half-close the runtime side once the client stops sending so the
+        // worker observes EOF, drops the attachment, and ends its stream.
+        // Without this an idle detached attachment lingers until the PTY
+        // produces output.
+        let copied = tokio::io::copy(reader, &mut runtime_writer).await;
+        let _ = runtime_writer.shutdown().await;
+        copied
+    };
     let runtime_to_client = tokio::io::copy(&mut runtime_reader, writer);
     let _ = tokio::try_join!(client_to_runtime, runtime_to_client)?;
     let _ = writer.shutdown().await;

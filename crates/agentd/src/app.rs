@@ -575,7 +575,12 @@ fn start_session_runtime(
     _runtimes: &SessionRuntimeRegistry,
     request: SessionStartRequest<'_>,
 ) -> Result<()> {
-    let current_exe = std::env::current_exe().context("failed to resolve agentd executable")?;
+    // AGENTD_WORKER_BIN lets the Go session worker stand in for the Rust one
+    // while the daemon is being ported; both speak the same worker protocol.
+    let worker_bin = match std::env::var_os("AGENTD_WORKER_BIN") {
+        Some(path) if !path.is_empty() => std::path::PathBuf::from(path),
+        _ => std::env::current_exe().context("failed to resolve agentd executable")?,
+    };
     let mut launch_args = request.launch.args.clone();
     if let Some(model) = request.model
         && let Some(flag) = config
@@ -587,7 +592,7 @@ fn start_session_runtime(
         launch_args.push(model.to_string());
     }
 
-    let mut command = std::process::Command::new(current_exe);
+    let mut command = std::process::Command::new(worker_bin);
     command
         .arg("session-worker")
         .arg("--session-id")

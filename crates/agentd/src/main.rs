@@ -53,7 +53,7 @@ pub struct SessionWorkerArgs {
     pub command: String,
     #[arg(long)]
     pub model: Option<String>,
-    #[arg(long = "arg")]
+    #[arg(long = "arg", allow_hyphen_values = true)]
     pub args: Vec<String>,
 }
 
