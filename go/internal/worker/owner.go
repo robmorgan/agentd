@@ -40,29 +40,59 @@ func (a *ownerAttachment) signalDetach() {
 	a.detachOnce.Do(func() { close(a.detach) })
 }
 
+// owner serialises all access to ownerState on a single goroutine. It is
+// stopped by closing done rather than cmds, because connection handlers and
+// the PTY pump may still try to reach it after the session has ended (for
+// example a client blocked writing to a slow socket past shutdownGrace).
+// Once stopped, do returns errOwnerStopped and post is a no-op.
 type owner struct {
 	cmds chan func(*ownerState)
+	done chan struct{}
 }
 
+var errOwnerStopped = errors.New("session worker is shutting down")
+
 func newOwner() *owner {
-	return &owner{cmds: make(chan func(*ownerState), 1024)}
+	return &owner{cmds: make(chan func(*ownerState), 1024), done: make(chan struct{})}
 }
 
 // do runs fn on the owner goroutine and waits for it to finish.
 func (o *owner) do(fn func(*ownerState) error) error {
-	done := make(chan error, 1)
-	o.cmds <- func(s *ownerState) { done <- fn(s) }
-	return <-done
+	result := make(chan error, 1)
+	select {
+	case o.cmds <- func(s *ownerState) { result <- fn(s) }:
+	case <-o.done:
+		return errOwnerStopped
+	}
+	select {
+	case err := <-result:
+		return err
+	case <-o.done:
+		return errOwnerStopped
+	}
 }
 
 // post runs fn on the owner goroutine without waiting.
 func (o *owner) post(fn func(*ownerState)) {
-	o.cmds <- fn
+	select {
+	case o.cmds <- fn:
+	case <-o.done:
+	}
+}
+
+// stop makes run return after the command in progress, if any.
+func (o *owner) stop() {
+	close(o.done)
 }
 
 func (o *owner) run(state *ownerState) {
-	for fn := range o.cmds {
-		fn(state)
+	for {
+		select {
+		case fn := <-o.cmds:
+			fn(state)
+		case <-o.done:
+			return
+		}
 	}
 }
 

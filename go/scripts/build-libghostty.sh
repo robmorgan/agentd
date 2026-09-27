@@ -14,8 +14,18 @@ BUILD="${HERE}/../.build"
 SRC="${BUILD}/ghostty"
 OUT="${BUILD}/ghostty-out"
 ZIG="${ZIG:-zig}"
+# zig build defaults to Debug, which makes the shadow terminal parse PTY
+# output roughly two orders of magnitude slower. Override for debugging.
+OPTIMIZE="${GHOSTTY_OPTIMIZE:-ReleaseFast}"
+STAMP="${GHOSTTY_COMMIT} ${OPTIMIZE}"
 
 if [[ "${1:-}" == "--env" ]]; then
+  echo "export PKG_CONFIG_PATH=\"${OUT}/share/pkgconfig\""
+  exit 0
+fi
+
+if [[ -f "${OUT}/share/pkgconfig/libghostty-vt-static.pc" && "$(cat "${OUT}/.commit" 2>/dev/null)" == "${STAMP}" ]]; then
+  echo "libghostty-vt ready: ${OUT}" >&2
   echo "export PKG_CONFIG_PATH=\"${OUT}/share/pkgconfig\""
   exit 0
 fi
@@ -42,10 +52,9 @@ if ! git -C "${SRC}" cat-file -e "${GHOSTTY_COMMIT}^{commit}" 2>/dev/null; then
 fi
 git -C "${SRC}" checkout -q --detach "${GHOSTTY_COMMIT}"
 
-if [[ ! -f "${OUT}/share/pkgconfig/libghostty-vt-static.pc" || "${OUT}/.commit" != *"${GHOSTTY_COMMIT}"* || "$(cat "${OUT}/.commit" 2>/dev/null)" != "${GHOSTTY_COMMIT}" ]]; then
-  (cd "${SRC}" && "${ZIG}" build -Demit-lib-vt --prefix "${OUT}")
-  echo "${GHOSTTY_COMMIT}" > "${OUT}/.commit"
-fi
+rm -rf "${OUT}"
+(cd "${SRC}" && "${ZIG}" build -Demit-lib-vt -Doptimize="${OPTIMIZE}" --prefix "${OUT}")
+echo "${STAMP}" > "${OUT}/.commit"
 
 echo "libghostty-vt ready: ${OUT}" >&2
 echo "export PKG_CONFIG_PATH=\"${OUT}/share/pkgconfig\""

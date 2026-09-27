@@ -180,6 +180,37 @@ func (d *Database) exec(query string, args ...any) error {
 	return err
 }
 
+// NewSession mirrors the Rust daemon's NewSession: the columns known when a
+// session row is first created.
+type NewSession struct {
+	SessionID         string
+	Agent             string
+	Model             *string
+	Mode              session.Mode
+	Workspace         string
+	RepoPath          string
+	RepoName          string
+	BaseBranch        string
+	Branch            string
+	Worktree          string
+	IntegrationPolicy session.IntegrationPolicy
+}
+
+func (d *Database) InsertSession(s NewSession) error {
+	var model any
+	if s.Model != nil {
+		model = *s.Model
+	}
+	return d.exec(`INSERT INTO sessions (
+                session_id, agent, model, mode, workspace, repo_path, repo_name, base_branch, branch, worktree,
+                status, integration_policy, attention, attention_summary, integration_state, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)`,
+		s.SessionID, s.Agent, model, string(s.Mode), s.Workspace, s.RepoPath, s.RepoName,
+		s.BaseBranch, s.Branch, s.Worktree, string(session.StatusCreating),
+		string(s.IntegrationPolicy), string(session.AttentionInfo), s.SessionID,
+		string(session.ApplyIdle), now())
+}
+
 func (d *Database) MarkRunning(sessionID string, workerPID, agentPID int) error {
 	return d.exec(`UPDATE sessions
              SET status = ?2, integration_state = ?3, worker_pid = ?4, agent_pid = ?5,

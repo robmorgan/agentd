@@ -186,7 +186,7 @@ func Run(args Args) error {
 	case <-finished:
 	case <-time.After(shutdownGrace):
 	}
-	close(rt.owner.cmds)
+	rt.owner.stop()
 	<-ownerDone
 	return nil
 }
@@ -355,11 +355,20 @@ func (rt *runtime) serveAttach(conn net.Conn, reader *bufio.Reader, kind session
 		req *protocol.Request
 		err error
 	}
+	// The reader goroutine exits when conn is closed (handleConnection's
+	// deferred Close) or the peer hangs up; stop keeps it from blocking on
+	// requests once this loop has returned.
 	requests := make(chan incoming, 1)
+	stop := make(chan struct{})
+	defer close(stop)
 	go func() {
 		for {
 			req, err := protocol.ReadRequest(reader)
-			requests <- incoming{req, err}
+			select {
+			case requests <- incoming{req, err}:
+			case <-stop:
+				return
+			}
 			if err != nil || req == nil {
 				return
 			}
@@ -377,6 +386,11 @@ loop:
 		case <-att.detach:
 			break loop
 		case <-rt.ended.ch:
+			// Flush output already queued for this client so the tail of
+			// the session is not lost behind SessionEnded.
+			if err := drainOutput(conn, att.sub); err != nil {
+				return err
+			}
 			final = rt.endedResponse()
 			break loop
 		case in := <-requests:
@@ -417,4 +431,17 @@ loop:
 	}
 
 	return protocol.WriteResponse(conn, final)
+}
+
+func drainOutput(conn net.Conn, sub *subscriber) error {
+	for {
+		select {
+		case data := <-sub.ch:
+			if err := protocol.WriteResponse(conn, &protocol.Response{PtyOutput: &protocol.Bytes{Data: data}}); err != nil {
+				return err
+			}
+		default:
+			return nil
+		}
+	}
 }
