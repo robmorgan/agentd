@@ -507,10 +507,11 @@ Done:
 - Attach fan-out and PTY input are bounded, and the runtime root is private to the user.
 - The transport split: the daemon serves `transport.Stream`s from any `transport.Listener`.
 - The daemon's QUIC listener (off unless `[remote] listen` is set): one QUIC stream per request or attachment, mutual TLS with pinned Ed25519 keys, managed with `agentd remote id|list|authorize|revoke`.
+- The CLI's QUIC client: `agent --host NAME` and `NAME/session` addresses, `agent host add|ls|rm` (confirm-on-first-use key pinning in `hosts.toml`), and `agent remote id` (`remote/client.key`).
 
 Next:
-1. The CLI's QUIC client for `agent --host`: quinn + rustls, the same ALPN (`agentd`) and fingerprint pinning, a client key and a known-hosts file.
-2. Host configuration and aliases, so `agent --host devbox` and `devbox/session` work.
+1. Automatic reattach after a network drop, and noticing dead clients faster than the 60s idle timeout.
+2. Cross-host discovery (`agent ls` across hosts) and host health.
 3. Per-client permissions and audit, if remote peers need to be limited.
 
 Known gaps:

@@ -252,28 +252,73 @@ path when a worker is focused. Background PTY writes are still available with
 ## Remote Access (Preview)
 
 `agentd` can accept remote clients over QUIC, so sessions on a devbox can be reached from a laptop
-over a LAN, Tailscale or WireGuard, without any hosted service. The daemon side is in place; the
-`agent --host` client is the next step, so there is nothing to connect with yet.
+over a LAN, Tailscale or WireGuard, without any hosted service. Both sides authenticate with pinned
+keys, like SSH host keys and `authorized_keys`.
 
-Remote access is off by default. To enable it, add a listen address to `config.toml`. Prefer a
-Tailscale or WireGuard address over a public one:
+**On the devbox**, remote access is off by default. Add a listen address to `config.toml`, preferring
+a Tailscale or WireGuard address over a public one, then restart the daemon:
 
 ```toml
 [remote]
 listen = "100.64.0.5:7433"   # UDP
 ```
 
-Both sides authenticate with pinned keys, like SSH host keys and `authorized_keys`:
+```sh
+agent daemon restart
+agentd remote id          # the daemon's key fingerprint, for the laptop to pin
+```
+
+**On the laptop**, add the host. `agent host add` shows the key the daemon presents and asks you to
+confirm it against `agentd remote id` (or pass `--fingerprint SHA256:...` to skip the prompt), then
+prints the command that authorizes the laptop:
 
 ```sh
-agentd remote id                               # the daemon's key fingerprint, for clients to pin
-agentd remote authorize SHA256:... my-laptop   # allow a client key
-agentd remote list
+agent host add devbox 100.64.0.5:7433
+```
+
+**Back on the devbox**, run the command it printed:
+
+```sh
+agentd remote authorize SHA256:... my-laptop
+```
+
+Now any command can run on the devbox, with `--host` or a `host/session` address:
+
+```sh
+agent --host devbox new --cwd /srv/repo auth-refactor   # --cwd is a path on the devbox
+agent --host devbox ls
+agent attach devbox/auth-refactor
+agent send-input devbox/auth-refactor -- "run the tests"
+agent history devbox/auth-refactor
+agent rm devbox/auth-refactor
+```
+
+Closing the laptop or losing the network leaves the session running; `agent attach` again, from any
+authorized machine, restores the screen. Without `--agent`, `new` uses the devbox's `default_agent`.
+
+Managing keys and hosts:
+
+```sh
+agent remote id                  # this machine's client key fingerprint
+agent host ls
+agent host rm devbox
+agentd remote list               # on the devbox: authorized clients
 agentd remote revoke SHA256:...
 ```
 
-Only authorized client keys can connect, and an authorized client has the same access as you have
-locally. Changes to the authorized list apply to new connections immediately.
+An authorized client has the same access as you have locally. Changes to the authorized list apply
+to new connections immediately. `agent daemon info` works remotely; `restart` and `upgrade` only
+manage the local daemon.
+
+Troubleshooting:
+
+- **"refused this machine's key"**: the laptop is not authorized; run the `agentd remote authorize`
+  command from the error on the devbox.
+- **"the key of host ... has changed"**: the devbox presented a different key from the pinned one.
+  If you know why (for example `remote/daemon.key` was recreated), run `agent host rm` and
+  `agent host add` again. Otherwise, treat it as a possible interception.
+- **"timed out connecting"**: check `[remote] listen` on the devbox, that the daemon was restarted,
+  and that UDP reaches the port (firewalls often allow TCP only).
 
 ## Troubleshooting
 
@@ -302,6 +347,7 @@ AGENTD_BIN=$PWD/go/bin/agentd agent daemon restart
 Current capabilities include:
 
 - local `agentd` daemon over a Unix socket
+- remote sessions over QUIC with `agent --host` and pinned keys (preview)
 - PTY-backed agent processes that outlive client connections
 - sessions that survive the daemon stopping, restarting, or being upgraded: each runs in its
   own worker process, and a new daemon picks it up again

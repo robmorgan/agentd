@@ -481,20 +481,20 @@ One slow session should not unnecessarily stall unrelated sessions.
 ## Deliverables
 
 * [x] Add QUIC listener to `agentd`
-* [ ] Add QUIC client transport
+* [x] Add QUIC client transport (`agent --host`)
 * [x] Establish TLS identity model (self-signed Ed25519 keys, pinned by fingerprint)
 * [x] Authenticate machines/clients (mutual TLS: authorized client keys, pinned daemon key)
 * [x] Define stream roles (one bidirectional stream per request or attachment)
 * [ ] Define stream negotiation
 * [ ] Support remote:
 
-  * [ ] `ls`
-  * [ ] `run`
-  * [ ] `attach`
-  * [ ] `send`
-  * [ ] `history`
+  * [x] `ls`
+  * [x] `run` (`agent --host H new --cwd DIR`)
+  * [x] `attach`
+  * [x] `send`
+  * [x] `history`
   * [ ] `diff`
-  * [ ] `kill`
+  * [x] `kill`
 * [ ] Preserve sessions across network loss
 * [ ] Reconnect cleanly
 * [ ] Restore terminal state after reconnect
@@ -882,8 +882,8 @@ agent attach devbox-1/auth-tests
 
 ## Deliverables
 
-* [ ] Host configuration
-* [ ] Host aliases
+* [x] Host configuration (`agent host add|ls|rm`, `hosts.toml`)
+* [x] Host aliases (`--host NAME`, `NAME/session`)
 * [ ] Host health
 * [ ] Cross-host session discovery
 * [ ] Stable global session identifiers
