@@ -12,10 +12,12 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/robmorgan/agentd/go/internal/daemon"
 	"github.com/robmorgan/agentd/go/internal/paths"
+	"github.com/robmorgan/agentd/go/internal/transport"
 	"github.com/robmorgan/agentd/go/internal/worker"
 )
 
@@ -34,6 +36,8 @@ func main() {
 		os.Exit(runServe(os.Args[2:]))
 	case "upgrade":
 		os.Exit(runUpgrade())
+	case "remote":
+		os.Exit(runRemote(os.Args[2:]))
 	case "session-worker":
 		os.Exit(runSessionWorker(os.Args[2:]))
 	default:
@@ -45,6 +49,7 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: agentd serve [--daemonize]")
 	fmt.Fprintln(os.Stderr, "       agentd upgrade")
+	fmt.Fprintln(os.Stderr, "       agentd remote id | list | authorize FINGERPRINT [NAME] | revoke FINGERPRINT")
 	fmt.Fprintln(os.Stderr, "       agentd session-worker --session-id ID --cwd DIR --created-at TS --agent-name NAME --command CMD [--model M] [--arg A]...")
 }
 
@@ -92,6 +97,64 @@ func runUpgrade() int {
 		return 1
 	}
 	fmt.Println("✓ Upgraded daemon")
+	return 0
+}
+
+// runRemote manages remote access: the daemon's own key and the client keys
+// allowed to connect. Remote access itself is switched on with [remote]
+// listen in config.toml.
+func runRemote(argv []string) int {
+	p, err := paths.Discover()
+	if err == nil {
+		err = p.EnsureLayout()
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+		return 1
+	}
+	fail := func(err error) int {
+		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+		return 1
+	}
+	authorized := p.AuthorizedClientsPath()
+	switch {
+	case len(argv) == 1 && argv[0] == "id":
+		id, err := transport.LoadOrCreateIdentity(p.RemoteKeyPath())
+		if err != nil {
+			return fail(err)
+		}
+		fmt.Println(id.Fingerprint)
+	case len(argv) == 1 && argv[0] == "list":
+		clients, err := transport.ReadAuthorized(authorized)
+		if err != nil {
+			return fail(err)
+		}
+		for _, c := range clients {
+			fmt.Println(strings.TrimSpace(c.Fingerprint + " " + c.Name))
+		}
+	case len(argv) >= 2 && argv[0] == "authorize":
+		added, err := transport.Authorize(authorized, argv[1], strings.Join(argv[2:], " "))
+		if err != nil {
+			return fail(err)
+		}
+		if added {
+			fmt.Printf("authorized %s\n", argv[1])
+		} else {
+			fmt.Printf("%s was already authorized\n", argv[1])
+		}
+	case len(argv) == 2 && argv[0] == "revoke":
+		removed, err := transport.Revoke(authorized, argv[1])
+		if err != nil {
+			return fail(err)
+		}
+		if !removed {
+			return fail(fmt.Errorf("%s is not authorized", argv[1]))
+		}
+		fmt.Printf("revoked %s\n", argv[1])
+	default:
+		usage()
+		return 2
+	}
 	return 0
 }
 

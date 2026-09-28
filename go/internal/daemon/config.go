@@ -13,6 +13,16 @@ import (
 type Config struct {
 	DefaultAgent string                 `toml:"default_agent"`
 	Agents       map[string]AgentConfig `toml:"agents"`
+	Remote       RemoteConfig           `toml:"remote"`
+}
+
+// RemoteConfig enables remote access over QUIC. It is off unless Listen is
+// set; even then only clients listed in the authorized-clients file can
+// connect.
+type RemoteConfig struct {
+	// Listen is the UDP host:port to accept QUIC connections on. Prefer a
+	// Tailscale or WireGuard address over a public one.
+	Listen string `toml:"listen"`
 }
 
 type AgentConfig struct {

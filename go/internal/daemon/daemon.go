@@ -39,6 +39,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/robmorgan/agentd/go/internal/db"
@@ -69,6 +70,10 @@ type Server struct {
 	// workerBin is the executable started as `<workerBin> session-worker`.
 	workerBin string
 	lockWait  time.Duration
+
+	// remoteAddr is where the QUIC listener is bound, if remote access is
+	// enabled and it started.
+	remoteAddr atomic.Pointer[string]
 
 	// createMu serialises session name allocation and row insertion.
 	createMu sync.Mutex
@@ -148,6 +153,8 @@ func (s *Server) Serve(ctx context.Context) error {
 		return fmt.Errorf("failed to write %s: %w", s.paths.PIDFile, err)
 	}
 
+	s.startRemote()
+
 	acceptDone := make(chan struct{})
 	go func() {
 		defer close(acceptDone)
@@ -183,6 +190,51 @@ func (s *Server) Serve(ctx context.Context) error {
 	// again here could delete the socket of a daemon started since, which
 	// is waiting for the lock released when Serve returns.
 	return nil
+}
+
+// startRemote starts the QUIC listener when remote access is configured. A
+// failure is logged and local service carries on: a bad remote setting must
+// not lock the user out of their local sessions.
+func (s *Server) startRemote() {
+	addr := s.config.Remote.Listen
+	if addr == "" {
+		return
+	}
+	id, err := transport.LoadOrCreateIdentity(s.paths.RemoteKeyPath())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agentd: remote access disabled: %v\n", err)
+		return
+	}
+	authorized := s.paths.AuthorizedClientsPath()
+	l, err := transport.ListenQUIC(addr, id, transport.QUICOptions{
+		Authorized: func(fp string) bool {
+			ok, err := transport.IsAuthorized(authorized, fp)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "agentd: reading %s: %v\n", authorized, err)
+			}
+			return ok
+		},
+		OnConnect: func(fp string, remote net.Addr) {
+			fmt.Fprintf(os.Stderr, "agentd: remote client %s connected from %s\n", fp, remote)
+		},
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agentd: remote access disabled: %v\n", err)
+		return
+	}
+	bound := l.Addr()
+	s.remoteAddr.Store(&bound)
+	fmt.Fprintf(os.Stderr, "agentd: accepting remote clients over QUIC on %s (key %s)\n", bound, id.Fingerprint)
+	go s.serveListener(l)
+}
+
+// RemoteAddr is the address the QUIC listener is bound to, or "" when
+// remote access is off or failed to start.
+func (s *Server) RemoteAddr() string {
+	if addr := s.remoteAddr.Load(); addr != nil {
+		return *addr
+	}
+	return ""
 }
 
 // serveListener serves streams from l until it is closed. Serve runs the

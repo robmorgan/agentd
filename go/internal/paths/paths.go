@@ -114,6 +114,16 @@ func (p *AppPaths) DaemonLogPath() string {
 	return filepath.Join(p.Root, "agentd.log")
 }
 
+// RemoteKeyPath is the daemon's key for remote (QUIC) connections.
+func (p *AppPaths) RemoteKeyPath() string {
+	return filepath.Join(p.Root, "remote", "daemon.key")
+}
+
+// AuthorizedClientsPath lists the client keys allowed to connect remotely.
+func (p *AppPaths) AuthorizedClientsPath() string {
+	return filepath.Join(p.Root, "remote", "authorized_clients")
+}
+
 // LockPath is held (flock) by the running daemon for its whole lifetime.
 func (p *AppPaths) LockPath() string {
 	return filepath.Join(p.Root, "agentd.lock")

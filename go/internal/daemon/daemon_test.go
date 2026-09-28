@@ -88,10 +88,17 @@ type harness struct {
 	done   chan error
 	// dialer, when set, replaces the Unix socket for client connections,
 	// so the same tests can run over another transport.
-	dialer func() (net.Conn, error)
+	dialer func() (transport.Stream, error)
 }
 
 func newHarness(t *testing.T) *harness {
+	t.Helper()
+	return newHarnessWithConfig(t, "")
+}
+
+// newHarnessWithConfig starts a daemon whose config.toml is the test config
+// followed by extra.
+func newHarnessWithConfig(t *testing.T, extra string) *harness {
 	t.Helper()
 	// Unix socket paths are limited to ~104 bytes, so avoid t.TempDir().
 	root, err := os.MkdirTemp("/tmp", "agdd-")
@@ -103,7 +110,7 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 	p := paths.FromRoot(root)
-	if err := os.WriteFile(p.Config, []byte(testConfig), 0o644); err != nil {
+	if err := os.WriteFile(p.Config, []byte(testConfig+extra), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	h := &harness{t: t, paths: p, cwd: cwd}
@@ -193,11 +200,11 @@ func (h *harness) eventually(what string, cond func() bool) {
 	}
 }
 
-func (h *harness) dial() net.Conn {
+func (h *harness) dial() transport.Stream {
 	h.t.Helper()
 	dial := h.dialer
 	if dial == nil {
-		dial = func() (net.Conn, error) { return net.Dial("unix", h.paths.Socket) }
+		dial = func() (transport.Stream, error) { return transport.DialUnix(h.paths.Socket, testTimeout) }
 	}
 	conn, err := dial()
 	if err != nil {
@@ -301,7 +308,7 @@ func wantError(t *testing.T, resp *protocol.Response, substr string) {
 
 type client struct {
 	t        *testing.T
-	conn     net.Conn
+	conn     transport.Stream
 	r        *bufio.Reader
 	attachID string
 	snapshot []byte
@@ -466,7 +473,7 @@ func TestMalformedFramesDoNotAffectDaemon(t *testing.T) {
 	} {
 		conn := h.dial()
 		conn.Write(frame)
-		conn.(*net.UnixConn).CloseWrite()
+		conn.CloseWrite()
 		conn.SetReadDeadline(time.Now().Add(testTimeout))
 		io.Copy(io.Discard, conn)
 		conn.Close()
@@ -967,7 +974,13 @@ func TestServesSessionsOverAnotherTransport(t *testing.T) {
 		close(served)
 	}()
 	addr := l.Addr().String()
-	h.dialer = func() (net.Conn, error) { return net.Dial("tcp", addr) }
+	h.dialer = func() (transport.Stream, error) {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		return conn.(*net.TCPConn), nil
+	}
 
 	id := h.mustCreate("over-tcp")
 	c := h.attach(id)
@@ -998,4 +1011,133 @@ func TestServesSessionsOverAnotherTransport(t *testing.T) {
 	case <-time.After(testTimeout):
 		t.Fatal("tcp listener still served after shutdown")
 	}
+}
+
+const remoteConfig = `
+[remote]
+listen = "127.0.0.1:0"
+`
+
+// dialRemote connects to the harness daemon over QUIC as client, pinning
+// the daemon's key, and points the harness helpers at that connection.
+func (h *harness) dialRemote(client *transport.Identity) (*transport.QUICClient, error) {
+	h.t.Helper()
+	h.eventually("QUIC listener", func() bool { return h.srv.RemoteAddr() != "" })
+	daemonKey, err := transport.LoadOrCreateIdentity(h.paths.RemoteKeyPath())
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	qc, err := transport.DialQUIC(ctx, h.srv.RemoteAddr(), client, daemonKey.Fingerprint)
+	if err != nil {
+		return nil, err
+	}
+	h.t.Cleanup(func() { qc.Close() })
+	h.dialer = func() (transport.Stream, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+		defer cancel()
+		return qc.OpenStream(ctx)
+	}
+	return qc, nil
+}
+
+func newClientIdentity(t *testing.T) *transport.Identity {
+	t.Helper()
+	id, err := transport.GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// A full session lifecycle over QUIC, set up through config.toml and the
+// authorized-clients file exactly as a user would.
+func TestServesSessionsOverQUIC(t *testing.T) {
+	h := newHarnessWithConfig(t, remoteConfig)
+	client := newClientIdentity(t)
+	if _, err := transport.Authorize(h.paths.AuthorizedClientsPath(), client.Fingerprint, "test laptop"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.dialRemote(client); err != nil {
+		t.Fatal(err)
+	}
+
+	id := h.mustCreate("remote")
+	c := h.attach(id)
+	c.input("one\n")
+	c.expectOutput("got:one")
+	c.conn.Close() // the laptop goes away without detaching
+	h.eventually("attachment release", func() bool { return len(h.attachments(id)) == 0 })
+	h.sendInput(id, "while-away\n")
+	h.eventually("output while detached", func() bool { return strings.Contains(h.history(id), "got:while-away") })
+
+	c2 := h.attach(id)
+	for _, want := range []string{"got:one", "got:while-away"} {
+		if !bytes.Contains(c2.snapshot, []byte(want)) {
+			t.Fatalf("reattach snapshot over QUIC missing %q", want)
+		}
+	}
+	c2.input("done\n")
+	if end := c2.expectEnd(); end.SessionEnded == nil || end.SessionEnded.Status != session.StatusExited {
+		t.Fatalf("end = %#v", end)
+	}
+	if resp := h.request(&protocol.Request{ListSessions: protocol.Empty}); resp.Sessions == nil || len(*resp.Sessions) != 1 {
+		t.Fatalf("list over QUIC = %#v", resp)
+	}
+	if st := h.management(&protocol.ManagementRequest{Status: protocol.Empty}).Status; st == nil || st.ProtocolVersion != protocol.ProtocolVersion {
+		t.Fatalf("management status over QUIC = %#v", st)
+	}
+}
+
+func remoteRequestWorks(h *harness, client *transport.Identity) bool {
+	h.t.Helper()
+	qc, err := h.dialRemote(client)
+	if err != nil {
+		return false
+	}
+	defer qc.Close()
+	conn, err := h.dialer()
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(testTimeout))
+	if protocol.WriteRequest(conn, &protocol.Request{ListSessions: protocol.Empty}) != nil {
+		return false
+	}
+	resp, err := protocol.ReadResponse(bufio.NewReader(conn))
+	return err == nil && resp != nil && resp.Sessions != nil
+}
+
+// Only clients in the authorized-clients file get in; the file is read on
+// every handshake, so authorizing and revoking apply to new connections
+// without restarting the daemon.
+func TestRemoteAccessRequiresAuthorizedKey(t *testing.T) {
+	h := newHarnessWithConfig(t, remoteConfig)
+	client := newClientIdentity(t)
+	if remoteRequestWorks(h, client) {
+		t.Fatal("unauthorized client was served")
+	}
+	transport.Authorize(h.paths.AuthorizedClientsPath(), client.Fingerprint, "")
+	if !remoteRequestWorks(h, client) {
+		t.Fatal("authorized client was refused")
+	}
+	transport.Revoke(h.paths.AuthorizedClientsPath(), client.Fingerprint)
+	if remoteRequestWorks(h, client) {
+		t.Fatal("revoked client was served")
+	}
+}
+
+// A remote setting that cannot be honoured disables remote access but must
+// not take local service down with it.
+func TestBadRemoteListenStillServesLocally(t *testing.T) {
+	h := newHarnessWithConfig(t, `
+[remote]
+listen = "not an address"
+`)
+	if addr := h.srv.RemoteAddr(); addr != "" {
+		t.Fatalf("remote listener started on %q", addr)
+	}
+	h.mustCreate("local-ok")
 }
