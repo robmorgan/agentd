@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"time"
+	"unicode/utf8"
 
 	"github.com/robmorgan/agentd/go/internal/session"
 )
@@ -845,7 +846,16 @@ func (d *decoder) bytes() []byte {
 	return out
 }
 
-func (d *decoder) str() string { return string(d.bytes()) }
+// str rejects invalid UTF-8, as the Rust decoder does, so that nothing the Go
+// side accepts (and may persist) can later fail to decode in the CLI.
+func (d *decoder) str() string {
+	b := d.bytes()
+	if !utf8.Valid(b) {
+		d.fail("invalid UTF-8 in string field")
+		return ""
+	}
+	return string(b)
+}
 
 func (d *decoder) optStr() *string {
 	if !d.bool() {

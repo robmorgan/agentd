@@ -327,3 +327,13 @@ func TestReadIncomingDecodeError(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+func TestInvalidUTF8StringsAreRejected(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteRequest(&buf, &Request{CreateSession: &CreateSession{Cwd: "/ok\xff", Agent: "sh"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadRequest(&buf); err == nil || !strings.Contains(err.Error(), "invalid UTF-8") {
+		t.Fatalf("got %v", err)
+	}
+}
