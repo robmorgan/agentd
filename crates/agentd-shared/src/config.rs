@@ -1,4 +1,4 @@
-use std::fs;
+use std::{fs, io::Write, os::unix::fs::OpenOptionsExt};
 
 use anyhow::{Context, Result, bail};
 use indexmap::IndexMap;
@@ -12,8 +12,6 @@ pub struct Config {
     pub default_agent: String,
     #[serde(default)]
     pub agents: IndexMap<String, AgentConfig>,
-    #[serde(default)]
-    pub git: GitConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,22 +23,17 @@ pub struct AgentConfig {
     pub model_flag: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GitConfig {
-    #[serde(default = "default_auto_commit_message")]
-    pub auto_commit_message: String,
-}
-
 fn default_model_flag() -> Option<String> {
     Some("--model".to_string())
 }
 
-fn default_agent_name() -> String {
-    "codex".to_string()
-}
+/// The agent used when a config does not say. An explicit `default_agent`
+/// always wins; without one, `claude` if it is configured, else the first
+/// configured agent (see `resolve_default_agent`).
+const PREFERRED_DEFAULT_AGENT: &str = "claude";
 
-fn default_auto_commit_message() -> String {
-    "agentd: finalize session {session_id}".to_string()
+fn default_agent_name() -> String {
+    String::new()
 }
 
 impl Config {
@@ -59,7 +52,15 @@ impl Config {
     pub fn write_default(paths: &AppPaths) -> Result<()> {
         let contents = toml::to_string_pretty(&Self::default())
             .context("failed to serialize default config")?;
-        fs::write(paths.config.as_std_path(), contents)
+        // Files under the runtime root are private to the user, like the root.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(paths.config.as_std_path())
+            .with_context(|| format!("failed to write {}", paths.config))?;
+        file.write_all(contents.as_bytes())
             .with_context(|| format!("failed to write {}", paths.config))?;
         Ok(())
     }
@@ -85,23 +86,28 @@ impl Config {
         )
     }
 
-    fn validate(self, paths: &AppPaths) -> Result<Self> {
+    fn validate(mut self, paths: &AppPaths) -> Result<Self> {
+        self.resolve_default_agent();
         self.default_agent_name(paths)?;
         Ok(self)
+    }
+
+    fn resolve_default_agent(&mut self) {
+        if !self.default_agent.is_empty() {
+            return;
+        }
+        self.default_agent =
+            if self.agents.is_empty() || self.agents.contains_key(PREFERRED_DEFAULT_AGENT) {
+                PREFERRED_DEFAULT_AGENT.to_string()
+            } else {
+                self.agents.keys().next().cloned().unwrap_or_default()
+            };
     }
 }
 
 impl Default for Config {
     fn default() -> Self {
         let mut agents = IndexMap::new();
-        agents.insert(
-            "codex".to_string(),
-            AgentConfig {
-                command: "codex".to_string(),
-                args: Vec::new(),
-                model_flag: default_model_flag(),
-            },
-        );
         agents.insert(
             "claude".to_string(),
             AgentConfig {
@@ -110,13 +116,15 @@ impl Default for Config {
                 model_flag: default_model_flag(),
             },
         );
-        Self { default_agent: default_agent_name(), agents, git: GitConfig::default() }
-    }
-}
-
-impl Default for GitConfig {
-    fn default() -> Self {
-        Self { auto_commit_message: default_auto_commit_message() }
+        agents.insert(
+            "codex".to_string(),
+            AgentConfig {
+                command: "codex".to_string(),
+                args: Vec::new(),
+                model_flag: default_model_flag(),
+            },
+        );
+        Self { default_agent: PREFERRED_DEFAULT_AGENT.to_string(), agents }
     }
 }
 
@@ -135,7 +143,6 @@ mod tests {
             config: root.join("config.toml"),
             logs_dir: root.join("logs"),
             sessions_dir: root.join("sessions"),
-            worktrees_dir: root.join("worktrees"),
             root,
         }
     }
@@ -148,12 +155,31 @@ mod tests {
     }
 
     #[test]
-    fn default_config_uses_codex_default_agent_and_order() {
+    fn write_default_creates_private_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let suffix =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root =
+            Utf8PathBuf::from(format!("/tmp/agentd-config-mode-{}-{suffix}", std::process::id()));
+        let paths =
+            AppPaths { config: root.join("config.toml"), root: root.clone(), ..test_paths() };
+        std::fs::create_dir_all(root.as_std_path()).unwrap();
+
+        Config::write_default(&paths).unwrap();
+
+        let mode = std::fs::metadata(paths.config.as_std_path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(Config::load(&paths).unwrap().default_agent, "claude");
+        let _ = std::fs::remove_dir_all(root.as_std_path());
+    }
+
+    #[test]
+    fn default_config_uses_claude_default_agent_and_order() {
         let config = Config::default();
-        assert_eq!(config.default_agent, "codex");
+        assert_eq!(config.default_agent, "claude");
         assert_eq!(
             config.agents.keys().map(String::as_str).collect::<Vec<_>>(),
-            vec!["codex", "claude"]
+            vec!["claude", "codex"]
         );
     }
 
@@ -185,7 +211,7 @@ command = "zed"
     }
 
     #[test]
-    fn missing_default_agent_defaults_to_codex() {
+    fn missing_default_agent_falls_back_to_first_agent_without_claude() {
         let paths = test_paths();
         let config: Config = toml::from_str(
             r#"
@@ -198,6 +224,24 @@ command = "codex"
         let config = config.validate(&paths).unwrap();
         assert_eq!(config.default_agent, "codex");
         assert_eq!(config.default_agent_name(&paths).unwrap(), "codex");
+    }
+
+    #[test]
+    fn missing_default_agent_prefers_claude() {
+        let paths = test_paths();
+        let config: Config = toml::from_str(
+            r#"
+[agents.codex]
+command = "codex"
+
+[agents.claude]
+command = "claude"
+"#,
+        )
+        .unwrap();
+
+        let config = config.validate(&paths).unwrap();
+        assert_eq!(config.default_agent_name(&paths).unwrap(), "claude");
     }
 
     #[test]

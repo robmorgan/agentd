@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "crates/agentd-shared",
-    "crates/agentd",
     "crates/agent-cli",
 ]
 resolver = "2"
@@ -13,7 +12,6 @@ version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1.0"
-base64 = "0.22"
 camino = { version = "1.1", features = ["serde1"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
@@ -23,8 +21,6 @@ futures = "0.3"
 indexmap = { version = "2.12", features = ["serde"] }
 libc = "0.2"
 nix = { version = "0.30", features = ["poll", "signal", "term", "user"] }
-portable-pty = "0.9"
-rand = "0.9"
 ratatui = "0.29"
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -33,8 +29,3 @@ supports-color = "3.0"
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["full"] }
 toml = "0.9"
-uuid = { version = "1.18", features = ["v4"] }
-
-[patch.crates-io]
-libghostty-vt = { path = "third_party/libghostty-vt" }
-libghostty-vt-sys = { path = "third_party/libghostty-vt-sys" }

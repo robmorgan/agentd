@@ -1,6 +1,9 @@
-use std::fs;
+use std::{
+    fs,
+    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use nix::unistd::getuid;
 
@@ -15,7 +18,6 @@ pub struct AppPaths {
     pub config: Utf8PathBuf,
     pub logs_dir: Utf8PathBuf,
     pub sessions_dir: Utf8PathBuf,
-    pub worktrees_dir: Utf8PathBuf,
 }
 
 impl AppPaths {
@@ -31,10 +33,15 @@ impl AppPaths {
         Ok(Self::from_root(root))
     }
 
+    /// Creates the runtime root, `logs/` and `sessions/` as private (0700)
+    /// directories, tightening them if they already exist. The root holds the
+    /// daemon socket, session sockets and logs of agent output, so a root that
+    /// is a symlink or belongs to another user is refused rather than used.
+    /// go/internal/paths EnsureLayout applies the same rules.
     pub fn ensure_layout(&self) -> Result<()> {
-        for path in [&self.root, &self.logs_dir, &self.sessions_dir, &self.worktrees_dir] {
-            fs::create_dir_all(path.as_std_path())
-                .with_context(|| format!("failed to create {}", path))?;
+        ensure_private_dir(&self.root, true)?;
+        for path in [&self.logs_dir, &self.sessions_dir] {
+            ensure_private_dir(path, false)?;
         }
         Ok(())
     }
@@ -47,12 +54,14 @@ impl AppPaths {
         self.logs_dir.join(format!("{session_id}.rendered.log"))
     }
 
-    pub fn session_socket_path(&self, session_id: &str) -> Utf8PathBuf {
-        self.sessions_dir.join(format!("{session_id}.sock"))
+    /// The worker's own stdout/stderr, written by the Go daemon when it
+    /// starts a session worker (go/internal/daemon workerLogPath).
+    pub fn worker_log_path(&self, session_id: &str) -> Utf8PathBuf {
+        self.logs_dir.join(format!("{session_id}.worker.log"))
     }
 
-    pub fn worktree_path(&self, session_id: &str) -> Utf8PathBuf {
-        self.worktrees_dir.join(session_id)
+    pub fn session_socket_path(&self, session_id: &str) -> Utf8PathBuf {
+        self.sessions_dir.join(format!("{session_id}.sock"))
     }
 
     pub fn as_utf8(path: &Utf8Path) -> &str {
@@ -67,10 +76,39 @@ impl AppPaths {
             config: root.join("config.toml"),
             logs_dir: root.join("logs"),
             sessions_dir: root.join("sessions"),
-            worktrees_dir: root.join("worktrees"),
             root,
         }
     }
+}
+
+const PRIVATE_DIR_MODE: u32 = 0o700;
+
+fn ensure_private_dir(path: &Utf8Path, recursive: bool) -> Result<()> {
+    match fs::DirBuilder::new().recursive(recursive).mode(PRIVATE_DIR_MODE).create(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(err).with_context(|| format!("failed to create {path}")),
+    }
+
+    let meta = fs::symlink_metadata(path).with_context(|| format!("failed to inspect {path}"))?;
+    if meta.file_type().is_symlink() {
+        bail!("refusing to use {path}: it is a symlink; point AGENTD_DIR at a real directory");
+    }
+    if !meta.is_dir() {
+        bail!("refusing to use {path}: it is not a directory");
+    }
+    let uid = getuid().as_raw();
+    if meta.uid() != uid {
+        bail!(
+            "refusing to use {path}: it is owned by uid {} but agent runs as uid {uid}",
+            meta.uid()
+        );
+    }
+    if meta.permissions().mode() & 0o777 != PRIVATE_DIR_MODE {
+        fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_DIR_MODE))
+            .with_context(|| format!("failed to set permissions on {path}"))?;
+    }
+    Ok(())
 }
 
 fn discover_root(
@@ -116,6 +154,56 @@ fn utf8_env_path(name: &str, value: Option<std::ffi::OsString>) -> Result<Option
 mod tests {
     use super::{APP_DIR_NAME, AppPaths, discover_root};
     use camino::Utf8PathBuf;
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    fn temp_root(name: &str) -> Utf8PathBuf {
+        let suffix =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        Utf8PathBuf::from(format!("/tmp/agentd-paths-{name}-{}-{suffix}", std::process::id()))
+    }
+
+    fn mode(path: &Utf8PathBuf) -> u32 {
+        fs::metadata(path.as_std_path()).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn ensure_layout_creates_private_directories() {
+        let paths = AppPaths::from_root(temp_root("fresh"));
+        paths.ensure_layout().unwrap();
+        for dir in [&paths.root, &paths.logs_dir, &paths.sessions_dir] {
+            assert_eq!(mode(dir), 0o700, "{dir}");
+        }
+        let _ = fs::remove_dir_all(paths.root.as_std_path());
+    }
+
+    #[test]
+    fn ensure_layout_tightens_existing_directories() {
+        let paths = AppPaths::from_root(temp_root("loose"));
+        for dir in [&paths.root, &paths.logs_dir, &paths.sessions_dir] {
+            fs::create_dir_all(dir.as_std_path()).unwrap();
+            fs::set_permissions(dir.as_std_path(), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        paths.ensure_layout().unwrap();
+        for dir in [&paths.root, &paths.logs_dir, &paths.sessions_dir] {
+            assert_eq!(mode(dir), 0o700, "{dir}");
+        }
+        let _ = fs::remove_dir_all(paths.root.as_std_path());
+    }
+
+    #[test]
+    fn ensure_layout_refuses_symlinked_root() {
+        let target = temp_root("target");
+        fs::create_dir_all(target.as_std_path()).unwrap();
+        let link = temp_root("link");
+        std::os::unix::fs::symlink(target.as_std_path(), link.as_std_path()).unwrap();
+
+        let err = AppPaths::from_root(link.clone()).ensure_layout().unwrap_err().to_string();
+        assert!(err.contains("symlink") && err.contains(link.as_str()), "{err}");
+        assert!(!target.join("logs").exists());
+
+        let _ = fs::remove_file(link.as_std_path());
+        let _ = fs::remove_dir_all(target.as_std_path());
+    }
 
     #[test]
     fn agentd_dir_is_used_as_exact_root() {
@@ -200,6 +288,5 @@ mod tests {
         assert_eq!(paths.config, Utf8PathBuf::from("/Users/tester/.agentd/config.toml"));
         assert_eq!(paths.logs_dir, Utf8PathBuf::from("/Users/tester/.agentd/logs"));
         assert_eq!(paths.sessions_dir, Utf8PathBuf::from("/Users/tester/.agentd/sessions"));
-        assert_eq!(paths.worktrees_dir, Utf8PathBuf::from("/Users/tester/.agentd/worktrees"));
     }
 }

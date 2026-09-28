@@ -1,20 +1,25 @@
-.PHONY: build install test dev-run ensure-ghostty ensure-ghostty-lib
+.PHONY: build install test dev-run go-build go-test
 
-ensure-ghostty:
-	git submodule update --init --recursive vendor/ghostty
+CARGO_BIN ?= $(or $(CARGO_HOME),$(HOME)/.cargo)/bin
 
-ensure-ghostty-lib: ensure-ghostty
-	cd vendor/ghostty && zig build -Demit-lib-vt
-
-build:
+# The agent CLI is Rust; the agentd daemon is Go (see go/README.md, which
+# needs Zig 0.16+ to build libghostty-vt). The CLI looks for agentd next to
+# its own executable, or at $AGENTD_BIN.
+build: go-build
 	cargo build
 
 dev-run: build
-	./target/debug/agent $(ARGS)
+	AGENTD_BIN=$(CURDIR)/go/bin/agentd ./target/debug/agent $(ARGS)
 
-install: ensure-ghostty-lib
-	cargo install --path crates/agentd
+install: go-build
 	cargo install --path crates/agent-cli
+	install -m 0755 go/bin/agentd $(CARGO_BIN)/agentd
 
-test:
+test: go-test
 	cargo test
+
+go-build:
+	$(MAKE) -C go build
+
+go-test:
+	$(MAKE) -C go test
