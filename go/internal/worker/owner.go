@@ -26,6 +26,7 @@ type ownerState struct {
 	nextAttachOrdinal   uint64
 	attachments         map[string]*ownerAttachment
 	output              *broadcaster
+	input               *ptyInput
 }
 
 type ownerAttachment struct {
@@ -118,9 +119,9 @@ func (s *ownerState) hasLiveAttachTerminal() bool {
 	return false
 }
 
+// writeInput queues client input for the PTY; see ptyInput.
 func (s *ownerState) writeInput(data []byte) error {
-	_, err := s.ptmx.Write(data)
-	return err
+	return s.input.enqueue(data)
 }
 
 // resize applies a client's geometry. A zero row or column count (a client
@@ -147,8 +148,8 @@ func (s *ownerState) publishOutput(data []byte) error {
 	writes := s.terminal.feed(data)
 	if !s.hasLiveAttachTerminal() {
 		for _, response := range writes {
-			if err := s.writeInput(response); err != nil {
-				return err
+			if err := s.input.enqueue(response); err != nil {
+				fmt.Fprintf(os.Stderr, "session worker: dropped terminal reply: %v\n", err)
 			}
 		}
 	}
@@ -169,11 +170,10 @@ func (s *ownerState) snapshot() ([]byte, error) {
 }
 
 type attachResult struct {
-	attachID    string
-	snapshot    []byte
-	connectedAt time.Time
-	detach      chan struct{}
-	sub         *subscriber
+	attachID string
+	snapshot []byte
+	detach   chan struct{}
+	sub      *subscriber
 }
 
 func (s *ownerState) attach(kind session.AttachmentKind, g protocol.Geometry) (*attachResult, error) {
@@ -202,11 +202,10 @@ func (s *ownerState) attach(kind session.AttachmentKind, g protocol.Geometry) (*
 	a := &ownerAttachment{kind: kind, connectedAt: connectedAt, detach: make(chan struct{})}
 	s.attachments[attachID] = a
 	return &attachResult{
-		attachID:    attachID,
-		snapshot:    snapshot,
-		connectedAt: connectedAt,
-		detach:      a.detach,
-		sub:         s.output.subscribe(),
+		attachID: attachID,
+		snapshot: snapshot,
+		detach:   a.detach,
+		sub:      s.output.subscribe(),
 	}, nil
 }
 

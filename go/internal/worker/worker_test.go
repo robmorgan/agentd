@@ -27,13 +27,15 @@ const testTimeout = 10 * time.Second
 
 // echoAgent echoes each line back as got:<line>. "size" prints the PTY size,
 // "where" prints the working directory and cwd environment, "flood" writes a
-// burst of output, "done" exits 0, "quit" exits 3.
+// burst of output, "stall" stops reading input for a few seconds, "done"
+// exits 0, "quit" exits 3.
 const echoAgent = `stty -echo; echo ready
 while IFS= read -r l; do
   case "$l" in
     quit) exit 3;;
     done) exit 0;;
     size) stty size;;
+    stall) stty raw; sleep 3; stty -raw; echo unstalled;;
     where) echo "pwd:$(pwd -P)"; echo "cwd:$AGENTD_CWD"; echo "ws:$AGENTD_WORKSPACE";;
     flood) i=0; while [ $i -lt 20000 ]; do echo "line $i padding padding padding padding"; i=$((i+1)); done; echo flood-done;;
     *) echo "got:$l";;
@@ -644,4 +646,63 @@ func TestMissingCwdFailsBeforeSpawn(t *testing.T) {
 	if _, statErr := os.Stat(paths.FromRoot(dir).SessionSocketPath("missing")); !os.IsNotExist(statErr) {
 		t.Fatalf("worker socket should not exist after a refused cwd: %v", statErr)
 	}
+}
+
+// An agent that stops reading its input while a client keeps sending must not
+// wedge the session: the PTY keeps draining, requests keep being answered,
+// and excess input is refused rather than blocking.
+func TestUnreadInputDoesNotStallSession(t *testing.T) {
+	h := startWorker(t)
+	h.sendInput("stall\n")
+	chunk := strings.Repeat("x", 4096) + "\n"
+	refused := false
+	for i := 0; i < 2*inputQueueDepth && !refused; i++ {
+		resp := h.request(&protocol.Request{SendInput: &protocol.SendInput{SessionID: h.sessionID, Data: []byte(chunk)}})
+		if resp.Error != nil {
+			if !strings.Contains(resp.Error.Message, "not reading its input") {
+				t.Fatalf("unexpected error %q", resp.Error.Message)
+			}
+			refused = true
+		}
+	}
+	if !refused {
+		t.Fatal("input was never refused while the agent was not reading")
+	}
+	// The session still answers while the agent is stalled.
+	start := time.Now()
+	h.history()
+	if time.Since(start) > time.Second {
+		t.Fatalf("history took %v while input was backed up", time.Since(start))
+	}
+	h.eventually("agent to recover", func() bool { return strings.Contains(h.history(), "unstalled") })
+	h.cleanup()
+	h.exited = true
+}
+
+// Agents such as Claude Code and Codex query the terminal at startup and
+// wait for the answer. With no terminal attached the worker answers on the
+// terminal's behalf; with one attached it leaves the answer to the client.
+func TestTerminalQueriesAnsweredWhileDetached(t *testing.T) {
+	// The agent asks for the cursor position and reports how many reply
+	// bytes arrived within a second.
+	const querier = `stty -echo; read go; stty raw -echo min 0 time 10; printf 'ask\033[6n'; n=$(dd bs=1 count=6 2>/dev/null | wc -c | tr -d ' '); stty sane; echo "replybytes:$n"; read l`
+
+	detached := startWorkerWith(t, querier)
+	detached.sendInput("go\n")
+	detached.eventually("query reply", func() bool { return strings.Contains(detached.history(), "replybytes:6") })
+	detached.sendInput("\n")
+	detached.waitExit()
+
+	attached := startWorkerWith(t, querier)
+	c := attached.attach(defaultGeometry)
+	c.input("go\n")
+	c.expectOutput("\x1b[6n") // the query reaches the attached terminal
+	c.expectOutput("replybytes:")
+	c.expectOutput("\n")
+	if !strings.Contains(c.output.String(), "replybytes:0") {
+		t.Fatalf("worker answered a query while a terminal was attached: %q", c.output.String())
+	}
+	c.input("\n")
+	c.expectEnd()
+	attached.waitExit()
 }

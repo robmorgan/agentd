@@ -25,10 +25,11 @@ import (
 )
 
 const (
-	defaultPtyRows     uint16 = 48
-	defaultPtyCols     uint16 = 160
-	maxScrollbackBytes uint   = 10_000_000
-	shutdownGrace             = 2 * time.Second
+	defaultPtyRows      uint16 = 48
+	defaultPtyCols      uint16 = 160
+	maxScrollbackBytes  uint   = 10_000_000
+	shutdownGrace              = 2 * time.Second
+	firstRequestTimeout        = 30 * time.Second
 )
 
 // agentKillGrace is how long a killed agent gets between SIGTERM and SIGKILL.
@@ -159,12 +160,22 @@ func Run(args Args) error {
 
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
-		_ = cmd.Process.Kill()
+		signalGroup(cmd.Process.Pid, syscall.SIGKILL)
 		return fail(fmt.Errorf("failed to bind worker socket: %w", err))
+	}
+	if err := os.Chmod(socketPath, 0o600); err != nil {
+		listener.Close()
+		signalGroup(cmd.Process.Pid, syscall.SIGKILL)
+		return fail(fmt.Errorf("failed to restrict worker socket: %w", err))
 	}
 	if err := store.MarkRunning(args.SessionID, os.Getpid(), cmd.Process.Pid); err != nil {
 		listener.Close()
-		_ = cmd.Process.Kill()
+		signalGroup(cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, db.ErrNotCreating) {
+			// The daemon gave up on this worker or the session was
+			// removed while it started; the row is not ours to touch.
+			return fmt.Errorf("session %s: %w", args.SessionID, err)
+		}
 		return fail(err)
 	}
 
@@ -196,6 +207,7 @@ func Run(args Args) error {
 		geometry:    protocol.Geometry{Cols: defaultPtyCols, Rows: defaultPtyRows},
 		attachments: make(map[string]*ownerAttachment),
 		output:      newBroadcaster(),
+		input:       newPTYInput(ptmx),
 	}
 	state.nextAttachOrdinal = 1
 
@@ -251,16 +263,18 @@ func Run(args Args) error {
 	}
 	rt.owner.stop()
 	<-ownerDone
+	// Only the owner goroutine enqueues input, so the queue can close now.
+	state.input.close()
 	return nil
 }
 
 func (rt *runtime) onChildExited(s *ownerState, exitCode *int32) {
 	plain, _ := s.history(false)
 	vt, _ := s.history(true)
-	if err := os.WriteFile(rt.paths.RenderedLogPath(rt.sessionID), []byte(plain), 0o644); err != nil {
+	if err := os.WriteFile(rt.paths.RenderedLogPath(rt.sessionID), []byte(plain), 0o600); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to write rendered history for %s: %v\n", rt.sessionID, err)
 	}
-	if err := os.WriteFile(rt.paths.LogPath(rt.sessionID), []byte(vt), 0o644); err != nil {
+	if err := os.WriteFile(rt.paths.LogPath(rt.sessionID), []byte(vt), 0o600); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to write VT history for %s: %v\n", rt.sessionID, err)
 	}
 	if err := rt.finalizeExit(exitCode); err != nil {
@@ -308,7 +322,11 @@ func (rt *runtime) endedResponse() *protocol.Response {
 
 func (rt *runtime) handleConnection(conn net.Conn) error {
 	reader := bufio.NewReader(conn)
+	// A peer that connects and never sends a request must not hold a
+	// handler forever.
+	conn.SetReadDeadline(time.Now().Add(firstRequestTimeout))
 	req, err := protocol.ReadRequest(reader)
+	conn.SetReadDeadline(time.Time{})
 	if err != nil || req == nil {
 		return err
 	}
