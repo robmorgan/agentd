@@ -1,4 +1,4 @@
-use std::fs;
+use std::{fs, io::Write, os::unix::fs::OpenOptionsExt};
 
 use anyhow::{Context, Result, bail};
 use indexmap::IndexMap;
@@ -50,7 +50,15 @@ impl Config {
     pub fn write_default(paths: &AppPaths) -> Result<()> {
         let contents = toml::to_string_pretty(&Self::default())
             .context("failed to serialize default config")?;
-        fs::write(paths.config.as_std_path(), contents)
+        // Files under the runtime root are private to the user, like the root.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(paths.config.as_std_path())
+            .with_context(|| format!("failed to write {}", paths.config))?;
+        file.write_all(contents.as_bytes())
             .with_context(|| format!("failed to write {}", paths.config))?;
         Ok(())
     }
@@ -129,6 +137,25 @@ mod tests {
         let paths = test_paths();
         let err = Config::default().require_agent(&paths, "missing").unwrap_err().to_string();
         assert!(err.contains(paths.config.as_str()));
+    }
+
+    #[test]
+    fn write_default_creates_private_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let suffix =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root =
+            Utf8PathBuf::from(format!("/tmp/agentd-config-mode-{}-{suffix}", std::process::id()));
+        let paths =
+            AppPaths { config: root.join("config.toml"), root: root.clone(), ..test_paths() };
+        std::fs::create_dir_all(root.as_std_path()).unwrap();
+
+        Config::write_default(&paths).unwrap();
+
+        let mode = std::fs::metadata(paths.config.as_std_path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(Config::load(&paths).unwrap().default_agent, "codex");
+        let _ = std::fs::remove_dir_all(root.as_std_path());
     }
 
     #[test]
