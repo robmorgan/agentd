@@ -285,13 +285,36 @@ func (d *Database) MarkExited(sessionID string, exitCode *int32) error {
 		string(session.AttentionNotice), summary, now())
 }
 
+// MarkUnknownRecovered records that a running session's worker is gone. It
+// only applies to rows still marked running, so it never clobbers the final
+// state a worker wrote on its way out.
 func (d *Database) MarkUnknownRecovered(sessionID string) error {
 	return d.exec(`UPDATE sessions
              SET status = ?2, worker_pid = NULL, agent_pid = NULL, attention = ?3,
                  attention_summary = ?4, updated_at = ?5
-             WHERE session_id = ?1`,
+             WHERE session_id = ?1 AND status = 'running'`,
 		sessionID, string(session.StatusUnknownRecovered), string(session.AttentionAction),
 		"daemon lost the live process", now())
+}
+
+// MarkFailedIfActive marks a creating or running session failed. The daemon
+// uses it when a worker dies without recording its own outcome.
+func (d *Database) MarkFailedIfActive(sessionID, errMsg string) error {
+	return d.exec(`UPDATE sessions
+             SET status = ?2, worker_pid = NULL, agent_pid = NULL, error = ?3,
+                 attention = ?4, attention_summary = ?3, updated_at = ?5
+             WHERE session_id = ?1 AND status IN ('creating', 'running')`,
+		sessionID, string(session.StatusFailed), errMsg, string(session.AttentionAction), now())
+}
+
+// MarkExitedIfActive is MarkExited restricted to sessions that have not
+// already recorded an outcome.
+func (d *Database) MarkExitedIfActive(sessionID string) error {
+	return d.exec(`UPDATE sessions
+             SET status = ?2, worker_pid = NULL, agent_pid = NULL,
+                 attention = ?3, attention_summary = ?4, updated_at = ?5, exited_at = ?5
+             WHERE session_id = ?1 AND status IN ('creating', 'running')`,
+		sessionID, string(session.StatusExited), string(session.AttentionNotice), "finished", now())
 }
 
 func (d *Database) DeleteSession(sessionID string) error {

@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -168,5 +169,63 @@ func TestCleanEOFReturnsNil(t *testing.T) {
 	}
 	if _, err := ReadRequest(bytes.NewReader([]byte{0x50, 0x44})); err == nil {
 		t.Fatal("expected truncated header error")
+	}
+}
+
+// The Rust CLI serialises DaemonManagementRequest::Shutdown with serde_json
+// as {"force":true}; the frame must match byte for byte.
+func TestManagementShutdownGoldenFrame(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteManagementRequest(&buf, &ManagementRequest{Shutdown: &ManagementShutdown{Force: true}}); err != nil {
+		t.Fatal(err)
+	}
+	payload := `{"force":true}`
+	want := append([]byte{
+		0x50, 0x44, 0x47, 0x41, // magic
+		0x01, 0x00, // management version 1
+		0x22, 0x4e, // kind 20002
+		0, 0, 0, 0,
+		byte(len(payload)), 0, 0, 0,
+	}, payload...)
+	if !bytes.Equal(buf.Bytes(), want) {
+		t.Fatalf("got  % x\nwant % x", buf.Bytes(), want)
+	}
+	req, mgmt, err := ReadIncoming(&buf)
+	if err != nil || req != nil || mgmt == nil || mgmt.Shutdown == nil || !mgmt.Shutdown.Force {
+		t.Fatalf("ReadIncoming = %v, %#v, %v", req, mgmt, err)
+	}
+}
+
+func TestManagementStatusResponseRoundTrip(t *testing.T) {
+	var buf bytes.Buffer
+	status := &ManagementStatus{DaemonVersion: "0.1.0", ProtocolVersion: ProtocolVersion, PID: 42, Root: "/r", Socket: "/r/agentd.sock", RunningSessions: true}
+	if err := WriteManagementResponse(&buf, &ManagementResponse{Status: status}); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(buf.Bytes(), []byte(`"running_sessions":true`)) {
+		t.Fatalf("status payload uses unexpected field names: %s", buf.Bytes()[16:])
+	}
+	got, err := ReadManagementResponse(&buf)
+	if err != nil || !reflect.DeepEqual(got.Status, status) {
+		t.Fatalf("round trip = %#v, %v", got, err)
+	}
+}
+
+func TestReadIncomingVersionMismatch(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteErrorAtVersion(&buf, 32, "nope"); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := ReadIncoming(&buf)
+	var ve *VersionError
+	if !errors.As(err, &ve) || ve.Version != 32 {
+		t.Fatalf("got %v", err)
+	}
+	// The error frame itself decodes at its own version.
+	buf.Reset()
+	WriteErrorAtVersion(&buf, ProtocolVersion, "nope")
+	resp, err := ReadResponse(&buf)
+	if err != nil || resp.Error == nil || resp.Error.Message != "nope" {
+		t.Fatalf("got %#v, %v", resp, err)
 	}
 }

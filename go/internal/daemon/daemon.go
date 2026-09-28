@@ -1,0 +1,342 @@
+// Package daemon implements `agentd serve`: the long-lived process that owns
+// the session registry, spawns one session worker per session, and serves the
+// agent protocol on the runtime root's Unix socket.
+//
+// Ownership model. A session belongs to the daemon's state (SQLite plus the
+// worker process), never to a client connection. Each session's PTY lives in
+// its own worker process (internal/worker), started in a new process session
+// so it survives the daemon exiting or restarting; a restarted daemon finds
+// running workers again through state.db and their per-session sockets.
+//
+// Goroutines, and what ends them:
+//   - Serve's accept loop: ends when the listener is closed at shutdown.
+//   - One handler per client connection: ends when its request is answered,
+//     or for attach when either side of the proxy closes. Shutdown closes
+//     every tracked connection, which unblocks all handlers.
+//   - One extra goroutine per attach proxy (client -> worker direction).
+//   - One supervisor per worker this daemon spawned: blocks in cmd.Wait, so
+//     workers are reaped, and records a failure if the worker died without
+//     recording its own outcome. It lives exactly as long as the worker; if
+//     the daemon exits first the worker is re-parented and keeps running.
+//     Once Serve has returned it no longer writes state, since the next
+//     daemon owns reconciliation from then on.
+//
+// Backpressure. The daemon never buffers PTY output: attach is a byte pipe
+// between the client socket and the worker socket. A slow client blocks only
+// its own proxy, which blocks only its own writer in the worker, where the
+// per-attachment fan-out queue applies the slow-consumer policy (see
+// internal/worker/broadcast.go).
+package daemon
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/robmorgan/agentd/go/internal/db"
+	"github.com/robmorgan/agentd/go/internal/paths"
+	"github.com/robmorgan/agentd/go/internal/protocol"
+)
+
+// Version is reported by GetDaemonInfo and daemon status.
+var Version = "0.1.0"
+
+// connectionDrainTimeout bounds how long shutdown waits for handlers after
+// their connections have been closed.
+const connectionDrainTimeout = 2 * time.Second
+
+type Server struct {
+	paths  *paths.AppPaths
+	db     *db.Database
+	config *Config
+	// workerBin is the executable started as `<workerBin> session-worker`.
+	workerBin string
+
+	// createMu serialises session name allocation and row insertion.
+	createMu sync.Mutex
+
+	shutdownOnce sync.Once
+	shutdown     chan struct{}
+
+	connsMu sync.Mutex
+	conns   map[net.Conn]struct{}
+	// closing is set under connsMu once shutdown starts, so no connection
+	// accepted afterwards is left untracked.
+	closing  bool
+	handlers sync.WaitGroup
+}
+
+// New opens the state database and config under p. workerBin is normally
+// os.Executable(); tests point it at a freshly built agentd.
+func New(p *paths.AppPaths, workerBin string) (*Server, error) {
+	if err := p.EnsureLayout(); err != nil {
+		return nil, err
+	}
+	store, err := db.Open(p.Database)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := LoadConfig(p.Config)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{
+		paths:     p,
+		db:        store,
+		config:    cfg,
+		workerBin: workerBin,
+		shutdown:  make(chan struct{}),
+		conns:     make(map[net.Conn]struct{}),
+	}, nil
+}
+
+// Shutdown asks Serve to stop. Running sessions are not affected.
+func (s *Server) Shutdown() {
+	s.shutdownOnce.Do(func() { close(s.shutdown) })
+}
+
+// Serve binds the daemon socket and serves until ctx is cancelled or a
+// shutdown request arrives. It returns once the socket and pid file are gone
+// and connection handlers have finished.
+func (s *Server) Serve(ctx context.Context) error {
+	if conn, err := net.Dial("unix", s.paths.Socket); err == nil {
+		conn.Close()
+		return fmt.Errorf("agentd is already running on %s", s.paths.Socket)
+	}
+	if err := os.Remove(s.paths.Socket); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("failed to remove stale agentd socket: %w", err)
+	}
+	if err := s.reconcileSessions(); err != nil {
+		return err
+	}
+
+	listener, err := net.Listen("unix", s.paths.Socket)
+	if err != nil {
+		return fmt.Errorf("failed to bind agentd socket: %w", err)
+	}
+	pid := strconv.Itoa(os.Getpid())
+	if err := os.WriteFile(s.paths.PIDFile, []byte(pid), 0o644); err != nil {
+		listener.Close()
+		return fmt.Errorf("failed to write %s: %w", s.paths.PIDFile, err)
+	}
+
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			if !s.track(conn) {
+				conn.Close()
+				continue
+			}
+			s.handlers.Add(1)
+			go func() {
+				defer s.handlers.Done()
+				defer s.untrack(conn)
+				if err := s.handleConnection(conn); err != nil && !isDisconnect(err) {
+					fmt.Fprintf(os.Stderr, "agentd: connection error: %v\n", err)
+				}
+			}()
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+	case <-s.shutdown:
+	}
+	s.Shutdown()
+
+	listener.Close()
+	<-acceptDone
+	s.closeConnections()
+	drained := make(chan struct{})
+	go func() {
+		s.handlers.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(connectionDrainTimeout):
+	}
+
+	// The listener removes its socket on Close; the pid file is ours to
+	// clean up, unless another daemon has already replaced it.
+	_ = os.Remove(s.paths.Socket)
+	if data, err := os.ReadFile(s.paths.PIDFile); err == nil && strings.TrimSpace(string(data)) == pid {
+		_ = os.Remove(s.paths.PIDFile)
+	}
+	return nil
+}
+
+func (s *Server) track(conn net.Conn) bool {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	if s.closing {
+		return false
+	}
+	s.conns[conn] = struct{}{}
+	return true
+}
+
+func (s *Server) untrack(conn net.Conn) {
+	s.connsMu.Lock()
+	delete(s.conns, conn)
+	s.connsMu.Unlock()
+	conn.Close()
+}
+
+func (s *Server) closeConnections() {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	s.closing = true
+	for conn := range s.conns {
+		conn.Close()
+	}
+}
+
+func (s *Server) handleConnection(conn net.Conn) error {
+	reader := bufio.NewReader(conn)
+	req, mgmt, err := protocol.ReadIncoming(reader)
+	var versionErr *protocol.VersionError
+	if errors.As(err, &versionErr) {
+		// Answer in the client's own framing so it can say why it was
+		// refused instead of reporting a dropped connection.
+		return protocol.WriteErrorAtVersion(conn, versionErr.Version, fmt.Sprintf(
+			"agentd speaks protocol version %d but this client sent version %d; upgrade the agent CLI or the daemon so they match",
+			protocol.ProtocolVersion, versionErr.Version))
+	}
+	if err != nil {
+		return err
+	}
+	switch {
+	case mgmt != nil:
+		return s.handleManagement(conn, mgmt)
+	case req != nil:
+		return s.handleRequest(conn, reader, req)
+	}
+	return nil
+}
+
+func (s *Server) handleManagement(conn net.Conn, req *protocol.ManagementRequest) error {
+	running, err := s.hasRunningSessions()
+	if err != nil {
+		return protocol.WriteManagementResponse(conn, &protocol.ManagementResponse{Error: &protocol.ErrorResponse{Message: err.Error()}})
+	}
+	switch {
+	case req.Status != nil:
+		return protocol.WriteManagementResponse(conn, &protocol.ManagementResponse{Status: &protocol.ManagementStatus{
+			DaemonVersion:   Version,
+			ProtocolVersion: protocol.ProtocolVersion,
+			PID:             uint32(os.Getpid()),
+			Root:            s.paths.Root,
+			Socket:          s.paths.Socket,
+			RunningSessions: running,
+		}})
+	case req.Shutdown != nil:
+		if running && !req.Shutdown.Force {
+			return protocol.WriteManagementResponse(conn, &protocol.ManagementResponse{Shutdown: &protocol.ManagementShutdownResult{
+				Stopped: false, RunningSessions: true, Message: "cannot shut down agentd while sessions are running",
+			}})
+		}
+		err := protocol.WriteManagementResponse(conn, &protocol.ManagementResponse{Shutdown: &protocol.ManagementShutdownResult{
+			Stopped: true, RunningSessions: running, Message: "agentd stopping",
+		}})
+		s.Shutdown()
+		return err
+	}
+	return nil
+}
+
+func (s *Server) handleRequest(conn net.Conn, reader *bufio.Reader, req *protocol.Request) error {
+	reply := func(resp *protocol.Response) error { return protocol.WriteResponse(conn, resp) }
+	replyErr := func(err error) error { return reply(protocol.ErrorResponsef("%v", err)) }
+
+	switch {
+	case req.GetDaemonInfo != nil:
+		return reply(&protocol.Response{DaemonInfo: &protocol.DaemonInfo{
+			DaemonVersion: Version, ProtocolVersion: protocol.ProtocolVersion,
+		}})
+	case req.ShutdownDaemon != nil:
+		running, err := s.hasRunningSessions()
+		if err != nil {
+			return replyErr(err)
+		}
+		if running {
+			return reply(protocol.ErrorResponsef("cannot shut down agentd while sessions are running"))
+		}
+		err = reply(protocol.OkResponse())
+		s.Shutdown()
+		return err
+	case req.CreateSession != nil:
+		result, err := s.createSession(req.CreateSession)
+		if err != nil {
+			return replyErr(err)
+		}
+		return reply(&protocol.Response{CreateSession: result})
+	case req.KillSession != nil:
+		k := req.KillSession
+		result, err := s.killSession(k.SessionID, k.Remove)
+		if err != nil {
+			return replyErr(err)
+		}
+		return reply(&protocol.Response{KillSession: result})
+	case req.ResolveSessionRuntime != nil:
+		socket, err := s.runtimeSocket(req.ResolveSessionRuntime.SessionID)
+		if err != nil {
+			return replyErr(err)
+		}
+		return reply(&protocol.Response{RuntimeEndpoint: &protocol.RuntimeEndpoint{SocketPath: socket}})
+	case req.AttachSession != nil:
+		return s.proxyAttach(conn, reader, req.AttachSession)
+	case req.AttachSnapshot != nil:
+		return reply(protocol.ErrorResponsef("attach snapshot requests are only valid during an active attach"))
+	case req.AttachInput != nil:
+		return reply(protocol.ErrorResponsef("attach_input is only valid during an attached session"))
+	case req.AttachResize != nil:
+		return reply(protocol.ErrorResponsef("attach_resize is only valid during an attached session"))
+	case req.SwitchAttachedSession != nil:
+		return reply(protocol.ErrorResponsef("shared attach uses client-local switching; reconnect the local client instead"))
+	case req.DetachSession != nil:
+		return s.proxyRequest(conn, req.DetachSession.SessionID, req)
+	case req.DetachAttachment != nil:
+		return s.proxyRequest(conn, req.DetachAttachment.SessionID, req)
+	case req.SendInput != nil:
+		return s.proxyRequest(conn, req.SendInput.SessionID, req)
+	case req.ListAttachments != nil:
+		return s.proxyRequest(conn, req.ListAttachments.SessionID, req)
+	case req.GetHistory != nil:
+		return s.history(conn, req)
+	case req.GetSession != nil:
+		rec, err := s.getSession(req.GetSession.SessionID)
+		if err != nil {
+			return replyErr(err)
+		}
+		if rec == nil {
+			return reply(protocol.ErrorResponsef("session `%s` not found", req.GetSession.SessionID))
+		}
+		return reply(&protocol.Response{Session: rec})
+	case req.ListSessions != nil:
+		recs, err := s.listSessions()
+		if err != nil {
+			return replyErr(err)
+		}
+		return reply(&protocol.Response{Sessions: &recs})
+	}
+	return reply(protocol.ErrorResponsef("unsupported request"))
+}
+
+func isDisconnect(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) ||
+		strings.Contains(err.Error(), "broken pipe") || strings.Contains(err.Error(), "connection reset")
+}

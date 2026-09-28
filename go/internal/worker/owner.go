@@ -7,7 +7,6 @@ import (
 	"os"
 	"sort"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -233,17 +232,6 @@ func (s *ownerState) detachAll() {
 	for _, a := range s.attachments {
 		a.signalDetach()
 	}
-}
-
-func terminateProcess(sessionID string, agentPID *uint32) error {
-	if agentPID == nil {
-		return fmt.Errorf("session `%s` has no recorded agent pid", sessionID)
-	}
-	err := syscall.Kill(int(*agentPID), syscall.SIGTERM)
-	if err == nil || errors.Is(err, syscall.ESRCH) {
-		return nil
-	}
-	return fmt.Errorf("failed to terminate `%s`: %w", sessionID, err)
 }
 
 func pumpPty(reader io.Reader, o *owner) {

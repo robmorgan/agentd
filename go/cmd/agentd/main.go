@@ -1,15 +1,21 @@
 // Command agentd is the Go implementation of the agentd daemon and its
-// session worker. During the port only the session-worker subcommand is
-// implemented. Since protocol v33 the worker no longer speaks the Rust
-// daemon's wire format, so it is driven by the Go daemon (in progress) and by
-// the tests under internal/worker.
+// session worker:
+//
+//	agentd serve [--daemonize]   run the daemon (the agent CLI starts it)
+//	agentd upgrade               replace a running daemon with this binary
+//	agentd session-worker ...    one session's PTY owner (started by serve)
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
+	"github.com/robmorgan/agentd/go/internal/daemon"
+	"github.com/robmorgan/agentd/go/internal/paths"
 	"github.com/robmorgan/agentd/go/internal/worker"
 )
 
@@ -24,6 +30,10 @@ func main() {
 		os.Exit(2)
 	}
 	switch os.Args[1] {
+	case "serve":
+		os.Exit(runServe(os.Args[2:]))
+	case "upgrade":
+		os.Exit(runUpgrade())
 	case "session-worker":
 		os.Exit(runSessionWorker(os.Args[2:]))
 	default:
@@ -33,7 +43,68 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: agentd session-worker --session-id ID --cwd DIR --agent-name NAME --command CMD [--model M] [--arg A]...")
+	fmt.Fprintln(os.Stderr, "usage: agentd serve [--daemonize]")
+	fmt.Fprintln(os.Stderr, "       agentd upgrade")
+	fmt.Fprintln(os.Stderr, "       agentd session-worker --session-id ID --cwd DIR --agent-name NAME --command CMD [--model M] [--arg A]...")
+}
+
+func runServe(argv []string) int {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	detach := fs.Bool("daemonize", false, "start the daemon in the background and return")
+	if err := fs.Parse(argv); err != nil {
+		return 2
+	}
+	p, exe, err := discover()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+		return 1
+	}
+	if *detach {
+		if err := daemon.Daemonize(p, exe); err != nil {
+			fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	srv, err := daemon.New(p, exe)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+		return 1
+	}
+	// SIGTERM/SIGINT stop the daemon; sessions keep running in their
+	// workers and are picked up again by the next daemon.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	if err := srv.Serve(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func runUpgrade() int {
+	p, exe, err := discover()
+	if err == nil {
+		err = daemon.Upgrade(p, exe)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+		return 1
+	}
+	fmt.Println("✓ Upgraded daemon")
+	return 0
+}
+
+func discover() (*paths.AppPaths, string, error) {
+	p, err := paths.Discover()
+	if err != nil {
+		return nil, "", err
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to resolve agentd executable: %w", err)
+	}
+	return p, exe, nil
 }
 
 func runSessionWorker(argv []string) int {

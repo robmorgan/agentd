@@ -10,7 +10,10 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -27,6 +30,10 @@ const (
 	maxScrollbackBytes uint   = 10_000_000
 	shutdownGrace             = 2 * time.Second
 )
+
+// agentKillGrace is how long a killed agent gets between SIGTERM and SIGKILL.
+// A variable so tests can shorten it.
+var agentKillGrace = 5 * time.Second
 
 type Args struct {
 	SessionID string
@@ -65,6 +72,37 @@ type runtime struct {
 	owner     *owner
 	ended     *endedSignal
 	conns     sync.WaitGroup
+	// agentPID leads the agent's process group (pty.Start puts the agent in
+	// its own session).
+	agentPID int
+	// killed is set once a kill has been requested, so the exit is recorded
+	// as a deliberate stop rather than a failure.
+	killed atomic.Bool
+}
+
+// terminateAgent asks the agent's whole process group to exit and escalates
+// to SIGKILL after agentKillGrace. The normal child-exit path then writes the
+// logs, records the final state, and ends every attachment. Safe to call more
+// than once and from any goroutine.
+func (rt *runtime) terminateAgent() {
+	if !rt.killed.CompareAndSwap(false, true) {
+		return
+	}
+	signalGroup(rt.agentPID, syscall.SIGTERM)
+	grace := agentKillGrace
+	go func() {
+		select {
+		case <-rt.ended.ch:
+		case <-time.After(grace):
+			signalGroup(rt.agentPID, syscall.SIGKILL)
+		}
+	}()
+}
+
+func signalGroup(pid int, sig syscall.Signal) {
+	if err := syscall.Kill(-pid, sig); err != nil {
+		_ = syscall.Kill(pid, sig)
+	}
 }
 
 func Run(args Args) error {
@@ -79,15 +117,21 @@ func Run(args Args) error {
 	if err != nil {
 		return err
 	}
+	// Until the agent is running, record any failure on the session so the
+	// daemon (and `agent ls`) can report it rather than timing out.
+	fail := func(err error) error {
+		_ = store.MarkFailed(args.SessionID, err.Error())
+		return err
+	}
 	socketPath := p.SessionSocketPath(args.SessionID)
 	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("failed to remove %s: %w", socketPath, err)
+		return fail(fmt.Errorf("failed to remove %s: %w", socketPath, err))
 	}
 
 	if info, err := os.Stat(args.Cwd); err != nil {
-		return fmt.Errorf("session cwd: %w", err)
+		return fail(fmt.Errorf("working directory `%s` does not exist", args.Cwd))
 	} else if !info.IsDir() {
-		return fmt.Errorf("session cwd %s is not a directory", args.Cwd)
+		return fail(fmt.Errorf("working directory `%s` is not a directory", args.Cwd))
 	}
 	cmd := exec.Command(args.Command, args.Args...)
 	cmd.Dir = args.Cwd
@@ -102,23 +146,26 @@ func Run(args Args) error {
 	)
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: defaultPtyRows, Cols: defaultPtyCols})
 	if err != nil {
-		return fmt.Errorf("failed to spawn agent process: %w", err)
+		return fail(fmt.Errorf("failed to spawn agent process: %w", err))
 	}
 	defer ptmx.Close()
 
 	terminal, err := newTerminalState(defaultPtyCols, defaultPtyRows, maxScrollbackBytes)
 	if err != nil {
-		return err
+		_ = cmd.Process.Kill()
+		return fail(err)
 	}
 	defer terminal.close()
 
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
-		return fmt.Errorf("failed to bind worker socket: %w", err)
+		_ = cmd.Process.Kill()
+		return fail(fmt.Errorf("failed to bind worker socket: %w", err))
 	}
 	if err := store.MarkRunning(args.SessionID, os.Getpid(), cmd.Process.Pid); err != nil {
 		listener.Close()
-		return err
+		_ = cmd.Process.Kill()
+		return fail(err)
 	}
 
 	rt := &runtime{
@@ -127,7 +174,21 @@ func Run(args Args) error {
 		db:        store,
 		owner:     newOwner(),
 		ended:     &endedSignal{ch: make(chan struct{})},
+		agentPID:  cmd.Process.Pid,
 	}
+
+	// The daemon stops a session by sending the worker SIGTERM.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigs)
+	go func() {
+		select {
+		case <-sigs:
+			rt.terminateAgent()
+		case <-rt.ended.ch:
+		}
+	}()
+
 	state := &ownerState{
 		sessionID:   args.SessionID,
 		ptmx:        ptmx,
@@ -222,7 +283,7 @@ func (rt *runtime) finalizeExit(exitCode *int32) error {
 	if rec.Status == session.StatusFailed {
 		return nil
 	}
-	if exitCode != nil && *exitCode == 0 {
+	if rt.killed.Load() || (exitCode != nil && *exitCode == 0) {
 		return rt.db.MarkExited(rt.sessionID, exitCode)
 	}
 	msg := "agent exited unexpectedly"
@@ -303,17 +364,7 @@ func (rt *runtime) handleConnection(conn net.Conn) error {
 		}
 		return reply(&protocol.Response{History: &protocol.History{Data: data}})
 	case req.KillSession != nil:
-		rec, err := rt.db.GetSession(rt.sessionID)
-		if err != nil {
-			return fail(err)
-		}
-		var agentPID *uint32
-		if rec != nil {
-			agentPID = rec.AgentPID
-		}
-		if err := terminateProcess(rt.sessionID, agentPID); err != nil {
-			return fail(err)
-		}
+		rt.terminateAgent()
 		return reply(protocol.OkResponse())
 	default:
 		return reply(protocol.ErrorResponsef("unsupported worker request"))

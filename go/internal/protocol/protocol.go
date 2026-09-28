@@ -263,9 +263,30 @@ func readStandardFrame(r io.Reader) (k kind, payload []byte, ok bool, err error)
 		return 0, nil, false, err
 	}
 	if h.version != ProtocolVersion {
-		return 0, nil, false, fmt.Errorf("unsupported protocol version `%d`", h.version)
+		return 0, nil, false, &VersionError{Version: h.version}
 	}
 	return kind(h.kind), payload, true, nil
+}
+
+// VersionError reports a frame whose protocol version this build does not
+// speak. The frame's payload has been consumed.
+type VersionError struct{ Version uint16 }
+
+func (e *VersionError) Error() string {
+	return fmt.Sprintf("unsupported protocol version `%d`", e.Version)
+}
+
+// WriteErrorAtVersion writes an Error response framed with the given protocol
+// version. The Error kind and its payload (one length-prefixed string) have
+// not changed across versions, so a peer speaking an older or newer protocol
+// can still decode why it was turned away.
+func WriteErrorAtVersion(w io.Writer, version uint16, message string) error {
+	e := &encoder{}
+	e.str(message)
+	if e.err != nil {
+		return e.err
+	}
+	return writeFrame(w, version, uint16(kErrorResponse), e.buf)
 }
 
 func WriteRequest(w io.Writer, req *Request) error {

@@ -53,6 +53,13 @@ type harness struct {
 
 func startWorker(t *testing.T) *harness {
 	t.Helper()
+	return startWorkerWith(t, echoAgent)
+}
+
+// newRoot creates a runtime root with one session row and points
+// AGENTD_DIR at it.
+func newRoot(t *testing.T) (string, *harness) {
+	t.Helper()
 	// Unix socket paths are limited to ~104 bytes, so avoid t.TempDir().
 	dir, err := os.MkdirTemp("/tmp", "agdw-")
 	if err != nil {
@@ -75,11 +82,17 @@ func startWorker(t *testing.T) *harness {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	return dir, h
+}
 
+func startWorkerWith(t *testing.T, script string) *harness {
+	t.Helper()
+	dir, h := newRoot(t)
+	p := h.paths
 	go func() {
 		h.done <- Run(Args{
 			SessionID: h.sessionID, Cwd: dir,
-			AgentName: "sh", Command: "/bin/sh", Args: []string{"-c", echoAgent},
+			AgentName: "sh", Command: "/bin/sh", Args: []string{"-c", script},
 		})
 	}()
 	t.Cleanup(h.cleanup)
@@ -421,11 +434,46 @@ func TestKillSession(t *testing.T) {
 	if resp.Ok == nil {
 		t.Fatalf("kill: %#v", resp)
 	}
+	// A requested kill is a deliberate stop, not a failure.
 	end := c.expectEnd()
-	if end.SessionEnded == nil || end.SessionEnded.Status != session.StatusFailed {
-		t.Fatalf("expected failed SessionEnded after kill, got %#v", end)
+	if end.SessionEnded == nil || end.SessionEnded.Status != session.StatusExited {
+		t.Fatalf("expected exited SessionEnded after kill, got %#v", end)
 	}
 	h.waitExit()
+	if logged, err := os.ReadFile(h.paths.RenderedLogPath(h.sessionID)); err != nil || !strings.Contains(string(logged), "got:hi") {
+		t.Fatalf("rendered log after kill = %q, %v", logged, err)
+	}
+}
+
+func TestKillEscalatesToSIGKILL(t *testing.T) {
+	old := agentKillGrace
+	agentKillGrace = 200 * time.Millisecond
+	t.Cleanup(func() { agentKillGrace = old })
+
+	h := startWorkerWith(t, `trap '' TERM; echo stubborn; while :; do sleep 1; done`)
+	h.eventually("agent to start", func() bool { return strings.Contains(h.history(), "stubborn") })
+	c := h.attach(defaultGeometry)
+	h.request(&protocol.Request{KillSession: &protocol.KillSession{SessionID: h.sessionID}})
+	if end := c.expectEnd(); end.SessionEnded == nil || end.SessionEnded.Status != session.StatusExited {
+		t.Fatalf("expected exited SessionEnded, got %#v", end)
+	}
+	h.waitExit()
+}
+
+func TestMissingCwdMarksSessionFailed(t *testing.T) {
+	dir, h := newRoot(t)
+	err := Run(Args{
+		SessionID: h.sessionID, Cwd: filepath.Join(dir, "nope"),
+		AgentName: "sh", Command: "/bin/sh", Args: []string{"-c", echoAgent},
+	})
+	h.exited = true
+	if err == nil {
+		t.Fatal("Run succeeded with a missing cwd")
+	}
+	rec, _ := h.store.GetSession(h.sessionID)
+	if rec == nil || rec.Status != session.StatusFailed || rec.Error == nil || !strings.Contains(*rec.Error, "does not exist") {
+		t.Fatalf("record = %#v", rec)
+	}
 }
 
 func TestClientDisconnectDuringOutput(t *testing.T) {
@@ -578,7 +626,7 @@ func TestMissingCwdFailsBeforeSpawn(t *testing.T) {
 		SessionID: "missing", Cwd: filepath.Join(dir, "does-not-exist"),
 		AgentName: "sh", Command: "/bin/sh", Args: []string{"-c", "exit 0"},
 	})
-	if err == nil || !strings.Contains(err.Error(), "session cwd") {
+	if err == nil || !strings.Contains(err.Error(), "working directory") {
 		t.Fatalf("expected cwd error, got %v", err)
 	}
 	if _, statErr := os.Stat(paths.FromRoot(dir).SessionSocketPath("missing")); !os.IsNotExist(statErr) {
