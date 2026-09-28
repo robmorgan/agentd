@@ -48,7 +48,10 @@ Two transports exist:
 * **QUIC** (off unless `[remote] listen` is set): remote clients. Each client holds one QUIC
   connection and opens one bidirectional QUIC stream per request or attachment, so long-lived
   attachments and short requests are multiplexed without blocking each other. Keep-alives hold
-  idle connections open, and each connection may have at most 256 streams.
+  idle connections open, and each connection may have at most 256 streams. The daemon's first
+  datagrams are 1200 bytes, QUIC's minimum, rather than quic-go's default 1280: Tailscale's
+  interface MTU is 1280 including IP and UDP headers, so larger ones never leave it and the
+  handshake times out. Path MTU discovery raises the size afterwards where the path allows.
 
 QUIC connections authenticate both ways with pinned keys inside TLS 1.3 (ALPN `agentd`), the way
 SSH uses host keys and `authorized_keys`, with no certificate authority:

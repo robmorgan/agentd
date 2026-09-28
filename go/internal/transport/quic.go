@@ -30,6 +30,12 @@ func quicConfig() *quic.Config {
 		// attach with no output) alive through NATs and firewalls.
 		KeepAlivePeriod: 15 * time.Second,
 		MaxIdleTimeout:  60 * time.Second,
+		// Start at QUIC's minimum datagram size, not quic-go's 1280 bytes:
+		// Tailscale's interface MTU is 1280 including the 28 bytes of IP and
+		// UDP headers, so a 1280-byte datagram with Don't Fragment set never
+		// leaves it and the handshake times out. Path MTU discovery still
+		// raises the size where the path allows.
+		InitialPacketSize: 1200,
 		// Each request or attachment uses one stream; this bounds how
 		// many a single client can have open at once.
 		MaxIncomingStreams:    256,

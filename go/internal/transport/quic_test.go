@@ -273,3 +273,13 @@ func TestFingerprintMatchesTheCLI(t *testing.T) {
 		t.Fatalf("fingerprint = %s, want %s", id.Fingerprint, parityFingerprint)
 	}
 }
+
+// quic-go's default first datagram (1280 bytes of UDP payload) does not fit
+// through a Tailscale interface (MTU 1280 including IP and UDP headers), and
+// the handshake then times out; see quicConfig.
+func TestFirstDatagramFitsTailscaleMTU(t *testing.T) {
+	const tailscaleMTU, ipv6UDPHeaders = 1280, 48
+	if size := int(quicConfig().InitialPacketSize); size == 0 || size+ipv6UDPHeaders > tailscaleMTU {
+		t.Fatalf("InitialPacketSize %d does not fit a %d-byte MTU", size, tailscaleMTU)
+	}
+}
