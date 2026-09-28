@@ -14,6 +14,11 @@ use crate::session::{
 pub const PROTOCOL_VERSION: u16 = 33;
 pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
 
+/// Largest payload a frame may declare or carry. Readers reject larger
+/// declared lengths before allocating, so a corrupt or hostile header cannot
+/// make us allocate up to 4 GiB. Must match go/internal/protocol.
+pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024 * 1024;
+
 const FRAME_MAGIC: u32 = 0x4147_4450;
 const FRAME_HEADER_LEN: usize = 16;
 const DAEMON_STATUS_REQUEST_KIND: u16 = 20_001;
@@ -363,7 +368,11 @@ async fn write_frame<W>(writer: &mut W, version: u16, kind: u16, payload: &[u8])
 where
     W: AsyncWrite + Unpin,
 {
-    ensure!(payload.len() <= u32::MAX as usize, "payload too large: {} bytes", payload.len());
+    ensure!(
+        payload.len() <= MAX_FRAME_PAYLOAD,
+        "frame payload too large: {} bytes (limit {MAX_FRAME_PAYLOAD})",
+        payload.len()
+    );
 
     let mut header = [0_u8; FRAME_HEADER_LEN];
     header[0..4].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
@@ -426,6 +435,10 @@ where
     let _flags = u16::from_le_bytes(header[8..10].try_into().unwrap());
     let _reserved = u16::from_le_bytes(header[10..12].try_into().unwrap());
     let payload_len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+    ensure!(
+        payload_len <= MAX_FRAME_PAYLOAD,
+        "frame payload too large: {payload_len} bytes (limit {MAX_FRAME_PAYLOAD})"
+    );
 
     let mut payload = vec![0_u8; payload_len];
     reader.read_exact(&mut payload).await?;
@@ -1125,9 +1138,9 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::{
         Cursor, DAEMON_MANAGEMENT_VERSION, DaemonInfo, DaemonManagementRequest,
-        DaemonManagementResponse, DaemonManagementStatus, IncomingRequest, PROTOCOL_VERSION,
-        Request, Response, decode_request, decode_response, encode_request, encode_response,
-        read_incoming_request, read_request, write_daemon_management_request,
+        DaemonManagementResponse, DaemonManagementStatus, IncomingRequest, MAX_FRAME_PAYLOAD,
+        PROTOCOL_VERSION, Request, Response, decode_request, decode_response, encode_request,
+        encode_response, read_incoming_request, read_request, write_daemon_management_request,
         write_daemon_management_response,
     };
     use crate::session::{
@@ -1618,5 +1631,51 @@ mod tests {
         let frame = raw_frame(32, 101, &[]);
         let err = super::read_response(&mut frame.as_slice()).await.unwrap_err().to_string();
         assert!(err.contains("unsupported protocol version `32`"), "{err}");
+    }
+
+    fn frame_header_declaring(version: u16, kind: u16, len: u32) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&super::FRAME_MAGIC.to_le_bytes());
+        frame.extend_from_slice(&version.to_le_bytes());
+        frame.extend_from_slice(&kind.to_le_bytes());
+        frame.extend_from_slice(&[0, 0, 0, 0]);
+        frame.extend_from_slice(&len.to_le_bytes());
+        frame
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_length_is_rejected_before_reading_payload() {
+        // Only the header is sent and the writer stays open: if the reader
+        // tried to allocate and fill the payload it would block, not error.
+        for (version, kind) in [(PROTOCOL_VERSION, 7_u16), (DAEMON_MANAGEMENT_VERSION, 20_001)] {
+            let (mut writer, mut reader) = tokio::io::duplex(64);
+            writer.write_all(&frame_header_declaring(version, kind, u32::MAX)).await.unwrap();
+            let err = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                super::read_incoming_request(&mut reader),
+            )
+            .await
+            .expect("oversized frame must be rejected promptly")
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("too large"), "{err}");
+            drop(writer);
+        }
+
+        let frame = frame_header_declaring(PROTOCOL_VERSION, 101, (MAX_FRAME_PAYLOAD + 1) as u32);
+        let err = super::read_response(&mut frame.as_slice()).await.unwrap_err().to_string();
+        assert!(err.contains("too large"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_is_not_written() {
+        let mut buf = Vec::new();
+        let payload = vec![0_u8; MAX_FRAME_PAYLOAD + 1];
+        let err = super::write_frame(&mut buf, PROTOCOL_VERSION, 7, &payload)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("too large"), "{err}");
+        assert!(buf.is_empty());
     }
 }

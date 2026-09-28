@@ -24,6 +24,12 @@ const (
 
 	frameMagic     uint32 = 0x4147_4450
 	frameHeaderLen        = 16
+
+	// MaxFramePayload bounds a frame's declared payload length, which comes
+	// straight off the wire, so one bad header cannot make a peer allocate
+	// gigabytes. It comfortably fits a snapshot or history of the maximum
+	// retained scrollback. crates/agentd-shared uses the same limit.
+	MaxFramePayload = 64 << 20
 )
 
 // Request is the union of all client to daemon and daemon to worker requests.
@@ -202,8 +208,8 @@ type frameHeader struct {
 }
 
 func writeFrame(w io.Writer, version uint16, k uint16, payload []byte) error {
-	if len(payload) > int(^uint32(0)) {
-		return fmt.Errorf("payload too large: %d bytes", len(payload))
+	if len(payload) > MaxFramePayload {
+		return fmt.Errorf("frame payload too large: %d bytes (limit %d)", len(payload), MaxFramePayload)
 	}
 	var header [frameHeaderLen]byte
 	binary.LittleEndian.PutUint32(header[0:4], frameMagic)
@@ -249,6 +255,9 @@ func readRawFrame(r io.Reader) (*frameHeader, []byte, error) {
 		kind:    binary.LittleEndian.Uint16(header[6:8]),
 	}
 	payloadLen := binary.LittleEndian.Uint32(header[12:16])
+	if payloadLen > MaxFramePayload {
+		return nil, nil, fmt.Errorf("frame payload too large: %d bytes (limit %d)", payloadLen, MaxFramePayload)
+	}
 	payload := make([]byte, payloadLen)
 	if _, err := io.ReadFull(r, payload); err != nil {
 		return nil, nil, err

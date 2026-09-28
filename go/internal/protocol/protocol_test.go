@@ -2,7 +2,9 @@ package protocol
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
@@ -227,5 +229,101 @@ func TestReadIncomingVersionMismatch(t *testing.T) {
 	resp, err := ReadResponse(&buf)
 	if err != nil || resp.Error == nil || resp.Error.Message != "nope" {
 		t.Fatalf("got %#v, %v", resp, err)
+	}
+}
+
+// The frames below are pinned byte for byte in
+// crates/agentd-shared/src/protocol.rs as well, so an encoding change on
+// either side fails both test suites.
+func assertRequestGolden(t *testing.T, req *Request, golden []byte) {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := WriteRequest(&buf, req); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf.Bytes(), golden) {
+		t.Fatalf("encoding changed\n got % x\nwant % x", buf.Bytes(), golden)
+	}
+	got, err := ReadRequest(bytes.NewReader(golden))
+	if err != nil || !reflect.DeepEqual(got, req) {
+		t.Fatalf("decode = %#v, %v", got, err)
+	}
+}
+
+func assertResponseGolden(t *testing.T, resp *Response, golden []byte) {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := WriteResponse(&buf, resp); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf.Bytes(), golden) {
+		t.Fatalf("encoding changed\n got % x\nwant % x", buf.Bytes(), golden)
+	}
+	got, err := ReadResponse(bytes.NewReader(golden))
+	if err != nil || !reflect.DeepEqual(got, resp) {
+		t.Fatalf("decode = %#v, %v", got, err)
+	}
+}
+
+func TestSharedGoldenFrames(t *testing.T) {
+	assertRequestGolden(t, &Request{CreateSession: &CreateSession{Cwd: "/w", Name: strp("fix"), Agent: "codex"}}, []byte{
+		0x50, 0x44, 0x47, 0x41, 0x21, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x18, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x2f, 0x77, 0x01, 0x03,
+		0x00, 0x00, 0x00, 0x66, 0x69, 0x78, 0x05, 0x00, 0x00, 0x00, 0x63, 0x6f,
+		0x64, 0x65, 0x78, 0x00,
+	})
+	assertResponseGolden(t, &Response{CreateSession: &session.CreateResult{SessionID: "ab", Cwd: "/w", Status: session.StatusRunning, Mode: session.ModePlan}}, []byte{
+		0x50, 0x44, 0x47, 0x41, 0x21, 0x00, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x0e, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x61, 0x62, 0x02, 0x00,
+		0x00, 0x00, 0x2f, 0x77, 0x02, 0x02,
+	})
+	assertResponseGolden(t, &Response{SessionEnded: &SessionEnded{SessionID: "ab", Status: session.StatusExited, ExitCode: i32p(-1), Error: strp("e")}}, []byte{
+		0x50, 0x44, 0x47, 0x41, 0x21, 0x00, 0x75, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x12, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x61, 0x62, 0x05, 0x01,
+		0xff, 0xff, 0xff, 0xff, 0x01, 0x01, 0x00, 0x00, 0x00, 0x65,
+	})
+	created := time.Unix(1_700_000_000, 123_456_789).UTC()
+	exited := time.Unix(1_700_000_100, 0).UTC()
+	assertResponseGolden(t, &Response{Session: &session.Record{
+		SessionID: "ab", Agent: "sh", Model: strp("m"), Mode: session.ModeExecute, Cwd: "/w",
+		Status: session.StatusExited, WorkerPID: u32p(7), ExitCode: i32p(3),
+		Attention: session.AttentionNotice, AttentionSummary: strp("s"),
+		CreatedAt: created, UpdatedAt: created, ExitedAt: &exited,
+	}}, []byte{
+		0x50, 0x44, 0x47, 0x41, 0x21, 0x00, 0x6c, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x61, 0x62, 0x02, 0x00,
+		0x00, 0x00, 0x73, 0x68, 0x01, 0x01, 0x00, 0x00, 0x00, 0x6d, 0x01, 0x02,
+		0x00, 0x00, 0x00, 0x2f, 0x77, 0x05, 0x01, 0x07, 0x00, 0x00, 0x00, 0x00,
+		0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00,
+		0x73, 0x00, 0xf1, 0x53, 0x65, 0x00, 0x00, 0x00, 0x00, 0x15, 0xcd, 0x5b,
+		0x07, 0x00, 0xf1, 0x53, 0x65, 0x00, 0x00, 0x00, 0x00, 0x15, 0xcd, 0x5b,
+		0x07, 0x01, 0x64, 0xf1, 0x53, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00,
+	})
+}
+
+func TestOversizedFrameRejectedBeforeAllocating(t *testing.T) {
+	var h [16]byte
+	binary.LittleEndian.PutUint32(h[0:4], frameMagic)
+	binary.LittleEndian.PutUint16(h[4:6], ProtocolVersion)
+	binary.LittleEndian.PutUint16(h[6:8], uint16(kListSessionsRequest))
+	binary.LittleEndian.PutUint32(h[12:16], 0xFFFFFFFF)
+	if _, err := ReadRequest(bytes.NewReader(h[:])); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("want size error, got %v", err)
+	}
+	if err := WriteResponse(io.Discard, &Response{PtyOutput: &Bytes{Data: make([]byte, MaxFramePayload+1)}}); err == nil {
+		t.Fatal("oversized write accepted")
+	}
+}
+
+func TestReadIncomingDecodeError(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writeFrame(&buf, ProtocolVersion, 4, nil); err != nil { // retired CreateWorktree kind
+		t.Fatal(err)
+	}
+	_, _, err := ReadIncoming(&buf)
+	var de *DecodeError
+	if !errors.As(err, &de) || de.Version != ProtocolVersion {
+		t.Fatalf("got %v", err)
 	}
 }

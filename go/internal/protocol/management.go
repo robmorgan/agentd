@@ -51,9 +51,21 @@ type ManagementShutdownResult struct {
 	Message         string `json:"message"`
 }
 
+// DecodeError reports a well-framed message at a supported version that
+// could not be decoded (an unknown or retired kind, a bad payload). The peer
+// is still speaking our framing, so it can be sent an error reply.
+type DecodeError struct {
+	Version uint16
+	Err     error
+}
+
+func (e *DecodeError) Error() string { return e.Err.Error() }
+func (e *DecodeError) Unwrap() error { return e.Err }
+
 // ReadIncoming reads the first frame of a daemon connection, which may belong
-// to either protocol. It returns (nil, nil, nil) on a clean EOF and a
-// *VersionError for a main-protocol frame at an unsupported version.
+// to either protocol. It returns (nil, nil, nil) on a clean EOF, a
+// *VersionError for a main-protocol frame at an unsupported version, and a
+// *DecodeError for a frame that is framed correctly but cannot be decoded.
 func ReadIncoming(r io.Reader) (*Request, *ManagementRequest, error) {
 	h, payload, err := readRawFrame(r)
 	if err != nil || h == nil {
@@ -61,13 +73,19 @@ func ReadIncoming(r io.Reader) (*Request, *ManagementRequest, error) {
 	}
 	if h.version == DaemonManagementVersion {
 		m, err := decodeManagementRequest(h.kind, payload)
-		return nil, m, err
+		if err != nil {
+			return nil, nil, &DecodeError{Version: h.version, Err: err}
+		}
+		return nil, m, nil
 	}
 	if h.version != ProtocolVersion {
 		return nil, nil, &VersionError{Version: h.version}
 	}
 	req, err := decodeRequest(kind(h.kind), payload)
-	return req, nil, err
+	if err != nil {
+		return nil, nil, &DecodeError{Version: h.version, Err: err}
+	}
+	return req, nil, nil
 }
 
 func decodeManagementRequest(k uint16, payload []byte) (*ManagementRequest, error) {
