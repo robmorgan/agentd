@@ -138,7 +138,13 @@ The selected root contains:
 * `agentd.pid` (informational)
 * `state.db` (schema v8; a v6 or v7 database from the former Rust daemon is migrated in place)
 * `sessions/` (one socket per live session)
-* `logs/` (session history, `<id>.worker.log`, and `agentd.log` for a daemonized daemon)
+* `agentd.log` (output of a daemonized daemon)
+* `logs/` (session history and `<id>.worker.log`)
+
+Upgrading from the Rust daemon: a v6/v7 `state.db` is migrated only once neither the previous
+daemon nor any session it started is still running; until then the Go daemon and the CLI's local
+mode refuse, and say what is still running. `agentd upgrade` stops a previous daemon through the
+daemon management protocol, which is unchanged.
 
 The root and everything in it are private to the user (directories 0700, files and sockets 0600),
 since logs hold full agent transcripts. `agentd` refuses a root owned by another user.

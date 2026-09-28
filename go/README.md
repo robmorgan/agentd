@@ -46,7 +46,11 @@ agent CLI ──unix socket──► agentd serve ──unix socket──► age
   output. Slow-consumer policy lives in the worker
   (`internal/worker/broadcast.go`).
 - Worker stderr goes to `logs/<id>.worker.log`; a daemonized `serve` logs to
-  `logs/agentd.log`.
+  `agentd.log` in the root (not `logs/`, where it could collide with a
+  session named `agentd`).
+- A pre-v8 `state.db` from the Rust daemon is migrated only once that daemon
+  and its sessions have stopped; until then startup refuses and says what is
+  still running.
 
 ## Running it
 
