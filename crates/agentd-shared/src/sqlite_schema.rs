@@ -5,8 +5,8 @@
 //! go/internal/db/db.go exactly: the Go daemon and the CLI's local fallback may
 //! open the same file. Opening a v6 or v7 database migrates it in place.
 
-use anyhow::{Result, bail};
-use rusqlite::Connection;
+use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, TransactionBehavior};
 
 pub const CURRENT_SCHEMA_VERSION: i32 = 8;
 pub const EXPECTED_SESSIONS_COLUMNS: &[&str] = &[
@@ -74,8 +74,20 @@ CREATE TABLE sessions (
     exited_at TEXT
 );";
 
+/// Creates or migrates the schema. The version read and any migration run in
+/// one IMMEDIATE transaction, so they happen under SQLite's write lock: a
+/// second process (the Go daemon, another CLI) opening the same file waits on
+/// the connection's busy timeout instead of racing the migration. A DEFERRED
+/// transaction would fail with SQLITE_BUSY at once when two readers both try
+/// to upgrade to a write lock, without consulting the busy handler.
+/// rusqlite's `Connection::open` sets a 5s busy timeout.
+///
+/// Only a real version or layout mismatch is reported as an unsupported
+/// schema; I/O and locking errors keep their own message.
 pub fn init_state_db(conn: &mut Connection) -> Result<()> {
-    let tx = conn.transaction()?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("failed to lock state database for schema initialization")?;
     let schema_version: i32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     let has_objects: bool = tx.query_row(
         "SELECT EXISTS(
@@ -97,7 +109,7 @@ pub fn init_state_db(conn: &mut Connection) -> Result<()> {
         ensure_supported_schema(&tx)?;
     }
 
-    tx.commit()?;
+    tx.commit().context("failed to commit state database schema")?;
     Ok(())
 }
 
@@ -324,6 +336,48 @@ mod tests {
         conn.execute_batch("CREATE TABLE sessions (x); PRAGMA user_version = 99;").unwrap();
         let err = init_state_db(&mut conn).unwrap_err().to_string();
         assert!(err.contains("unsupported state database schema version 99"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Several connections initializing one fresh file at once must all
+    /// succeed: the IMMEDIATE transaction serializes them on the write lock.
+    #[test]
+    fn concurrent_init_of_fresh_database_succeeds() {
+        let path = temp_db_path();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut conn = Connection::open(&path).unwrap();
+                    barrier.wait();
+                    init_state_db(&mut conn)
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn locked_database_is_not_reported_as_unsupported_schema() {
+        let path = temp_db_path();
+        let mut conn = Connection::open(&path).unwrap();
+        init_state_db(&mut conn).unwrap();
+
+        let holder = Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        conn.busy_timeout(std::time::Duration::from_millis(50)).unwrap();
+        let err = format!("{:#}", init_state_db(&mut conn).unwrap_err());
+        assert!(err.contains("locked"), "{err}");
+        assert!(!err.contains("unsupported"), "{err}");
+        assert!(!err.contains("Remove or migrate"), "{err}");
+        holder.execute_batch("ROLLBACK").unwrap();
         let _ = std::fs::remove_file(path);
     }
 }

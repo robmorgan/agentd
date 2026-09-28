@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -81,16 +82,37 @@ type Database struct {
 	path string
 }
 
+// errUnsupportedSchema marks init failures caused by the database's layout
+// rather than by I/O or locking, so only those are reported as a schema
+// problem the user has to act on.
+var errUnsupportedSchema = errors.New("unsupported state database schema")
+
+// ErrNotCreating is returned by MarkRunning when the session is no longer
+// waiting for its worker (it was removed, or the daemon gave up on it).
+var ErrNotCreating = errors.New("session is no longer being created")
+
 func Open(path string) (*Database, error) {
 	d := &Database{path: path}
 	if err := d.init(); err != nil {
-		return nil, fmt.Errorf("unsupported state database schema in %s: %w", path, err)
+		if errors.Is(err, errUnsupportedSchema) {
+			detail := strings.TrimPrefix(err.Error(), errUnsupportedSchema.Error()+": ")
+			return nil, fmt.Errorf("%w in %s: %s", errUnsupportedSchema, path, detail)
+		}
+		return nil, fmt.Errorf("failed to open state database %s: %w", path, err)
+	}
+	// Session metadata is private to the user; SQLite creates files 0644.
+	if err := os.Chmod(path, 0o600); err != nil {
+		return nil, fmt.Errorf("failed to restrict %s: %w", path, err)
 	}
 	return d, nil
 }
 
+// connect opens a connection. _txlock=immediate makes every transaction take
+// the write lock when it begins, so concurrent openers (daemon, workers, the
+// CLI's local mode) queue on busy_timeout instead of deadlocking on a lock
+// upgrade, which SQLite reports as SQLITE_BUSY without waiting.
 func (d *Database) connect() (*sql.DB, error) {
-	conn, err := sql.Open("sqlite", d.path+"?_pragma=busy_timeout(5000)")
+	conn, err := sql.Open("sqlite", d.path+"?_pragma=busy_timeout(5000)&_txlock=immediate")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open %s: %w", d.path, err)
 	}
@@ -142,10 +164,10 @@ func (d *Database) init() error {
 				return err
 			}
 		default:
-			return fmt.Errorf("unsupported state database schema version %d; expected %d. Remove or migrate the runtime root.", schemaVersion, CurrentSchemaVersion)
+			return fmt.Errorf("%w: version %d; expected %d. Remove or migrate the runtime root.", errUnsupportedSchema, schemaVersion, CurrentSchemaVersion)
 		}
 		if err := ensureSupportedSchema(tx); err != nil {
-			return err
+			return fmt.Errorf("%w: %v", errUnsupportedSchema, err)
 		}
 	}
 	return tx.Commit()
@@ -251,14 +273,32 @@ func (d *Database) InsertSession(s NewSession) error {
 		string(session.AttentionInfo), s.SessionID, now())
 }
 
+// MarkRunning records that a worker has its agent running. It only applies
+// to a session still in `creating`, and returns ErrNotCreating otherwise, so
+// a worker the daemon gave up on (or whose session was removed meanwhile)
+// cannot claim the session.
 func (d *Database) MarkRunning(sessionID string, workerPID, agentPID int) error {
-	return d.exec(`UPDATE sessions
+	conn, err := d.connect()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	res, err := conn.Exec(`UPDATE sessions
              SET status = ?2, worker_pid = ?3, agent_pid = ?4,
                  exit_code = NULL, error = NULL, attention = ?5, attention_summary = ?6,
                  updated_at = ?7, exited_at = NULL
-             WHERE session_id = ?1`,
+             WHERE session_id = ?1 AND status = 'creating'`,
 		sessionID, string(session.StatusRunning), workerPID, agentPID,
 		string(session.AttentionInfo), "running", now())
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return ErrNotCreating
+	}
+	return nil
 }
 
 func (d *Database) MarkFailed(sessionID, errMsg string) error {
@@ -305,6 +345,17 @@ func (d *Database) MarkFailedIfActive(sessionID, errMsg string) error {
                  attention = ?4, attention_summary = ?3, updated_at = ?5
              WHERE session_id = ?1 AND status IN ('creating', 'running')`,
 		sessionID, string(session.StatusFailed), errMsg, string(session.AttentionAction), now())
+}
+
+// MarkWorkerLost marks a running session failed when the given worker died
+// without recording an outcome. Keyed on the worker's pid, it never touches a
+// newer session that reused the name.
+func (d *Database) MarkWorkerLost(sessionID string, workerPID int, errMsg string) error {
+	return d.exec(`UPDATE sessions
+             SET status = ?3, worker_pid = NULL, agent_pid = NULL, error = ?4,
+                 attention = ?5, attention_summary = ?4, updated_at = ?6
+             WHERE session_id = ?1 AND worker_pid = ?2 AND status = 'running'`,
+		sessionID, workerPID, string(session.StatusFailed), errMsg, string(session.AttentionAction), now())
 }
 
 // MarkExitedIfActive is MarkExited restricted to sessions that have not

@@ -2,8 +2,11 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/robmorgan/agentd/go/internal/session"
@@ -62,8 +65,9 @@ func TestFreshDatabaseIsV8AndRoundTrips(t *testing.T) {
 
 // TestMigrateV7ToV8 opens a database laid out the way the Rust daemon writes
 // it and checks the worktree path becomes the session cwd.
-func TestMigrateV7ToV8(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.db")
+// writeV7Fixture creates a database in the Rust daemon's v7 layout.
+func writeV7Fixture(t *testing.T, path string) {
+	t.Helper()
 	raw := openRaw(t, path)
 	if _, err := raw.Exec(createSessionsTableV7 + `
         INSERT INTO sessions (
@@ -81,6 +85,12 @@ func TestMigrateV7ToV8(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw.Close()
+
+}
+
+func TestMigrateV7ToV8(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	writeV7Fixture(t, path)
 
 	store, err := Open(path)
 	if err != nil {
@@ -121,8 +131,98 @@ func TestUnknownSchemaVersionIsRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw.Close()
-	if _, err := Open(path); err == nil {
-		t.Fatal("expected unsupported schema error")
+	_, err := Open(path)
+	if err == nil || !strings.Contains(err.Error(), "unsupported state database schema in "+path+": version 99") {
+		t.Fatalf("got %v", err)
 	}
 	_ = os.Remove(path)
+}
+
+// The daemon, its workers and the CLI's local mode can all open an old
+// database at once; exactly one migrates and the rest must wait, not fail.
+func TestConcurrentOpenOfV7Database(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	writeV7Fixture(t, path)
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := Open(path)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := userVersion(t, path); got != CurrentSchemaVersion {
+		t.Fatalf("user_version = %d", got)
+	}
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("state.db mode = %v, %v", info.Mode(), err)
+	}
+}
+
+// The conditional transitions exist so that the daemon's supervisor never
+// overwrites an outcome the worker already recorded.
+func TestStateTransitionGuards(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	get := func(id string) *session.Record {
+		t.Helper()
+		rec, err := store.GetSession(id)
+		if err != nil || rec == nil {
+			t.Fatalf("get %s: %v %v", id, rec, err)
+		}
+		return rec
+	}
+	for _, id := range []string{"a", "b"} {
+		if err := store.InsertSession(NewSession{SessionID: id, Agent: "sh", Mode: session.ModeExecute, Cwd: "/"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := store.MarkRunning("a", 10, 11); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkRunning("a", 12, 13); !errors.Is(err, ErrNotCreating) {
+		t.Fatalf("second MarkRunning = %v", err)
+	}
+	if err := store.MarkRunning("missing", 1, 2); !errors.Is(err, ErrNotCreating) {
+		t.Fatalf("MarkRunning on missing row = %v", err)
+	}
+	zero := int32(0)
+	if err := store.MarkExited("a", &zero); err != nil {
+		t.Fatal(err)
+	}
+	for _, mark := range []func() error{
+		func() error { return store.MarkFailedIfActive("a", "boom") },
+		func() error { return store.MarkExitedIfActive("a") },
+		func() error { return store.MarkUnknownRecovered("a") },
+	} {
+		if err := mark(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rec := get("a"); rec.Status != session.StatusExited || rec.Error != nil || rec.ExitCode == nil || *rec.ExitCode != 0 {
+		t.Fatalf("final state clobbered: %+v", rec)
+	}
+
+	// A session still being created can be failed, and then cannot be claimed.
+	if err := store.MarkFailedIfActive("b", "timed out"); err != nil {
+		t.Fatal(err)
+	}
+	if rec := get("b"); rec.Status != session.StatusFailed {
+		t.Fatalf("b = %+v", rec)
+	}
+	if err := store.MarkRunning("b", 10, 11); !errors.Is(err, ErrNotCreating) {
+		t.Fatalf("MarkRunning after failure = %v", err)
+	}
 }
