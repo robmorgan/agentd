@@ -669,10 +669,7 @@ async fn start_daemon(paths: &AppPaths, daemon_exe: &Path, timeout: Duration) ->
             return Ok(());
         }
         if Instant::now() >= deadline {
-            bail!(
-                "timed out waiting for agentd to start; see {}",
-                paths.logs_dir.join("agentd.log")
-            );
+            bail!("timed out waiting for agentd to start; see {}", paths.root.join("agentd.log"));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -1395,7 +1392,7 @@ fn print_session(session: &SessionRecord) {
     if let Some(summary) = &session.attention_summary {
         println!("attention_summary: {summary}");
     }
-    println!("cwd: {}", session.cwd);
+    println!("cwd: {}", crate::session_display::escape_controls(&session.cwd));
     if let Some(worker_pid) = session.worker_pid {
         println!("worker_pid: {worker_pid}");
     }
@@ -2393,7 +2390,7 @@ command = "claude"
         .to_string();
 
         assert!(err.contains("timed out waiting for agentd to start"), "{err}");
-        assert!(err.contains(paths.logs_dir.join("agentd.log").as_str()), "{err}");
+        assert!(err.contains(paths.root.join("agentd.log").as_str()), "{err}");
         assert!(paths.pid_file.exists());
         assert!(paths.socket.exists());
     }

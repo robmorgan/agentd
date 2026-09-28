@@ -27,8 +27,8 @@ use crate::{
     CODEX_MODELS, RawModeGuard, StatusString, centered_rect, daemon_get_session,
     daemon_list_sessions, kill_session, send_request,
     session_display::{
-        RunState, build_session_display_row, render_run_icon, session_elapsed_label,
-        session_run_state, style_age, style_cwd, style_name, style_run,
+        RunState, build_session_display_row, escape_controls, render_run_icon,
+        session_elapsed_label, session_run_state, style_age, style_cwd, style_name, style_run,
     },
 };
 
@@ -600,7 +600,7 @@ impl SessionPicker {
         ));
         if let Some(session) = self.session_by_id(session_id) {
             lines.push(style_host_picker_menu_line(
-                &fit_host_picker_line(session.cwd.clone(), width),
+                &fit_host_picker_line(escape_controls(&session.cwd), width),
                 width,
                 false,
             ));
@@ -658,7 +658,7 @@ impl SessionPicker {
         let mut lines = vec![style_host_picker_background_row(width)];
         if let Some(session) = self.session_by_id(session_id) {
             lines.push(style_host_picker_menu_line(
-                &fit_host_picker_line(session.cwd.clone(), width),
+                &fit_host_picker_line(escape_controls(&session.cwd), width),
                 width,
                 false,
             ));

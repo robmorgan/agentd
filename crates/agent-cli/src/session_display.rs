@@ -46,18 +46,31 @@ pub(crate) fn build_session_display_row(session: &SessionRecord) -> SessionDispl
 /// Shortens a session cwd for list views by replacing the home directory with
 /// `~`. The full path is still shown by `agent status`.
 pub(crate) fn display_cwd(cwd: &str, home: Option<&std::ffi::OsStr>) -> String {
+    let cwd = escape_controls(cwd);
     let Some(home) = home.and_then(|home| home.to_str()).map(|home| home.trim_end_matches('/'))
     else {
-        return cwd.to_string();
+        return cwd;
     };
     if home.is_empty() {
-        return cwd.to_string();
+        return cwd;
     }
     match cwd.strip_prefix(home) {
         Some("") => "~".to_string(),
         Some(rest) if rest.starts_with('/') => format!("~{rest}"),
-        _ => cwd.to_string(),
+        _ => cwd,
     }
+}
+
+/// Directory names may contain control characters, including escape
+/// sequences a terminal would act on. Anything shown from a path is passed
+/// through this first, so it is printed rather than interpreted.
+pub(crate) fn escape_controls(text: &str) -> String {
+    if !text.chars().any(char::is_control) {
+        return text.to_string();
+    }
+    text.chars()
+        .map(|c| if c.is_control() { c.escape_default().to_string() } else { c.to_string() })
+        .collect()
 }
 
 pub(crate) fn session_run_state(session: &SessionRecord) -> RunState {
@@ -126,8 +139,8 @@ fn format_elapsed_seconds(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        RunState, build_session_display_row, display_cwd, format_elapsed_seconds, render_run_icon,
-        session_elapsed_label_at, session_run_state,
+        RunState, build_session_display_row, display_cwd, escape_controls, format_elapsed_seconds,
+        render_run_icon, session_elapsed_label_at, session_run_state,
     };
     use agentd_shared::session::{AttentionLevel, SessionMode, SessionRecord, SessionStatus};
     use chrono::{Duration, Utc};
@@ -179,6 +192,15 @@ mod tests {
         session.status = SessionStatus::UnknownRecovered;
         assert_eq!(session_run_state(&session), RunState::Recovered);
         assert_eq!(render_run_icon(RunState::Recovered), "○");
+    }
+
+    #[test]
+    fn paths_with_control_characters_are_escaped() {
+        let hostile = "/tmp/\u{1b}]52;c;cHduZWQ=\u{7}x";
+        let shown = display_cwd(hostile, None);
+        assert!(!shown.chars().any(char::is_control), "{shown:?}");
+        assert_eq!(shown, "/tmp/\\u{1b}]52;c;cHduZWQ=\\u{7}x");
+        assert_eq!(escape_controls("/plain/path"), "/plain/path");
     }
 
     #[test]

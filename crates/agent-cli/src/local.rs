@@ -50,6 +50,7 @@ pub struct LocalStore {
 impl LocalStore {
     pub fn open(paths: &AppPaths) -> Result<Self> {
         let store = Self { path: paths.database.to_string() };
+        refuse_live_legacy_runtime(paths)?;
         store.init()?;
         Ok(store)
     }
@@ -141,6 +142,58 @@ impl LocalStore {
         init_state_db(&mut conn)
             .with_context(|| format!("failed to open state database {}", self.path))
     }
+}
+
+/// Opening the store migrates a state.db written by the agentd that preceded
+/// the Go daemon (schema v6/v7), and that migration drops columns the old
+/// daemon and its session workers still query. Local mode is reached exactly
+/// when an incompatible daemon answers, so check before migrating: refuse
+/// while the old daemon or any of its sessions is still running. Mirrors
+/// checkLegacyRuntime in go/internal/daemon.
+fn refuse_live_legacy_runtime(paths: &AppPaths) -> Result<()> {
+    if !paths.database.exists() {
+        return Ok(());
+    }
+    let conn = Connection::open_with_flags(
+        paths.database.as_std_path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .with_context(|| format!("failed to open state database {}", paths.database))?;
+    let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 0 || version >= agentd_shared::sqlite_schema::CURRENT_SCHEMA_VERSION {
+        return Ok(());
+    }
+    if std::os::unix::net::UnixStream::connect(paths.socket.as_std_path()).is_ok() {
+        bail!(
+            "the previous agentd is still running on {} and its state.db (schema v{version}) cannot be upgraded under it; run `agent daemon restart` to stop it and start the new daemon",
+            paths.socket
+        );
+    }
+    let mut stmt =
+        conn.prepare("SELECT session_id, worker_pid FROM sessions WHERE status = 'running'")?;
+    let rows =
+        stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)))?;
+    let mut live = Vec::new();
+    for row in rows {
+        let (session_id, worker_pid) = row?;
+        if std::os::unix::net::UnixStream::connect(
+            paths.session_socket_path(&session_id).as_std_path(),
+        )
+        .is_ok()
+        {
+            live.push(match worker_pid {
+                Some(pid) => format!("{session_id} (worker pid {pid})"),
+                None => session_id,
+            });
+        }
+    }
+    if !live.is_empty() {
+        bail!(
+            "sessions started by the previous agentd are still running: {}; they cannot be carried over. Exit those agents (or kill their worker processes), then try again",
+            live.join(", ")
+        );
+    }
+    Ok(())
 }
 
 pub fn session_is_active(session: &SessionRecord) -> bool {
@@ -574,5 +627,41 @@ mod tests {
         session.status = SessionStatus::Exited;
         let normalized = normalize_degraded_session(session);
         assert_eq!(normalized.status, SessionStatus::Exited);
+    }
+
+    #[test]
+    fn local_mode_does_not_migrate_under_a_live_legacy_runtime() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        {
+            let conn = Connection::open(paths.database.as_std_path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, status TEXT, worker_pid INTEGER);
+                 INSERT INTO sessions VALUES ('old', 'running', 4242);
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
+        }
+        let version = |paths: &AppPaths| -> i32 {
+            Connection::open(paths.database.as_std_path())
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap()
+        };
+
+        let daemon = std::os::unix::net::UnixListener::bind(paths.socket.as_std_path()).unwrap();
+        let err = LocalStore::open(&paths).unwrap_err().to_string();
+        assert!(err.contains("previous agentd is still running"), "{err}");
+        drop(daemon);
+        fs::remove_file(paths.socket.as_std_path()).unwrap();
+
+        let worker =
+            std::os::unix::net::UnixListener::bind(paths.session_socket_path("old").as_std_path())
+                .unwrap();
+        let err = LocalStore::open(&paths).unwrap_err().to_string();
+        assert!(err.contains("old (worker pid 4242)"), "{err}");
+        drop(worker);
+        assert_eq!(version(&paths), 7, "state.db was migrated under a live legacy runtime");
+        let _ = fs::remove_dir_all(paths.root.as_std_path());
     }
 }
