@@ -1,19 +1,20 @@
 package daemon
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/robmorgan/agentd/go/internal/db"
 	"github.com/robmorgan/agentd/go/internal/paths"
+	"github.com/robmorgan/agentd/go/internal/protocol"
 	"github.com/robmorgan/agentd/go/internal/session"
 )
 
@@ -24,7 +25,7 @@ func Daemonize(p *paths.AppPaths, exe string) error {
 	if err := p.EnsureLayout(); err != nil {
 		return err
 	}
-	logFile, err := os.OpenFile(filepath.Join(p.LogsDir, "agentd.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	logFile, err := os.OpenFile(filepath.Join(p.LogsDir, "agentd.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
@@ -55,7 +56,11 @@ func Upgrade(p *paths.AppPaths, exe string) error {
 	}
 	var running []string
 	for _, rec := range recs {
-		if rec.WorkerPID != nil && rec.Status == session.StatusRunning && processExists(int(*rec.WorkerPID)) {
+		if rec.Status != session.StatusRunning {
+			continue
+		}
+		if conn, err := net.DialTimeout("unix", p.SessionSocketPath(rec.SessionID), workerDialTimeout); err == nil {
+			conn.Close()
 			running = append(running, fmt.Sprintf("%s (%s)", rec.SessionID, rec.Agent))
 		}
 	}
@@ -81,29 +86,36 @@ func Upgrade(p *paths.AppPaths, exe string) error {
 	}
 }
 
+// stopDaemon stops the running daemon, if any. The daemon's lock says
+// whether one is running, and it is asked to stop over its own socket, so no
+// pid is ever read from disk and signalled.
 func stopDaemon(p *paths.AppPaths) error {
-	data, err := os.ReadFile(p.PIDFile)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+	running, err := daemonRunning(p.LockPath())
+	if err != nil || !running {
+		return err
 	}
+	conn, err := net.DialTimeout("unix", p.Socket, workerDialTimeout)
 	if err != nil {
-		return fmt.Errorf("failed to read %s: %w", p.PIDFile, err)
+		return fmt.Errorf("agentd holds %s but does not answer on %s: %w", p.LockPath(), p.Socket, err)
 	}
-	raw := strings.TrimSpace(string(data))
-	if raw == "" {
-		return nil
+	conn.SetDeadline(time.Now().Add(workerDialTimeout))
+	err = protocol.WriteManagementRequest(conn, &protocol.ManagementRequest{Shutdown: &protocol.ManagementShutdown{Force: true}})
+	if err == nil {
+		_, err = protocol.ReadManagementResponse(bufio.NewReader(conn))
 	}
-	pid, err := strconv.Atoi(raw)
+	conn.Close()
 	if err != nil {
-		return fmt.Errorf("failed to parse pid from %s: %w", p.PIDFile, err)
+		return fmt.Errorf("failed to ask agentd to stop: %w", err)
 	}
-	for _, sig := range []syscall.Signal{syscall.SIGTERM, syscall.SIGKILL} {
-		if err := syscall.Kill(pid, sig); err != nil && !errors.Is(err, syscall.ESRCH) {
-			return fmt.Errorf("failed to send %v to agentd: %w", sig, err)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		running, err := daemonRunning(p.LockPath())
+		if err != nil || !running {
+			return err
 		}
-		if waitForExit(pid, 5*time.Second) {
-			return nil
+		if time.Now().After(deadline) {
+			return errors.New("agentd did not stop")
 		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	return errors.New("agentd did not exit after SIGTERM and SIGKILL")
 }

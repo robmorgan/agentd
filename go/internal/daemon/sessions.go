@@ -1,9 +1,11 @@
 package daemon
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,9 +21,10 @@ import (
 const (
 	workerReadyTimeout = 5 * time.Second
 	// workerStopTimeout covers the worker's own SIGTERM->SIGKILL grace for
-	// the agent (5s) plus time to write logs and exit.
+	// the agent (worker.agentKillGrace, 5s) plus time to write logs and exit.
 	workerStopTimeout = 8 * time.Second
 	workerKillTimeout = 2 * time.Second
+	workerDialTimeout = 2 * time.Second
 	pollInterval      = 20 * time.Millisecond
 
 	sessionNameRules = "use 1-64 lowercase letters, numbers, and single hyphens"
@@ -50,19 +53,22 @@ func validSessionName(name string) bool {
 	return true
 }
 
-func (s *Server) workerLogPath(sessionID string) string {
-	return filepath.Join(s.paths.LogsDir, sessionID+".worker.log")
-}
-
-// alive reports whether a running record still has a live worker. A worker
-// removes its socket only after recording its outcome, so a running row with
-// a live pid and a socket is genuinely live.
-func (s *Server) alive(rec *session.Record) bool {
-	if rec.Status != session.StatusRunning || rec.WorkerPID == nil || !processExists(int(*rec.WorkerPID)) {
+// workerAnswers reports whether a session's worker accepts connections. This
+// is the liveness test for sessions: unlike a stored pid it cannot be fooled
+// by pid reuse, and unlike the socket file existing it cannot be fooled by a
+// worker that died without cleaning up.
+func (s *Server) workerAnswers(id string) bool {
+	conn, err := net.DialTimeout("unix", s.paths.SessionSocketPath(id), workerDialTimeout)
+	if err != nil {
 		return false
 	}
-	_, err := os.Stat(s.paths.SessionSocketPath(rec.SessionID))
-	return err == nil
+	conn.Close()
+	return true
+}
+
+// alive reports whether a running record still has a live worker.
+func (s *Server) alive(rec *session.Record) bool {
+	return rec.Status == session.StatusRunning && s.workerAnswers(rec.SessionID)
 }
 
 // refresh downgrades a running record whose worker has vanished, e.g. one
@@ -134,10 +140,10 @@ func (s *Server) reconcileSessions() error {
 				return err
 			}
 		case session.StatusCreating:
-			if rec.WorkerPID == nil {
-				if err := s.db.MarkFailedIfActive(rec.SessionID, "agentd stopped while the session was starting"); err != nil {
-					return err
-				}
+			// The daemon that was creating it is gone. If its worker is
+			// still starting, MarkRunning will now refuse it and it exits.
+			if err := s.db.MarkFailedIfActive(rec.SessionID, "agentd stopped while the session was starting"); err != nil {
+				return err
 			}
 		}
 	}
@@ -233,11 +239,11 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 		args = append(args, "--arg", a)
 	}
 
-	exited, err := s.spawnWorker(id, args)
+	cmd, exited, err := s.spawnWorker(id, args)
 	if err != nil {
 		return fail(err)
 	}
-	if err := s.waitWorkerReady(id, exited); err != nil {
+	if err := s.waitWorkerReady(id, cmd, exited); err != nil {
 		return nil, err
 	}
 	return &session.CreateResult{
@@ -248,10 +254,10 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 // spawnWorker starts a session worker in its own process session, so it is
 // not tied to the daemon's lifetime or terminal, and starts its supervisor.
 // The returned channel closes when the worker exits.
-func (s *Server) spawnWorker(id string, args []string) (<-chan struct{}, error) {
-	logFile, err := os.OpenFile(s.workerLogPath(id), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+func (s *Server) spawnWorker(id string, args []string) (*exec.Cmd, <-chan struct{}, error) {
+	logFile, err := os.OpenFile(s.paths.WorkerLogPath(id), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open worker log: %w", err)
+		return nil, nil, fmt.Errorf("failed to open worker log: %w", err)
 	}
 	defer logFile.Close()
 
@@ -261,9 +267,10 @@ func (s *Server) spawnWorker(id string, args []string) (<-chan struct{}, error) 
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("failed to spawn session worker: %w", err)
+		return nil, nil, fmt.Errorf("failed to spawn session worker: %w", err)
 	}
 
+	workerPID := cmd.Process.Pid
 	exited := make(chan struct{})
 	go func() {
 		defer close(exited)
@@ -274,31 +281,32 @@ func (s *Server) spawnWorker(id string, args []string) (<-chan struct{}, error) 
 		default:
 		}
 		// A worker that exits cleanly has already recorded the outcome;
-		// this only catches crashes and SIGKILL.
-		if err := s.db.MarkFailedIfActive(id, "session worker exited unexpectedly"); err != nil {
+		// this only catches crashes and SIGKILL. The update is keyed on
+		// this worker's pid, so it cannot touch a newer session that has
+		// since reused the name.
+		if err := s.db.MarkWorkerLost(id, workerPID, "session worker exited unexpectedly"); err != nil {
 			fmt.Fprintf(os.Stderr, "agentd: failed to record worker exit for %s: %v\n", id, err)
 		}
-		_ = os.Remove(s.paths.SessionSocketPath(id))
 	}()
-	return exited, nil
+	return cmd, exited, nil
 }
 
-func (s *Server) waitWorkerReady(id string, exited <-chan struct{}) error {
+func (s *Server) waitWorkerReady(id string, cmd *exec.Cmd, exited <-chan struct{}) error {
 	deadline := time.Now().Add(workerReadyTimeout)
+	workerGone := false
 	for {
 		rec, err := s.db.GetSession(id)
 		if err != nil {
 			return err
 		}
 		if rec == nil {
-			return errors.New("session missing after worker spawn")
+			_ = cmd.Process.Kill()
+			return errors.New("session was removed while it was starting")
 		}
 		switch rec.Status {
 		case session.StatusRunning:
-			if rec.WorkerPID != nil {
-				if _, err := os.Stat(s.paths.SessionSocketPath(id)); err == nil {
-					return nil
-				}
+			if s.workerAnswers(id) {
+				return nil
 			}
 		case session.StatusFailed, session.StatusExited:
 			if rec.Error != nil {
@@ -306,28 +314,33 @@ func (s *Server) waitWorkerReady(id string, exited <-chan struct{}) error {
 			}
 			return errors.New("session worker exited before becoming ready")
 		}
+		if workerGone {
+			// The worker exited without recording a failure (it crashed).
+			_ = s.db.MarkFailedIfActive(id, "session worker exited before becoming ready")
+			return fmt.Errorf("session worker exited before becoming ready; see %s", s.paths.WorkerLogPath(id))
+		}
 		select {
 		case <-exited:
-			// Let the loop observe the final state the worker (or its
-			// supervisor) recorded.
-			exited = nil
+			// Look at the state once more: the worker may have recorded
+			// why it stopped.
+			workerGone = true
 			continue
 		default:
 		}
 		if time.Now().After(deadline) {
-			if rec.WorkerPID != nil {
-				_ = syscall.Kill(int(*rec.WorkerPID), syscall.SIGKILL)
-			}
+			// Give up on this worker. Its MarkRunning would now be
+			// refused anyway, but don't leave it running.
 			_ = s.db.MarkFailedIfActive(id, "timed out waiting for session worker to start")
+			_ = cmd.Process.Kill()
 			return errors.New("timed out waiting for session worker to start")
 		}
 		time.Sleep(pollInterval)
 	}
 }
 
-// killSession stops a live session through its worker (SIGTERM, which the
-// worker turns into a graceful stop of the agent) and, with remove, deletes
-// its record and logs.
+// killSession stops a live session through its worker, which stops the
+// agent's process group gracefully, and with remove deletes its record and
+// logs.
 func (s *Server) killSession(id string, remove bool) (*protocol.KillSessionResult, error) {
 	rec, err := s.getSession(id)
 	if err != nil {
@@ -347,7 +360,7 @@ func (s *Server) killSession(id string, remove bool) (*protocol.KillSessionResul
 	}
 	if remove {
 		for _, path := range []string{
-			s.paths.LogPath(id), s.paths.RenderedLogPath(id), s.workerLogPath(id), s.paths.SessionSocketPath(id),
+			s.paths.LogPath(id), s.paths.RenderedLogPath(id), s.paths.WorkerLogPath(id), s.paths.SessionSocketPath(id),
 		} {
 			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return nil, fmt.Errorf("failed to remove %s: %w", path, err)
@@ -360,24 +373,78 @@ func (s *Server) killSession(id string, remove bool) (*protocol.KillSessionResul
 	return &protocol.KillSessionResult{Removed: remove, WasRunning: wasRunning}, nil
 }
 
+// stopWorker asks the worker, over its socket, to stop the agent and waits
+// for the session to record its end. Signals are the fallback for a wedged
+// worker only, and only while its socket still answers, which proves the
+// pids it recorded still belong to it.
 func (s *Server) stopWorker(rec *session.Record) error {
-	workerPID := int(*rec.WorkerPID)
-	if err := syscall.Kill(workerPID, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return fmt.Errorf("failed to send SIGTERM to session `%s`: %w", rec.SessionID, err)
-	}
-	if waitForExit(workerPID, workerStopTimeout) {
+	id := rec.SessionID
+	if err := s.requestWorkerKill(id); err == nil && s.waitStopped(id, workerStopTimeout) {
 		return nil
 	}
-	// The worker is wedged. Take the agent's process group down with it and
-	// record the stop ourselves.
+	if !s.workerAnswers(id) {
+		// It went away on its own (or crashed); whatever it recorded
+		// stands, and a crash is marked by its supervisor or on refresh.
+		_ = s.db.MarkExitedIfActive(id)
+		return nil
+	}
 	if rec.AgentPID != nil {
-		_ = syscall.Kill(-int(*rec.AgentPID), syscall.SIGKILL)
+		if pid := int(*rec.AgentPID); pid > 1 {
+			if pgid, err := syscall.Getpgid(pid); err == nil && pgid == pid {
+				_ = syscall.Kill(-pid, syscall.SIGKILL)
+			}
+		}
 	}
-	_ = syscall.Kill(workerPID, syscall.SIGKILL)
-	if !waitForExit(workerPID, workerKillTimeout) {
-		return fmt.Errorf("session `%s` did not exit after SIGTERM and SIGKILL", rec.SessionID)
+	if rec.WorkerPID != nil {
+		if pid := int(*rec.WorkerPID); pid > 1 {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
 	}
-	return s.db.MarkExitedIfActive(rec.SessionID)
+	deadline := time.Now().Add(workerKillTimeout)
+	for s.workerAnswers(id) {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("session `%s` did not stop", id)
+		}
+		time.Sleep(pollInterval)
+	}
+	return s.db.MarkExitedIfActive(id)
+}
+
+func (s *Server) requestWorkerKill(id string) error {
+	conn, err := net.DialTimeout("unix", s.paths.SessionSocketPath(id), workerDialTimeout)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(workerDialTimeout))
+	if err := protocol.WriteRequest(conn, &protocol.Request{KillSession: &protocol.KillSession{SessionID: id}}); err != nil {
+		return err
+	}
+	resp, err := protocol.ReadResponse(bufio.NewReader(conn))
+	switch {
+	case err != nil:
+		return err
+	case resp == nil:
+		return errors.New("worker closed the connection")
+	case resp.Error != nil:
+		return errors.New(resp.Error.Message)
+	}
+	return nil
+}
+
+// waitStopped waits for a session to leave the running state.
+func (s *Server) waitStopped(id string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		rec, err := s.db.GetSession(id)
+		if err == nil && (rec == nil || rec.Status != session.StatusRunning) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(pollInterval)
+	}
 }
 
 func (s *Server) runtimeSocket(id string) (string, error) {
@@ -391,27 +458,8 @@ func (s *Server) runtimeSocket(id string) (string, error) {
 	if rec.Status != session.StatusRunning {
 		return "", fmt.Errorf("session `%s` is not running", id)
 	}
-	socket := s.paths.SessionSocketPath(id)
-	if _, err := os.Stat(socket); err != nil {
+	if !s.workerAnswers(id) {
 		return "", fmt.Errorf("session `%s` does not have a live runtime socket", id)
 	}
-	return socket, nil
-}
-
-func processExists(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	return syscall.Kill(pid, 0) == nil
-}
-
-func waitForExit(pid int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for processExists(pid) {
-		if time.Now().After(deadline) {
-			return false
-		}
-		time.Sleep(pollInterval)
-	}
-	return true
+	return s.paths.SessionSocketPath(id), nil
 }

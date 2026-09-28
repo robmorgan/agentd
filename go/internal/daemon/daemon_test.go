@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -395,6 +396,7 @@ func TestSecondDaemonRefusesToStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	srv.lockWait = 100 * time.Millisecond
 	if err := srv.Serve(context.Background()); err == nil || !strings.Contains(err.Error(), "already running") {
 		t.Fatalf("second Serve = %v", err)
 	}
@@ -451,7 +453,7 @@ func TestMalformedFramesDoNotAffectDaemon(t *testing.T) {
 	for _, frame := range [][]byte{
 		[]byte("definitely not a frame"),
 		{0x50, 0x44, 0x47, 0x41, 33, 0, 0xe7, 0x03, 0, 0, 0, 0, 0, 0, 0, 0}, // unknown kind 999
-		{0x50, 0x44, 0x47, 0x41, 33, 0},                                    // truncated header
+		{0x50, 0x44, 0x47, 0x41, 33, 0},                                     // truncated header
 	} {
 		conn := h.dial()
 		conn.Write(frame)
@@ -609,7 +611,7 @@ func TestKillAndRemove(t *testing.T) {
 		t.Fatalf("rm = %#v (%v)", resp, resp.Error)
 	}
 	wantError(t, h.request(&protocol.Request{GetSession: &protocol.SessionRef{SessionID: id}}), "not found")
-	for _, path := range []string{h.paths.LogPath(id), h.paths.RenderedLogPath(id), h.srv.workerLogPath(id)} {
+	for _, path := range []string{h.paths.LogPath(id), h.paths.RenderedLogPath(id), h.paths.WorkerLogPath(id)} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("%s survived rm: %v", path, err)
 		}
@@ -730,5 +732,151 @@ func TestWorkerLostWhileDaemonDown(t *testing.T) {
 	h.start()
 	if got := h.session(id); got.Status != session.StatusUnknownRecovered {
 		t.Fatalf("status = %s, want unknown_recovered", got.Status)
+	}
+}
+
+func processExists(pid int) bool {
+	return pid > 0 && syscall.Kill(pid, 0) == nil
+}
+
+func waitForExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for processExists(pid) {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return true
+}
+
+// After a crash, a session's recorded pids may belong to unrelated processes
+// by the time anyone looks. The daemon must treat the session as lost and
+// never signal those pids.
+func TestRecycledPidsAreNeverSignalled(t *testing.T) {
+	h := newHarness(t)
+	id := h.mustCreate("")
+	rec := h.session(id)
+	h.stop()
+	// The worker dies without cleaning up: its socket file stays behind.
+	_ = syscall.Kill(-int(*rec.AgentPID), syscall.SIGKILL)
+	_ = syscall.Kill(int(*rec.WorkerPID), syscall.SIGKILL)
+	waitForExit(int(*rec.WorkerPID), testTimeout)
+	if _, err := os.Stat(h.paths.SessionSocketPath(id)); err != nil {
+		t.Fatalf("expected a stale socket file: %v", err)
+	}
+
+	// An unrelated process now holds the recorded pids.
+	bystander := exec.Command("sleep", "60")
+	bystander.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := bystander.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { bystander.Process.Kill(); bystander.Wait() })
+	raw, err := sql.Open("sqlite", h.paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = raw.Exec(`UPDATE sessions SET status = 'running', worker_pid = ?1, agent_pid = ?1 WHERE session_id = ?2`, bystander.Process.Pid, id)
+	raw.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h.start()
+	if got := h.session(id); got.Status != session.StatusUnknownRecovered {
+		t.Fatalf("status = %s, want unknown_recovered", got.Status)
+	}
+	wantError(t, h.request(&protocol.Request{KillSession: &protocol.KillSession{SessionID: id}}), "is not running")
+	if resp := h.request(&protocol.Request{KillSession: &protocol.KillSession{SessionID: id, Remove: true}}); resp.KillSession == nil || resp.KillSession.WasRunning {
+		t.Fatalf("rm = %#v (%v)", resp, resp.Error)
+	}
+	if st := h.management(&protocol.ManagementRequest{Status: protocol.Empty}).Status; st.RunningSessions {
+		t.Fatal("a recycled pid made the daemon think a session is running")
+	}
+	if !processExists(bystander.Process.Pid) {
+		t.Fatal("the daemon signalled an unrelated process")
+	}
+}
+
+func TestBadRequestsGetAnError(t *testing.T) {
+	h := newHarness(t)
+	// A retired v32 kind at the current version gets a reply, not a hang-up.
+	conn := h.dial()
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(testTimeout))
+	conn.Write([]byte{0x50, 0x44, 0x47, 0x41, 33, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0})
+	resp, err := protocol.ReadResponse(bufio.NewReader(conn))
+	if err != nil || resp == nil || resp.Error == nil || !strings.Contains(resp.Error.Message, "could not decode") {
+		t.Fatalf("got %#v, %v", resp, err)
+	}
+
+	// Session ids that could never have been created are refused before
+	// any path is built from them.
+	for _, id := range []string{"../../etc/x", "a/b", "UPPER", ""} {
+		wantError(t, h.request(&protocol.Request{GetHistory: &protocol.GetHistory{SessionID: id}}), "not found")
+		wantError(t, h.request(&protocol.Request{SendInput: &protocol.SendInput{SessionID: id, Data: []byte("x")}}), "not found")
+	}
+}
+
+func TestRuntimeFilesArePrivate(t *testing.T) {
+	h := newHarness(t)
+	id := h.mustCreate("")
+	h.sendInput(id, "done\n")
+	h.eventually("session to end", func() bool { return h.session(id).Status == session.StatusExited })
+	for path, want := range map[string]os.FileMode{
+		h.paths.Root:                0o700,
+		h.paths.LogsDir:             0o700,
+		h.paths.SessionsDir:         0o700,
+		h.paths.Socket:              0o600,
+		h.paths.PIDFile:             0o600,
+		h.paths.Database:            0o600,
+		h.paths.LogPath(id):         0o600,
+		h.paths.RenderedLogPath(id): 0o600,
+		h.paths.WorkerLogPath(id):   0o600,
+	} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != want {
+			t.Errorf("%s mode = %v, want %v", path, got, want)
+		}
+	}
+}
+
+func TestValidSessionName(t *testing.T) {
+	for name, want := range map[string]bool{
+		"a": true, "a-b": true, "abc-123": true, strings.Repeat("a", 64): true,
+		"": false, "-a": false, "a-": false, "a--b": false, "A": false, "a_b": false,
+		"é": false, "a/b": false, "..": false, strings.Repeat("a", 65): false,
+	} {
+		if got := validSessionName(name); got != want {
+			t.Errorf("%q: got %v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestLoadConfig(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := LoadConfig(filepath.Join(dir, "missing.toml"))
+	if err != nil || cfg.DefaultAgent != "codex" || cfg.Agents["claude"].Command != "claude" {
+		t.Fatalf("defaults = %+v, %v", cfg, err)
+	}
+	path := filepath.Join(dir, "config.toml")
+	os.WriteFile(path, []byte("default_agent = \"x\"\n[agents.y]\ncommand = \"y\"\n"), 0o600)
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "default_agent `x`") {
+		t.Fatalf("got %v", err)
+	}
+	os.WriteFile(path, []byte("[agents.y]\ncommand = \"y\"\nmodel_flag = \"\"\n[agents.z]\ncommand = \"z\"\n[agents.codex]\ncommand = \"codex\"\n"), 0o600)
+	cfg, err = LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Agents["y"].modelFlag(); got != "" {
+		t.Fatalf("empty model_flag = %q", got)
+	}
+	if got := cfg.Agents["z"].modelFlag(); got != "--model" {
+		t.Fatalf("default model_flag = %q", got)
 	}
 }

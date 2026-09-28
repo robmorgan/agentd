@@ -44,14 +44,7 @@ func (s *Server) proxyRequest(client net.Conn, id string, req *protocol.Request)
 		return protocol.WriteResponse(client, protocol.ErrorResponsef("%v", err))
 	}
 	defer worker.Close()
-	worker.SetDeadline(time.Now().Add(workerRequestTimeout))
-	if err := protocol.WriteRequest(worker, req); err != nil {
-		return protocol.WriteResponse(client, protocol.ErrorResponsef("session `%s` runtime: %v", id, err))
-	}
-	resp, err := protocol.ReadResponse(bufio.NewReader(worker))
-	if err == nil && resp == nil {
-		err = errors.New("closed the connection")
-	}
+	resp, err := exchange(worker, req)
 	if err != nil {
 		return protocol.WriteResponse(client, protocol.ErrorResponsef("session `%s` runtime: %v", id, err))
 	}
@@ -59,12 +52,16 @@ func (s *Server) proxyRequest(client net.Conn, id string, req *protocol.Request)
 }
 
 // history serves live history from the worker, falling back to the logs a
-// worker writes when its session ends.
+// worker writes when its session ends (including when the worker exits
+// between the lookup and the request).
 func (s *Server) history(client net.Conn, req *protocol.Request) error {
 	id := req.GetHistory.SessionID
-	if worker, err := net.Dial("unix", s.paths.SessionSocketPath(id)); err == nil {
+	if worker, err := net.DialTimeout("unix", s.paths.SessionSocketPath(id), workerDialTimeout); err == nil {
+		resp, err := exchange(worker, req)
 		worker.Close()
-		return s.proxyRequest(client, id, req)
+		if err == nil {
+			return protocol.WriteResponse(client, resp)
+		}
 	}
 	rec, err := s.getSession(id)
 	if err != nil {
@@ -79,13 +76,25 @@ func (s *Server) history(client net.Conn, req *protocol.Request) error {
 	}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return protocol.WriteResponse(client, protocol.ErrorResponsef(
-			"history for session `%s` is not available; it is only retained until the daemon restarts", id))
+		return protocol.WriteResponse(client, protocol.ErrorResponsef("history for session `%s` is not available", id))
 	}
 	if err != nil {
 		return protocol.WriteResponse(client, protocol.ErrorResponsef("failed to read %s: %v", path, err))
 	}
 	return protocol.WriteResponse(client, &protocol.Response{History: &protocol.History{Data: string(data)}})
+}
+
+// exchange sends one request to a worker and reads its one response.
+func exchange(worker net.Conn, req *protocol.Request) (*protocol.Response, error) {
+	worker.SetDeadline(time.Now().Add(workerRequestTimeout))
+	if err := protocol.WriteRequest(worker, req); err != nil {
+		return nil, err
+	}
+	resp, err := protocol.ReadResponse(bufio.NewReader(worker))
+	if err == nil && resp == nil {
+		err = errors.New("closed the connection")
+	}
+	return resp, err
 }
 
 // proxyAttach splices an attaching client onto the worker. After forwarding

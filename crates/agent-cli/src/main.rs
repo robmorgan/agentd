@@ -3,7 +3,7 @@ use std::{
     io::Write,
     mem::MaybeUninit,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
 };
@@ -40,7 +40,6 @@ use agentd_shared::{
     config::Config,
     header::{AGENTD_PRIMARY_BLUE_RGB, agentd_header},
     paths::AppPaths,
-    process::process_exists,
     protocol::{
         DaemonInfo, DaemonManagementRequest, DaemonManagementResponse, DaemonManagementStatus,
         PROTOCOL_VERSION, Request, Response, read_daemon_management_response, read_response,
@@ -157,13 +156,15 @@ enum Command {
     Kill {
         #[arg(long)]
         rm: bool,
-        #[arg(short, long)]
+        /// Accepted for compatibility; it forced worktree removal, which is gone.
+        #[arg(short, long, hide = true)]
         force: bool,
         session_id: String,
     },
     #[command(about = "Stop and remove a session", display_order = 3)]
     Rm {
-        #[arg(short, long)]
+        /// Accepted for compatibility; it forced worktree removal, which is gone.
+        #[arg(short, long, hide = true)]
         force: bool,
         session_id: String,
     },
@@ -294,9 +295,6 @@ async fn main() -> Result<()> {
             bail_live_command(&reason)?;
         }
         (Some(Command::Kill { rm, force, session_id }), ExecutionMode::Daemon) => {
-            if force && !rm {
-                bail!("`--force` requires `--rm`");
-            }
             let response = send_request(
                 &paths,
                 &Request::KillSession { session_id: session_id.clone(), remove: rm, force },
@@ -311,14 +309,11 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Some(Command::Kill { rm, force, session_id }), ExecutionMode::Local(reason)) => {
-            if force && !rm {
-                bail!("`--force` requires `--rm`");
-            }
+        (Some(Command::Kill { rm, force: _, session_id }), ExecutionMode::Local(reason)) => {
             if should_print_degraded_notice(DegradedNoticeCommand::Kill, &reason) {
                 print_degraded_notice(&reason);
             }
-            local_kill(&paths, &session_id, rm)?;
+            local_kill(&paths, &session_id, rm).await?;
         }
         (Some(Command::Rm { force, session_id }), ExecutionMode::Daemon) => {
             let response = send_request(
@@ -339,7 +334,7 @@ async fn main() -> Result<()> {
             if should_print_degraded_notice(DegradedNoticeCommand::Kill, &reason) {
                 print_degraded_notice(&reason);
             }
-            local_kill(&paths, &session_id, true)?;
+            local_kill(&paths, &session_id, true).await?;
         }
         (Some(Command::Attach { session_id }), ExecutionMode::Daemon) => {
             attach_session(&paths, &session_id).await?;
@@ -646,11 +641,19 @@ async fn ensure_daemon(paths: &AppPaths) -> Result<()> {
     ensure_compatible_daemon(paths).await
 }
 
+/// Starts `agentd serve --daemonize` and waits for its socket to answer.
+///
+/// The daemon holds an exclusive flock on `<root>/agentd.lock` for its whole
+/// life, waits up to 5s for it on startup (so a restart can hand over), and
+/// removes a stale socket itself while holding the lock. So the CLI never
+/// deletes the socket or pid file and never judges liveness from the pid file
+/// (a recycled pid would make that judgement wrong forever); if another
+/// daemon wins the race, its socket answering is just as good.
 async fn spawn_daemon(paths: &AppPaths) -> Result<()> {
-    clear_stale_daemon_state(paths)?;
+    start_daemon(paths, &daemon_executable()?, DAEMON_START_TIMEOUT).await
+}
 
-    let daemon_exe = daemon_executable()?;
-
+async fn start_daemon(paths: &AppPaths, daemon_exe: &Path, timeout: Duration) -> Result<()> {
     std::process::Command::new(daemon_exe)
         .arg("serve")
         .arg("--daemonize")
@@ -660,62 +663,24 @@ async fn spawn_daemon(paths: &AppPaths) -> Result<()> {
         .spawn()
         .context("failed to start agentd")?;
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + timeout;
     loop {
         if try_connect(paths).await.is_ok() {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            bail!("timed out waiting for agentd to start");
+            bail!(
+                "timed out waiting for agentd to start; see {}",
+                paths.logs_dir.join("agentd.log")
+            );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
-fn clear_stale_daemon_state(paths: &AppPaths) -> Result<()> {
-    let pid = read_daemon_pid(paths)?;
-    if let Some(pid) = pid
-        && process_exists(Some(pid))
-    {
-        if paths.socket.exists() {
-            bail!("agentd is running (pid {pid}) but not responding; restart the daemon");
-        }
-        bail!(
-            "agentd is running (pid {pid}) but socket {} is missing; restart the daemon",
-            paths.socket
-        );
-    }
-
-    remove_file_if_exists(&paths.socket)
-        .with_context(|| format!("failed to remove stale socket {}", paths.socket))?;
-    remove_file_if_exists(&paths.pid_file)
-        .with_context(|| format!("failed to remove stale pid file {}", paths.pid_file))?;
-    Ok(())
-}
-
-fn read_daemon_pid(paths: &AppPaths) -> Result<Option<u32>> {
-    let contents = match fs::read_to_string(paths.pid_file.as_std_path()) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| format!("failed to read {}", paths.pid_file)),
-    };
-    let raw = contents.trim();
-    if raw.is_empty() {
-        return Ok(None);
-    }
-    let pid = raw
-        .parse::<u32>()
-        .with_context(|| format!("failed to parse pid from {}", paths.pid_file))?;
-    Ok(Some(pid))
-}
-
-fn remove_file_if_exists(path: &camino::Utf8Path) -> Result<()> {
-    match fs::remove_file(path.as_std_path()) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err.into()),
-    }
-}
+/// Longer than the daemon's own 5s wait for `agentd.lock`, so a restart that
+/// has to wait out the previous daemon still counts as a successful start.
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(7);
 
 /// The daemon binary started by `serve --daemonize` and `upgrade`: `$AGENTD_BIN`
 /// when set and non-empty (for example go/bin/agentd during development),
@@ -927,25 +892,24 @@ async fn print_history(paths: &AppPaths, session_id: &str, vt: bool) -> Result<(
     }
 }
 
-fn local_kill(paths: &AppPaths, session_id: &str, remove: bool) -> Result<()> {
+/// `agent kill`/`agent rm` without a daemon. A session counts as running only
+/// if its worker socket answers (see local::worker_is_live); pids recorded in
+/// state.db are never signalled on their own say-so.
+async fn local_kill(paths: &AppPaths, session_id: &str, remove: bool) -> Result<()> {
     let store = LocalStore::open(paths)?;
     let session = store
         .get_session(session_id)?
         .ok_or_else(|| anyhow::anyhow!("session `{session_id}` not found"))?;
-    let was_running = local::session_is_running(&session);
-
-    if !was_running && !remove {
-        if session.status == SessionStatus::Running {
-            store.mark_unknown_recovered(session_id)?;
-        }
-        bail!("session `{session_id}` is not running");
-    }
+    let was_running = local::worker_is_live(paths, session_id).await;
 
     if was_running {
-        local::terminate_session_process(session_id, session.worker_pid)?;
-        store.mark_exited(session_id, None)?;
-    } else if session.status == SessionStatus::Running {
+        local::stop_live_session(&store, paths, session_id).await?;
+    } else if local::session_is_active(&session) {
         store.mark_unknown_recovered(session_id)?;
+    }
+
+    if !was_running && !remove {
+        bail!("session `{session_id}` is not running");
     }
 
     if remove {
@@ -1925,10 +1889,11 @@ mod tests {
         ATTACH_DETACH_BYTE, ATTACH_NEXT_SESSION_BYTE, ATTACH_OVERLAY_BYTE,
         ATTACH_OVERLAY_LEGACY_BYTE, AttachInputAction, AttachInputParser, AttachSessionDirection,
         Cli, Command, DaemonCommand, DegradedNoticeCommand, SessionEndSummary,
-        adjacent_live_session_id_in, attach_startup_bytes, clear_stale_daemon_state, cli_command,
-        cli_styles, daemon_executable_from, ensure_compatible_daemon, format_attach_title,
+        adjacent_live_session_id_in, attach_startup_bytes, cli_command, cli_styles,
+        daemon_executable_from, ensure_compatible_daemon, format_attach_title,
         format_session_end_summary, resolve_cwd, resolve_detach_session_id,
-        resolve_new_session_options, should_print_degraded_notice, terminal_title_bytes,
+        resolve_new_session_options, should_print_degraded_notice, start_daemon,
+        terminal_title_bytes,
     };
     use agentd_shared::session::{AttentionLevel, SessionMode, SessionRecord, SessionStatus};
     use agentd_shared::{header::AGENTD_PRIMARY_BLUE_RGB, paths::AppPaths};
@@ -2408,17 +2373,159 @@ command = "claude"
         assert!(err.contains("does not speak agent protocol 33"), "{err}");
     }
 
-    #[test]
-    fn clear_stale_daemon_state_removes_dead_pid_and_socket() {
+    /// The daemon owns stale-socket cleanup (under its agentd.lock), so a
+    /// start that never answers leaves the socket and pid file alone, even
+    /// when the pid file names a live process, and points at the daemon log.
+    #[tokio::test]
+    async fn start_daemon_times_out_without_touching_socket_or_pid_file() {
         let paths = test_paths();
         paths.ensure_layout().unwrap();
-        fs::write(paths.pid_file.as_str(), "999999\n").unwrap();
+        fs::write(paths.pid_file.as_str(), format!("{}\n", std::process::id())).unwrap();
         fs::write(paths.socket.as_str(), "").unwrap();
 
-        clear_stale_daemon_state(&paths).unwrap();
+        let err = start_daemon(
+            &paths,
+            std::path::Path::new("/usr/bin/true"),
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
 
-        assert!(!paths.pid_file.exists());
-        assert!(!paths.socket.exists());
+        assert!(err.contains("timed out waiting for agentd to start"), "{err}");
+        assert!(err.contains(paths.logs_dir.join("agentd.log").as_str()), "{err}");
+        assert!(paths.pid_file.exists());
+        assert!(paths.socket.exists());
+    }
+
+    fn insert_running_row(paths: &AppPaths, worker_pid: u32, agent_pid: u32) {
+        crate::local::LocalStore::open(paths).unwrap();
+        let conn = rusqlite::Connection::open(paths.database.as_std_path()).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (
+                session_id, agent, model, mode, cwd, status, worker_pid, agent_pid,
+                attention, attention_summary, created_at, updated_at
+            ) VALUES ('demo', 'sh', NULL, 'execute', '/tmp', 'running', ?1, ?2, 'info', 'running',
+                '2026-09-28T01:02:03+00:00', '2026-09-28T01:02:03+00:00')",
+            rusqlite::params![worker_pid, agent_pid],
+        )
+        .unwrap();
+    }
+
+    fn row_state(paths: &AppPaths) -> (String, Option<u32>, Option<u32>, Option<i32>) {
+        let conn = rusqlite::Connection::open(paths.database.as_std_path()).unwrap();
+        conn.query_row(
+            "SELECT status, worker_pid, agent_pid, exit_code FROM sessions WHERE session_id = 'demo'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap()
+    }
+
+    /// A running row whose worker socket does not answer is not live, even if
+    /// its recorded pids belong to running processes (a recycled pid): nothing
+    /// is signalled, and the row is marked recovered with its pids cleared.
+    #[tokio::test]
+    async fn local_kill_never_signals_pids_without_a_live_worker_socket() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let mut bystander = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        insert_running_row(&paths, bystander.id(), bystander.id());
+        // A stale socket file with no listener behind it.
+        fs::write(paths.session_socket_path("demo").as_std_path(), "").unwrap();
+
+        let err = super::local_kill(&paths, "demo", false).await.unwrap_err().to_string();
+        assert!(err.contains("is not running"), "{err}");
+        assert!(bystander.try_wait().unwrap().is_none(), "unrelated process was signalled");
+        assert_eq!(row_state(&paths), ("unknown_recovered".to_string(), None, None, None));
+
+        super::local_kill(&paths, "demo", true).await.unwrap();
+        assert!(bystander.try_wait().unwrap().is_none(), "unrelated process was signalled");
+        assert!(!paths.session_socket_path("demo").exists());
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+    }
+
+    /// A live worker is asked to stop over its socket; the final state it
+    /// records is kept rather than overwritten.
+    #[tokio::test]
+    async fn local_kill_asks_live_worker_to_stop() {
+        use agentd_shared::protocol::{Request, Response, read_request, write_response};
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        insert_running_row(&paths, 999_999, 999_998);
+        let listener =
+            tokio::net::UnixListener::bind(paths.session_socket_path("demo").as_std_path())
+                .unwrap();
+        let db = paths.database.clone();
+        let worker = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                // The liveness probe connects and hangs up without a request.
+                let Some(request) = read_request(&mut stream).await.unwrap() else { continue };
+                assert!(
+                    matches!(request, Request::KillSession { ref session_id, .. } if session_id == "demo")
+                );
+                write_response(&mut stream, &Response::Ok).await.unwrap();
+                let conn = rusqlite::Connection::open(db.as_std_path()).unwrap();
+                conn.execute(
+                    "UPDATE sessions SET status = 'exited', exit_code = 143, worker_pid = NULL,
+                        agent_pid = NULL WHERE session_id = 'demo'",
+                    [],
+                )
+                .unwrap();
+                return;
+            }
+        });
+
+        super::local_kill(&paths, "demo", false).await.unwrap();
+        worker.await.unwrap();
+        assert_eq!(row_state(&paths), ("exited".to_string(), None, None, Some(143)));
+    }
+
+    /// A worker that answers but never records a stop is escalated to signals
+    /// (its socket still answering is what vouches for the recorded pid), and
+    /// the exit is recorded locally. Takes the full worker stop timeout.
+    #[tokio::test]
+    async fn local_kill_escalates_when_live_worker_does_not_stop() {
+        use agentd_shared::protocol::{Response, read_request, write_response};
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let mut stuck_worker = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        insert_running_row(&paths, stuck_worker.id(), stuck_worker.id());
+        // Reap it as soon as it dies, as init would reap a real worker; an
+        // unreaped zombie still looks alive to kill(pid, 0) on Linux.
+        let reaper = std::thread::spawn(move || stuck_worker.wait().unwrap());
+        let listener =
+            tokio::net::UnixListener::bind(paths.session_socket_path("demo").as_std_path())
+                .unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                if read_request(&mut stream).await.unwrap().is_some() {
+                    write_response(&mut stream, &Response::Ok).await.unwrap();
+                }
+            }
+        });
+
+        super::local_kill(&paths, "demo", false).await.unwrap();
+        server.abort();
+        let status = reaper.join().unwrap();
+        assert!(!status.success(), "worker should have been signalled");
+        assert_eq!(row_state(&paths), ("exited".to_string(), None, None, None));
+    }
+
+    #[test]
+    fn worktree_era_force_flags_are_hidden() {
+        let mut command = cli_command();
+        for name in ["kill", "rm"] {
+            let sub = command.find_subcommand_mut(name).unwrap();
+            let force = sub.get_arguments().find(|arg| arg.get_id() == "force").unwrap();
+            assert!(force.is_hide_set(), "{name} --force should be hidden");
+        }
+        // `--force` without `--rm` is no longer an error.
+        let cli = Cli::try_parse_from(["agent", "kill", "-f", "demo"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Kill { rm: false, force: true, .. })));
     }
 
     #[test]

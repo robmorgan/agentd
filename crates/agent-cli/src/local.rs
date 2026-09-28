@@ -4,12 +4,14 @@
 
 use std::{
     fs,
+    os::unix::fs::OpenOptionsExt,
     time::{Duration, Instant},
 };
 
 use agentd_shared::{
     paths::AppPaths,
     process::process_exists,
+    protocol::{Request, Response, read_response, write_request},
     session::{AttentionLevel, SessionMode, SessionRecord, SessionStatus},
     sqlite_schema::init_state_db,
 };
@@ -21,6 +23,19 @@ use nix::{
     unistd::Pid,
 };
 use rusqlite::{Connection, OptionalExtension, params};
+use tokio::{io::BufReader, net::UnixStream};
+
+/// How long a worker socket gets to accept a connection before the session is
+/// treated as not live.
+const WORKER_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long the worker gets to answer a KillSession request.
+const WORKER_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a stopped session gets to record its final state. The Go worker
+/// gives the agent 5s between SIGTERM and SIGKILL, so this leaves headroom.
+const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(8);
+/// Each step of the signal escalation used when the worker does not stop.
+const SIGNAL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 const SELECT_SESSION: &str =
     "SELECT session_id, agent, model, mode, cwd, status, worker_pid, agent_pid,
@@ -57,26 +72,47 @@ impl LocalStore {
         .map_err(Into::into)
     }
 
-    pub fn mark_exited(&self, session_id: &str, exit_code: Option<i32>) -> Result<()> {
+    /// Records that a stopped session exited. Like go/internal/db
+    /// MarkExitedIfActive it only touches rows still `creating`/`running`, so
+    /// it never overwrites the final state a worker recorded itself.
+    pub fn mark_exited_if_active(&self, session_id: &str) -> Result<()> {
         let conn = self.connect()?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE sessions
-             SET status = ?2, exit_code = ?3, updated_at = ?4, exited_at = ?4
-             WHERE session_id = ?1",
-            params![session_id, status_to_str(SessionStatus::Exited), exit_code, now],
+             SET status = ?2, worker_pid = NULL, agent_pid = NULL,
+                 attention = ?3, attention_summary = ?4, updated_at = ?5, exited_at = ?5
+             WHERE session_id = ?1 AND status IN ('creating', 'running')",
+            params![
+                session_id,
+                status_to_str(SessionStatus::Exited),
+                attention_to_str(AttentionLevel::Notice),
+                "finished",
+                now
+            ],
         )?;
         Ok(())
     }
 
+    /// Records that a session's worker is gone. Mirrors go/internal/db
+    /// MarkUnknownRecovered: the recorded pids are cleared so nothing later
+    /// signals a pid that may since have been reused, and a final state the
+    /// worker already wrote is left alone.
     pub fn mark_unknown_recovered(&self, session_id: &str) -> Result<()> {
         let conn = self.connect()?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE sessions
-             SET status = ?2, updated_at = ?3
-             WHERE session_id = ?1",
-            params![session_id, status_to_str(SessionStatus::UnknownRecovered), now],
+             SET status = ?2, worker_pid = NULL, agent_pid = NULL, attention = ?3,
+                 attention_summary = ?4, updated_at = ?5
+             WHERE session_id = ?1 AND status IN ('creating', 'running')",
+            params![
+                session_id,
+                status_to_str(SessionStatus::UnknownRecovered),
+                attention_to_str(AttentionLevel::Action),
+                "daemon lost the live process",
+                now
+            ],
         )?;
         Ok(())
     }
@@ -92,25 +128,27 @@ impl LocalStore {
     }
 
     fn init(&self) -> Result<()> {
+        // Create the file private to the user before SQLite does (SQLite
+        // would use 0644 minus umask); the -wal/-shm files inherit its mode.
+        match fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&self.path) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err).with_context(|| format!("failed to create {}", self.path)),
+        }
         let mut conn = self.connect()?;
+        // init_state_db words real schema mismatches itself; this context
+        // only names the file, so a lock or I/O error is not misreported.
         init_state_db(&mut conn)
-            .with_context(|| format!("unsupported state database schema in {}", self.path))
+            .with_context(|| format!("failed to open state database {}", self.path))
     }
 }
 
-pub fn session_is_running(session: &SessionRecord) -> bool {
-    session.status == SessionStatus::Running && process_exists(session.worker_pid)
+pub fn session_is_active(session: &SessionRecord) -> bool {
+    matches!(session.status, SessionStatus::Creating | SessionStatus::Running)
 }
 
-pub fn normalize_session(session: SessionRecord) -> SessionRecord {
-    if session.status == SessionStatus::Running && !process_exists(session.worker_pid) {
-        let mut session = session;
-        session.status = SessionStatus::UnknownRecovered;
-        return session;
-    }
-    session
-}
-
+/// Without a daemon nothing can vouch for a `running` row, so list and status
+/// show it as recovered. The row itself is not changed.
 pub fn normalize_degraded_session(session: SessionRecord) -> SessionRecord {
     match session.status {
         SessionStatus::Running => {
@@ -118,34 +156,147 @@ pub fn normalize_degraded_session(session: SessionRecord) -> SessionRecord {
             session.status = SessionStatus::UnknownRecovered;
             session
         }
-        _ => normalize_session(session),
+        _ => session,
     }
 }
 
-pub fn terminate_session_process(session_id: &str, pid: Option<u32>) -> Result<()> {
-    let pid = pid.ok_or_else(|| anyhow!("session `{session_id}` has no recorded pid"))?;
-    if pid == 0 {
-        bail!("session `{session_id}` has an invalid pid");
-    }
+/// A session is live only if its worker still accepts connections on
+/// `sessions/<id>.sock`. The pids in `state.db` are not trusted for this: a
+/// worker that died without cleaning up leaves pids that the OS may since have
+/// handed to unrelated processes.
+pub async fn worker_is_live(paths: &AppPaths, session_id: &str) -> bool {
+    let socket = paths.session_socket_path(session_id);
+    matches!(
+        tokio::time::timeout(WORKER_CONNECT_TIMEOUT, UnixStream::connect(socket.as_std_path()))
+            .await,
+        Ok(Ok(_))
+    )
+}
 
-    let pid = Pid::from_raw(pid as i32);
-    send_signal(pid, Signal::SIGTERM, session_id)?;
-    if wait_for_exit(pid, Duration::from_secs(5)) {
+/// Stops a live session. The worker is asked first (a KillSession request on
+/// its socket, which the Go worker answers with Ok before stopping the agent's
+/// process group gracefully and recording the exit). Signals are only a
+/// fallback, and only while the worker socket still answers, which is what
+/// ties the recorded pids to a process that is really ours.
+pub async fn stop_live_session(
+    store: &LocalStore,
+    paths: &AppPaths,
+    session_id: &str,
+) -> Result<()> {
+    if request_worker_stop(paths, session_id).await.is_ok()
+        && wait_for_session_to_stop(store, session_id, WORKER_STOP_TIMEOUT).await?
+    {
         return Ok(());
     }
 
-    send_signal(pid, Signal::SIGKILL, session_id)?;
-    if wait_for_exit(pid, Duration::from_secs(5)) {
+    let Some(session) = store.get_session(session_id)? else {
+        return Ok(());
+    };
+    if !session_is_active(&session) {
         return Ok(());
     }
+    if !worker_is_live(paths, session_id).await {
+        // The worker went away without recording an outcome. Its pids can no
+        // longer be trusted, so record the stop without signalling anything.
+        store.mark_exited_if_active(session_id)?;
+        return Ok(());
+    }
+    escalate_with_signals(store, &session).await
+}
 
-    bail!("session `{session_id}` did not exit after SIGTERM and SIGKILL")
+async fn request_worker_stop(paths: &AppPaths, session_id: &str) -> Result<()> {
+    let socket = paths.session_socket_path(session_id);
+    let exchange = async {
+        let mut stream = UnixStream::connect(socket.as_std_path()).await?;
+        write_request(
+            &mut stream,
+            &Request::KillSession {
+                session_id: session_id.to_string(),
+                remove: false,
+                force: false,
+            },
+        )
+        .await?;
+        let mut reader = BufReader::new(stream);
+        match read_response(&mut reader).await? {
+            Some(Response::Ok) => Ok(()),
+            Some(Response::Error { message }) => bail!(message),
+            Some(other) => bail!("unexpected worker response: {other:?}"),
+            None => bail!("session worker closed the connection"),
+        }
+    };
+    tokio::time::timeout(WORKER_CONNECT_TIMEOUT + WORKER_REPLY_TIMEOUT, exchange)
+        .await
+        .map_err(|_| anyhow!("timed out waiting for session `{session_id}` worker"))?
+}
+
+/// Polls `state.db` until the row leaves `creating`/`running` (or is gone).
+async fn wait_for_session_to_stop(
+    store: &LocalStore,
+    session_id: &str,
+    timeout: Duration,
+) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match store.get_session(session_id)? {
+            Some(session) if session_is_active(&session) => {}
+            _ => return Ok(true),
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The worker answered on its socket but did not stop: SIGTERM it, then
+/// SIGKILL the agent's process group and the worker, the way the Go daemon's
+/// stopWorker does, and record the exit ourselves.
+async fn escalate_with_signals(store: &LocalStore, session: &SessionRecord) -> Result<()> {
+    let session_id = session.session_id.as_str();
+    let worker = signalable_pid(session.worker_pid).ok_or_else(|| {
+        anyhow!("session `{session_id}` did not stop and has no valid worker pid to signal")
+    })?;
+
+    send_signal(worker, Signal::SIGTERM, session_id)?;
+    if !wait_for_exit(worker, SIGNAL_WAIT_TIMEOUT).await {
+        if let Some(agent) = signalable_pid(session.agent_pid) {
+            let _ = kill(Pid::from_raw(-agent.as_raw()), Signal::SIGKILL);
+        }
+        send_signal(worker, Signal::SIGKILL, session_id)?;
+        if !wait_for_exit(worker, SIGNAL_WAIT_TIMEOUT).await {
+            bail!("session `{session_id}` did not exit after SIGTERM and SIGKILL");
+        }
+    }
+    store.mark_exited_if_active(session_id)
+}
+
+/// Only pids that name one ordinary process are ever signalled: 0 and 1 (and
+/// anything that would turn negative as a pid_t) have special meanings to
+/// kill(2).
+fn signalable_pid(pid: Option<u32>) -> Option<Pid> {
+    let pid = pid?;
+    (pid > 1 && pid <= i32::MAX as u32).then(|| Pid::from_raw(pid as i32))
 }
 
 /// Removes what agentd itself owns for a session: its logs. The session's
 /// working directory belongs to the user and is never touched.
+/// Mirrors what the Go daemon removes for `agent rm`.
 pub fn remove_session_artifacts(paths: &AppPaths, session: &SessionRecord) -> Result<()> {
-    remove_log_if_present(paths, session)
+    let id = session.session_id.as_str();
+    for path in [
+        paths.log_path(id),
+        paths.rendered_log_path(id),
+        paths.worker_log_path(id),
+        paths.session_socket_path(id),
+    ] {
+        match fs::remove_file(path.as_std_path()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(anyhow!(err)).context(format!("failed to remove {path}")),
+        }
+    }
+    Ok(())
 }
 
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
@@ -194,6 +345,14 @@ fn status_to_str(status: SessionStatus) -> &'static str {
     }
 }
 
+fn attention_to_str(attention: AttentionLevel) -> &'static str {
+    match attention {
+        AttentionLevel::Info => "info",
+        AttentionLevel::Notice => "notice",
+        AttentionLevel::Action => "action",
+    }
+}
+
 fn str_to_status(value: &str) -> std::result::Result<SessionStatus, std::io::Error> {
     match value {
         "creating" => Ok(SessionStatus::Creating),
@@ -234,43 +393,23 @@ fn str_to_mode(value: &str) -> std::result::Result<SessionMode, std::io::Error> 
 
 fn send_signal(pid: Pid, signal: Signal, session_id: &str) -> Result<()> {
     match kill(pid, Some(signal)) {
-        Ok(()) => Ok(()),
-        Err(Errno::ESRCH) => bail!("session `{session_id}` is not running"),
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
         Err(err) => Err(anyhow!(err))
             .context(format!("failed to send {signal:?} to session `{session_id}`")),
     }
 }
 
-fn wait_for_exit(pid: Pid, timeout: Duration) -> bool {
+async fn wait_for_exit(pid: Pid, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        match kill(pid, None) {
-            Ok(()) => {
-                if !process_exists(Some(pid.as_raw() as u32)) {
-                    return true;
-                }
-            }
-            Err(Errno::ESRCH) => return true,
-            Err(_) => return false,
+        if !process_exists(Some(pid.as_raw() as u32)) {
+            return true;
         }
         if Instant::now() >= deadline {
             return false;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
-}
-
-fn remove_log_if_present(paths: &AppPaths, session: &SessionRecord) -> Result<()> {
-    for log_path in
-        [paths.log_path(&session.session_id), paths.rendered_log_path(&session.session_id)]
-    {
-        match fs::remove_file(log_path.as_std_path()) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(anyhow!(err)).context(format!("failed to remove {}", log_path)),
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -349,14 +488,56 @@ mod tests {
         assert_eq!(session.worker_pid, Some(999999));
         assert_eq!(store.list_sessions().unwrap().len(), 1);
 
-        store.mark_exited("demo", Some(3)).unwrap();
+        store.mark_exited_if_active("demo").unwrap();
         let session = store.get_session("demo").unwrap().unwrap();
         assert_eq!(session.status, SessionStatus::Exited);
-        assert_eq!(session.exit_code, Some(3));
+        assert_eq!(session.worker_pid, None);
         assert!(session.exited_at.is_some());
+
+        // Neither transition overwrites a final state already recorded.
+        store.mark_unknown_recovered("demo").unwrap();
+        store.mark_exited_if_active("demo").unwrap();
+        let again = store.get_session("demo").unwrap().unwrap();
+        assert_eq!(again.status, SessionStatus::Exited);
+        assert_eq!(again.updated_at, session.updated_at);
 
         store.delete_session("demo").unwrap();
         assert!(store.get_session("demo").unwrap().is_none());
+    }
+
+    /// Mirrors go/internal/db MarkUnknownRecovered: stale pids are cleared.
+    #[test]
+    fn mark_unknown_recovered_clears_pids() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let store = LocalStore::open(&paths).unwrap();
+        let conn = Connection::open(paths.database.as_std_path()).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (
+                session_id, agent, model, mode, cwd, status, worker_pid, agent_pid,
+                attention, attention_summary, created_at, updated_at
+            ) VALUES ('demo', 'sh', NULL, 'execute', '/w', 'running', 999999, 999998, 'info', NULL,
+                '2026-09-28T01:02:03+00:00', '2026-09-28T01:02:03+00:00')",
+            [],
+        )
+        .unwrap();
+
+        store.mark_unknown_recovered("demo").unwrap();
+
+        let session = store.get_session("demo").unwrap().unwrap();
+        assert_eq!(session.status, SessionStatus::UnknownRecovered);
+        assert_eq!((session.worker_pid, session.agent_pid), (None, None));
+        assert_eq!(session.attention, AttentionLevel::Action);
+    }
+
+    #[test]
+    fn state_db_is_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        LocalStore::open(&paths).unwrap();
+        let mode = fs::metadata(paths.database.as_std_path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]
@@ -368,11 +549,15 @@ mod tests {
         fs::write(cwd.join("file.txt").as_std_path(), "keep\n").unwrap();
         fs::write(paths.log_path("demo").as_std_path(), "log").unwrap();
         fs::write(paths.rendered_log_path("demo").as_std_path(), "log").unwrap();
+        fs::write(paths.worker_log_path("demo").as_std_path(), "log").unwrap();
+        fs::write(paths.session_socket_path("demo").as_std_path(), "").unwrap();
 
         remove_session_artifacts(&paths, &demo_session(cwd.as_str())).unwrap();
 
         assert!(!paths.log_path("demo").exists());
         assert!(!paths.rendered_log_path("demo").exists());
+        assert!(!paths.worker_log_path("demo").exists());
+        assert!(!paths.session_socket_path("demo").exists());
         assert!(cwd.join("file.txt").exists());
     }
 

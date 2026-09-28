@@ -49,9 +49,17 @@ import (
 // Version is reported by GetDaemonInfo and daemon status.
 var Version = "0.1.0"
 
-// connectionDrainTimeout bounds how long shutdown waits for handlers after
-// their connections have been closed.
-const connectionDrainTimeout = 2 * time.Second
+const (
+	// connectionDrainTimeout bounds how long shutdown waits for handlers
+	// after their connections have been closed.
+	connectionDrainTimeout = 2 * time.Second
+	// firstRequestTimeout bounds how long a new connection may take to send
+	// its first frame.
+	firstRequestTimeout = 30 * time.Second
+	// defaultLockWait is how long a starting daemon waits for a previous one
+	// to finish draining after a restart.
+	defaultLockWait = 5 * time.Second
+)
 
 type Server struct {
 	paths  *paths.AppPaths
@@ -59,6 +67,7 @@ type Server struct {
 	config *Config
 	// workerBin is the executable started as `<workerBin> session-worker`.
 	workerBin string
+	lockWait  time.Duration
 
 	// createMu serialises session name allocation and row insertion.
 	createMu sync.Mutex
@@ -93,6 +102,7 @@ func New(p *paths.AppPaths, workerBin string) (*Server, error) {
 		db:        store,
 		config:    cfg,
 		workerBin: workerBin,
+		lockWait:  defaultLockWait,
 		shutdown:  make(chan struct{}),
 		conns:     make(map[net.Conn]struct{}),
 	}, nil
@@ -107,10 +117,14 @@ func (s *Server) Shutdown() {
 // shutdown request arrives. It returns once the socket and pid file are gone
 // and connection handlers have finished.
 func (s *Server) Serve(ctx context.Context) error {
-	if conn, err := net.Dial("unix", s.paths.Socket); err == nil {
-		conn.Close()
-		return fmt.Errorf("agentd is already running on %s", s.paths.Socket)
+	lock, err := acquireLock(s.paths.LockPath(), s.lockWait)
+	if err != nil {
+		return err
 	}
+	defer releaseLock(lock)
+
+	// Holding the lock, any socket left at the path belongs to a daemon
+	// that is gone.
 	if err := os.Remove(s.paths.Socket); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("failed to remove stale agentd socket: %w", err)
 	}
@@ -122,8 +136,14 @@ func (s *Server) Serve(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to bind agentd socket: %w", err)
 	}
+	if err := os.Chmod(s.paths.Socket, 0o600); err != nil {
+		listener.Close()
+		return fmt.Errorf("failed to restrict agentd socket: %w", err)
+	}
+	// The pid file is informational (agent daemon info); the lock, not the
+	// pid file, decides whether a daemon is running.
 	pid := strconv.Itoa(os.Getpid())
-	if err := os.WriteFile(s.paths.PIDFile, []byte(pid), 0o644); err != nil {
+	if err := os.WriteFile(s.paths.PIDFile, []byte(pid), 0o600); err != nil {
 		listener.Close()
 		return fmt.Errorf("failed to write %s: %w", s.paths.PIDFile, err)
 	}
@@ -158,10 +178,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	s.Shutdown()
 
 	// Remove the pid file before closing the listener (which unlinks the
-	// socket). The agent CLI starts a replacement daemon as soon as the
-	// socket stops answering, and refuses to while the pid file names a live
-	// process, so the pid file must already be gone when the socket goes,
-	// even though this process keeps running while connections drain.
+	// socket): a client that finds the socket gone starts a replacement
+	// daemon, which then waits for our lock while we drain.
 	if data, err := os.ReadFile(s.paths.PIDFile); err == nil && strings.TrimSpace(string(data)) == pid {
 		_ = os.Remove(s.paths.PIDFile)
 	}
@@ -179,7 +197,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 
 	// The socket and pid file were removed above. Removing the socket path
-	// again here could delete the socket of a daemon started since.
+	// again here could delete the socket of a daemon started since, which
+	// is waiting for the lock released when Serve returns.
 	return nil
 }
 
@@ -211,7 +230,11 @@ func (s *Server) closeConnections() {
 
 func (s *Server) handleConnection(conn net.Conn) error {
 	reader := bufio.NewReader(conn)
+	// A client that connects and never sends a request must not hold a
+	// handler (and a file descriptor) until shutdown.
+	conn.SetReadDeadline(time.Now().Add(firstRequestTimeout))
 	req, mgmt, err := protocol.ReadIncoming(reader)
+	conn.SetReadDeadline(time.Time{})
 	var versionErr *protocol.VersionError
 	if errors.As(err, &versionErr) {
 		// Answer in the client's own framing so it can say why it was
@@ -219,6 +242,14 @@ func (s *Server) handleConnection(conn net.Conn) error {
 		return protocol.WriteErrorAtVersion(conn, versionErr.Version, fmt.Sprintf(
 			"agentd speaks protocol version %d but this client sent version %d; upgrade the agent CLI or the daemon so they match",
 			protocol.ProtocolVersion, versionErr.Version))
+	}
+	var decodeErr *protocol.DecodeError
+	if errors.As(err, &decodeErr) {
+		msg := fmt.Sprintf("agentd could not decode the request: %v", decodeErr.Err)
+		if decodeErr.Version == protocol.DaemonManagementVersion {
+			return protocol.WriteManagementResponse(conn, &protocol.ManagementResponse{Error: &protocol.ErrorResponse{Message: msg}})
+		}
+		return protocol.WriteResponse(conn, protocol.ErrorResponsef("%s", msg))
 	}
 	if err != nil {
 		return err
@@ -265,6 +296,13 @@ func (s *Server) handleManagement(conn net.Conn, req *protocol.ManagementRequest
 func (s *Server) handleRequest(conn net.Conn, reader *bufio.Reader, req *protocol.Request) error {
 	reply := func(resp *protocol.Response) error { return protocol.WriteResponse(conn, resp) }
 	replyErr := func(err error) error { return reply(protocol.ErrorResponsef("%v", err)) }
+
+	// Session ids become socket and log paths, so anything that could not
+	// have been created as a session name (e.g. "../x") is refused here,
+	// before any path is built from it.
+	if id, ok := requestSessionID(req); ok && !validSessionName(id) {
+		return reply(protocol.ErrorResponsef("session `%s` not found", id))
+	}
 
 	switch {
 	case req.GetDaemonInfo != nil:
@@ -338,6 +376,31 @@ func (s *Server) handleRequest(conn net.Conn, reader *bufio.Reader, req *protoco
 		return reply(&protocol.Response{Sessions: &recs})
 	}
 	return reply(protocol.ErrorResponsef("unsupported request"))
+}
+
+// requestSessionID returns the existing session a request refers to.
+func requestSessionID(req *protocol.Request) (string, bool) {
+	switch {
+	case req.KillSession != nil:
+		return req.KillSession.SessionID, true
+	case req.ResolveSessionRuntime != nil:
+		return req.ResolveSessionRuntime.SessionID, true
+	case req.AttachSession != nil:
+		return req.AttachSession.SessionID, true
+	case req.DetachSession != nil:
+		return req.DetachSession.SessionID, true
+	case req.DetachAttachment != nil:
+		return req.DetachAttachment.SessionID, true
+	case req.SendInput != nil:
+		return req.SendInput.SessionID, true
+	case req.GetSession != nil:
+		return req.GetSession.SessionID, true
+	case req.ListAttachments != nil:
+		return req.ListAttachments.SessionID, true
+	case req.GetHistory != nil:
+		return req.GetHistory.SessionID, true
+	}
+	return "", false
 }
 
 func isDisconnect(err error) bool {
