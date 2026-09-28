@@ -215,7 +215,6 @@ The daemon injects:
 - `AGENTD_SESSION_ID`
 - `AGENTD_SOCKET`
 - `AGENTD_CWD`
-- `AGENTD_WORKSPACE` (alias of `AGENTD_CWD`, kept for one release)
 - `AGENTD_SESSION_NAME` (same as `AGENTD_SESSION_ID`)
 
 Instrumented agents can use the injected session environment to locate the daemon socket, but
@@ -282,5 +281,3 @@ Current capabilities include:
 - per-session PTY history held by the session while it runs and saved to `logs/` when it ends
 
 Sessions whose worker dies while no daemon is running are shown as `unknown_recovered`.
-Upgrading `state.db` from the former Rust daemon's schema (v7) to v8 happens in place the first
-time the Go daemon opens it and cannot be undone.

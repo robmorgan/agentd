@@ -1,12 +1,6 @@
-You are working in the `agentd` repository.
+You are working in the `agentd` repository: a daemon runtime for supervising coding agents as durable tasks. It is a Go daemon (`go/`: `agentd serve` plus one `agentd session-worker` per session) and a Rust `agent` CLI (`crates/`), with QUIC planned as the primary remote transport.
 
-Your task is to begin moving `agentd` toward a Go-based, distributed agent runtime with QUIC as its primary remote transport, while preserving the useful behavior and product direction that already exists.
-
-Do not treat this as a greenfield rewrite.
-
-First inspect the entire repository, understand the existing architecture and behavior, read `README.md`, `ARCHITECTURE.md`, `ROADMAP.md`, the protocol implementation, daemon/session lifecycle, PTY handling, persistence, libghostty integration, CLI/TUI, and tests.
-
-Then design and implement the next incremental step toward the architecture below.
+Before larger changes, read `README.md`, `ARCHITECTURE.md`, `ROADMAP.md` and `go/README.md`. The code is the source of truth for current behavior.
 
 # Product direction
 
@@ -39,9 +33,9 @@ A client should eventually be able to connect to either daemon using the same ap
 
 The core runtime must not require a hosted control plane.
 
-# Target architecture
+# Architecture
 
-The intended architecture is approximately:
+The architecture, with the remote transport still to come, is approximately:
 
 ```text
                     agent clients
@@ -105,11 +99,9 @@ A later connection should be able to reattach to the existing session.
 
 # Important architectural decisions
 
-## 1. Go is the target language for the daemon
+## 1. Go owns the daemon
 
-The daemon should gradually move toward Go.
-
-Go should own:
+The daemon and its per-session workers are Go. Go owns:
 
 - networking
 - concurrency
@@ -122,9 +114,7 @@ Go should own:
 - PTY fan-out
 - task/agent lifecycle
 
-Do not rewrite everything merely to translate Rust into Go.
-
-Use the migration to simplify the architecture where appropriate.
+The `agent` CLI is Rust and speaks the same protocol. Keep the two codecs in step; golden-frame tests on both sides pin identical bytes.
 
 Preserve existing user-visible behavior unless there is a compelling reason to change it.
 
@@ -292,125 +282,24 @@ rather than merely:
 
 > Which terminal is running?
 
-# Desired migration strategy
-
-Do not attempt to complete the entire roadmap in one change.
-
-Work incrementally.
-
-The immediate goal is to establish a clean foundation for the Go daemon while preserving the existing implementation as a behavioral reference.
-
-A sensible first milestone is:
+# Package layout
 
 ```text
-Go daemon
-   │
-   ├── starts and stops correctly
-   ├── owns a Unix socket
-   ├── understands a minimal versioned protocol
-   ├── can spawn one PTY-backed process
-   ├── can retain that process after client disconnect
-   └── can reattach a client
+go/
+  cmd/agentd/          serve, upgrade, session-worker
+  internal/
+    daemon/            session registry, proxies, lifecycle, supervision
+    worker/            one session: PTY, terminal state, fan-out, input queue
+    protocol/          framed protocol + daemon management protocol
+    db/                state.db
+    session/           session model
+    paths/             runtime root
+crates/
+  agent-cli/           the `agent` CLI and TUI
+  agentd-shared/       Rust side of the protocol, schema, paths, config
 ```
 
-Remote QUIC does not need to work in the first milestone.
-
-# Before changing code
-
-Perform a repository audit.
-
-Identify:
-
-1. Current crates/packages and their responsibilities.
-2. Where daemon lifecycle lives.
-3. Where PTYs are created and owned.
-4. Where attached clients are tracked.
-5. How multiple attachers currently work.
-6. How PTY output is fanned out.
-7. How the binary protocol works.
-8. Which protocol messages exist.
-9. How SQLite state is structured.
-10. How worktrees are created and cleaned up.
-11. How `libghostty-vt` is currently embedded.
-12. How terminal state restoration currently works.
-13. Which tests define important behavior.
-14. Which parts can reasonably be reused during a Go migration.
-15. Which parts should remain unchanged for now.
-
-Do not assume the roadmap is perfectly aligned with the implementation.
-
-The code is the source of truth for current behavior.
-
-# Create a migration plan
-
-Before large implementation changes, create or update a concise engineering document describing:
-
-- current architecture
-- target architecture
-- migration boundaries
-- compatibility strategy
-- protocol strategy
-- package layout
-- risks
-- what is deliberately deferred
-
-Prefer a staged migration.
-
-For example:
-
-```text
-Stage A
-Freeze current behavior with tests.
-
-Stage B
-Introduce Go module and shared protocol definitions.
-
-Stage C
-Implement Go daemon lifecycle and Unix transport.
-
-Stage D
-Implement PTY session runtime.
-
-Stage E
-Integrate libghostty from Go.
-
-Stage F
-Move CLI operations to Go daemon.
-
-Stage G
-Remove superseded Rust daemon code.
-
-Stage H
-Introduce QUIC transport.
-```
-
-Adjust this based on what you discover in the repository.
-
-# Suggested Go package boundaries
-
-Do not blindly implement this layout, but prefer small packages with clear ownership.
-
-Something approximately like:
-
-```text
-cmd/
-  agent/
-  agentd/
-
-internal/
-  daemon/
-  session/
-  task/
-  agent/
-  pty/
-  protocol/
-  transport/
-    unix/
-    quic/
-  terminal/
-  persistence/
-  attention/
-```
+Transports (Unix sockets today, QUIC next) should get their own package when the transport split happens.
 
 Avoid excessive package fragmentation.
 
@@ -420,7 +309,7 @@ Interfaces should exist where there are real boundaries such as transports or te
 
 # Protocol direction
 
-Preserve the useful parts of the existing framed binary protocol.
+Keep the framed binary protocol (version 1; `go/internal/protocol` and `crates/agentd-shared/src/protocol.rs`).
 
 Do not prematurely replace it with:
 
@@ -539,28 +428,29 @@ Do not add QUIC merely to satisfy the roadmap before the protocol and session ow
 
 When real `agentd` workloads expose bugs or meaningful inefficiencies in dependencies, prefer producing clean upstream fixes rather than maintaining unnecessary forks.
 
-# CLI compatibility
+# CLI
 
 Preserve the existing user experience where practical.
 
-Important commands include concepts such as:
+The commands are:
 
 ```text
-agent run
-agent ls
+agent new [--cwd DIR] [NAME]
+agent list | ls
 agent attach
 agent attachments
 agent detach
 agent history
-agent diff
-agent send
+agent send-input
+agent status
 agent kill
-agent daemon
+agent rm
+agent daemon info | restart | upgrade
 ```
 
 Do not rename commands merely because implementation internals changed.
 
-# Non-goals for this work
+# Non-goals
 
 Do not implement:
 
@@ -577,8 +467,6 @@ Do not implement:
 - agent marketplace
 - complex plugin systems
 - arbitrary RPC framework
-
-Do not turn this into a complete rewrite of the product.
 
 # Coding style
 
@@ -611,28 +499,25 @@ As implementation progresses, keep these synchronized:
 
 Document architectural decisions that would otherwise be difficult to infer from code.
 
-# First task
+# Current state and next milestone
 
-Start by performing the repository audit.
+Done:
+- The Go daemon and per-session workers, on protocol v1 and state schema v1.
+- Sessions survive client disconnects and daemon restarts.
+- Liveness is checked through the worker sockets, and a flock enforces a single daemon.
+- Attach fan-out and PTY input are bounded, and the runtime root is private to the user.
 
-Then propose the smallest coherent first implementation milestone that moves the project toward the target architecture without destroying existing functionality.
+Next:
+1. Separate protocol semantics from transport framing, behind a small transport interface. Unix sockets are the first implementation.
+2. QUIC: a control stream, plus one stream per attachment, using a maintained Go QUIC library.
+3. Remote addressing and authentication (`agent --host`).
 
-Unless the repository structure reveals a strong reason otherwise, prefer beginning with:
+Known gaps:
+- History is only saved when a session exits.
+- A lagging attach client loses output until the program repaints. The fix is an unsolicited snapshot resync, which needs CLI support.
+- Agents receive `AGENTD_SOCKET` and are trusted peers of the daemon.
 
-1. behavioral/integration tests around the existing daemon;
-2. introduction of the Go module;
-3. a minimal Go `agentd` process;
-4. local Unix socket transport;
-5. a small versioned protocol implementation;
-6. one PTY-backed durable session;
-7. attach → detach → reattach;
-8. tests proving the child process survives client disconnection.
-
-Do not begin with QUIC.
-
-The point of the first milestone is to establish the correct ownership and session model.
-
-QUIC becomes valuable once that model is sound.
+Do not begin QUIC before the transport split: the session and ownership model has to be clean first.
 
 # Definition of the eventual vertical slice
 

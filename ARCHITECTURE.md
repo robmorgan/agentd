@@ -58,12 +58,13 @@ Payloads are binary-encoded field-by-field rather than serialized as JSON:
 * optional values => presence `u8` followed by the encoded value
 * lists => `u32 count` followed by elements
 
-PTY snapshots, PTY output, and interactive input are sent as raw bytes. Message kind numbers are
-stable across versions; numbers retired in v33 are left unassigned. A client on another version
-gets an `Error` frame in its own framing explaining the mismatch.
+PTY snapshots, PTY output, and interactive input are sent as raw bytes. The current protocol
+version is 1. A client on another version gets an `Error` frame in its own framing explaining the
+mismatch, so the `Error` message kind and its payload never change.
 
-A second, deliberately tiny daemon management protocol (framed at version 1, JSON payloads) carries
-`agent daemon info` status and shutdown, so those keep working across main protocol bumps.
+A second, deliberately tiny daemon management protocol (framed at header version 0, JSON payloads)
+carries daemon status and shutdown for `agent daemon info`, `restart` and `upgrade`, so those keep
+working even when the CLI and daemon speak different versions of the main protocol.
 
 Most commands use a simple request/response exchange:
 
@@ -89,10 +90,11 @@ When you create a session (`agent new [--cwd DIR] [NAME]`), the daemon:
 4. Waits for the worker to report the session running and bind its socket.
 
 The worker spawns the configured agent inside a PTY in `cwd`, with `AGENTD_SESSION_ID`,
-`AGENTD_SOCKET`, `AGENTD_CWD` (and `AGENTD_WORKSPACE` as an alias) injected.
+`AGENTD_SOCKET` and `AGENTD_CWD` injected.
 
 The daemon does not manage git worktrees or branches. That responsibility sits with whatever starts
-the session (the user, a wrapper, a skill, or the agent itself). See `docs/drop-worktrees.md`.
+the session (the user, a wrapper, a skill, or the agent itself); the README shows the worktree
+recipe.
 
 For each session there are three kinds of state:
 
@@ -136,15 +138,10 @@ The selected root contains:
 * `agentd.sock`
 * `agentd.lock` (held by the running daemon)
 * `agentd.pid` (informational)
-* `state.db` (schema v8; a v6 or v7 database from the former Rust daemon is migrated in place)
+* `state.db` (schema v1; the daemon refuses any other version)
 * `sessions/` (one socket per live session)
 * `agentd.log` (output of a daemonized daemon)
 * `logs/` (session history and `<id>.worker.log`)
-
-Upgrading from the Rust daemon: a v6/v7 `state.db` is migrated only once neither the previous
-daemon nor any session it started is still running; until then the Go daemon and the CLI's local
-mode refuse, and say what is still running. `agentd upgrade` stops a previous daemon through the
-daemon management protocol, which is unchanged.
 
 The root and everything in it are private to the user (directories 0700, files and sockets 0600),
 since logs hold full agent transcripts. `agentd` refuses a root owned by another user.

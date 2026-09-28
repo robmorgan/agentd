@@ -246,7 +246,7 @@ The purpose is not merely a language rewrite. The Go implementation should becom
 * [x] Support interactive reattach
 * [x] Support PTY resize
 * [x] Support multiple attached clients
-* [x] Replace worktree lifecycle with a per-session `cwd` (see `docs/drop-worktrees.md`)
+* [x] Sessions run in a per-session `cwd`; agentd does not manage git worktrees
 * [x] Port SQLite-backed metadata
 * [x] Preserve compatibility with existing session semantics where practical
 * [x] Sessions survive daemon restart (each session's worker is its own process)
