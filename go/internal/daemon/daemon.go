@@ -157,6 +157,14 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 	s.Shutdown()
 
+	// Remove the pid file before closing the listener (which unlinks the
+	// socket). The agent CLI starts a replacement daemon as soon as the
+	// socket stops answering, and refuses to while the pid file names a live
+	// process, so the pid file must already be gone when the socket goes,
+	// even though this process keeps running while connections drain.
+	if data, err := os.ReadFile(s.paths.PIDFile); err == nil && strings.TrimSpace(string(data)) == pid {
+		_ = os.Remove(s.paths.PIDFile)
+	}
 	listener.Close()
 	<-acceptDone
 	s.closeConnections()
@@ -170,12 +178,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	case <-time.After(connectionDrainTimeout):
 	}
 
-	// The listener removes its socket on Close; the pid file is ours to
-	// clean up, unless another daemon has already replaced it.
-	_ = os.Remove(s.paths.Socket)
-	if data, err := os.ReadFile(s.paths.PIDFile); err == nil && strings.TrimSpace(string(data)) == pid {
-		_ = os.Remove(s.paths.PIDFile)
-	}
+	// The socket and pid file were removed above. Removing the socket path
+	// again here could delete the socket of a daemon started since.
 	return nil
 }
 

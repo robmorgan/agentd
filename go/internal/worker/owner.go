@@ -123,7 +123,13 @@ func (s *ownerState) writeInput(data []byte) error {
 	return err
 }
 
+// resize applies a client's geometry. A zero row or column count (a client
+// whose terminal reports no size) keeps the current size instead: the PTY
+// and libghostty both reject it.
 func (s *ownerState) resize(g protocol.Geometry) error {
+	if g.Cols == 0 || g.Rows == 0 {
+		return nil
+	}
 	if err := pty.Setsize(s.ptmx, &pty.Winsize{Rows: g.Rows, Cols: g.Cols, X: g.PixelWidth, Y: g.PixelHeight}); err != nil {
 		return fmt.Errorf("failed to resize pty: %w", err)
 	}

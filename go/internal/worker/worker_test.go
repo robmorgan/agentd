@@ -410,6 +410,18 @@ func TestResize(t *testing.T) {
 	h.waitExit()
 }
 
+func TestZeroGeometryKeepsCurrentSize(t *testing.T) {
+	h := startWorker(t)
+	c := h.attach(protocol.Geometry{Cols: 100, Rows: 30})
+	c2 := h.attach(protocol.Geometry{})
+	c.send(&protocol.Request{AttachResize: &protocol.Geometry{}})
+	c2.input("size\n")
+	c2.expectOutput("30 100")
+	c2.input("done\n")
+	c2.expectEnd()
+	h.waitExit()
+}
+
 func TestAgentFailureEndsSession(t *testing.T) {
 	h := startWorker(t)
 	c := h.attach(defaultGeometry)

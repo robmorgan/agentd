@@ -219,7 +219,7 @@ enum Command {
     name = "agent daemon",
     help_template = GROUP_HELP_TEMPLATE,
     before_help = "agent daemon\nInspect, restart, or upgrade the local daemon process.",
-    after_help = "Notes:\n  `restart` keeps metadata but does not preserve live PTY connectivity.\n  `upgrade` refuses to run while sessions are still live.",
+    after_help = "Notes:\n  `restart` keeps running sessions; they live in their own worker processes\n  and reattach to the new daemon.\n  `upgrade` refuses to run while sessions are still live.",
     styles = cli_styles(),
     next_display_order = 1
 )]
@@ -228,7 +228,8 @@ enum DaemonCommand {
     Info,
     #[command(about = "Restart the daemon", display_order = 2)]
     Restart {
-        #[arg(long)]
+        /// Accepted for compatibility; restarts no longer affect running sessions.
+        #[arg(long, hide = true)]
         force: bool,
     },
     #[command(about = "Upgrade the daemon binary when no sessions are live", display_order = 3)]
@@ -450,8 +451,8 @@ async fn main() -> Result<()> {
                 let status = daemon_management_status(&paths).await?;
                 print_daemon_management_status(&status);
             }
-            DaemonCommand::Restart { force } => {
-                restart_daemon(&paths, force).await?;
+            DaemonCommand::Restart { force: _ } => {
+                restart_daemon(&paths).await?;
                 let status = daemon_management_status(&paths).await?;
                 print_daemon_management_status(&status);
             }
@@ -815,14 +816,12 @@ async fn wait_for_daemon_stop(paths: &AppPaths) -> Result<()> {
     }
 }
 
-async fn restart_daemon(paths: &AppPaths, force: bool) -> Result<()> {
+// Sessions run in their own worker processes and survive the daemon, so a
+// restart is always safe; the new daemon picks them up from state.db.
+async fn restart_daemon(paths: &AppPaths) -> Result<()> {
     match try_connect(paths).await {
         Ok(_) => {
-            let status = daemon_management_status(paths).await?;
-            if status.running_sessions && !force {
-                bail!("cannot restart agentd while sessions are running");
-            }
-            request_daemon_shutdown(paths, force).await?;
+            request_daemon_shutdown(paths, true).await?;
             spawn_daemon(paths).await?;
             ensure_compatible_daemon(paths).await
         }
