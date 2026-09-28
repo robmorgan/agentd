@@ -7,7 +7,7 @@
   </p>
 </p>
 
-Developers are starting to run **multiple coding agents** in parallel including Claude Code and Codex.
+Developers are running **multiple coding agents** in parallel including Claude Code and Codex.
 But once you run more than one, things get messy:
 
 * terminals everywhere
