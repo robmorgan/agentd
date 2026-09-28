@@ -15,7 +15,6 @@ pub struct AppPaths {
     pub config: Utf8PathBuf,
     pub logs_dir: Utf8PathBuf,
     pub sessions_dir: Utf8PathBuf,
-    pub worktrees_dir: Utf8PathBuf,
 }
 
 impl AppPaths {
@@ -32,7 +31,7 @@ impl AppPaths {
     }
 
     pub fn ensure_layout(&self) -> Result<()> {
-        for path in [&self.root, &self.logs_dir, &self.sessions_dir, &self.worktrees_dir] {
+        for path in [&self.root, &self.logs_dir, &self.sessions_dir] {
             fs::create_dir_all(path.as_std_path())
                 .with_context(|| format!("failed to create {}", path))?;
         }
@@ -51,10 +50,6 @@ impl AppPaths {
         self.sessions_dir.join(format!("{session_id}.sock"))
     }
 
-    pub fn worktree_path(&self, session_id: &str) -> Utf8PathBuf {
-        self.worktrees_dir.join(session_id)
-    }
-
     pub fn as_utf8(path: &Utf8Path) -> &str {
         path.as_str()
     }
@@ -67,7 +62,6 @@ impl AppPaths {
             config: root.join("config.toml"),
             logs_dir: root.join("logs"),
             sessions_dir: root.join("sessions"),
-            worktrees_dir: root.join("worktrees"),
             root,
         }
     }
@@ -200,6 +194,5 @@ mod tests {
         assert_eq!(paths.config, Utf8PathBuf::from("/Users/tester/.agentd/config.toml"));
         assert_eq!(paths.logs_dir, Utf8PathBuf::from("/Users/tester/.agentd/logs"));
         assert_eq!(paths.sessions_dir, Utf8PathBuf::from("/Users/tester/.agentd/sessions"));
-        assert_eq!(paths.worktrees_dir, Utf8PathBuf::from("/Users/tester/.agentd/worktrees"));
     }
 }

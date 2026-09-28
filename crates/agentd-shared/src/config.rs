@@ -12,8 +12,9 @@ pub struct Config {
     pub default_agent: String,
     #[serde(default)]
     pub agents: IndexMap<String, AgentConfig>,
-    #[serde(default)]
-    pub git: GitConfig,
+    // Config files written before agentd dropped worktree management may still
+    // carry a `[git]` table. Unknown tables are ignored, so they keep parsing;
+    // do not add `deny_unknown_fields` here.
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,22 +26,12 @@ pub struct AgentConfig {
     pub model_flag: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GitConfig {
-    #[serde(default = "default_auto_commit_message")]
-    pub auto_commit_message: String,
-}
-
 fn default_model_flag() -> Option<String> {
     Some("--model".to_string())
 }
 
 fn default_agent_name() -> String {
     "codex".to_string()
-}
-
-fn default_auto_commit_message() -> String {
-    "agentd: finalize session {session_id}".to_string()
 }
 
 impl Config {
@@ -110,13 +101,7 @@ impl Default for Config {
                 model_flag: default_model_flag(),
             },
         );
-        Self { default_agent: default_agent_name(), agents, git: GitConfig::default() }
-    }
-}
-
-impl Default for GitConfig {
-    fn default() -> Self {
-        Self { auto_commit_message: default_auto_commit_message() }
+        Self { default_agent: default_agent_name(), agents }
     }
 }
 
@@ -135,7 +120,6 @@ mod tests {
             config: root.join("config.toml"),
             logs_dir: root.join("logs"),
             sessions_dir: root.join("sessions"),
-            worktrees_dir: root.join("worktrees"),
             root,
         }
     }
@@ -182,6 +166,27 @@ command = "zed"
             vec!["claude", "codex", "zed"]
         );
         assert_eq!(config.default_agent_name(&paths).unwrap(), "claude");
+    }
+
+    #[test]
+    fn legacy_git_table_is_ignored() {
+        let paths = test_paths();
+        let config: Config = toml::from_str(
+            r#"
+default_agent = "claude"
+
+[agents.claude]
+command = "claude"
+
+[git]
+auto_commit_message = "agentd: finalize session {session_id}"
+"#,
+        )
+        .unwrap();
+
+        let config = config.validate(&paths).unwrap();
+        assert_eq!(config.default_agent_name(&paths).unwrap(), "claude");
+        assert!(!toml::to_string_pretty(&config).unwrap().contains("[git]"));
     }
 
     #[test]

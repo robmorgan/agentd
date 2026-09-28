@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::{IsTerminal, Write},
+    io::Write,
     mem::MaybeUninit,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::PathBuf,
@@ -18,7 +18,6 @@ use clap::{
 };
 use crossterm::{
     event::EventStream,
-    style::{Attribute as CrosAttribute, Color as CrosColor, Stylize},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 use futures::StreamExt;
@@ -48,9 +47,8 @@ use agentd_shared::{
         write_daemon_management_request, write_request,
     },
     session::{
-        ApplyState, AttachmentKind, AttachmentRecord, AttentionLevel, IntegrationPolicy,
-        SESSION_NAME_RULES, SessionDiff, SessionRecord, SessionStatus, WorktreeRecord,
-        validate_session_name,
+        AttachmentKind, AttachmentRecord, AttentionLevel, SESSION_NAME_RULES, SessionRecord,
+        SessionStatus, validate_session_name,
     },
 };
 
@@ -95,7 +93,7 @@ Core flows:
   Start a session      agent new fix-flaky-tests
   Inspect sessions     agent list
   Reconnect live PTY   agent attach <name>
-  Review changes       agent diff <name> | agent merge <name>";
+  Run somewhere else   agent new --cwd ../wt/fix fix";
 
 fn help_accent_style() -> clap::builder::styling::Style {
     Color::Rgb(RgbColor::from(AGENTD_PRIMARY_BLUE_RGB)).on_default()
@@ -129,7 +127,7 @@ fn cli_styles() -> Styles {
     name = "agent",
     version,
     about = "Run, inspect, and review local coding sessions",
-    before_help = "agent\nA local multi-session coding workflow for daemon-backed agents.\n\nCore flows:\n  Start a session      agent new fix-flaky-tests\n  Inspect sessions     agent list\n  Reconnect live PTY   agent attach <name>\n  Review changes       agent diff <name> | agent merge <name>",
+    before_help = "agent\nA local multi-session coding workflow for daemon-backed agents.\n\nCore flows:\n  Start a session      agent new fix-flaky-tests\n  Inspect sessions     agent list\n  Reconnect live PTY   agent attach <name>\n  Run somewhere else   agent new --cwd ../wt/fix fix",
     after_help = "Examples:\n  agent new add-health-checks\n  agent list\n  agent status <name>\n  agent daemon info\n\nUse `agent <command> --help` for command-specific details.",
     help_template = ROOT_HELP_TEMPLATE,
     styles = cli_styles(),
@@ -149,8 +147,9 @@ enum Command {
     #[command(about = "Start and attach to a new session", display_order = 1)]
     New {
         name: Option<String>,
-        #[arg(long)]
-        workspace: Option<PathBuf>,
+        /// Directory the agent runs in (default: the current directory)
+        #[arg(long, value_name = "DIR", alias = "workspace")]
+        cwd: Option<PathBuf>,
         #[arg(long)]
         agent: Option<String>,
     },
@@ -191,16 +190,6 @@ enum Command {
         )]
         data: Vec<String>,
     },
-    #[command(about = "Merge a session branch back to the base branch", display_order = 7)]
-    Merge { session_id: Option<String> },
-    #[command(about = "Compatibility alias for `agent merge`", display_order = 8, hide = true)]
-    Accept { session_id: String },
-    #[command(about = "Discard a session's worktree and changes", display_order = 9)]
-    Discard {
-        session_id: String,
-        #[arg(long)]
-        force: bool,
-    },
     #[command(about = "Print captured session history", display_order = 10)]
     History {
         session_id: String,
@@ -218,34 +207,11 @@ enum Command {
     Attachments { session_id: String },
     #[command(about = "Show detailed session status", display_order = 13)]
     Status { session_id: String },
-    #[command(about = "Show the session diff against its base branch", display_order = 14)]
-    Diff { session_id: String },
-    #[command(about = "Create or clean up session worktrees", display_order = 15)]
-    Worktree {
-        #[command(subcommand)]
-        command: WorktreeCommand,
-    },
     #[command(about = "Inspect or control the local agent daemon", display_order = 16)]
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
     },
-}
-
-#[derive(Debug, Subcommand)]
-#[command(
-    name = "agent worktree",
-    help_template = GROUP_HELP_TEMPLATE,
-    before_help = "agent worktree\nManage the git worktree attached to a session.\n\nTypical flow:\n  agent worktree create <name>\n  agent worktree cleanup <name>",
-    after_help = "Use `agent status <name>` first if you are unsure whether a session is still live.",
-    styles = cli_styles(),
-    next_display_order = 1
-)]
-enum WorktreeCommand {
-    #[command(about = "Create the session worktree on disk", display_order = 1)]
-    Create { session_id: String },
-    #[command(about = "Remove the session worktree from disk", display_order = 2)]
-    Cleanup { session_id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -279,6 +245,14 @@ async fn main() -> Result<()> {
     let paths = AppPaths::discover()?;
     paths.ensure_layout()?;
     ensure_config(&paths)?;
+    // Validate `new` before a daemon may be started, so a bad --cwd or name
+    // fails fast with its own error.
+    let mut new_session = match &cli.command {
+        Some(Command::New { name, cwd, agent }) => {
+            Some(resolve_new_session_options(&paths, cwd.clone(), name.clone(), agent.clone())?)
+        }
+        _ => None,
+    };
     let execution = resolve_execution_mode(&paths, cli.command.as_ref()).await?;
 
     match (cli.command, execution) {
@@ -294,16 +268,15 @@ async fn main() -> Result<()> {
         (Some(Command::Runtime { .. }), ExecutionMode::Local(reason)) => {
             bail!("{reason}. `agent runtime` requires a compatible daemon");
         }
-        (Some(Command::New { name, workspace, agent }), ExecutionMode::Daemon) => {
-            let options = resolve_new_session_options(&paths, workspace, name, agent)?;
+        (Some(Command::New { .. }), ExecutionMode::Daemon) => {
+            let options = new_session.take().expect("new session options resolved above");
             let response = send_request(
                 &paths,
                 &Request::CreateSession {
-                    workspace: options.workspace.to_string_lossy().to_string(),
+                    cwd: options.cwd,
                     name: options.name,
                     agent: options.agent,
                     model: None,
-                    integration_policy: IntegrationPolicy::ManualReview,
                 },
             )
             .await?;
@@ -344,7 +317,7 @@ async fn main() -> Result<()> {
             if should_print_degraded_notice(DegradedNoticeCommand::Kill, &reason) {
                 print_degraded_notice(&reason);
             }
-            local_kill(&paths, &session_id, rm, force)?;
+            local_kill(&paths, &session_id, rm)?;
         }
         (Some(Command::Rm { force, session_id }), ExecutionMode::Daemon) => {
             let response = send_request(
@@ -361,11 +334,11 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Some(Command::Rm { force, session_id }), ExecutionMode::Local(reason)) => {
+        (Some(Command::Rm { force: _, session_id }), ExecutionMode::Local(reason)) => {
             if should_print_degraded_notice(DegradedNoticeCommand::Kill, &reason) {
                 print_degraded_notice(&reason);
             }
-            local_kill(&paths, &session_id, true, force)?;
+            local_kill(&paths, &session_id, true)?;
         }
         (Some(Command::Attach { session_id }), ExecutionMode::Daemon) => {
             attach_session(&paths, &session_id).await?;
@@ -424,31 +397,6 @@ async fn main() -> Result<()> {
         (Some(Command::SendInput { .. }), ExecutionMode::Local(reason)) => {
             bail_live_command(&reason)?;
         }
-        (Some(Command::Merge { session_id }), ExecutionMode::Daemon) => {
-            let session_id = resolve_merge_session_id(session_id)?;
-            apply_session_with_user_output(&paths, session_id).await?;
-        }
-        (Some(Command::Merge { .. }), ExecutionMode::Local(reason)) => {
-            bail_daemon_command(&reason, "agent merge")?;
-        }
-        (Some(Command::Accept { session_id }), ExecutionMode::Daemon) => {
-            apply_session_with_user_output(&paths, session_id).await?;
-        }
-        (Some(Command::Accept { .. }), ExecutionMode::Local(reason)) => {
-            bail_daemon_command(&reason, "agent accept")?;
-        }
-        (Some(Command::Discard { session_id, force }), ExecutionMode::Daemon) => {
-            let response =
-                send_request(&paths, &Request::DiscardSession { session_id, force }).await?;
-            match response {
-                Response::Session { session } => print_session(&session),
-                Response::Error { message } => bail!(message),
-                other => bail!("unexpected response: {:?}", other),
-            }
-        }
-        (Some(Command::Discard { .. }), ExecutionMode::Local(reason)) => {
-            bail_live_command(&reason)?;
-        }
         (Some(Command::History { session_id, vt }), ExecutionMode::Daemon) => {
             print_history(&paths, &session_id, vt).await?;
         }
@@ -478,19 +426,6 @@ async fn main() -> Result<()> {
         (Some(Command::Attachments { .. }), ExecutionMode::Local(reason)) => {
             bail!("{reason}. `agent attachments` requires a compatible daemon");
         }
-        (Some(Command::Diff { session_id }), ExecutionMode::Daemon) => {
-            let response = send_request(&paths, &Request::DiffSession { session_id }).await?;
-            match response {
-                Response::Diff { diff } => print_diff(&diff),
-                Response::Error { message } => bail!(message),
-                other => bail!("unexpected response: {:?}", other),
-            }
-        }
-        (Some(Command::Diff { .. }), ExecutionMode::Local(reason)) => {
-            bail!(
-                "{reason}. `agent diff` requires a compatible daemon; use `agent sessions` and `agent kill` to recover first"
-            );
-        }
         (Some(Command::Status { session_id }), ExecutionMode::Daemon) => {
             let response = send_request(&paths, &Request::GetSession { session_id }).await?;
             match response {
@@ -509,34 +444,6 @@ async fn main() -> Result<()> {
                 .map(normalize_degraded_session)
                 .ok_or_else(|| anyhow::anyhow!("session `{session_id}` not found"))?;
             print_session(&session);
-        }
-        (Some(Command::Worktree { command }), ExecutionMode::Daemon) => match command {
-            WorktreeCommand::Create { session_id } => {
-                let response =
-                    send_request(&paths, &Request::CreateWorktree { session_id }).await?;
-                match response {
-                    Response::Worktree { worktree } => print_worktree(&worktree),
-                    Response::Error { message } => bail!(message),
-                    other => bail!("unexpected response: {:?}", other),
-                }
-            }
-            WorktreeCommand::Cleanup { session_id } => {
-                let response =
-                    send_request(&paths, &Request::CleanupWorktree { session_id }).await?;
-                match response {
-                    Response::Worktree { worktree } => {
-                        println!("cleaned up worktree for session {}", worktree.session_id);
-                        print_worktree(&worktree);
-                    }
-                    Response::Error { message } => bail!(message),
-                    other => bail!("unexpected response: {:?}", other),
-                }
-            }
-        },
-        (Some(Command::Worktree { .. }), ExecutionMode::Local(reason)) => {
-            bail!(
-                "{reason}. worktree management requires a compatible daemon or a manual cleanup flow"
-            );
         }
         (Some(Command::Daemon { command }), ExecutionMode::Daemon) => match command {
             DaemonCommand::Info => {
@@ -578,7 +485,7 @@ enum ExecutionMode {
 
 #[derive(Debug)]
 struct NewSessionOptions {
-    workspace: PathBuf,
+    cwd: String,
     name: Option<String>,
     agent: String,
 }
@@ -659,28 +566,48 @@ fn bail_live_command(reason: &str) -> Result<()> {
     )
 }
 
-fn bail_daemon_command(reason: &str, command: &str) -> Result<()> {
-    bail!("{reason}. `{command}` requires a compatible daemon")
-}
-
 fn resolve_new_session_options(
     paths: &AppPaths,
-    workspace: Option<PathBuf>,
+    cwd: Option<PathBuf>,
     name: Option<String>,
     agent: Option<String>,
 ) -> Result<NewSessionOptions> {
     let config = Config::load(paths)?;
     Ok(NewSessionOptions {
-        workspace: match workspace {
-            Some(workspace) => workspace,
-            None => std::env::current_dir().context("failed to resolve current directory")?,
-        },
+        cwd: resolve_cwd(cwd)?,
         name: normalize_requested_name(name)?,
         agent: match agent {
             Some(agent) => agent,
             None => config.default_agent_name(paths)?.to_string(),
         },
     })
+}
+
+/// Resolves the directory a new session runs in: `--cwd` when given, else the
+/// caller's current directory. The daemon only checks that it exists, so the
+/// client sends an absolute, canonical path and fails early with a clear error.
+pub(crate) fn resolve_cwd(cwd: Option<PathBuf>) -> Result<String> {
+    let requested = match cwd {
+        Some(cwd) => cwd,
+        None => std::env::current_dir().context("failed to resolve current directory")?,
+    };
+    let canonical = match fs::canonicalize(&requested) {
+        Ok(path) => path,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            bail!("working directory `{}` does not exist", requested.display())
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to resolve `{}`", requested.display()));
+        }
+    };
+    if !canonical.is_dir() {
+        bail!("working directory `{}` is not a directory", requested.display());
+    }
+    canonical
+        .into_os_string()
+        .into_string()
+        .map_err(|path| anyhow!("working directory `{}` is not valid UTF-8", path.display()))
 }
 
 fn normalize_requested_name(name: Option<String>) -> Result<Option<String>> {
@@ -698,14 +625,6 @@ fn resolve_detach_session_id(session_id: Option<String>) -> Result<String> {
         Some(session_id) => Ok(session_id),
         None => std::env::var("AGENTD_SESSION_ID")
             .context("`agent detach` without a session id only works inside a managed session"),
-    }
-}
-
-fn resolve_merge_session_id(session_id: Option<String>) -> Result<String> {
-    match session_id {
-        Some(session_id) => Ok(session_id),
-        None => std::env::var("AGENTD_SESSION_ID")
-            .context("`agent merge` without a session id only works inside a managed session"),
     }
 }
 
@@ -797,8 +716,21 @@ fn remove_file_if_exists(path: &camino::Utf8Path) -> Result<()> {
     }
 }
 
+/// The daemon binary started by `serve --daemonize` and `upgrade`: `$AGENTD_BIN`
+/// when set and non-empty (for example go/bin/agentd during development),
+/// otherwise the `agentd` next to this executable.
 fn daemon_executable() -> Result<PathBuf> {
-    let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
+    daemon_executable_from(std::env::var_os("AGENTD_BIN"), std::env::current_exe())
+}
+
+fn daemon_executable_from(
+    agentd_bin: Option<std::ffi::OsString>,
+    current_exe: std::io::Result<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(path) = agentd_bin.filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    let current_exe = current_exe.context("failed to resolve current executable")?;
     current_exe
         .parent()
         .map(|path| path.join("agentd"))
@@ -809,9 +741,12 @@ async fn ensure_compatible_daemon(paths: &AppPaths) -> Result<()> {
     match daemon_info(paths).await {
         Ok(info) if info.protocol_version == PROTOCOL_VERSION => Ok(()),
         Ok(info) => bail!(
-            "agentd `{}` is out of date with agent `{}`; try upgrading the daemon",
+            "agentd `{}` speaks protocol {} but agent `{}` needs protocol {}; {}",
             info.daemon_version,
-            env!("CARGO_PKG_VERSION")
+            info.protocol_version,
+            env!("CARGO_PKG_VERSION"),
+            PROTOCOL_VERSION,
+            UPGRADE_HINT
         ),
         Err(err) => Err(err),
     }
@@ -941,8 +876,11 @@ async fn send_request_no_bootstrap(paths: &AppPaths, request: &Request) -> Resul
     Ok(response)
 }
 
-fn incompatible_daemon_message() -> &'static str {
-    "agentd is out of date with the client; try upgrading the daemon"
+const UPGRADE_HINT: &str =
+    "run `agent daemon upgrade` (set AGENTD_BIN to choose the daemon binary)";
+
+fn incompatible_daemon_message() -> String {
+    format!("agentd does not speak agent protocol {PROTOCOL_VERSION}; {UPGRADE_HINT}")
 }
 
 async fn send_daemon_management_request(
@@ -990,16 +928,12 @@ async fn print_history(paths: &AppPaths, session_id: &str, vt: bool) -> Result<(
     }
 }
 
-fn local_kill(paths: &AppPaths, session_id: &str, remove: bool, force: bool) -> Result<()> {
+fn local_kill(paths: &AppPaths, session_id: &str, remove: bool) -> Result<()> {
     let store = LocalStore::open(paths)?;
     let session = store
         .get_session(session_id)?
         .ok_or_else(|| anyhow::anyhow!("session `{session_id}` not found"))?;
     let was_running = local::session_is_running(&session);
-
-    if remove {
-        local::ensure_removable(&session, force)?;
-    }
 
     if !was_running && !remove {
         if session.status == SessionStatus::Running {
@@ -1016,7 +950,7 @@ fn local_kill(paths: &AppPaths, session_id: &str, remove: bool, force: bool) -> 
     }
 
     if remove {
-        remove_session_artifacts(paths, &session, force)?;
+        remove_session_artifacts(paths, &session)?;
         store.delete_session(session_id)?;
     }
 
@@ -1108,25 +1042,14 @@ pub(crate) async fn connect_attached_session(
                 write_half,
             }))
         }
-        Response::SessionEnded {
-            session_id,
-            status,
-            apply_state,
-            has_commits,
-            branch,
-            worktree,
-            exit_code,
-            error,
-        } => Ok(AttachHandshake::SessionEnded(SessionEndSummary {
-            session_id,
-            status,
-            apply_state,
-            has_commits,
-            branch,
-            worktree,
-            exit_code,
-            error,
-        })),
+        Response::SessionEnded { session_id, status, exit_code, error } => {
+            Ok(AttachHandshake::SessionEnded(SessionEndSummary {
+                session_id,
+                status,
+                exit_code,
+                error,
+            }))
+        }
         Response::Error { message } => bail!(message),
         other => bail!("unexpected attach response: {other:?}"),
     }
@@ -1217,24 +1140,11 @@ async fn attach_session_once(
                             drop(write_half);
                             return Ok(AttachOutcome::SwitchSession(session_id));
                         }
-                        Response::SessionEnded {
-                            session_id,
-                            status,
-                            apply_state,
-                            has_commits,
-                            branch,
-                            worktree,
-                            exit_code,
-                            error,
-                        } => {
+                        Response::SessionEnded { session_id, status, exit_code, error } => {
                             drop(write_half);
                             return Ok(AttachOutcome::SessionEnded(SessionEndSummary {
                                 session_id,
                                 status,
-                                apply_state,
-                                has_commits,
-                                branch,
-                                worktree,
                                 exit_code,
                                 error,
                             }));
@@ -1318,24 +1228,11 @@ async fn attach_session_once(
                             drop(write_half);
                             return Ok(AttachOutcome::SwitchSession(session_id));
                         }
-                        Response::SessionEnded {
-                            session_id,
-                            status,
-                            apply_state,
-                            has_commits,
-                            branch,
-                            worktree,
-                            exit_code,
-                            error,
-                        } => {
+                        Response::SessionEnded { session_id, status, exit_code, error } => {
                             drop(write_half);
                             return Ok(AttachOutcome::SessionEnded(SessionEndSummary {
                                 session_id,
                                 status,
-                                apply_state,
-                                has_commits,
-                                branch,
-                                worktree,
                                 exit_code,
                                 error,
                             }));
@@ -1379,23 +1276,10 @@ async fn refresh_attach_snapshot(
             Response::SwitchSession { session_id } => {
                 return Ok(AttachOverlayClose::SwitchSession(session_id));
             }
-            Response::SessionEnded {
-                session_id,
-                status,
-                apply_state,
-                has_commits,
-                branch,
-                worktree,
-                exit_code,
-                error,
-            } => {
+            Response::SessionEnded { session_id, status, exit_code, error } => {
                 return Ok(AttachOverlayClose::SessionEnded(SessionEndSummary {
                     session_id,
                     status,
-                    apply_state,
-                    has_commits,
-                    branch,
-                    worktree,
                     exit_code,
                     error,
                 }));
@@ -1544,19 +1428,11 @@ fn print_session(session: &SessionRecord) {
         println!("model: {model}");
     }
     println!("status: {}", session.status_string());
-    println!("apply_state: {}", session.apply_state_string());
-    println!("has_commits: {}", session.has_commits);
-    println!("has_pending_changes: {}", session.has_pending_changes);
     println!("attention: {}", session.attention_string());
     if let Some(summary) = &session.attention_summary {
         println!("attention_summary: {summary}");
     }
-    println!("repo_name: {}", session.repo_name);
-    println!("repo_path: {}", session.repo_path);
-    println!("workspace: {}", session.workspace);
-    println!("base_branch: {}", session.base_branch);
-    println!("branch: {}", session.branch);
-    println!("worktree: {}", session.worktree);
+    println!("cwd: {}", session.cwd);
     if let Some(worker_pid) = session.worker_pid {
         println!("worker_pid: {worker_pid}");
     }
@@ -1569,114 +1445,6 @@ fn print_session(session: &SessionRecord) {
     if let Some(error) = &session.error {
         println!("error: {error}");
     }
-}
-
-async fn apply_session_with_user_output(paths: &AppPaths, session_id: String) -> Result<()> {
-    let merge_session = get_session(paths, session_id.clone()).await?;
-    println!("{}", format_merge_progress(&merge_session));
-
-    let response = send_request(paths, &Request::ApplySession { session_id }).await?;
-    match response {
-        Response::Session { session } => {
-            print_merge_result(&session);
-            Ok(())
-        }
-        Response::Error { message } => bail!(message),
-        other => bail!("unexpected response: {:?}", other),
-    }
-}
-
-async fn get_session(paths: &AppPaths, session_id: String) -> Result<SessionRecord> {
-    let response = send_request(paths, &Request::GetSession { session_id }).await?;
-    match response {
-        Response::Session { session } => Ok(session),
-        Response::Error { message } => bail!(message),
-        other => bail!("unexpected response: {:?}", other),
-    }
-}
-
-fn print_merge_result(session: &SessionRecord) {
-    match format_merge_result(session) {
-        Some(output) => println!("{output}"),
-        None => print_session(session),
-    }
-}
-
-fn format_merge_progress(session: &SessionRecord) -> String {
-    format!("⟳ Merging {} → {}...", session.session_id, session.base_branch)
-}
-
-fn format_merge_result(session: &SessionRecord) -> Option<String> {
-    if session.apply_state != ApplyState::Applied {
-        return None;
-    }
-
-    let summary = session.attention_summary.as_deref()?.trim();
-    if summary.is_empty() {
-        return None;
-    }
-
-    Some(format!(
-        "✔ Merge complete\n  {summary}\n  Target branch: {}\n  Source branch: {}",
-        session.base_branch, session.branch
-    ))
-}
-
-fn print_worktree(worktree: &WorktreeRecord) {
-    println!("name: {}", worktree.session_id);
-    println!("repo_path: {}", worktree.repo_path);
-    println!("base_branch: {}", worktree.base_branch);
-    println!("branch: {}", worktree.branch);
-    println!("worktree: {}", worktree.worktree);
-}
-
-fn print_diff(diff: &SessionDiff) {
-    println!("name: {}", diff.session_id);
-    println!("base_branch: {}", diff.base_branch);
-    println!("branch: {}", diff.branch);
-    println!("worktree: {}", diff.worktree);
-    println!();
-    print!("{}", render_diff_text(&diff.diff, diff_color_enabled()));
-}
-
-fn diff_color_enabled() -> bool {
-    should_colorize_diff_output(std::io::stdout().is_terminal(), std::env::var_os("NO_COLOR"))
-}
-
-fn should_colorize_diff_output(is_terminal: bool, no_color: Option<std::ffi::OsString>) -> bool {
-    is_terminal && no_color.is_none()
-}
-
-fn render_diff_text(diff: &str, color: bool) -> String {
-    if !color {
-        return diff.to_string();
-    }
-
-    let mut rendered = String::with_capacity(diff.len() + 32);
-    for line in diff.split_inclusive('\n') {
-        let styled = if line.starts_with("diff --git")
-            || line.starts_with("--- ")
-            || line.starts_with("+++ ")
-        {
-            format!(
-                "{}",
-                line.with(CrosColor::Rgb { r: 153, g: 214, b: 255 }).attribute(CrosAttribute::Bold)
-            )
-        } else if line.starts_with("@@") {
-            format!(
-                "{}",
-                line.with(CrosColor::Rgb { r: 242, g: 201, b: 76 }).attribute(CrosAttribute::Bold)
-            )
-        } else if line.starts_with('+') && !line.starts_with("+++") {
-            format!("{}", line.with(CrosColor::Rgb { r: 111, g: 207, b: 151 }))
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            format!("{}", line.with(CrosColor::Rgb { r: 255, g: 107, b: 107 }))
-        } else {
-            line.to_string()
-        };
-        rendered.push_str(&styled);
-    }
-    rendered
 }
 
 fn print_kill_result(session_id: &str, was_running: bool, removed: bool) {
@@ -1930,10 +1698,6 @@ enum AttachOutcome {
 struct SessionEndSummary {
     session_id: String,
     status: SessionStatus,
-    apply_state: ApplyState,
-    has_commits: bool,
-    branch: String,
-    worktree: String,
     exit_code: Option<i32>,
     error: Option<String>,
 }
@@ -1948,29 +1712,10 @@ fn format_session_end_summary(summary: &SessionEndSummary) -> String {
             Some(error) => format!("session {} failed: {error}", summary.session_id),
             None => format!("session {} failed", summary.session_id),
         },
-        SessionStatus::Exited | SessionStatus::UnknownRecovered => {
-            if summary.apply_state == ApplyState::Applied {
-                return format!(
-                    "session {} merged from {} ({})",
-                    summary.session_id, summary.branch, summary.worktree
-                );
-            }
-            if summary.has_commits {
-                return format!(
-                    "session {} finished with changes on {} ({})\nrun: agent diff {} | agent merge {} | agent discard {}",
-                    summary.session_id,
-                    summary.branch,
-                    summary.worktree,
-                    summary.session_id,
-                    summary.session_id,
-                    summary.session_id
-                );
-            }
-            match summary.exit_code {
-                Some(code) => format!("session {} finished (exit {code})", summary.session_id),
-                None => format!("session {} finished", summary.session_id),
-            }
-        }
+        SessionStatus::Exited | SessionStatus::UnknownRecovered => match summary.exit_code {
+            Some(code) => format!("session {} finished (exit {code})", summary.session_id),
+            None => format!("session {} finished", summary.session_id),
+        },
         SessionStatus::Creating | SessionStatus::Running => {
             format!("session {} ended", summary.session_id)
         }
@@ -2059,7 +1804,6 @@ impl Drop for AttachTerminalGuard {
 
 trait StatusString {
     fn status_string(&self) -> &'static str;
-    fn apply_state_string(&self) -> &'static str;
     fn attention_string(&self) -> &'static str;
 }
 
@@ -2071,15 +1815,6 @@ impl StatusString for SessionRecord {
             SessionStatus::Exited => "exited",
             SessionStatus::Failed => "failed",
             SessionStatus::UnknownRecovered => "unknown_recovered",
-        }
-    }
-
-    fn apply_state_string(&self) -> &'static str {
-        match self.apply_state {
-            ApplyState::Idle => "idle",
-            ApplyState::AutoApplying => "auto_applying",
-            ApplyState::Applied => "applied",
-            ApplyState::Discarded => "discarded",
         }
     }
 
@@ -2191,15 +1926,12 @@ mod tests {
         ATTACH_DETACH_BYTE, ATTACH_NEXT_SESSION_BYTE, ATTACH_OVERLAY_BYTE,
         ATTACH_OVERLAY_LEGACY_BYTE, AttachInputAction, AttachInputParser, AttachSessionDirection,
         Cli, Command, DaemonCommand, DegradedNoticeCommand, SessionEndSummary,
-        adjacent_live_session_id_in, attach_startup_bytes, bail_daemon_command,
-        clear_stale_daemon_state, cli_command, cli_styles, format_attach_title,
-        format_merge_progress, format_merge_result, format_session_end_summary, render_diff_text,
-        resolve_detach_session_id, resolve_merge_session_id, resolve_new_session_options,
-        should_colorize_diff_output, should_print_degraded_notice, terminal_title_bytes,
+        adjacent_live_session_id_in, attach_startup_bytes, clear_stale_daemon_state, cli_command,
+        cli_styles, daemon_executable_from, ensure_compatible_daemon, format_attach_title,
+        format_session_end_summary, resolve_cwd, resolve_detach_session_id,
+        resolve_new_session_options, should_print_degraded_notice, terminal_title_bytes,
     };
-    use agentd_shared::session::{
-        ApplyState, AttentionLevel, IntegrationPolicy, SessionMode, SessionRecord, SessionStatus,
-    };
+    use agentd_shared::session::{AttentionLevel, SessionMode, SessionRecord, SessionStatus};
     use agentd_shared::{header::AGENTD_PRIMARY_BLUE_RGB, paths::AppPaths};
     use chrono::{Duration, Utc};
     use clap::{
@@ -2313,9 +2045,9 @@ mod tests {
     fn new_command_parses_optional_name() {
         let cli = Cli::try_parse_from(["agent", "new", "fix-failing-tests"]).unwrap();
         match cli.command {
-            Some(Command::New { name, workspace, agent }) => {
+            Some(Command::New { name, cwd, agent }) => {
                 assert_eq!(name.as_deref(), Some("fix-failing-tests"));
-                assert!(workspace.is_none());
+                assert!(cwd.is_none());
                 assert!(agent.is_none());
             }
             other => panic!("unexpected command: {other:?}"),
@@ -2349,24 +2081,101 @@ mod tests {
 
     #[test]
     fn new_command_parses_optional_flags() {
-        let cli = Cli::try_parse_from([
-            "agent",
-            "new",
-            "--workspace",
-            "/tmp/repo",
-            "--agent",
-            "claude",
-            "fix",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["agent", "new", "--cwd", "/tmp/repo", "--agent", "claude", "fix"])
+                .unwrap();
         match cli.command {
-            Some(Command::New { name, workspace, agent }) => {
+            Some(Command::New { name, cwd, agent }) => {
                 assert_eq!(name.as_deref(), Some("fix"));
-                assert_eq!(workspace, Some(PathBuf::from("/tmp/repo")));
+                assert_eq!(cwd, Some(PathBuf::from("/tmp/repo")));
                 assert_eq!(agent.as_deref(), Some("claude"));
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn new_command_accepts_legacy_workspace_flag_as_cwd() {
+        let cli = Cli::try_parse_from(["agent", "new", "--workspace", "/tmp/repo"]).unwrap();
+        match cli.command {
+            Some(Command::New { cwd, .. }) => assert_eq!(cwd, Some(PathBuf::from("/tmp/repo"))),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn removed_git_commands_are_rejected() {
+        for command in [
+            vec!["agent", "merge", "demo"],
+            vec!["agent", "accept", "demo"],
+            vec!["agent", "discard", "demo"],
+            vec!["agent", "diff", "demo"],
+            vec!["agent", "worktree", "create", "demo"],
+        ] {
+            let err = Cli::try_parse_from(&command).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_cwd_canonicalizes_existing_directories() {
+        let paths = test_paths();
+        let dir = paths.root.join("work");
+        fs::create_dir_all(dir.join("sub").as_std_path()).unwrap();
+        let dotted = dir.join("sub").join("..");
+
+        let resolved = resolve_cwd(Some(dotted.into_std_path_buf())).unwrap();
+
+        assert_eq!(resolved, fs::canonicalize(dir.as_std_path()).unwrap().to_str().unwrap());
+        assert!(PathBuf::from(&resolved).is_absolute());
+    }
+
+    #[test]
+    fn resolve_cwd_defaults_to_current_directory() {
+        let resolved = resolve_cwd(None).unwrap();
+        assert_eq!(
+            resolved,
+            fs::canonicalize(std::env::current_dir().unwrap()).unwrap().to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_cwd_rejects_missing_directory() {
+        let err = resolve_cwd(Some(PathBuf::from("/definitely/not/here/agentd"))).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "working directory `/definitely/not/here/agentd` does not exist"
+        );
+    }
+
+    #[test]
+    fn resolve_cwd_rejects_files() {
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let file = paths.root.join("file.txt");
+        fs::write(file.as_std_path(), "x").unwrap();
+
+        let err = resolve_cwd(Some(file.clone().into_std_path_buf())).unwrap_err();
+        assert!(err.to_string().contains("is not a directory"), "{err}");
+    }
+
+    #[test]
+    fn daemon_executable_prefers_non_empty_agentd_bin() {
+        let exe = Ok(PathBuf::from("/opt/agent/bin/agent"));
+        assert_eq!(
+            daemon_executable_from(Some(OsString::from("/src/go/bin/agentd")), exe).unwrap(),
+            PathBuf::from("/src/go/bin/agentd")
+        );
+        let exe = Ok(PathBuf::from("/opt/agent/bin/agent"));
+        assert_eq!(
+            daemon_executable_from(Some(OsString::new()), exe).unwrap(),
+            PathBuf::from("/opt/agent/bin/agentd")
+        );
+        let exe = Ok(PathBuf::from("/opt/agent/bin/agent"));
+        assert_eq!(
+            daemon_executable_from(None, exe).unwrap(),
+            PathBuf::from("/opt/agent/bin/agentd")
+        );
     }
 
     #[test]
@@ -2389,7 +2198,7 @@ mod tests {
     fn resolve_new_session_options_uses_defaults() {
         let paths = test_paths();
         let options = resolve_new_session_options(&paths, None, None, None).unwrap();
-        assert_eq!(options.workspace, std::env::current_dir().unwrap());
+        assert_eq!(options.cwd, resolve_cwd(None).unwrap());
         assert!(options.name.is_none());
         assert_eq!(options.agent, "codex");
     }
@@ -2419,14 +2228,16 @@ command = "claude"
     #[test]
     fn resolve_new_session_options_preserves_explicit_values() {
         let paths = test_paths();
+        let repo = paths.root.join("repo");
+        fs::create_dir_all(repo.as_std_path()).unwrap();
         let options = resolve_new_session_options(
             &paths,
-            Some(PathBuf::from("/tmp/repo")),
+            Some(repo.clone().into_std_path_buf()),
             Some("fix-tests".to_string()),
             Some("claude".to_string()),
         )
         .unwrap();
-        assert_eq!(options.workspace, PathBuf::from("/tmp/repo"));
+        assert_eq!(options.cwd, resolve_cwd(Some(repo.into_std_path_buf())).unwrap());
         assert_eq!(options.name.as_deref(), Some("fix-tests"));
         assert_eq!(options.agent, "claude");
     }
@@ -2436,7 +2247,7 @@ command = "claude"
         let paths = test_paths();
         let err = resolve_new_session_options(
             &paths,
-            Some(PathBuf::from("/tmp/repo")),
+            None,
             Some("fix tests".to_string()),
             Some("claude".to_string()),
         )
@@ -2551,23 +2362,51 @@ command = "claude"
         assert!(err.to_string().contains("only works inside a managed session"));
     }
 
-    #[test]
-    fn resolve_merge_session_id_uses_environment() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("AGENTD_SESSION_ID", "env-session");
-        }
-        let session_id = resolve_merge_session_id(None).unwrap();
-        assert_eq!(session_id, "env-session");
+    /// Serves one connection on the test socket: reads the client's request
+    /// frame header, then either hangs up (what the Rust v32 daemon does when it
+    /// cannot parse a v33 frame) or replies with the given raw bytes.
+    async fn fake_daemon(paths: &AppPaths, reply: Option<Vec<u8>>) -> tokio::task::JoinHandle<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        paths.ensure_layout().unwrap();
+        let listener = tokio::net::UnixListener::bind(paths.socket.as_std_path()).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = [0_u8; 16];
+            stream.read_exact(&mut header).await.unwrap();
+            if let Some(reply) = reply {
+                stream.write_all(&reply).await.unwrap();
+            }
+        })
     }
 
-    #[test]
-    fn daemon_command_error_for_accept_does_not_mention_pty() {
-        let err = bail_daemon_command("agentd is unavailable", "agent merge").unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "agentd is unavailable. `agent merge` requires a compatible daemon"
-        );
+    #[tokio::test]
+    async fn cli_refuses_v32_daemon_that_hangs_up() {
+        let paths = test_paths();
+        let server = fake_daemon(&paths, None).await;
+        let err = format!("{:#}", ensure_compatible_daemon(&paths).await.unwrap_err());
+        server.await.unwrap();
+        assert!(err.contains("does not speak agent protocol 33"), "{err}");
+        assert!(err.contains("agent daemon upgrade"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn cli_refuses_daemon_reporting_old_protocol() {
+        // A v32-framed DaemonInfo response: the frame version alone is rejected.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&0x4147_4450_u32.to_le_bytes());
+        frame.extend_from_slice(&32_u16.to_le_bytes());
+        frame.extend_from_slice(&101_u16.to_le_bytes());
+        frame.extend_from_slice(&[0, 0, 0, 0]);
+        let payload = [5, 0, 0, 0, b'0', b'.', b'1', b'.', b'0', 32, 0];
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&payload);
+
+        let paths = test_paths();
+        let server = fake_daemon(&paths, Some(frame)).await;
+        let err = format!("{:#}", ensure_compatible_daemon(&paths).await.unwrap_err());
+        server.await.unwrap();
+        assert!(err.contains("unsupported protocol version `32`"), "{err}");
+        assert!(err.contains("does not speak agent protocol 33"), "{err}");
     }
 
     #[test]
@@ -2719,9 +2558,9 @@ command = "claude"
     #[test]
     fn adjacent_session_selection_wraps_in_both_directions() {
         let sessions = vec![
-            demo_session("needs-input", SessionStatus::Running, false, 1, AttentionLevel::Action),
-            demo_session("running", SessionStatus::Running, true, 2, AttentionLevel::Info),
-            demo_session("idle", SessionStatus::Running, false, 3, AttentionLevel::Info),
+            demo_session("needs-input", SessionStatus::Running, 1, AttentionLevel::Action),
+            demo_session("running", SessionStatus::Running, 2, AttentionLevel::Info),
+            demo_session("idle", SessionStatus::Running, 3, AttentionLevel::Info),
         ];
         let sessions = runtime::ordered_sessions(&sessions);
 
@@ -2746,8 +2585,8 @@ command = "claude"
     #[test]
     fn adjacent_session_selection_ignores_non_live_sessions() {
         let sessions = vec![
-            demo_session("current", SessionStatus::Running, false, 1, AttentionLevel::Info),
-            demo_session("finished", SessionStatus::Exited, false, 4, AttentionLevel::Info),
+            demo_session("current", SessionStatus::Running, 1, AttentionLevel::Info),
+            demo_session("finished", SessionStatus::Exited, 4, AttentionLevel::Info),
         ]
         .into_iter()
         .filter(runtime::session_accepts_attach)
@@ -2763,9 +2602,9 @@ command = "claude"
     #[test]
     fn adjacent_session_selection_uses_switcher_order() {
         let sessions = vec![
-            demo_session("running", SessionStatus::Running, false, 1, AttentionLevel::Info),
-            demo_session("pending", SessionStatus::Running, true, 2, AttentionLevel::Info),
-            demo_session("needs-input", SessionStatus::Running, false, 3, AttentionLevel::Action),
+            demo_session("running", SessionStatus::Running, 1, AttentionLevel::Info),
+            demo_session("pending", SessionStatus::Running, 2, AttentionLevel::Info),
+            demo_session("needs-input", SessionStatus::Running, 3, AttentionLevel::Action),
         ];
         let sessions = sessions
             .into_iter()
@@ -2783,154 +2622,54 @@ command = "claude"
         );
     }
 
+    fn end_summary(
+        status: SessionStatus,
+        exit_code: Option<i32>,
+        error: Option<&str>,
+    ) -> SessionEndSummary {
+        SessionEndSummary {
+            session_id: "demo".to_string(),
+            status,
+            exit_code,
+            error: error.map(str::to_string),
+        }
+    }
+
     #[test]
     fn format_session_end_summary_reports_exit_code() {
-        let summary = SessionEndSummary {
-            session_id: "demo".to_string(),
-            status: SessionStatus::Exited,
-            apply_state: ApplyState::Idle,
-            has_commits: false,
-            branch: "agent/demo".to_string(),
-            worktree: "/tmp/demo".to_string(),
-            exit_code: Some(7),
-            error: None,
-        };
-
+        let summary = end_summary(SessionStatus::Exited, Some(7), None);
         assert_eq!(format_session_end_summary(&summary), "session demo finished (exit 7)");
     }
 
     #[test]
-    fn format_session_end_summary_reports_error() {
-        let summary = SessionEndSummary {
-            session_id: "demo".to_string(),
-            status: SessionStatus::Failed,
-            apply_state: ApplyState::Idle,
-            has_commits: false,
-            branch: "agent/demo".to_string(),
-            worktree: "/tmp/demo".to_string(),
-            exit_code: None,
-            error: Some("boom".to_string()),
-        };
+    fn format_session_end_summary_reports_finish_without_exit_code() {
+        let summary = end_summary(SessionStatus::Exited, None, None);
+        assert_eq!(format_session_end_summary(&summary), "session demo finished");
+    }
 
+    #[test]
+    fn format_session_end_summary_reports_error() {
+        let summary = end_summary(SessionStatus::Failed, None, Some("boom"));
         assert_eq!(format_session_end_summary(&summary), "session demo failed: boom");
     }
 
     #[test]
     fn format_session_end_summary_reports_failure_message() {
-        let summary = SessionEndSummary {
-            session_id: "demo".to_string(),
-            status: SessionStatus::Failed,
-            apply_state: ApplyState::Idle,
-            has_commits: false,
-            branch: "agent/demo".to_string(),
-            worktree: "/tmp/worktree".to_string(),
-            exit_code: Some(1),
-            error: Some("spawn failed".to_string()),
-        };
+        let summary = end_summary(SessionStatus::Failed, Some(1), Some("spawn failed"));
         assert_eq!(format_session_end_summary(&summary), "session demo failed: spawn failed");
     }
 
     #[test]
-    fn format_session_end_summary_reports_merge_actions() {
-        let summary = SessionEndSummary {
-            session_id: "demo".to_string(),
-            status: SessionStatus::Exited,
-            apply_state: ApplyState::Idle,
-            has_commits: true,
-            branch: "agent/demo".to_string(),
-            worktree: "/tmp/worktree".to_string(),
-            exit_code: Some(0),
-            error: None,
-        };
-        assert!(format_session_end_summary(&summary).contains("agent merge demo"));
-    }
-
-    #[test]
-    fn format_session_end_summary_reports_merged_sessions() {
-        let summary = SessionEndSummary {
-            session_id: "demo".to_string(),
-            status: SessionStatus::Exited,
-            apply_state: ApplyState::Applied,
-            has_commits: false,
-            branch: "agent/demo".to_string(),
-            worktree: "/tmp/worktree".to_string(),
-            exit_code: Some(0),
-            error: None,
-        };
-        assert!(format_session_end_summary(&summary).contains("merged"));
-    }
-
-    #[test]
-    fn format_merge_progress_reports_session_and_base_branch() {
-        let session = demo_session("demo", SessionStatus::Exited, false, 1, AttentionLevel::Info);
-        assert_eq!(format_merge_progress(&session), "⟳ Merging demo → main...");
-    }
-
-    #[test]
-    fn format_merge_result_reports_merge_summary_and_branches() {
-        let mut session =
-            demo_session("demo", SessionStatus::Exited, false, 1, AttentionLevel::Info);
-        session.apply_state = ApplyState::Applied;
-        session.attention_summary = Some("changes merged into main".to_string());
-
-        assert_eq!(
-            format_merge_result(&session).as_deref(),
-            Some(
-                "✔ Merge complete\n  changes merged into main\n  Target branch: main\n  Source branch: agent/demo"
-            )
-        );
-    }
-
-    #[test]
-    fn format_merge_result_reports_noop_merge_summary() {
-        let mut session =
-            demo_session("demo", SessionStatus::Exited, false, 1, AttentionLevel::Info);
-        session.apply_state = ApplyState::Applied;
-        session.attention_summary = Some("changes already present on base branch".to_string());
-
-        assert_eq!(
-            format_merge_result(&session).as_deref(),
-            Some(
-                "✔ Merge complete\n  changes already present on base branch\n  Target branch: main\n  Source branch: agent/demo"
-            )
-        );
-    }
-
-    #[test]
-    fn format_merge_result_falls_back_without_attention_summary() {
-        let mut session =
-            demo_session("demo", SessionStatus::Exited, false, 1, AttentionLevel::Info);
-        session.apply_state = ApplyState::Applied;
-
-        assert_eq!(format_merge_result(&session), None);
-    }
-
-    #[test]
-    fn diff_colorization_is_disabled_without_terminal() {
-        assert!(!should_colorize_diff_output(false, None));
-    }
-
-    #[test]
-    fn diff_colorization_respects_no_color() {
-        assert!(!should_colorize_diff_output(true, Some(OsString::from("1"))));
-    }
-
-    #[test]
-    fn render_diff_text_keeps_plain_output_without_color() {
-        let diff = "@@ -1 +1 @@\n-old\n+new\n";
-        assert_eq!(render_diff_text(diff, false), diff);
-    }
-
-    #[test]
-    fn render_diff_text_adds_ansi_when_enabled() {
-        let rendered = render_diff_text("@@ -1 +1 @@\n-old\n+new\n", true);
-        assert!(rendered.contains("\u{1b}["));
+    fn format_session_end_summary_does_not_mention_git() {
+        let summary = end_summary(SessionStatus::Exited, Some(0), None);
+        let text = format_session_end_summary(&summary);
+        assert!(!text.contains("merge"), "{text}");
+        assert!(!text.contains("branch"), "{text}");
     }
 
     fn demo_session(
         session_id: &str,
         status: SessionStatus,
-        has_pending_changes: bool,
         updated_minutes_ago: i64,
         attention: AttentionLevel,
     ) -> SessionRecord {
@@ -2940,19 +2679,8 @@ command = "claude"
             agent: "codex".to_string(),
             model: Some("gpt-5.4".to_string()),
             mode: SessionMode::Execute,
-            workspace: "/tmp/workspace".to_string(),
-            repo_path: "/tmp/workspace".to_string(),
-            repo_name: "workspace".to_string(),
-            base_branch: "main".to_string(),
-            branch: format!("agent/{session_id}"),
-            worktree: format!("/tmp/{session_id}"),
+            cwd: format!("/tmp/{session_id}"),
             status,
-            integration_policy: IntegrationPolicy::ManualReview,
-            apply_state: ApplyState::Idle,
-            dirty_count: if has_pending_changes { 1 } else { 0 },
-            ahead_count: if has_pending_changes { 1 } else { 0 },
-            has_commits: has_pending_changes,
-            has_pending_changes,
             worker_pid: Some(123),
             agent_pid: Some(456),
             exit_code: None,
@@ -2976,7 +2704,6 @@ command = "claude"
             config: root.join("config.toml"),
             logs_dir: root.join("logs"),
             sessions_dir: root.join("sessions"),
-            worktrees_dir: root.join("worktrees"),
             root,
         }
     }

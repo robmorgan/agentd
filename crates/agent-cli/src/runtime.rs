@@ -5,7 +5,7 @@ use crossterm::{
     cursor::{MoveToColumn, MoveUp},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{self, Clear, ClearType},
 };
 use ratatui::{
     Frame, Terminal,
@@ -20,19 +20,15 @@ use agentd_shared::{
     header::agentd_header,
     paths::AppPaths,
     protocol::{Request, Response},
-    session::{
-        ApplyState, AttentionLevel, IntegrationPolicy, SESSION_NAME_RULES, SessionMode,
-        SessionRecord, SessionStatus, validate_session_name,
-    },
+    session::{SESSION_NAME_RULES, SessionRecord, SessionStatus, validate_session_name},
 };
 
 use crate::{
     CODEX_MODELS, RawModeGuard, StatusString, centered_rect, daemon_get_session,
     daemon_list_sessions, kill_session, send_request,
     session_display::{
-        RunState, build_session_display_row, render_count_text, render_run_icon,
-        session_elapsed_label, session_run_state, style_age, style_ahead, style_branch,
-        style_dirty, style_name, style_run,
+        RunState, build_session_display_row, render_run_icon, session_elapsed_label,
+        session_run_state, style_age, style_cwd, style_name, style_run,
     },
 };
 
@@ -40,8 +36,7 @@ use crate::{
 enum Command {
     SessionSwitcher,
     NewSession,
-    GitStatus,
-    Diff,
+    SessionDetails,
     StopSession,
 }
 
@@ -50,8 +45,7 @@ enum OverlayMode {
     Palette,
     SessionSwitcher,
     NewSession { edit_agent: bool },
-    GitStatus,
-    Diff,
+    SessionDetails,
     StopConfirm,
 }
 
@@ -72,12 +66,7 @@ const HOST_PICKER_QUERY_BG: &str = "\x1b[48;2;62;63;71m";
 const HOST_PICKER_PLACEHOLDER_FG: &str = "\x1b[38;2;151;152;153m";
 const HOST_PICKER_TEXT_FG: &str = "\x1b[38;2;255;255;255m";
 const HOST_PICKER_STATUS_RED_FG: &str = "\x1b[31m";
-const HOST_PICKER_STATUS_BLUE_FG: &str = "\x1b[35m";
 const HOST_PICKER_STATUS_GREEN_FG: &str = "\x1b[32m";
-const HOST_PICKER_DIFF_HEADER_STYLE: &str = "\x1b[38;2;153;214;255m\x1b[1m";
-const HOST_PICKER_DIFF_HUNK_STYLE: &str = "\x1b[38;2;242;201;76m\x1b[1m";
-const HOST_PICKER_DIFF_ADD_STYLE: &str = "\x1b[38;2;111;207;151m";
-const HOST_PICKER_DIFF_REMOVE_STYLE: &str = "\x1b[38;2;255;107;107m";
 const HOST_PICKER_SELECTED_STYLE: &str = "\x1b[34m";
 const HOST_PICKER_LEGEND_TEXT_STYLE: &str = "\x1b[90m";
 const HOST_PICKER_CURSOR: &str = "█";
@@ -87,41 +76,31 @@ const HOST_PICKER_ENTER_SEQUENCE: &[u8] = b"\x1b[?25l";
 const HOST_PICKER_EXIT_SEQUENCE: &[u8] = b"\x1b[?25h";
 const SESSION_LIST_DEFAULT_WIDTH: usize = 120;
 const SESSION_LIST_RUN_WIDTH: usize = 3;
-const SESSION_LIST_COUNT_WIDTH: usize = 3;
 const SESSION_LIST_AGE_WIDTH: usize = 5;
 const SESSION_LIST_NAME_MIN_WIDTH: usize = 10;
 const SESSION_LIST_NAME_MAX_WIDTH: usize = 26;
 const SESSION_LIST_NAME_FLOOR_WIDTH: usize = 8;
-const SESSION_LIST_BRANCH_MIN_WIDTH: usize = 16;
-const SESSION_LIST_BRANCH_MAX_WIDTH: usize = 40;
-const SESSION_LIST_BRANCH_FLOOR_WIDTH: usize = 10;
-const SESSION_LIST_STRUCTURAL_WIDTH: usize = 12;
-const HOST_PICKER_SESSION_PREFIX_WIDTH: usize = 12;
-const HOST_PICKER_SESSION_STRUCTURAL_WIDTH: usize = 6;
-
-fn default_integration_policy(paths: &AppPaths) -> IntegrationPolicy {
-    let _ = Config::load(paths);
-    IntegrationPolicy::ManualReview
-}
+const SESSION_LIST_CWD_MIN_WIDTH: usize = 16;
+const SESSION_LIST_CWD_MAX_WIDTH: usize = 48;
+const SESSION_LIST_CWD_FLOOR_WIDTH: usize = 10;
+const SESSION_LIST_STRUCTURAL_WIDTH: usize = 8;
+const HOST_PICKER_SESSION_PREFIX_WIDTH: usize = 4;
+const HOST_PICKER_SESSION_STRUCTURAL_WIDTH: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SessionListLayout {
     visible_width: usize,
     run: usize,
-    dirty: usize,
-    ahead: usize,
     age: usize,
     name: usize,
-    branch: usize,
+    cwd: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HostPickerSessionLayout {
-    dirty: usize,
-    ahead: usize,
     age: usize,
     name: usize,
-    branch: usize,
+    cwd: usize,
 }
 
 struct PickerScreenGuard;
@@ -144,25 +123,6 @@ fn write_screen_bytes(bytes: &[u8]) -> Result<()> {
     let mut stdout = std::io::stdout();
     stdout.write_all(bytes).context("failed to write screen bytes")?;
     stdout.flush().context("failed to flush screen bytes")
-}
-
-struct AlternateScreenGuard;
-
-impl AlternateScreenGuard {
-    fn enter() -> Result<Self> {
-        let mut stdout = std::io::stdout();
-        execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
-        stdout.flush().context("failed to flush alternate screen enter")?;
-        Ok(Self)
-    }
-}
-
-impl Drop for AlternateScreenGuard {
-    fn drop(&mut self) {
-        let mut stdout = std::io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen);
-        let _ = stdout.flush();
-    }
 }
 
 fn configured_agent_names(paths: &AppPaths) -> Result<Vec<String>> {
@@ -203,30 +163,16 @@ pub async fn pick_session(paths: &AppPaths) -> Result<Option<String>> {
     picker.refresh_sessions().await?;
     let mut rendered_lines = 0;
     let mut last_lines = Vec::new();
-    let mut diff_screen: Option<AlternateScreenGuard> = None;
     let blink_start = std::time::Instant::now();
 
     loop {
-        if picker.is_diff_view() {
-            if diff_screen.is_none() {
-                clear_host_picker(rendered_lines)?;
-                rendered_lines = 0;
-                last_lines.clear();
-                diff_screen = Some(AlternateScreenGuard::enter()?);
-            }
-            picker.draw_diff_view()?;
-        } else {
-            if diff_screen.take().is_some() {
-                last_lines.clear();
-            }
-            let width = terminal::size().map(|(cols, _)| cols as usize).unwrap_or(80);
-            let cursor_visible =
-                (blink_start.elapsed().as_millis() / HOST_PICKER_CURSOR_BLINK_MS).is_multiple_of(2);
-            let lines = picker.render_lines(width, cursor_visible);
-            if lines != last_lines {
-                rendered_lines = draw_host_picker(&lines, rendered_lines)?;
-                last_lines = lines;
-            }
+        let width = terminal::size().map(|(cols, _)| cols as usize).unwrap_or(80);
+        let cursor_visible =
+            (blink_start.elapsed().as_millis() / HOST_PICKER_CURSOR_BLINK_MS).is_multiple_of(2);
+        let lines = picker.render_lines(width, cursor_visible);
+        if lines != last_lines {
+            rendered_lines = draw_host_picker(&lines, rendered_lines)?;
+            last_lines = lines;
         }
 
         if !event::poll(Duration::from_millis(200)).context("failed to poll picker input")? {
@@ -308,8 +254,6 @@ struct SessionPicker {
     create_agents: Vec<String>,
     composer: PickerComposer,
     mode: PickerMode,
-    detail_text: String,
-    detail_scroll: usize,
     toast: Option<PickerToast>,
 }
 
@@ -324,15 +268,12 @@ enum PickerMode {
     Browse,
     CreateAgentSelect { selected: usize },
     SessionActions { session_id: String, selected: usize },
-    DiffView { session_id: String },
     DeleteConfirm { session_id: String, selected: usize },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionAction {
     Attach,
-    Diff,
-    Merge,
     Delete,
 }
 
@@ -374,8 +315,6 @@ impl SessionPicker {
             create_agents,
             composer: PickerComposer { query: String::new(), selected: 0 },
             mode: PickerMode::Browse,
-            detail_text: String::new(),
-            detail_scroll: 0,
             toast: None,
         }
     }
@@ -397,7 +336,6 @@ impl SessionPicker {
             PickerMode::SessionActions { session_id, selected } => {
                 self.handle_action_menu_key(key, session_id, selected).await
             }
-            PickerMode::DiffView { session_id } => self.handle_diff_view_key(key, session_id).await,
             PickerMode::DeleteConfirm { session_id, selected } => {
                 self.handle_delete_confirm_key(key, session_id, selected).await
             }
@@ -573,39 +511,6 @@ impl SessionPicker {
         Ok(None)
     }
 
-    async fn handle_diff_view_key(
-        &mut self,
-        key: KeyEvent,
-        session_id: String,
-    ) -> Result<Option<Option<String>>> {
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = PickerMode::SessionActions {
-                    session_id: session_id.clone(),
-                    selected: self.action_index(&session_id, SessionAction::Diff),
-                };
-            }
-            KeyCode::Up => {
-                self.detail_scroll = self.detail_scroll.saturating_sub(1);
-            }
-            KeyCode::Down => {
-                self.detail_scroll = self.detail_scroll.saturating_add(1);
-            }
-            KeyCode::PageUp => {
-                self.detail_scroll = self.detail_scroll.saturating_sub(10);
-            }
-            KeyCode::PageDown => {
-                self.detail_scroll = self.detail_scroll.saturating_add(10);
-            }
-            _ => {}
-        }
-        Ok(None)
-    }
-
-    fn is_diff_view(&self) -> bool {
-        matches!(self.mode, PickerMode::DiffView { .. })
-    }
-
     fn render_lines(&self, width: usize, cursor_visible: bool) -> Vec<String> {
         let mut lines = vec![render_host_picker_title_line(width), String::new()];
         lines.extend(self.render_header_lines(width, cursor_visible));
@@ -671,7 +576,6 @@ impl SessionPicker {
             PickerMode::SessionActions { session_id, selected } => {
                 self.render_session_action_lines(width, session_id, *selected)
             }
-            PickerMode::DiffView { session_id } => self.render_diff_lines(width, session_id),
             PickerMode::DeleteConfirm { session_id, selected } => {
                 self.render_delete_confirm_lines(width, session_id, *selected)
             }
@@ -687,7 +591,7 @@ impl SessionPicker {
         let mut lines = vec![style_host_picker_background_row(width)];
         let heading = self
             .session_by_id(session_id)
-            .map(|session| format!("{}  {}", session.session_id, session.branch))
+            .map(|session| format!("{}  {}", session.session_id, session.agent))
             .unwrap_or_else(|| session_id.to_string());
         lines.push(style_host_picker_menu_line(
             &fit_host_picker_line(heading, width),
@@ -696,7 +600,7 @@ impl SessionPicker {
         ));
         if let Some(session) = self.session_by_id(session_id) {
             lines.push(style_host_picker_menu_line(
-                &fit_host_picker_line(session.worktree.clone(), width),
+                &fit_host_picker_line(session.cwd.clone(), width),
                 width,
                 false,
             ));
@@ -754,13 +658,13 @@ impl SessionPicker {
         let mut lines = vec![style_host_picker_background_row(width)];
         if let Some(session) = self.session_by_id(session_id) {
             lines.push(style_host_picker_menu_line(
-                &fit_host_picker_line(session.worktree.clone(), width),
+                &fit_host_picker_line(session.cwd.clone(), width),
                 width,
                 false,
             ));
         }
         lines.push(style_host_picker_menu_line(
-            &format!("Delete {session_id} and remove its worktree?"),
+            &format!("Delete {session_id}? Its working directory is kept."),
             width,
             false,
         ));
@@ -782,69 +686,6 @@ impl SessionPicker {
         ));
         lines.push(String::new());
         lines
-    }
-
-    fn render_diff_lines(&self, width: usize, session_id: &str) -> Vec<String> {
-        let mut lines = vec![style_host_picker_background_row(width)];
-        let title = self
-            .session_by_id(session_id)
-            .map(|session| format!("Diff: {}  {}", session.session_id, session.branch))
-            .unwrap_or_else(|| format!("Diff: {session_id}"));
-        lines.push(style_host_picker_menu_line(&fit_host_picker_line(title, width), width, false));
-        if let Some(session) = self.session_by_id(session_id) {
-            lines.push(style_host_picker_menu_line(
-                &fit_host_picker_line(session.worktree.clone(), width),
-                width,
-                false,
-            ));
-        }
-        let max_lines = 12usize;
-        let detail_lines = self.detail_text.lines().collect::<Vec<_>>();
-        let start = self.detail_scroll.min(detail_lines.len().saturating_sub(1));
-        for line in detail_lines.into_iter().skip(start).take(max_lines) {
-            lines.push(style_host_picker_diff_line(line, width));
-        }
-        if self.detail_text.is_empty() {
-            lines.push(fit_host_picker_line("No diff available.".to_string(), width));
-        }
-        lines.push(style_host_picker_background_row(width));
-        lines.push(fit_host_picker_line("Up/Down scroll. Esc goes back.".to_string(), width));
-        lines.push(String::new());
-        lines
-    }
-
-    fn draw_diff_view(&self) -> Result<()> {
-        let (title, subtitle) = self.diff_view_metadata();
-        let backend = CrosstermBackend::new(std::io::stdout());
-        let mut terminal = Terminal::new(backend).context("failed to initialize diff viewer")?;
-        terminal.draw(|frame| {
-            render_fullscreen_diff_view(
-                frame,
-                frame.area(),
-                &title,
-                &subtitle,
-                &self.detail_text,
-                self.detail_scroll as u16,
-            );
-        })?;
-        Ok(())
-    }
-
-    fn diff_view_metadata(&self) -> (String, String) {
-        let session_id = match &self.mode {
-            PickerMode::DiffView { session_id } => Some(session_id.as_str()),
-            _ => None,
-        };
-        let title = session_id
-            .and_then(|id| self.session_by_id(id))
-            .map(|session| format!("Diff: {}  {}", session.session_id, session.branch))
-            .or_else(|| session_id.map(|id| format!("Diff: {id}")))
-            .unwrap_or_else(|| "Diff".to_string());
-        let subtitle = session_id
-            .and_then(|id| self.session_by_id(id))
-            .map(|session| session.worktree.clone())
-            .unwrap_or_default();
-        (title, subtitle)
     }
 
     fn filtered_sessions(&self) -> Vec<&SessionRecord> {
@@ -890,13 +731,6 @@ impl SessionPicker {
                     PickerMode::Browse
                 } else {
                     PickerMode::SessionActions { session_id, selected: selected.min(len - 1) }
-                }
-            }
-            PickerMode::DiffView { session_id } => {
-                if self.session_by_id(&session_id).is_none() {
-                    PickerMode::Browse
-                } else {
-                    PickerMode::DiffView { session_id }
                 }
             }
             PickerMode::DeleteConfirm { session_id, selected } => {
@@ -964,10 +798,6 @@ impl SessionPicker {
         if session_accepts_attach(session) {
             actions.push(SessionAction::Attach);
         }
-        actions.push(SessionAction::Diff);
-        if session.has_commits {
-            actions.push(SessionAction::Merge);
-        }
         actions.push(SessionAction::Delete);
         actions
     }
@@ -1007,16 +837,6 @@ impl SessionPicker {
     ) -> Result<Option<Option<String>>> {
         match action {
             SessionAction::Attach => Ok(Some(Some(session_id))),
-            SessionAction::Diff => {
-                self.load_diff(&session_id).await?;
-                self.mode = PickerMode::DiffView { session_id };
-                Ok(None)
-            }
-            SessionAction::Merge => {
-                self.apply_session(&session_id).await?;
-                self.mode = PickerMode::Browse;
-                Ok(None)
-            }
             SessionAction::Delete => {
                 self.open_delete_confirmation(&session_id, 1);
                 Ok(None)
@@ -1031,15 +851,14 @@ impl SessionPicker {
                 Some(PickerToast::error(format!("invalid session name: {SESSION_NAME_RULES}")));
             return Ok(None);
         }
-        let workspace = std::env::current_dir().context("failed to determine current directory")?;
+        let cwd = crate::resolve_cwd(None)?;
         let response = send_request(
             &self.paths,
             &Request::CreateSession {
-                workspace: workspace.to_string_lossy().to_string(),
+                cwd,
                 name,
                 agent: agent.to_string(),
                 model: if agent == "codex" { Some(CODEX_MODELS[0].to_string()) } else { None },
-                integration_policy: default_integration_policy(&self.paths),
             },
         )
         .await?;
@@ -1048,27 +867,6 @@ impl SessionPicker {
             Response::Error { message } => {
                 self.toast = Some(PickerToast::error(message));
                 Ok(None)
-            }
-            other => bail!("unexpected response: {:?}", other),
-        }
-    }
-
-    async fn apply_session(&mut self, session_id: &str) -> Result<()> {
-        let response = send_request(
-            &self.paths,
-            &Request::ApplySession { session_id: session_id.to_string() },
-        )
-        .await?;
-        match response {
-            Response::Session { session } => {
-                self.refresh_sessions().await?;
-                self.toast = Some(PickerToast::notice(format!("merged {}", session.session_id)));
-                Ok(())
-            }
-            Response::Error { message } => {
-                self.toast =
-                    Some(PickerToast::error(format_merge_failure_toast(session_id, &message)));
-                Ok(())
             }
             other => bail!("unexpected response: {:?}", other),
         }
@@ -1090,24 +888,6 @@ impl SessionPicker {
                 Ok(())
             }
             Response::Error { message } => bail!(message),
-            other => bail!("unexpected response: {:?}", other),
-        }
-    }
-
-    async fn load_diff(&mut self, session_id: &str) -> Result<()> {
-        let response =
-            send_request(&self.paths, &Request::DiffSession { session_id: session_id.to_string() })
-                .await?;
-        match response {
-            Response::Diff { diff } => {
-                self.detail_text = diff.diff;
-                self.detail_scroll = 0;
-                Ok(())
-            }
-            Response::Error { message } => {
-                self.toast = Some(PickerToast::error(message));
-                Ok(())
-            }
             other => bail!("unexpected response: {:?}", other),
         }
     }
@@ -1145,13 +925,6 @@ fn sanitize_picker_message(message: &str) -> String {
     message.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn format_merge_failure_toast(session_id: &str, message: &str) -> String {
-    format!(
-        "{} Exit the tui and run `agent merge {session_id}` for detailed instructions.",
-        sanitize_picker_message(message)
-    )
-}
-
 fn render_host_picker_toast_line(toast: &PickerToast, width: usize) -> String {
     let prefix = match toast.kind {
         PickerToastKind::Notice => "notice",
@@ -1174,11 +947,7 @@ fn render_host_picker_title_line(_width: usize) -> String {
 fn render_host_picker_create_row(label: &str, width: usize, selected: bool) -> String {
     let max_chars = width.saturating_sub(1).max(1);
     let leader = if selected { "› ".to_string() } else { "  ".to_string() };
-    let prefix = format!(
-        "{leader}+ {} {} ",
-        format_session_list_cell("-", SESSION_LIST_COUNT_WIDTH),
-        format_session_list_cell("-", SESSION_LIST_COUNT_WIDTH),
-    );
+    let prefix = format!("{leader}+ ");
     let remaining = max_chars.saturating_sub(prefix.chars().count());
     let visible_tail = truncate_session_list_cell(label, remaining);
     let tail_style = if selected { HOST_PICKER_SELECTED_STYLE } else { "" };
@@ -1192,23 +961,19 @@ fn render_session_list_header_row(layout: SessionListLayout) -> String {
 fn render_session_list_row(session: &SessionRecord, layout: SessionListLayout) -> String {
     let row = build_session_display_row(session);
     let run = render_session_list_run_cell(&row, layout.run);
-    let dirty = render_session_list_dirty_cell(&row, layout.dirty);
-    let ahead = render_session_list_ahead_cell(&row, layout.ahead);
     let age = style_age(&format_session_list_cell(&row.age_text, layout.age));
     let name = style_name(&format_session_list_cell(&row.name, layout.name));
-    let branch = style_branch(&format_session_list_cell(&row.branch, layout.branch));
-    format!("  {run}  {dirty}  {ahead}  {age}  {name}  {branch}")
+    let cwd = style_cwd(&format_path_cell(&row.cwd, layout.cwd));
+    format!("  {run}  {age}  {name}  {cwd}")
 }
 
 fn render_session_list_header_content(layout: SessionListLayout) -> String {
     format!(
-        "  {}  {}  {}  {}  {}  {}",
+        "  {}  {}  {}  {}",
         format_session_list_cell("RUN", layout.run),
-        format_session_list_cell("Δ", layout.dirty),
-        format_session_list_cell("↑", layout.ahead),
         format_session_list_cell("AGE", layout.age),
         format_session_list_cell("NAME", layout.name),
-        format_session_list_cell("BRANCH", layout.branch),
+        format_session_list_cell("CWD", layout.cwd),
     )
 }
 
@@ -1217,26 +982,6 @@ fn render_session_list_run_cell(
     width: usize,
 ) -> String {
     style_run(&format_session_list_cell(render_run_icon(row.run_state), width), row.run_state)
-}
-
-fn render_session_list_dirty_cell(
-    row: &crate::session_display::SessionDisplayRow,
-    width: usize,
-) -> String {
-    style_dirty(
-        &format_session_list_cell(&render_count_text(row.dirty_count), width),
-        row.dirty_count,
-    )
-}
-
-fn render_session_list_ahead_cell(
-    row: &crate::session_display::SessionDisplayRow,
-    width: usize,
-) -> String {
-    style_ahead(
-        &format_session_list_cell(&render_count_text(row.ahead_count), width),
-        row.ahead_count,
-    )
 }
 
 fn style_host_picker_content_row(content: &str, visible_width: usize) -> String {
@@ -1249,23 +994,21 @@ fn session_list_layout(width: usize) -> SessionListLayout {
     let mut layout = SessionListLayout {
         visible_width,
         run: SESSION_LIST_RUN_WIDTH,
-        dirty: SESSION_LIST_COUNT_WIDTH,
-        ahead: SESSION_LIST_COUNT_WIDTH,
         age: SESSION_LIST_AGE_WIDTH,
         name: SESSION_LIST_NAME_MIN_WIDTH,
-        branch: SESSION_LIST_BRANCH_MIN_WIDTH,
+        cwd: SESSION_LIST_CWD_MIN_WIDTH,
     };
     let min_total = session_list_total_width(layout);
     if visible_width >= min_total {
         let mut remaining = visible_width - min_total;
-        grow_session_list_column(&mut layout.branch, SESSION_LIST_BRANCH_MAX_WIDTH, &mut remaining);
+        grow_session_list_column(&mut layout.cwd, SESSION_LIST_CWD_MAX_WIDTH, &mut remaining);
         grow_session_list_column(&mut layout.name, SESSION_LIST_NAME_MAX_WIDTH, &mut remaining);
         return layout;
     }
 
     let mut deficit = min_total - visible_width;
     shrink_session_list_column(&mut layout.name, SESSION_LIST_NAME_FLOOR_WIDTH, &mut deficit);
-    shrink_session_list_column(&mut layout.branch, SESSION_LIST_BRANCH_FLOOR_WIDTH, &mut deficit);
+    shrink_session_list_column(&mut layout.cwd, SESSION_LIST_CWD_FLOOR_WIDTH, &mut deficit);
     layout
 }
 
@@ -1274,13 +1017,7 @@ fn session_list_visible_width(width: usize) -> usize {
 }
 
 fn session_list_total_width(layout: SessionListLayout) -> usize {
-    SESSION_LIST_STRUCTURAL_WIDTH
-        + layout.run
-        + layout.dirty
-        + layout.ahead
-        + layout.age
-        + layout.name
-        + layout.branch
+    SESSION_LIST_STRUCTURAL_WIDTH + layout.run + layout.age + layout.name + layout.cwd
 }
 
 fn grow_session_list_column(width: &mut usize, max_width: usize, remaining: &mut usize) {
@@ -1299,37 +1036,45 @@ fn host_picker_session_layout(width: usize) -> HostPickerSessionLayout {
     let body_width =
         width.saturating_sub(1).max(1).saturating_sub(HOST_PICKER_SESSION_PREFIX_WIDTH);
     let mut layout = HostPickerSessionLayout {
-        dirty: SESSION_LIST_COUNT_WIDTH,
-        ahead: SESSION_LIST_COUNT_WIDTH,
         age: SESSION_LIST_AGE_WIDTH,
         name: SESSION_LIST_NAME_MIN_WIDTH,
-        branch: SESSION_LIST_BRANCH_MIN_WIDTH,
+        cwd: SESSION_LIST_CWD_MIN_WIDTH,
     };
     let min_total = host_picker_session_total_width(layout);
     if body_width >= min_total {
         let mut remaining = body_width - min_total;
-        grow_session_list_column(&mut layout.branch, SESSION_LIST_BRANCH_MAX_WIDTH, &mut remaining);
+        grow_session_list_column(&mut layout.cwd, SESSION_LIST_CWD_MAX_WIDTH, &mut remaining);
         grow_session_list_column(&mut layout.name, SESSION_LIST_NAME_MAX_WIDTH, &mut remaining);
         return layout;
     }
 
     let mut deficit = min_total - body_width;
     shrink_session_list_column(&mut layout.name, SESSION_LIST_NAME_FLOOR_WIDTH, &mut deficit);
-    shrink_session_list_column(&mut layout.branch, SESSION_LIST_BRANCH_FLOOR_WIDTH, &mut deficit);
+    shrink_session_list_column(&mut layout.cwd, SESSION_LIST_CWD_FLOOR_WIDTH, &mut deficit);
     layout
 }
 
 fn host_picker_session_total_width(layout: HostPickerSessionLayout) -> usize {
-    HOST_PICKER_SESSION_STRUCTURAL_WIDTH
-        + layout.dirty
-        + layout.ahead
-        + layout.age
-        + layout.name
-        + layout.branch
+    HOST_PICKER_SESSION_STRUCTURAL_WIDTH + layout.age + layout.name + layout.cwd
 }
 
 fn format_session_list_cell(content: &str, width: usize) -> String {
     let truncated = truncate_session_list_cell(content, width);
+    format!("{truncated:<width$}")
+}
+
+/// Like `format_session_list_cell`, but truncates from the left so the end of
+/// a path (usually the most specific part) stays visible.
+fn format_path_cell(content: &str, width: usize) -> String {
+    let char_count = content.chars().count();
+    let truncated = if char_count <= width {
+        content.to_string()
+    } else if width <= 3 {
+        content.chars().skip(char_count - width).collect()
+    } else {
+        let tail = content.chars().skip(char_count - (width - 3)).collect::<String>();
+        format!("...{tail}")
+    };
     format!("{truncated:<width$}")
 }
 
@@ -1355,25 +1100,6 @@ fn style_host_picker_menu_line(content: &str, width: usize, selected: bool) -> S
     let padding = max_chars.saturating_sub(visible_len);
     let style = if selected { HOST_PICKER_SELECTED_STYLE } else { "" };
     format!("{HOST_PICKER_QUERY_BG}{style}{visible}{}{ANSI_RESET}", " ".repeat(padding))
-}
-
-fn style_host_picker_diff_line(content: &str, width: usize) -> String {
-    let visible = fit_host_picker_line(content.to_string(), width);
-    let style = if visible.starts_with("diff --git")
-        || visible.starts_with("--- ")
-        || visible.starts_with("+++ ")
-    {
-        HOST_PICKER_DIFF_HEADER_STYLE
-    } else if visible.starts_with("@@") {
-        HOST_PICKER_DIFF_HUNK_STYLE
-    } else if visible.starts_with('+') && !visible.starts_with("+++") {
-        HOST_PICKER_DIFF_ADD_STYLE
-    } else if visible.starts_with('-') && !visible.starts_with("---") {
-        HOST_PICKER_DIFF_REMOVE_STYLE
-    } else {
-        ""
-    };
-    if style.is_empty() { visible } else { format!("{style}{visible}{ANSI_RESET}") }
 }
 
 fn style_host_picker_query_line(query: &str, width: usize, cursor_visible: bool) -> String {
@@ -1411,8 +1137,6 @@ impl SessionAction {
     fn label(self) -> &'static str {
         match self {
             Self::Attach => "attach",
-            Self::Diff => "diff",
-            Self::Merge => "merge",
             Self::Delete => "delete",
         }
     }
@@ -1431,7 +1155,6 @@ pub struct AttachOverlay {
     agent_input: String,
     detail_text: String,
     detail_scroll: u16,
-    diff_screen_active: bool,
     toast: Option<String>,
 }
 
@@ -1450,7 +1173,6 @@ impl AttachOverlay {
             agent_input: "codex".to_string(),
             detail_text: String::new(),
             detail_scroll: 0,
-            diff_screen_active: false,
             toast: None,
         }
     }
@@ -1478,7 +1200,6 @@ impl AttachOverlay {
     }
 
     pub fn draw(&mut self) -> Result<()> {
-        self.sync_diff_screen()?;
         let backend = CrosstermBackend::new(std::io::stdout());
         let mut terminal = Terminal::new(backend).context("failed to initialize overlay")?;
         terminal.draw(|frame| self.render(frame))?;
@@ -1495,10 +1216,7 @@ impl AttachOverlay {
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<Option<OverlayOutcome>> {
         if matches!(key.code, KeyCode::Esc)
-            && !matches!(
-                self.mode,
-                OverlayMode::GitStatus | OverlayMode::Diff | OverlayMode::Palette
-            )
+            && !matches!(self.mode, OverlayMode::SessionDetails | OverlayMode::Palette)
         {
             self.mode = OverlayMode::Palette;
             return Ok(None);
@@ -1510,7 +1228,7 @@ impl AttachOverlay {
             OverlayMode::NewSession { edit_agent } => {
                 self.handle_new_session_key(key, edit_agent).await
             }
-            OverlayMode::GitStatus | OverlayMode::Diff => self.handle_detail_key(key).await,
+            OverlayMode::SessionDetails => self.handle_detail_key(key).await,
             OverlayMode::StopConfirm => self.handle_stop_confirm_key(key).await,
         }
     }
@@ -1620,12 +1338,11 @@ impl AttachOverlay {
                     self.toast = Some(format!("invalid session name: {SESSION_NAME_RULES}"));
                     return Ok(None);
                 }
-                let workspace =
-                    std::env::current_dir().context("failed to determine current directory")?;
+                let cwd = crate::resolve_cwd(None)?;
                 let response = send_request(
                     &self.paths,
                     &Request::CreateSession {
-                        workspace: workspace.to_string_lossy().to_string(),
+                        cwd,
                         name: (!name.is_empty()).then(|| name.to_string()),
                         agent: agent.to_string(),
                         model: if agent == "codex" {
@@ -1633,7 +1350,6 @@ impl AttachOverlay {
                         } else {
                             None
                         },
-                        integration_policy: default_integration_policy(&self.paths),
                     },
                 )
                 .await?;
@@ -1696,39 +1412,17 @@ impl AttachOverlay {
                 self.name_input.clear();
                 self.agent_input = "codex".to_string();
             }
-            Command::GitStatus => {
+            Command::SessionDetails => {
                 let session = daemon_get_session(&self.paths, &self.session_id).await?;
                 self.detail_text = format!(
-                    "repo       {}\nrepo_path   {}\nworktree    {}\nbranch      {}\nbase        {}\ndirty       {}\nahead       {}\ncommits     {}\npending     {}\nstatus      {}",
-                    session.repo_name,
-                    session.repo_path,
-                    session.worktree,
-                    session.branch,
-                    session.base_branch,
-                    session.dirty_count,
-                    session.ahead_count,
-                    if session.has_commits { "yes" } else { "no" },
-                    if session.has_pending_changes { "yes" } else { "no" },
+                    "name       {}\nagent      {}\ncwd        {}\nstatus     {}",
+                    session.session_id,
+                    session.agent,
+                    session.cwd,
                     session_status_text(&session),
                 );
                 self.detail_scroll = 0;
-                self.mode = OverlayMode::GitStatus;
-            }
-            Command::Diff => {
-                let response = send_request(
-                    &self.paths,
-                    &Request::DiffSession { session_id: self.session_id.clone() },
-                )
-                .await?;
-                match response {
-                    Response::Diff { diff } => {
-                        self.detail_text = diff.diff;
-                        self.detail_scroll = 0;
-                        self.mode = OverlayMode::Diff;
-                    }
-                    Response::Error { message } => self.toast = Some(message),
-                    other => bail!("unexpected response: {:?}", other),
-                }
+                self.mode = OverlayMode::SessionDetails;
             }
             Command::StopSession => {
                 self.mode = OverlayMode::StopConfirm;
@@ -1738,32 +1432,13 @@ impl AttachOverlay {
     }
 
     fn render(&self, frame: &mut Frame) {
-        if matches!(self.mode, OverlayMode::Diff) {
-            let session =
-                self.sessions.iter().find(|session| session.session_id == self.session_id);
-            let title = session
-                .map(|session| format!("Diff: {}  {}", session.session_id, session.branch))
-                .unwrap_or_else(|| format!("Diff: {}", self.session_id));
-            let subtitle = session.map(|session| session.worktree.clone()).unwrap_or_default();
-            render_fullscreen_diff_view(
-                frame,
-                frame.area(),
-                &title,
-                &subtitle,
-                &self.detail_text,
-                self.detail_scroll,
-            );
-            return;
-        }
-
         let area = centered_rect(80, 80, frame.area());
         frame.render_widget(WidgetClear, area);
         let title = match self.mode {
             OverlayMode::Palette => "Overlay",
             OverlayMode::SessionSwitcher => "Switch Session",
             OverlayMode::NewSession { .. } => "New Session",
-            OverlayMode::GitStatus => "Session Details",
-            OverlayMode::Diff => "Diff",
+            OverlayMode::SessionDetails => "Session Details",
             OverlayMode::StopConfirm => "Stop Session",
         };
         let block = Block::default().borders(Borders::ALL).title(title);
@@ -1776,24 +1451,9 @@ impl AttachOverlay {
             OverlayMode::NewSession { edit_agent } => {
                 self.render_new_session(frame, inner, edit_agent)
             }
-            OverlayMode::GitStatus | OverlayMode::Diff => self.render_detail(frame, inner),
+            OverlayMode::SessionDetails => self.render_detail(frame, inner),
             OverlayMode::StopConfirm => self.render_stop_confirm(frame, inner),
         }
-    }
-
-    fn sync_diff_screen(&mut self) -> Result<()> {
-        let wants_diff_screen = matches!(self.mode, OverlayMode::Diff);
-        if wants_diff_screen && !self.diff_screen_active {
-            let _guard = AlternateScreenGuard::enter()?;
-            std::mem::forget(_guard);
-            self.diff_screen_active = true;
-        } else if !wants_diff_screen && self.diff_screen_active {
-            let mut stdout = std::io::stdout();
-            execute!(stdout, LeaveAlternateScreen).context("failed to leave alternate screen")?;
-            stdout.flush().context("failed to flush alternate screen leave")?;
-            self.diff_screen_active = false;
-        }
-        Ok(())
     }
 
     fn render_palette(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
@@ -1849,22 +1509,12 @@ impl AttachOverlay {
                 let row = build_session_display_row(session);
                 Line::from(vec![
                     Span::styled(render_run_icon(row.run_state), run_state_style(row.run_state)),
-                    Span::raw(" "),
-                    Span::styled(
-                        render_count_text(row.dirty_count),
-                        dirty_count_style(row.dirty_count),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        render_count_text(row.ahead_count),
-                        ahead_count_style(row.ahead_count),
-                    ),
                     Span::raw("  "),
                     Span::styled(session_elapsed_label(session), subtle_style()),
                     Span::raw("  "),
                     Span::styled(session.session_id.as_str(), name_style),
                     Span::raw("  "),
-                    Span::styled(session.branch.as_str(), subtle_style()),
+                    Span::styled(row.cwd, subtle_style()),
                 ])
             })
             .collect::<Vec<_>>();
@@ -1949,71 +1599,6 @@ impl AttachOverlay {
     }
 }
 
-impl Drop for AttachOverlay {
-    fn drop(&mut self) {
-        if self.diff_screen_active {
-            let mut stdout = std::io::stdout();
-            let _ = execute!(stdout, LeaveAlternateScreen);
-            let _ = stdout.flush();
-        }
-    }
-}
-
-fn render_fullscreen_diff_view(
-    frame: &mut Frame,
-    area: ratatui::layout::Rect,
-    title: &str,
-    subtitle: &str,
-    detail_text: &str,
-    detail_scroll: u16,
-) {
-    let block = Block::default().borders(Borders::ALL).title("Diff");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let chunks = ratatui::layout::Layout::default()
-        .direction(ratatui::layout::Direction::Vertical)
-        .constraints([
-            ratatui::layout::Constraint::Length(1),
-            ratatui::layout::Constraint::Length(1),
-            ratatui::layout::Constraint::Min(1),
-            ratatui::layout::Constraint::Length(1),
-        ])
-        .split(inner);
-
-    frame.render_widget(Paragraph::new(title), chunks[0]);
-    frame.render_widget(Paragraph::new(subtitle).style(subtle_style()), chunks[1]);
-
-    let body = if detail_text.is_empty() {
-        vec![Line::from("No diff available.")]
-    } else {
-        detail_text.lines().map(diff_text_line).collect::<Vec<_>>()
-    };
-    frame.render_widget(Paragraph::new(body).scroll((detail_scroll, 0)), chunks[2]);
-    frame.render_widget(
-        Paragraph::new("Up/Down/PageUp/PageDown scroll. Esc goes back.").style(subtle_style()),
-        chunks[3],
-    );
-}
-
-fn diff_text_line(line: &str) -> Line<'static> {
-    Line::from(Span::styled(line.to_string(), diff_line_style(line)))
-}
-
-fn diff_line_style(line: &str) -> Style {
-    if line.starts_with("diff --git") || line.starts_with("--- ") || line.starts_with("+++ ") {
-        Style::default().fg(Color::Rgb(153, 214, 255)).add_modifier(Modifier::BOLD)
-    } else if line.starts_with("@@") {
-        Style::default().fg(Color::Rgb(242, 201, 76)).add_modifier(Modifier::BOLD)
-    } else if line.starts_with('+') && !line.starts_with("+++") {
-        Style::default().fg(Color::Rgb(111, 207, 151))
-    } else if line.starts_with('-') && !line.starts_with("---") {
-        Style::default().fg(Color::Rgb(255, 107, 107))
-    } else {
-        Style::default()
-    }
-}
-
 fn filtered_palette_items(query: &str) -> Vec<PaletteItem> {
     palette_items()
         .into_iter()
@@ -2044,23 +1629,19 @@ fn palette_items() -> Vec<PaletteItem> {
     vec![
         PaletteItem { key_hint: "s", title: "Switch Session", command: Command::SessionSwitcher },
         PaletteItem { key_hint: "t", title: "New Session", command: Command::NewSession },
-        PaletteItem { key_hint: "g", title: "Session Details", command: Command::GitStatus },
-        PaletteItem { key_hint: "d", title: "Diff", command: Command::Diff },
+        PaletteItem { key_hint: "i", title: "Session Details", command: Command::SessionDetails },
         PaletteItem { key_hint: "x", title: "Stop Session", command: Command::StopSession },
     ]
 }
 
 fn session_search_text(session: &SessionRecord) -> String {
     format!(
-        "{} {} {} {} {} {} {} {}",
+        "{} {} {} {} {}",
         session.session_id,
-        session.repo_name,
-        session.branch,
+        session.agent,
+        session.cwd,
         session.status_string(),
-        session.apply_state.as_str(),
         session.attention_string(),
-        if session.dirty_count > 0 { "dirty" } else { "" },
-        if session.ahead_count > 0 { "ahead" } else { "" },
     )
 }
 
@@ -2073,8 +1654,7 @@ fn session_sort_bucket(session: &SessionRecord) -> u8 {
     match row.run_state {
         RunState::Failed | RunState::Recovered => 2,
         _ if row.needs_attention => 3,
-        RunState::Completed => 4,
-        RunState::Exited => 5,
+        RunState::Exited => 4,
         RunState::Running | RunState::Starting => unreachable!(),
     }
 }
@@ -2087,18 +1667,7 @@ fn session_icon_color(session: &SessionRecord) -> Color {
     match session_run_state(session) {
         RunState::Starting | RunState::Running => Color::Green,
         RunState::Exited | RunState::Recovered => Color::DarkGray,
-        RunState::Completed => Color::Cyan,
         RunState::Failed => Color::Red,
-    }
-}
-
-fn pending_changes_marker(session: &SessionRecord) -> &'static str {
-    if session.dirty_count > 0 {
-        "Δ"
-    } else if session.ahead_count > 0 {
-        "↑"
-    } else {
-        " "
     }
 }
 
@@ -2108,42 +1677,29 @@ fn render_host_picker_session_row(session: &SessionRecord, width: usize, selecte
     let layout = host_picker_session_layout(width);
     let tail_style = if selected { HOST_PICKER_SELECTED_STYLE } else { "" };
     let run = style_run(render_run_icon(row.run_state), row.run_state);
-    let dirty = style_dirty(
-        &format_session_list_cell(&render_count_text(row.dirty_count), layout.dirty),
-        row.dirty_count,
-    );
-    let ahead = style_ahead(
-        &format_session_list_cell(&render_count_text(row.ahead_count), layout.ahead),
-        row.ahead_count,
-    );
     let age = style_age(&format_session_list_cell(&row.age_text, layout.age));
     let name = style_name(&format_session_list_cell(&row.name, layout.name));
-    let branch = style_branch(&format_session_list_cell(&row.branch, layout.branch));
-    format!(
-        "{tail_style}{leader}{ANSI_RESET}{run} {dirty} {ahead} {tail_style}{age} {name} {branch}{ANSI_RESET}",
-    )
+    let cwd = style_cwd(&format_path_cell(&row.cwd, layout.cwd));
+    format!("{tail_style}{leader}{ANSI_RESET}{run} {tail_style}{age} {name} {cwd}{ANSI_RESET}",)
 }
 
 fn render_host_picker_legend_row(width: usize, sessions: &[SessionRecord]) -> String {
     let entries = [
-        demo_legend_entry(SessionStatus::Running, ApplyState::Idle, 0, 0, "running"),
-        demo_legend_entry(SessionStatus::Exited, ApplyState::Idle, 2, 0, "dirty"),
-        demo_legend_entry(SessionStatus::Exited, ApplyState::Idle, 0, 3, "ahead"),
-        demo_legend_entry(SessionStatus::Running, ApplyState::Applied, 0, 0, "completed"),
-        demo_legend_entry(SessionStatus::Failed, ApplyState::Idle, 0, 0, "failed"),
+        (RunState::Running, "running"),
+        (RunState::Exited, "exited"),
+        (RunState::Recovered, "lost"),
+        (RunState::Failed, "failed"),
     ];
     let max_chars = width.saturating_sub(1).max(1);
     let mut line = "  ".to_string();
     let matching_entries = entries
         .into_iter()
-        .filter(|(entry_session, label)| match *label {
-            "dirty" => sessions.iter().any(|session| session.dirty_count > 0),
-            "ahead" => sessions.iter().any(|session| session.ahead_count > 0),
-            _ => sessions
-                .iter()
-                .any(|session| session_run_state(session) == session_run_state(entry_session)),
+        .filter(|(run_state, _)| {
+            sessions.iter().any(|session| session_run_state(session) == *run_state)
         })
-        .map(|(session, label)| legend_entry(&session, label))
+        .map(|(run_state, label)| {
+            (style_run(render_run_icon(run_state), run_state), label.to_string())
+        })
         .collect::<Vec<_>>();
     if matching_entries.is_empty() {
         return String::new();
@@ -2174,57 +1730,6 @@ fn render_host_picker_legend_row(width: usize, sessions: &[SessionRecord]) -> St
     line
 }
 
-fn demo_legend_entry(
-    status: SessionStatus,
-    apply_state: ApplyState,
-    dirty_count: u32,
-    ahead_count: u32,
-    label: &'static str,
-) -> (SessionRecord, &'static str) {
-    (
-        SessionRecord {
-            session_id: String::new(),
-            agent: "codex".to_string(),
-            model: None,
-            mode: SessionMode::Execute,
-            workspace: String::new(),
-            repo_path: String::new(),
-            repo_name: String::new(),
-            base_branch: String::new(),
-            branch: String::new(),
-            worktree: String::new(),
-            status,
-            integration_policy: IntegrationPolicy::AutoApplySafe,
-            apply_state,
-            dirty_count,
-            ahead_count,
-            has_commits: ahead_count > 0,
-            has_pending_changes: dirty_count > 0 || ahead_count > 0,
-            worker_pid: None,
-            agent_pid: None,
-            exit_code: None,
-            error: None,
-            attention: AttentionLevel::Info,
-            attention_summary: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            exited_at: None,
-        },
-        label,
-    )
-}
-
-fn legend_entry(session: &SessionRecord, label: &'static str) -> (String, String) {
-    if label == "dirty" {
-        return (style_dirty("Δ", 1), "dirty".to_string());
-    }
-    if label == "ahead" {
-        return (style_ahead("↑", 1), "ahead".to_string());
-    }
-    let run_state = session_run_state(session);
-    (style_run(render_run_icon(run_state), run_state), label.to_string())
-}
-
 fn session_status_text(session: &SessionRecord) -> String {
     if let Some(summary) = &session.attention_summary {
         return summary.clone();
@@ -2234,8 +1739,10 @@ fn session_status_text(session: &SessionRecord) -> String {
         RunState::Running => "running".to_string(),
         RunState::Failed => session.error.clone().unwrap_or_else(|| "failed".to_string()),
         RunState::Recovered => "daemon lost the live process".to_string(),
-        RunState::Completed => "applied".to_string(),
-        RunState::Exited => "complete".to_string(),
+        RunState::Exited => match session.exit_code {
+            Some(code) => format!("exited ({code})"),
+            None => "exited".to_string(),
+        },
     }
 }
 
@@ -2243,18 +1750,9 @@ fn run_state_style(run_state: RunState) -> Style {
     let color = match run_state {
         RunState::Starting | RunState::Running => Color::Green,
         RunState::Exited | RunState::Recovered => Color::DarkGray,
-        RunState::Completed => Color::Cyan,
         RunState::Failed => Color::Red,
     };
     Style::default().fg(color)
-}
-
-fn dirty_count_style(count: u32) -> Style {
-    if count > 0 { Style::default().fg(Color::Yellow) } else { Style::default() }
-}
-
-fn ahead_count_style(count: u32) -> Style {
-    if count > 0 { Style::default().fg(Color::Magenta) } else { Style::default() }
 }
 
 fn subtle_style() -> Style {
@@ -2272,41 +1770,27 @@ fn matches_query<T: AsRef<str>>(haystack: T, query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANSI_RESET, AttachOverlay, HOST_PICKER_CURSOR, HOST_PICKER_DIFF_ADD_STYLE,
-        HOST_PICKER_DIFF_HEADER_STYLE, HOST_PICKER_DIFF_HUNK_STYLE, HOST_PICKER_DIFF_REMOVE_STYLE,
-        HOST_PICKER_ENTER_SEQUENCE, HOST_PICKER_EXIT_SEQUENCE, HOST_PICKER_LEGEND_TEXT_STYLE,
-        HOST_PICKER_PLACEHOLDER_FG, HOST_PICKER_QUERY_BG, HOST_PICKER_SELECTED_STYLE,
-        HOST_PICKER_STATUS_BLUE_FG, HOST_PICKER_STATUS_GREEN_FG, HOST_PICKER_STATUS_RED_FG,
-        HOST_PICKER_TEXT_FG, OverlayMode, OverlayOutcome, PickerComposer, PickerMode, PickerRow,
-        PickerToast, SessionAction, SessionPicker, configured_agent_names, fit_host_picker_line,
-        format_merge_failure_toast, ordered_create_agents, ordered_sessions,
-        pending_changes_marker, render_host_picker_create_row, render_host_picker_legend_row,
+        ANSI_RESET, AttachOverlay, HOST_PICKER_CURSOR, HOST_PICKER_ENTER_SEQUENCE,
+        HOST_PICKER_EXIT_SEQUENCE, HOST_PICKER_LEGEND_TEXT_STYLE, HOST_PICKER_PLACEHOLDER_FG,
+        HOST_PICKER_QUERY_BG, HOST_PICKER_SELECTED_STYLE, HOST_PICKER_STATUS_GREEN_FG,
+        HOST_PICKER_STATUS_RED_FG, HOST_PICKER_TEXT_FG, OverlayMode, OverlayOutcome,
+        PickerComposer, PickerMode, PickerRow, PickerToast, SessionAction, SessionPicker,
+        configured_agent_names, fit_host_picker_line, format_path_cell, ordered_create_agents,
+        ordered_sessions, render_host_picker_create_row, render_host_picker_legend_row,
         render_host_picker_session_row, render_host_picker_title_line,
         render_host_picker_toast_line, render_session_list_header_content,
         render_session_list_header_row, render_session_list_lines, sanitize_picker_message,
         session_icon, session_icon_color, session_list_layout, style_host_picker_background_row,
-        style_host_picker_diff_line, style_host_picker_query_line,
+        style_host_picker_query_line,
     };
     use agentd_shared::{
         paths::AppPaths,
-        session::{
-            ApplyState, AttentionLevel, IntegrationPolicy, SessionMode, SessionRecord,
-            SessionStatus,
-        },
+        session::{AttentionLevel, SessionMode, SessionRecord, SessionStatus},
     };
     use camino::Utf8PathBuf;
     use chrono::{Duration, Utc};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use futures::executor::block_on;
-
-    #[derive(Clone, Copy)]
-    enum IntegrationState {
-        Clean,
-        Applied,
-        PendingReview,
-        Blocked,
-        Conflicted,
-    }
 
     fn strip_ansi(input: &str) -> String {
         let mut output = String::new();
@@ -2331,7 +1815,7 @@ mod tests {
     #[test]
     fn picker_rows_include_create_and_matching_sessions() {
         let mut picker = SessionPicker::new(test_paths());
-        picker.sessions = vec![demo("alpha", "repo-a"), demo("beta", "repo-b")];
+        picker.sessions = vec![demo("alpha"), demo("beta")];
 
         let rows = picker.picker_rows();
         assert_eq!(rows[2], PickerRow::Create);
@@ -2343,7 +1827,7 @@ mod tests {
     #[test]
     fn query_filter_keeps_create_row() {
         let mut picker = SessionPicker::new(test_paths());
-        picker.sessions = vec![demo("alpha", "repo-a"), demo("beta", "repo-b")];
+        picker.sessions = vec![demo("alpha"), demo("beta")];
         picker.composer = PickerComposer { query: "beta".to_string(), selected: 0 };
 
         let rows = picker.picker_rows();
@@ -2353,7 +1837,7 @@ mod tests {
     #[test]
     fn clamp_selection_caps_to_available_rows() {
         let mut picker = SessionPicker::new(test_paths());
-        picker.sessions = vec![demo("alpha", "repo-a")];
+        picker.sessions = vec![demo("alpha")];
         picker.composer.selected = 8;
 
         picker.clamp_selection();
@@ -2377,7 +1861,7 @@ mod tests {
     #[test]
     fn composer_input_selects_first_matching_session_before_create_row() {
         let mut picker = SessionPicker::new(test_paths());
-        picker.sessions = vec![demo("alpha", "repo-a"), demo("beta", "repo-b")];
+        picker.sessions = vec![demo("alpha"), demo("beta")];
 
         let outcome = block_on(
             picker.handle_composer_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
@@ -2395,7 +1879,7 @@ mod tests {
     #[test]
     fn paste_selects_first_matching_session_before_create_row() {
         let mut picker = SessionPicker::new(test_paths());
-        picker.sessions = vec![demo("alpha", "repo-a"), demo("beta", "repo-b")];
+        picker.sessions = vec![demo("alpha"), demo("beta")];
 
         picker.handle_paste("beta");
 
@@ -2462,25 +1946,23 @@ mod tests {
     fn action_menu_shows_attach_for_live_sessions() {
         let picker = SessionPicker {
             paths: test_paths(),
-            sessions: vec![demo("alpha", "repo-a")],
+            sessions: vec![demo("alpha")],
             default_agent: Some("codex".to_string()),
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::Browse,
-            detail_text: String::new(),
-            detail_scroll: 0,
             toast: None,
         };
 
         assert_eq!(
             picker.action_items("alpha"),
-            vec![SessionAction::Attach, SessionAction::Diff, SessionAction::Delete]
+            vec![SessionAction::Attach, SessionAction::Delete]
         );
     }
 
     #[test]
     fn action_menu_hides_attach_for_exited_sessions() {
-        let mut session = demo("alpha", "repo-a");
+        let mut session = demo("alpha");
         session.status = SessionStatus::Exited;
         let picker = SessionPicker {
             paths: test_paths(),
@@ -2489,75 +1971,21 @@ mod tests {
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::Browse,
-            detail_text: String::new(),
-            detail_scroll: 0,
             toast: None,
         };
 
-        assert_eq!(picker.action_items("alpha"), vec![SessionAction::Diff, SessionAction::Delete]);
-    }
-
-    #[test]
-    fn action_menu_shows_merge_for_pending_review() {
-        let mut session = demo("alpha", "repo-a");
-        session.has_commits = true;
-        session.status = SessionStatus::Exited;
-        let picker = SessionPicker {
-            paths: test_paths(),
-            sessions: vec![session],
-            default_agent: Some("codex".to_string()),
-            create_agents: vec!["claude".to_string(), "codex".to_string()],
-            composer: default_composer(),
-            mode: PickerMode::Browse,
-            detail_text: String::new(),
-            detail_scroll: 0,
-            toast: None,
-        };
-
-        assert_eq!(
-            picker.action_items("alpha"),
-            vec![SessionAction::Diff, SessionAction::Merge, SessionAction::Delete]
-        );
-    }
-
-    #[test]
-    fn action_menu_shows_attach_and_merge_when_both_apply() {
-        let mut session = demo("alpha", "repo-a");
-        session.has_commits = true;
-        let picker = SessionPicker {
-            paths: test_paths(),
-            sessions: vec![session],
-            default_agent: Some("codex".to_string()),
-            create_agents: vec!["claude".to_string(), "codex".to_string()],
-            composer: default_composer(),
-            mode: PickerMode::Browse,
-            detail_text: String::new(),
-            detail_scroll: 0,
-            toast: None,
-        };
-
-        assert_eq!(
-            picker.action_items("alpha"),
-            vec![
-                SessionAction::Attach,
-                SessionAction::Diff,
-                SessionAction::Merge,
-                SessionAction::Delete
-            ]
-        );
+        assert_eq!(picker.action_items("alpha"), vec![SessionAction::Delete]);
     }
 
     #[test]
     fn clamp_mode_selection_caps_to_visible_actions() {
         let mut picker = SessionPicker {
             paths: test_paths(),
-            sessions: vec![demo("alpha", "repo-a")],
+            sessions: vec![demo("alpha")],
             default_agent: Some("codex".to_string()),
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::SessionActions { session_id: "alpha".to_string(), selected: 9 },
-            detail_text: String::new(),
-            detail_scroll: 0,
             toast: None,
         };
 
@@ -2565,7 +1993,7 @@ mod tests {
 
         assert_eq!(
             picker.mode,
-            PickerMode::SessionActions { session_id: "alpha".to_string(), selected: 2 }
+            PickerMode::SessionActions { session_id: "alpha".to_string(), selected: 1 }
         );
     }
 
@@ -2578,8 +2006,6 @@ mod tests {
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::DeleteConfirm { session_id: "missing".to_string(), selected: 1 },
-            detail_text: String::new(),
-            detail_scroll: 0,
             toast: None,
         };
 
@@ -2592,22 +2018,20 @@ mod tests {
     fn render_lines_hides_session_list_in_action_mode() {
         let picker = SessionPicker {
             paths: test_paths(),
-            sessions: vec![demo("alpha", "repo-a"), demo("beta", "repo-b")],
+            sessions: vec![demo("alpha"), demo("beta")],
             default_agent: Some("codex".to_string()),
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::SessionActions { session_id: "alpha".to_string(), selected: 0 },
-            detail_text: String::new(),
-            detail_scroll: 0,
             toast: None,
         };
 
         let lines = picker.render_lines(120, true);
         let rendered = lines.join("\n");
 
-        assert!(!rendered.contains("beta  repo-b"));
+        assert!(!rendered.contains("/tmp/beta"));
         assert!(rendered.contains("› 1. attach"));
-        assert!(rendered.contains("  2. diff"));
+        assert!(rendered.contains("  2. delete"));
         assert!(rendered.contains("/tmp/alpha"));
     }
 
@@ -2615,13 +2039,11 @@ mod tests {
     fn render_lines_show_selector_on_delete_confirmation_rows() {
         let picker = SessionPicker {
             paths: test_paths(),
-            sessions: vec![demo("alpha", "repo-a")],
+            sessions: vec![demo("alpha")],
             default_agent: Some("codex".to_string()),
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::DeleteConfirm { session_id: "alpha".to_string(), selected: 1 },
-            detail_text: String::new(),
-            detail_scroll: 0,
             toast: None,
         };
 
@@ -2630,19 +2052,19 @@ mod tests {
 
         assert!(rendered.contains("  1. yes"));
         assert!(rendered.contains("› 2. no"));
+        assert!(rendered.contains("Its working directory is kept."));
+        assert!(!rendered.contains("worktree"));
     }
 
     #[test]
     fn render_lines_remove_helper_and_agent_row_in_browse_mode() {
         let picker = SessionPicker {
             paths: test_paths(),
-            sessions: vec![demo("alpha", "repo-a")],
+            sessions: vec![demo("alpha")],
             default_agent: Some("codex".to_string()),
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::Browse,
-            detail_text: String::new(),
-            detail_scroll: 0,
             toast: None,
         };
 
@@ -2661,13 +2083,11 @@ mod tests {
     fn create_agent_menu_defaults_to_codex_when_present() {
         let mut picker = SessionPicker {
             paths: test_paths(),
-            sessions: vec![demo("alpha", "repo-a")],
+            sessions: vec![demo("alpha")],
             default_agent: Some("codex".to_string()),
             create_agents: vec!["codex".to_string(), "claude".to_string()],
             composer: default_composer(),
             mode: PickerMode::Browse,
-            detail_text: String::new(),
-            detail_scroll: 0,
             toast: None,
         };
 
@@ -2680,13 +2100,11 @@ mod tests {
     fn create_agent_menu_clamps_and_renders_agents() {
         let mut picker = SessionPicker {
             paths: test_paths(),
-            sessions: vec![demo("alpha", "repo-a")],
+            sessions: vec![demo("alpha")],
             default_agent: Some("codex".to_string()),
             create_agents: vec!["codex".to_string(), "claude".to_string()],
             composer: default_composer(),
             mode: PickerMode::CreateAgentSelect { selected: 9 },
-            detail_text: String::new(),
-            detail_scroll: 0,
             toast: None,
         };
 
@@ -2696,7 +2114,7 @@ mod tests {
         assert_eq!(picker.mode, PickerMode::CreateAgentSelect { selected: 1 });
         assert!(rendered.contains("1. codex (Default)"));
         assert!(rendered.contains("› 2. claude"));
-        assert!(!rendered.contains("alpha  repo-a"));
+        assert!(!rendered.contains("/tmp/alpha"));
     }
 
     #[test]
@@ -2727,166 +2145,34 @@ mod tests {
 
     #[test]
     fn runtime_icons_match_requested_symbols() {
-        assert_eq!(
-            session_icon(&demo_with(
-                "alpha",
-                "repo-a",
-                SessionStatus::Running,
-                IntegrationState::Blocked
-            )),
-            "●"
-        );
-        assert_eq!(
-            session_icon(&demo_with(
-                "alpha",
-                "repo-a",
-                SessionStatus::Failed,
-                IntegrationState::Clean
-            )),
-            "✖"
-        );
-        assert_eq!(
-            session_icon(&demo_with(
-                "alpha",
-                "repo-a",
-                SessionStatus::UnknownRecovered,
-                IntegrationState::Clean
-            )),
-            "○"
-        );
-        assert_eq!(
-            session_icon(&demo_with(
-                "alpha",
-                "repo-a",
-                SessionStatus::Running,
-                IntegrationState::Applied
-            )),
-            "✓"
-        );
-        assert_eq!(
-            session_icon(&demo_with(
-                "alpha",
-                "repo-a",
-                SessionStatus::Running,
-                IntegrationState::PendingReview
-            )),
-            "●"
-        );
-        assert_eq!(
-            session_icon(&demo_with(
-                "alpha",
-                "repo-a",
-                SessionStatus::Running,
-                IntegrationState::Clean
-            )),
-            "●"
-        );
-        assert_eq!(
-            session_icon(&demo_with(
-                "alpha",
-                "repo-a",
-                SessionStatus::UnknownRecovered,
-                IntegrationState::Clean
-            )),
-            "○"
-        );
-        assert_eq!(
-            session_icon(&demo_with(
-                "alpha",
-                "repo-a",
-                SessionStatus::Exited,
-                IntegrationState::Clean
-            )),
-            "○"
-        );
+        assert_eq!(session_icon(&demo_with("alpha", SessionStatus::Running)), "●");
+        assert_eq!(session_icon(&demo_with("alpha", SessionStatus::Creating)), "●");
+        assert_eq!(session_icon(&demo_with("alpha", SessionStatus::Failed)), "✖");
+        assert_eq!(session_icon(&demo_with("alpha", SessionStatus::UnknownRecovered)), "○");
+        assert_eq!(session_icon(&demo_with("alpha", SessionStatus::Exited)), "○");
     }
 
     #[test]
     fn runtime_icon_colors_match_requested_palette() {
+        use ratatui::style::Color;
+        assert_eq!(session_icon_color(&demo_with("alpha", SessionStatus::Running)), Color::Green);
+        assert_eq!(session_icon_color(&demo_with("alpha", SessionStatus::Failed)), Color::Red);
         assert_eq!(
-            session_icon_color(&demo_with(
-                "alpha",
-                "repo-a",
-                SessionStatus::Running,
-                IntegrationState::Blocked
-            )),
-            ratatui::style::Color::Green
+            session_icon_color(&demo_with("alpha", SessionStatus::UnknownRecovered)),
+            Color::DarkGray
         );
-        assert_eq!(
-            session_icon_color(&demo_with(
-                "alpha",
-                "repo-a",
-                SessionStatus::Failed,
-                IntegrationState::Clean
-            )),
-            ratatui::style::Color::Red
-        );
-        assert_eq!(
-            session_icon_color(&demo_with(
-                "alpha",
-                "repo-a",
-                SessionStatus::UnknownRecovered,
-                IntegrationState::Clean
-            )),
-            ratatui::style::Color::DarkGray
-        );
-        assert_eq!(
-            session_icon_color(&demo_with(
-                "alpha",
-                "repo-a",
-                SessionStatus::Exited,
-                IntegrationState::PendingReview
-            )),
-            ratatui::style::Color::DarkGray
-        );
-        assert_eq!(
-            pending_changes_marker(&demo_with(
-                "alpha",
-                "repo-a",
-                SessionStatus::Exited,
-                IntegrationState::PendingReview
-            )),
-            "↑"
-        );
-        assert_eq!(
-            session_icon_color(&demo_with(
-                "alpha",
-                "repo-a",
-                SessionStatus::Running,
-                IntegrationState::Clean
-            )),
-            ratatui::style::Color::Green
-        );
-        assert_eq!(
-            session_icon_color(&demo_with(
-                "alpha",
-                "repo-a",
-                SessionStatus::UnknownRecovered,
-                IntegrationState::Clean
-            )),
-            ratatui::style::Color::DarkGray
-        );
+        assert_eq!(session_icon_color(&demo_with("alpha", SessionStatus::Exited)), Color::DarkGray);
     }
 
     #[test]
     fn host_picker_session_row_includes_status_color_escape() {
-        let mut running_session =
-            demo_with("alpha", "repo-a", SessionStatus::Running, IntegrationState::Clean);
+        let mut running_session = demo_with("alpha", SessionStatus::Running);
         running_session.created_at = Utc::now() - Duration::minutes(23);
         let running = render_host_picker_session_row(&running_session, 120, true);
-        let review = render_host_picker_session_row(
-            &demo_with("alpha", "repo-a", SessionStatus::Exited, IntegrationState::PendingReview),
-            120,
-            false,
-        );
-        let failed = render_host_picker_session_row(
-            &demo_with("alpha", "repo-a", SessionStatus::Failed, IntegrationState::Clean),
-            120,
-            false,
-        );
+        let failed =
+            render_host_picker_session_row(&demo_with("alpha", SessionStatus::Failed), 120, false);
 
         assert!(running.contains(HOST_PICKER_STATUS_GREEN_FG));
-        assert!(review.contains(HOST_PICKER_STATUS_BLUE_FG));
         assert!(failed.contains(HOST_PICKER_STATUS_RED_FG));
         assert!(running.contains(HOST_PICKER_SELECTED_STYLE));
         assert!(running.contains("› "));
@@ -2894,8 +2180,7 @@ mod tests {
         let running_plain = strip_ansi(&running);
         assert!(running_plain.contains("23m"));
         assert!(running_plain.contains("alpha"));
-        assert!(running_plain.contains("agent/alpha"));
-        assert!(review.contains("1"));
+        assert!(running_plain.contains("/tmp/alpha"));
         assert!(failed.contains("✖"));
     }
 
@@ -2904,34 +2189,22 @@ mod tests {
         let rendered = render_host_picker_legend_row(
             200,
             &[
-                demo_with("alpha", "repo-a", SessionStatus::Running, IntegrationState::Blocked),
-                demo_with("beta", "repo-b", SessionStatus::Running, IntegrationState::Applied),
-                demo_with(
-                    "delta",
-                    "repo-d",
-                    SessionStatus::Exited,
-                    IntegrationState::PendingReview,
-                ),
-                demo_with(
-                    "gamma",
-                    "repo-c",
-                    SessionStatus::UnknownRecovered,
-                    IntegrationState::Clean,
-                ),
+                demo_with("alpha", SessionStatus::Running),
+                demo_with("delta", SessionStatus::Exited),
+                demo_with("gamma", SessionStatus::Failed),
             ],
         );
-        assert!(rendered.contains(HOST_PICKER_STATUS_BLUE_FG));
+        assert!(rendered.contains(HOST_PICKER_STATUS_RED_FG));
         assert!(rendered.contains(HOST_PICKER_STATUS_GREEN_FG));
         assert!(rendered.contains(HOST_PICKER_LEGEND_TEXT_STYLE));
         assert!(rendered.starts_with("  "));
         assert!(rendered.contains("●"));
-        assert!(rendered.contains("Δ"));
-        assert!(rendered.contains("↑"));
-        assert!(rendered.contains("✓"));
+        assert!(rendered.contains("○"));
+        assert!(rendered.contains("✖"));
         assert!(rendered.contains("running"));
-        assert!(rendered.contains("completed"));
-        assert!(rendered.contains("dirty"));
-        assert!(rendered.contains("ahead"));
+        assert!(rendered.contains("exited"));
+        assert!(rendered.contains("failed"));
+        assert!(!rendered.contains("lost"));
         assert!(rendered.contains(" • "));
     }
 
@@ -2949,72 +2222,51 @@ mod tests {
 
     #[test]
     fn session_list_renders_title_header_and_rows_without_selector() {
-        let session = demo("alpha", "repo-a");
+        let session = demo("alpha");
         let rendered = render_session_list_lines(&[session], 120).join("\n");
 
         assert!(!rendered.contains("agentd - "));
         assert!(rendered.contains("RUN"));
-        assert!(rendered.contains("Δ"));
-        assert!(rendered.contains("↑"));
         assert!(rendered.contains("NAME"));
+        assert!(rendered.contains("CWD"));
+        assert!(!rendered.contains("BRANCH"));
+        assert!(rendered.contains("/tmp/alpha"));
         assert!(rendered.contains("●"));
         assert!(!rendered.contains("› "));
     }
 
     #[test]
-    fn ordered_sessions_keep_active_sessions_first_even_when_applied_or_pending() {
+    fn ordered_sessions_keep_active_sessions_first_then_attention() {
         let now = Utc::now();
-        let mut running = demo("running", "repo-a");
+        let mut running = demo("running");
         running.updated_at = now - Duration::minutes(2);
-        let mut applied =
-            demo_with("applied", "repo-b", SessionStatus::Running, IntegrationState::Applied);
-        applied.updated_at = now - Duration::minutes(1);
-        let mut failed =
-            demo_with("failed", "repo-c", SessionStatus::Failed, IntegrationState::Conflicted);
+        let mut creating = demo_with("creating", SessionStatus::Creating);
+        creating.updated_at = now - Duration::minutes(1);
+        let mut failed = demo_with("failed", SessionStatus::Failed);
         failed.updated_at = now;
-        let mut pending =
-            demo_with("pending", "repo-d", SessionStatus::Running, IntegrationState::PendingReview);
-        pending.updated_at = now - Duration::minutes(3);
+        let mut exited = demo_with("exited", SessionStatus::Exited);
+        exited.updated_at = now;
+        let mut needs_action = demo_with("needs-action", SessionStatus::Exited);
+        needs_action.attention = AttentionLevel::Action;
+        needs_action.updated_at = now - Duration::minutes(5);
 
-        let sessions = [failed, running, applied, pending];
+        let sessions = [exited, failed, running, needs_action, creating];
         let ordered = ordered_sessions(&sessions);
 
         assert_eq!(
             ordered.iter().map(|session| session.session_id.as_str()).collect::<Vec<_>>(),
-            vec!["applied", "running", "pending", "failed"]
+            vec!["creating", "running", "failed", "needs-action", "exited"]
         );
     }
 
     #[test]
-    fn session_list_uses_completed_icon_for_live_applied_sessions() {
-        let running = demo("running", "repo-a");
-        let applied =
-            demo_with("applied", "repo-b", SessionStatus::Running, IntegrationState::Applied);
-        let rendered = strip_ansi(&render_session_list_lines(&[running, applied], 120).join("\n"));
-
-        assert!(rendered.contains("✓"));
-        assert!(rendered.contains("●"));
-    }
-
-    #[test]
-    fn host_picker_uses_applied_icon_for_live_applied_sessions() {
-        let session =
-            demo_with("alpha", "repo-a", SessionStatus::Running, IntegrationState::Applied);
-        let rendered = render_host_picker_session_row(&session, 120, false);
-
-        assert!(rendered.contains("\u{1b}[36m"));
-        assert!(rendered.contains("✓"));
-        assert!(!rendered.contains("●"));
-    }
-
-    #[test]
     fn session_list_uses_single_row_and_dynamic_widths() {
-        let mut session = demo("alpha", "repository-with-a-long-name");
+        let mut session = demo("alpha");
         session.session_id =
             "a-very-long-session-name-that-should-be-truncated-in-the-fixed-width-column"
                 .to_string();
-        session.branch =
-            "agent/this-is-a-very-long-branch-name-that-should-be-truncated".to_string();
+        session.cwd =
+            "/srv/checkouts/a-very-long-directory-name/that-should-be-truncated".to_string();
         session.attention_summary =
             Some("needs manual review because a long follow-up summary is present".to_string());
 
@@ -3024,8 +2276,9 @@ mod tests {
         assert_eq!(wide.lines().count(), 2);
         assert!(!wide.contains("needs manual review because a long follow-up summary is present"));
         assert!(wide.contains("a-very"));
-        assert!(wide.contains("agent/this-is-a-very"));
-        assert!(narrow.contains("agent/"));
+        assert!(wide.contains("that-should-be-truncated"));
+        assert!(narrow.contains("..."));
+        assert!(narrow.contains("that-should-be-truncated"));
     }
 
     #[test]
@@ -3040,13 +2293,8 @@ mod tests {
     fn session_list_does_not_render_legend() {
         let rendered = render_session_list_lines(
             &[
-                demo_with("alpha", "repo-a", SessionStatus::Running, IntegrationState::Blocked),
-                demo_with(
-                    "beta",
-                    "repo-b",
-                    SessionStatus::UnknownRecovered,
-                    IntegrationState::Clean,
-                ),
+                demo_with("alpha", SessionStatus::Running),
+                demo_with("beta", SessionStatus::UnknownRecovered),
             ],
             120,
         )
@@ -3079,25 +2327,22 @@ mod tests {
     fn host_picker_legend_is_hidden_in_submenus() {
         let picker = SessionPicker {
             paths: test_paths(),
-            sessions: vec![demo("alpha", "repo-a")],
+            sessions: vec![demo("alpha")],
             default_agent: Some("codex".to_string()),
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::CreateAgentSelect { selected: 0 },
-            detail_text: String::new(),
-            detail_scroll: 0,
             toast: None,
         };
 
         let rendered = picker.render_lines(200, true).join("\n");
-        assert!(!rendered.contains("dirty"));
-        assert!(!rendered.contains("ahead"));
+        assert!(!rendered.contains(" • "));
+        assert!(!rendered.contains("running"));
     }
 
     #[test]
     fn host_picker_session_row_uses_exit_time_for_finished_sessions() {
-        let mut session =
-            demo_with("alpha", "repo-a", SessionStatus::Exited, IntegrationState::Clean);
+        let mut session = demo_with("alpha", SessionStatus::Exited);
         let created_at = Utc::now() - Duration::hours(5);
         session.created_at = created_at;
         session.exited_at = Some(created_at + Duration::minutes(90));
@@ -3110,28 +2355,27 @@ mod tests {
 
     #[test]
     fn host_picker_session_row_uses_fixed_width_columns_and_truncation() {
-        let mut session = demo("alpha", "repository-with-a-long-name");
+        let mut session = demo("alpha");
         session.created_at = Utc::now() - Duration::minutes(23);
         session.session_id =
             "a-very-long-session-name-that-should-be-truncated-in-the-fixed-width-column"
                 .to_string();
-        session.branch =
-            "agent/this-is-a-very-long-branch-name-that-should-be-truncated".to_string();
+        session.cwd =
+            "/srv/checkouts/a-very-long-directory-name/that-should-be-truncated".to_string();
 
         let wide = strip_ansi(&render_host_picker_session_row(&session, 120, false));
         let narrow = strip_ansi(&render_host_picker_session_row(&session, 60, false));
 
         assert!(wide.contains("23m"));
         assert!(wide.contains("a-very"));
-        assert!(wide.contains("agent/this-is-a-very"));
+        assert!(wide.contains("directory-name/that-should-be-truncated"));
         assert!(narrow.contains("23m"));
-        assert!(narrow.contains("agent/"));
-        assert!(narrow.trim_end().ends_with("..."));
+        assert!(narrow.contains("...") && narrow.trim_end().ends_with("truncated"));
     }
 
     #[test]
     fn host_picker_create_row_aligns_with_elapsed_column() {
-        let mut session = demo("alpha", "repo-a");
+        let mut session = demo("alpha");
         session.created_at = Utc::now() - Duration::minutes(23);
 
         let session_row = strip_ansi(&render_host_picker_session_row(&session, 120, false));
@@ -3162,32 +2406,6 @@ mod tests {
     }
 
     #[test]
-    fn diff_view_renders_and_hides_legend() {
-        let picker = SessionPicker {
-            paths: test_paths(),
-            sessions: vec![demo("alpha", "repo-a")],
-            default_agent: Some("codex".to_string()),
-            create_agents: vec!["claude".to_string(), "codex".to_string()],
-            composer: default_composer(),
-            mode: PickerMode::DiffView { session_id: "alpha".to_string() },
-            detail_text: "@@ -1 +1 @@\n-old\n+new\n".to_string(),
-            detail_scroll: 0,
-            toast: None,
-        };
-
-        let rendered = picker.render_lines(200, true).join("\n");
-        assert!(rendered.contains("Diff: alpha"));
-        assert!(rendered.contains(HOST_PICKER_DIFF_HUNK_STYLE));
-        assert!(rendered.contains(HOST_PICKER_DIFF_REMOVE_STYLE));
-        assert!(rendered.contains(HOST_PICKER_DIFF_ADD_STYLE));
-        assert!(rendered.contains("@@ -1 +1 @@"));
-        assert!(rendered.contains("-old"));
-        assert!(rendered.contains("+new"));
-        assert!(!rendered.contains("pending review"));
-        assert!(!rendered.contains("needs input"));
-    }
-
-    #[test]
     fn picker_toast_flattens_embedded_newlines() {
         assert_eq!(
             sanitize_picker_message("merge would conflict\nrun:\n  git status"),
@@ -3206,23 +2424,14 @@ mod tests {
     }
 
     #[test]
-    fn merge_failure_toast_points_to_agent_merge() {
-        let message = format_merge_failure_toast("alpha", "merge would conflict\nrun:\n  git -C x");
-        assert!(message.contains("merge would conflict run: git -C x"));
-        assert!(message.contains("agent merge alpha"));
-    }
-
-    #[test]
     fn browse_mode_renders_error_toast_on_single_line() {
         let picker = SessionPicker {
             paths: test_paths(),
-            sessions: vec![demo("alpha", "repo-a")],
+            sessions: vec![demo("alpha")],
             default_agent: Some("codex".to_string()),
             create_agents: vec!["claude".to_string(), "codex".to_string()],
             composer: default_composer(),
             mode: PickerMode::Browse,
-            detail_text: String::new(),
-            detail_scroll: 0,
             toast: Some(PickerToast::error("merge would conflict\nrun:\n  git status".to_string())),
         };
 
@@ -3232,16 +2441,10 @@ mod tests {
     }
 
     #[test]
-    fn style_host_picker_diff_line_colors_diff_sections() {
-        assert!(
-            style_host_picker_diff_line("diff --git a/a b/a", 80)
-                .contains(HOST_PICKER_DIFF_HEADER_STYLE)
-        );
-        assert!(
-            style_host_picker_diff_line("@@ -1 +1 @@", 80).contains(HOST_PICKER_DIFF_HUNK_STYLE)
-        );
-        assert!(style_host_picker_diff_line("+new", 80).contains(HOST_PICKER_DIFF_ADD_STYLE));
-        assert!(style_host_picker_diff_line("-old", 80).contains(HOST_PICKER_DIFF_REMOVE_STYLE));
+    fn format_path_cell_keeps_the_end_of_long_paths() {
+        assert_eq!(format_path_cell("/a/b", 6), "/a/b  ");
+        assert_eq!(format_path_cell("/srv/repo/checkout", 10), "...heckout");
+        assert_eq!(format_path_cell("/srv/repo", 3), "epo");
     }
 
     #[test]
@@ -3291,50 +2494,24 @@ mod tests {
         assert!(!HOST_PICKER_EXIT_SEQUENCE.windows(6).any(|window| window == b"\x1b[?1049"));
     }
 
-    fn demo(session_id: &str, repo_name: &str) -> SessionRecord {
-        demo_with(session_id, repo_name, SessionStatus::Running, IntegrationState::Clean)
+    fn demo(session_id: &str) -> SessionRecord {
+        demo_with(session_id, SessionStatus::Running)
     }
 
-    fn demo_with(
-        session_id: &str,
-        repo_name: &str,
-        status: SessionStatus,
-        integration_state: IntegrationState,
-    ) -> SessionRecord {
-        let (apply_state, dirty_count, ahead_count) = match integration_state {
-            IntegrationState::Clean => (ApplyState::Idle, 0, 0),
-            IntegrationState::Applied => (ApplyState::Applied, 0, 0),
-            IntegrationState::PendingReview => (ApplyState::Idle, 0, 1),
-            IntegrationState::Blocked | IntegrationState::Conflicted => (ApplyState::Idle, 1, 1),
-        };
-        let attention = match integration_state {
-            IntegrationState::Blocked => AttentionLevel::Action,
-            _ => AttentionLevel::Info,
-        };
+    fn demo_with(session_id: &str, status: SessionStatus) -> SessionRecord {
         let now = Utc::now();
         SessionRecord {
             session_id: session_id.to_string(),
             agent: "codex".to_string(),
             model: Some("gpt-5.4".to_string()),
             mode: SessionMode::Execute,
-            workspace: "/tmp/repo".to_string(),
-            repo_path: "/tmp/repo".to_string(),
-            repo_name: repo_name.to_string(),
-            base_branch: "main".to_string(),
-            branch: format!("agent/{session_id}"),
-            worktree: format!("/tmp/{session_id}"),
+            cwd: format!("/tmp/{session_id}"),
             status,
-            integration_policy: IntegrationPolicy::AutoApplySafe,
-            apply_state,
-            dirty_count,
-            ahead_count,
-            has_commits: ahead_count > 0,
-            has_pending_changes: dirty_count > 0 || ahead_count > 0,
             worker_pid: Some(123),
             agent_pid: Some(456),
             exit_code: None,
             error: None,
-            attention,
+            attention: AttentionLevel::Info,
             attention_summary: None,
             created_at: now,
             updated_at: now,
@@ -3351,7 +2528,6 @@ mod tests {
             config: root.join("config.toml"),
             logs_dir: root.join("logs"),
             sessions_dir: root.join("sessions"),
-            worktrees_dir: root.join("worktrees"),
             root,
         }
     }

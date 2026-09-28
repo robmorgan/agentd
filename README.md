@@ -184,14 +184,14 @@ make install
 
 ## Working Directories And Worktrees
 
-A session runs in the directory you give it. `agent new` and `agent run` default to the
-current directory; pass `--cwd DIR` to pick another. `agentd` does not create git worktrees,
+A session runs in the directory you give it. `agent new` defaults to the current directory;
+pass `--cwd DIR` to pick another (it must exist). `agentd` does not create git worktrees,
 branches, or merge anything back. If you want isolation between agents working on the same
 repository, create the worktree yourself and point the session at it:
 
 ```sh
 git worktree add -b agent/auth-refactor ../wt/auth-refactor main
-agent run --cwd ../wt/auth-refactor --name auth-refactor "refactor auth"
+agent new --cwd ../wt/auth-refactor auth-refactor
 ```
 
 A skill or a wrapper script can package this recipe. Two agents started in the same checkout
@@ -263,6 +263,14 @@ agent daemon upgrade
 ```
 
 `agent daemon upgrade` now refuses to run while live sessions are active; stop them first.
+
+`agent` starts the daemon on demand with `agentd serve --daemonize`, using the `agentd` binary
+installed next to `agent`. Set `AGENTD_BIN` to use a different daemon binary, for example the Go
+daemon during development:
+
+```sh
+AGENTD_BIN=$PWD/go/bin/agentd agent daemon restart
+```
 
 ## Status And Limitations
 

@@ -1,9 +1,11 @@
 [workspace]
 members = [
     "crates/agentd-shared",
-    "crates/agentd",
     "crates/agent-cli",
 ]
+# crates/agentd (the Rust daemon, protocol v32) stays on disk as the behavioural
+# reference but cannot build against the v33 shared types; see docs/drop-worktrees.md.
+exclude = ["crates/agentd"]
 resolver = "2"
 
 [workspace.package]
