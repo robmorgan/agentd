@@ -255,26 +255,41 @@ path when a worker is focused. Background PTY writes are still available with
 over a LAN, Tailscale or WireGuard, without any hosted service. Both sides authenticate with pinned
 keys, like SSH host keys and `authorized_keys`.
 
-**On the devbox**, remote access is off by default. Add a listen address to `config.toml`, preferring
-a Tailscale or WireGuard address over a public one, then restart the daemon:
-
-```toml
-[remote]
-listen = "100.64.0.5:7433"   # UDP
-```
+**On the devbox**, remote access is off by default. Turn it on:
 
 ```sh
-agent daemon restart
-agentd remote id          # the daemon's key fingerprint, for the laptop to pin
+agentd remote enable
 ```
 
-**On the laptop**, add the host. `agent host add` shows the key the daemon presents and asks you to
-confirm it against `agentd remote id` (or pass `--fingerprint SHA256:...` to skip the prompt), then
-prints the command that authorizes the laptop:
+This finds the devbox's Tailscale address and listens on UDP port 7433 there. It sets
+`[remote] listen` in `config.toml`, restarts the daemon (sessions keep running), and prints the
+`agent host add` command to run on the laptop, with the daemon's key fingerprint included.
+
+Without Tailscale, it offers the address of the interface holding the default route and asks first.
+A private LAN address is only reachable on that network and may change with DHCP; a public address
+is reachable from the whole internet, so it gets a stronger warning. To choose the address
+yourself (for example a WireGuard one), or to skip the question in a script:
 
 ```sh
-agent host add devbox 100.64.0.5:7433
+agentd remote enable 10.8.0.2          # port 7433
+agentd remote enable 10.8.0.2:9000
+agentd remote enable --yes             # accept the detected address
+agentd remote status
+agentd remote disable
 ```
+
+If the address does not exist yet when the daemon starts (say, Tailscale is still coming up at
+boot), the daemon keeps retrying every few seconds. `agentd remote status` and `agent daemon info`
+show why it is not listening.
+
+**On the laptop**, run the command `enable` printed:
+
+```sh
+agent host add devbox 100.64.0.5:7433 --fingerprint SHA256:...
+```
+
+Without `--fingerprint`, `agent host add` shows the key the daemon presents and asks you to confirm
+it against `agentd remote id`. Either way it then prints the command that authorizes the laptop.
 
 **Back on the devbox**, run the command it printed:
 

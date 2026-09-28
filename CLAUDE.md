@@ -507,6 +507,7 @@ Done:
 - Attach fan-out and PTY input are bounded, and the runtime root is private to the user.
 - The transport split: the daemon serves `transport.Stream`s from any `transport.Listener`.
 - The daemon's QUIC listener (off unless `[remote] listen` is set): one QUIC stream per request or attachment, mutual TLS with pinned Ed25519 keys, managed with `agentd remote id|list|authorize|revoke`.
+- `agentd remote enable [ADDRESS] | disable | status`: detects a Tailscale address (or asks about the default-route one), edits `[remote] listen`, restarts the daemon; an unbindable listen address is retried in the background.
 - The CLI's QUIC client: `agent --host NAME` and `NAME/session` addresses, `agent host add|ls|rm` (confirm-on-first-use key pinning in `hosts.toml`), and `agent remote id` (`remote/client.key`).
 
 Next:

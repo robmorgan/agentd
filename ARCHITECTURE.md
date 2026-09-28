@@ -69,6 +69,14 @@ before the daemon rejects its key, so a refusal may only surface on the first st
 recognises the TLS alert there and says how to authorize the machine. Both sides' tests pin one
 key and its fingerprint, so the Go and Rust fingerprint definitions cannot drift apart.
 
+`agentd remote enable` picks the listen address when none is given: first a Tailscale address
+(`100.64.0.0/10` or `fd7a:115c:a1e0::/48` on an interface, or `tailscale ip -4`), used without
+asking; otherwise the source address of the default route, found by connecting a UDP socket (which
+sends nothing), which it asks about first, since that is a LAN address that may change or a public
+one. It edits only the `listen` line of `config.toml`, keeping comments, and refuses layouts it
+cannot edit safely. A daemon whose listen address cannot be bound keeps local service and retries
+the bind every 5 seconds until shutdown, reporting the reason in its management status.
+
 A client that disappears without closing (a laptop lid, a lost network) is noticed by the daemon's
 60-second idle timeout; until then its attachment is still listed. The session is unaffected.
 
