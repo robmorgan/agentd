@@ -235,27 +235,28 @@ The purpose is not merely a language rewrite. The Go implementation should becom
 
 ## Deliverables
 
-* [ ] Introduce Go workspace/module
-* [ ] Implement daemon lifecycle in Go
-* [ ] Implement local Unix socket listener
-* [ ] Implement existing framed protocol in Go
+* [x] Introduce Go workspace/module
+* [x] Implement daemon lifecycle in Go
+* [x] Implement local Unix socket listener
+* [x] Implement existing framed protocol in Go
 * [ ] Implement client library
-* [ ] Implement CLI transport using Go client
-* [ ] Spawn agent processes under PTYs
-* [ ] Support detach without process termination
-* [ ] Support interactive reattach
-* [ ] Support PTY resize
-* [ ] Support multiple attached clients
-* [ ] Replace worktree lifecycle with a per-session `cwd` (see `docs/drop-worktrees.md`)
-* [ ] Port SQLite-backed metadata
-* [ ] Preserve compatibility with existing session semantics where practical
+* [ ] Implement CLI transport using Go client (the Rust CLI speaks the protocol directly for now)
+* [x] Spawn agent processes under PTYs
+* [x] Support detach without process termination
+* [x] Support interactive reattach
+* [x] Support PTY resize
+* [x] Support multiple attached clients
+* [x] Replace worktree lifecycle with a per-session `cwd` (see `docs/drop-worktrees.md`)
+* [x] Port SQLite-backed metadata
+* [x] Preserve compatibility with existing session semantics where practical
+* [x] Sessions survive daemon restart (each session's worker is its own process)
 
 ## Exit criteria
 
 The following must work entirely through the Go daemon:
 
 ```sh
-agent run "implement feature X"
+agent new --cwd ~/src/project feature-x
 
 agent ls
 

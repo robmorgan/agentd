@@ -152,28 +152,20 @@ Clients surface tasks based on attention instead of raw output.
 
 ## Build
 
-Initialize the pinned Ghostty submodule first:
+`agentd` is two binaries: the `agent` CLI (Rust) and the `agentd` daemon (Go). The daemon
+links `libghostty-vt`, which needs **Zig 0.16 or newer**; `go/scripts/build-libghostty.sh`
+fetches the pinned ghostty commit and builds it under `go/.build/` (point `ZIG=` at a 0.16
+toolchain if the one on `PATH` is older). See `go/README.md` for details.
 
 ```sh
-git submodule update --init --recursive
+make build    # go/bin/agentd and target/debug/agent
+make test     # Go tests (with -race) and cargo test
 ```
 
-This checks out `ghostty-org/ghostty` into `vendor/ghostty` at the commit
-recorded by the repository's submodule pointer.
-
-If you create an ad hoc Git worktree outside `agentd`, run the same command in
-that worktree before building.
-
-Then build:
+For local development, run the debug CLI against the freshly built daemon without reinstalling:
 
 ```sh
-cargo build
-```
-
-For local development, run the debug binaries directly without reinstalling:
-
-```sh
-make dev-run ARGS="sessions"
+make dev-run ARGS="list"
 ```
 
 ## Install
@@ -181,6 +173,8 @@ make dev-run ARGS="sessions"
 ```sh
 make install
 ```
+
+This installs `agent` with `cargo install` and copies `agentd` next to it.
 
 ## Working Directories And Worktrees
 

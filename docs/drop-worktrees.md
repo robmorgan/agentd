@@ -1,7 +1,7 @@
 # Dropping worktree management from agentd
 
-Status: accepted 2026-09-28. Stages 1 and 2 are implemented on branch `go-port`;
-stages 3 to 5 are pending.
+Status: accepted 2026-09-28. Stages 1 to 4 are implemented on branch `go-port`;
+stage 5 is pending.
 
 ## Decision
 
@@ -61,7 +61,7 @@ Environment injected into the agent: `AGENTD_WORKTREE`, `AGENTD_BRANCH`.
 
 ## What replaces it
 
-- `session.Record.Cwd`. `agent run` and `agent new` accept `--cwd DIR`,
+- `session.Record.Cwd`. `agent new` accepts `--cwd DIR` (the CLI has no `agent run`),
   defaulting to the caller's current directory. The default session name is
   derived from the basename of `cwd` instead of the repo name.
 - Session names are unique per daemon. The branch-existence check in
@@ -72,7 +72,7 @@ Environment injected into the agent: `AGENTD_WORKTREE`, `AGENTD_BRANCH`.
 
   ```sh
   git worktree add -b agent/auth-refactor ../wt/auth-refactor main
-  agent run --cwd ../wt/auth-refactor --name auth-refactor "refactor auth"
+  agent new --cwd ../wt/auth-refactor auth-refactor
   ```
 
   A skill or wrapper can package this. `agentd` does not.
@@ -124,13 +124,13 @@ The Rust daemon is left untouched as the behavioural reference.
   old flags and exits 2, which the Rust daemon records as a failed session.
   The Rust side is left untouched.
 
-### Stage 3. Go daemon `agentd serve`
+### Stage 3. Go daemon `agentd serve` (done)
 
 Already the next milestone. With Stage 2 done, `create_session` is: validate
 `cwd` exists, insert record, spawn worker. No git binary required. This stage
 is where `run`, `ls`, `attach`, `kill` land in Go.
 
-### Stage 4. Rust `agent` CLI on v33
+### Stage 4. Rust `agent` CLI on v33 (done)
 
 - Remove `Merge`, `Accept`, `Discard`, `Worktree`, `Diff` commands.
 - Add `--cwd` to `New`/`Run`.
@@ -155,8 +155,8 @@ finalisation, `refresh_commit_state`; `git.rs` tests; CLI tests for `merge`,
 
 Added or changed:
 
-- `agent run --cwd` in a non-git directory succeeds.
-- `agent run` with a missing `cwd` fails before a worker is spawned and the
+- `agent new --cwd` in a non-git directory succeeds.
+- `agent new` with a missing `cwd` fails before a worker is spawned and the
   record ends in the failed state.
 - Worker test asserts `AGENTD_CWD` and `cmd.Dir`.
 - Protocol fixture test asserts v32 frames for the removed kinds are rejected

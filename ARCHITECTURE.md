@@ -111,10 +111,14 @@ fast, the only thing sitting in-between you and your PTY is a unix socket.
 
 ## Go Port
 
-The server side is being ported to Go under `go/` (see `go/README.md`). The wire protocol,
-runtime root layout, and SQLite schema are shared byte-for-byte, so pieces can be swapped
-independently. Today the Go session worker is complete and the Rust daemon will spawn it
-instead of its own worker when `AGENTD_WORKER_BIN` points at `go/bin/agentd`. The Go
-worker uses `go.mitchellh.com/libghostty` for the shadow terminal, which tracks a newer
-`libghostty-vt` than `vendor/ghostty` and needs Zig 0.16, so it builds its own pinned
-checkout under `go/.build/`.
+The server side has been ported to Go under `go/` (see `go/README.md`): `agentd serve` is the
+daemon and `agentd session-worker` owns one session's PTY. The Go daemon speaks protocol v33 and
+state schema v8, which replace worktrees with a per-session `cwd` (`docs/drop-worktrees.md`); a
+v7 `state.db` left by the Rust daemon is migrated in place. The Rust daemon crate remains on disk,
+outside the Cargo workspace, as the behavioural reference until it is deleted.
+
+Each worker runs in its own process session, so sessions survive the daemon stopping or
+restarting; the next daemon finds them again through `state.db` and the per-session sockets. The
+Go worker uses `go.mitchellh.com/libghostty` for the shadow terminal, which tracks a newer
+`libghostty-vt` than `vendor/ghostty` and needs Zig 0.16, so it builds its own pinned checkout under
+`go/.build/`.
