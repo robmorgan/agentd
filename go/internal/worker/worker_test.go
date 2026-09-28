@@ -617,7 +617,11 @@ func isConnClosed(err error) bool {
 func TestAgentRunsInCwd(t *testing.T) {
 	h := startWorker(t)
 	c := h.attach(defaultGeometry)
-	c.expectOutput("ready")
+	// A fast agent prints "ready" before the attach, and then it is in the
+	// snapshot rather than the output stream.
+	if !bytes.Contains(c.snapshot, []byte("ready")) {
+		c.expectOutput("ready")
+	}
 	c.input("where\n")
 	real, err := filepath.EvalSymlinks(h.paths.Root)
 	if err != nil {
