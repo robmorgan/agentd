@@ -1,25 +1,20 @@
-# agentd (Go port)
+# agentd (Go)
 
-This directory holds the Go implementation of the `agentd` server side: the
-daemon (`agentd serve`) and the per-session worker it spawns. The `agent` CLI
-is Rust (`../crates/agent-cli`) and speaks the same protocol.
+This directory holds the `agentd` daemon (`agentd serve`) and the
+per-session worker it spawns (`agentd session-worker`). The `agent` CLI is
+Rust (`../crates/agent-cli`) and speaks the same framed protocol (version 1)
+and state schema (version 1).
 
-The Go side speaks protocol v33 and schema v8, which drop worktree management
-in favour of a per-session working directory (see `../docs/drop-worktrees.md`).
-A runtime root created by the former Rust daemon is migrated in place the first
-time the Go side opens its `state.db`.
+## Layout at a glance
 
-## Status
-
-| Piece | State |
+| Package | What it does |
 |---|---|
-| `internal/protocol` | Complete. Same framing and primitive encodings as `crates/agentd-shared/src/protocol.rs`; version 33 removes the worktree, apply, discard and diff messages. Round-trip, golden-frame and removed-kind tests. |
-| `internal/session`, `internal/paths` | Complete. Session records carry `Cwd` instead of repo/branch/worktree fields. |
-| `internal/db` | Schema v8 init, v6/v7 migration (worktree path becomes `cwd`), and the session row operations the daemon and worker need. Uses `modernc.org/sqlite` (pure Go). |
-| `internal/worker` | Complete session worker: PTY via `creack/pty`, shadow terminal via `go.mitchellh.com/libghostty`, per-session Unix socket speaking the worker protocol. Covered by real-PTY tests (attach/detach/reattach, survival across disconnect, multiple attachers, resize, exit, kill, slow and disconnecting clients, malformed frames) run under `-race`. |
-| `cmd/agentd session-worker` | Done. Takes `--cwd`; injects `AGENTD_CWD` (and `AGENTD_WORKSPACE` as an alias). |
-| `internal/daemon` | Complete daemon: lock/socket/pid file lifecycle, create/kill/rm/ls/get, attach and request proxies to workers, history, daemon management protocol, worker supervision and startup reconciliation. Tests run the daemon in-process against real worker processes. |
-| `cmd/agentd serve`, `upgrade` | Done. `serve --daemonize` is what the agent CLI runs. |
+| `internal/protocol` | The framed binary protocol and the small daemon management protocol. The same framing and encodings as `crates/agentd-shared/src/protocol.rs`; golden-frame tests on both sides pin identical bytes. |
+| `internal/session`, `internal/paths` | The session model and runtime-root resolution, shared in meaning with `crates/agentd-shared`. |
+| `internal/db` | `state.db`: schema, and the guarded session state transitions the daemon and workers use. Uses `modernc.org/sqlite` (pure Go). |
+| `internal/daemon` | `agentd serve`: lock/socket/pid file lifecycle, create/kill/rm/ls/get, attach and request proxies to workers, history, daemon management, worker supervision and startup reconciliation. Tests run the daemon in-process against real worker processes. |
+| `internal/worker` | One session: PTY via `creack/pty`, shadow terminal via `go.mitchellh.com/libghostty`, per-session Unix socket. Real-PTY tests run under `-race`. |
+| `cmd/agentd` | `serve [--daemonize]`, `upgrade`, `session-worker`. The agent CLI runs `serve --daemonize`. |
 
 ## How the daemon and workers fit together
 
@@ -48,9 +43,6 @@ agent CLI ──unix socket──► agentd serve ──unix socket──► age
 - Worker stderr goes to `logs/<id>.worker.log`; a daemonized `serve` logs to
   `agentd.log` in the root (not `logs/`, where it could collide with a
   session named `agentd`).
-- A pre-v8 `state.db` from the Rust daemon is migrated only once that daemon
-  and its sessions have stopped; until then startup refuses and says what is
-  still running.
 
 ## Running it
 

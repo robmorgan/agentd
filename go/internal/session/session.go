@@ -1,8 +1,7 @@
-// Package session holds the session model used by the Go daemon and worker.
-//
-// It started as a mirror of crates/agentd-shared/src/session.rs. As of
-// protocol v33 it diverges: sessions carry a working directory (Cwd) and no
-// git worktree, branch, or integration state. See docs/drop-worktrees.md.
+// Package session holds the session model shared by the daemon, its workers
+// and (through the wire protocol and state.db) the agent CLI, whose Rust
+// mirror is crates/agentd-shared/src/session.rs. A session runs in a working
+// directory (Cwd); agentd does not manage git state there.
 package session
 
 import (

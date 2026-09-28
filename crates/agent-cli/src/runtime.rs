@@ -875,11 +875,7 @@ impl SessionPicker {
     async fn remove_session(&mut self, session_id: &str) -> Result<()> {
         let response = send_request(
             &self.paths,
-            &Request::KillSession {
-                session_id: session_id.to_string(),
-                remove: true,
-                force: false,
-            },
+            &Request::KillSession { session_id: session_id.to_string(), remove: true },
         )
         .await?;
         match response {
@@ -2053,7 +2049,6 @@ mod tests {
         assert!(rendered.contains("  1. yes"));
         assert!(rendered.contains("› 2. no"));
         assert!(rendered.contains("Its working directory is kept."));
-        assert!(!rendered.contains("worktree"));
     }
 
     #[test]

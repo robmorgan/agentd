@@ -8,11 +8,14 @@ use crate::session::{
     SessionRecord, SessionStatus,
 };
 
-/// Version 33 drops the worktree, apply, discard and diff messages and the git
-/// fields on session records (see docs/drop-worktrees.md). The encoding must
-/// stay byte for byte identical to go/internal/protocol/protocol.go.
-pub const PROTOCOL_VERSION: u16 = 33;
-pub const DAEMON_MANAGEMENT_VERSION: u16 = 1;
+/// Version of the session protocol. The encoding must stay byte for byte
+/// identical to go/internal/protocol/protocol.go.
+pub const PROTOCOL_VERSION: u16 = 1;
+
+/// Header version used by daemon management frames (status and shutdown).
+/// It never changes, so `agent daemon status` and `agent daemon stop` keep
+/// working against a daemon that speaks a different PROTOCOL_VERSION.
+pub const DAEMON_MANAGEMENT_VERSION: u16 = 0;
 
 /// Largest payload a frame may declare or carry. Readers reject larger
 /// declared lengths before allocating, so a corrupt or hostile header cannot
@@ -75,10 +78,6 @@ pub enum Request {
     KillSession {
         session_id: String,
         remove: bool,
-        force: bool,
-    },
-    ResolveSessionRuntime {
-        session_id: String,
     },
     AttachSession {
         session_id: String,
@@ -111,10 +110,6 @@ pub enum Request {
         data: Vec<u8>,
         source_session_id: Option<String>,
     },
-    SwitchAttachedSession {
-        source_session_id: String,
-        target_session_id: String,
-    },
     GetSession {
         session_id: String,
     },
@@ -139,9 +134,6 @@ pub enum Response {
     KillSession {
         removed: bool,
         was_running: bool,
-    },
-    RuntimeEndpoint {
-        socket_path: String,
     },
     Attached {
         attach_id: String,
@@ -172,9 +164,6 @@ pub enum Response {
     PtyOutput {
         data: Vec<u8>,
     },
-    SwitchSession {
-        session_id: String,
-    },
     EndOfStream,
     Error {
         message: String,
@@ -182,44 +171,40 @@ pub enum Response {
     Ok,
 }
 
-// Kind numbers are stable across versions. Numbers removed in v33 (4, 5, 10,
-// 19, 20, 106, 107: worktree, diff, apply and discard) are left unassigned so a
-// v32 frame can never be misread as something else; 10 and 107 are reserved
-// for a future cwd-based diff.
+// Requests are numbered from 1 and responses from 101. The ErrorResponse kind
+// (114) and its payload (a single string) must never change: a peer speaking
+// another protocol version is refused with an Error frame in its own framing,
+// and it can only read that refusal if the kind and payload stay fixed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 enum MessageKind {
     GetDaemonInfoRequest = 1,
     ShutdownDaemonRequest = 2,
     CreateSessionRequest = 3,
-    KillSessionRequest = 6,
-    ResolveSessionRuntimeRequest = 25,
-    AttachSessionRequest = 7,
-    AttachInputRequest = 8,
-    AttachSnapshotRequest = 24,
-    SendInputRequest = 9,
-    ListAttachmentsRequest = 22,
-    DetachAttachmentRequest = 23,
-    AttachResizeRequest = 21,
-    DetachSessionRequest = 17,
-    SwitchAttachedSessionRequest = 16,
-    GetSessionRequest = 11,
-    ListSessionsRequest = 12,
-    GetHistoryRequest = 14,
+    KillSessionRequest = 4,
+    AttachSessionRequest = 5,
+    AttachInputRequest = 6,
+    AttachResizeRequest = 7,
+    AttachSnapshotRequest = 8,
+    DetachSessionRequest = 9,
+    DetachAttachmentRequest = 10,
+    SendInputRequest = 11,
+    GetSessionRequest = 12,
+    ListSessionsRequest = 13,
+    ListAttachmentsRequest = 14,
+    GetHistoryRequest = 15,
     DaemonInfoResponse = 101,
     CreateSessionResponse = 102,
     KillSessionResponse = 103,
-    RuntimeEndpointResponse = 120,
     AttachedResponse = 104,
-    AttachSnapshotResponse = 119,
-    SessionEndedResponse = 117,
-    AttachmentsResponse = 118,
-    InputAcceptedResponse = 105,
+    AttachSnapshotResponse = 105,
+    SessionEndedResponse = 106,
+    InputAcceptedResponse = 107,
     SessionResponse = 108,
     SessionsResponse = 109,
+    AttachmentsResponse = 110,
     HistoryResponse = 111,
     PtyOutputResponse = 112,
-    SwitchSessionResponse = 116,
     EndOfStreamResponse = 113,
     ErrorResponse = 114,
     OkResponse = 115,
@@ -231,34 +216,30 @@ impl MessageKind {
             1 => Self::GetDaemonInfoRequest,
             2 => Self::ShutdownDaemonRequest,
             3 => Self::CreateSessionRequest,
-            6 => Self::KillSessionRequest,
-            25 => Self::ResolveSessionRuntimeRequest,
-            7 => Self::AttachSessionRequest,
-            8 => Self::AttachInputRequest,
-            24 => Self::AttachSnapshotRequest,
-            9 => Self::SendInputRequest,
-            22 => Self::ListAttachmentsRequest,
-            23 => Self::DetachAttachmentRequest,
-            21 => Self::AttachResizeRequest,
-            17 => Self::DetachSessionRequest,
-            16 => Self::SwitchAttachedSessionRequest,
-            11 => Self::GetSessionRequest,
-            12 => Self::ListSessionsRequest,
-            14 => Self::GetHistoryRequest,
+            4 => Self::KillSessionRequest,
+            5 => Self::AttachSessionRequest,
+            6 => Self::AttachInputRequest,
+            7 => Self::AttachResizeRequest,
+            8 => Self::AttachSnapshotRequest,
+            9 => Self::DetachSessionRequest,
+            10 => Self::DetachAttachmentRequest,
+            11 => Self::SendInputRequest,
+            12 => Self::GetSessionRequest,
+            13 => Self::ListSessionsRequest,
+            14 => Self::ListAttachmentsRequest,
+            15 => Self::GetHistoryRequest,
             101 => Self::DaemonInfoResponse,
             102 => Self::CreateSessionResponse,
             103 => Self::KillSessionResponse,
-            120 => Self::RuntimeEndpointResponse,
             104 => Self::AttachedResponse,
-            119 => Self::AttachSnapshotResponse,
-            117 => Self::SessionEndedResponse,
-            118 => Self::AttachmentsResponse,
-            105 => Self::InputAcceptedResponse,
+            105 => Self::AttachSnapshotResponse,
+            106 => Self::SessionEndedResponse,
+            107 => Self::InputAcceptedResponse,
             108 => Self::SessionResponse,
             109 => Self::SessionsResponse,
+            110 => Self::AttachmentsResponse,
             111 => Self::HistoryResponse,
             112 => Self::PtyOutputResponse,
-            116 => Self::SwitchSessionResponse,
             113 => Self::EndOfStreamResponse,
             114 => Self::ErrorResponse,
             115 => Self::OkResponse,
@@ -457,15 +438,10 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             put_optional_string(&mut payload, model.as_deref())?;
             MessageKind::CreateSessionRequest
         }
-        Request::KillSession { session_id, remove, force } => {
+        Request::KillSession { session_id, remove } => {
             put_string(&mut payload, session_id)?;
             put_bool(&mut payload, *remove);
-            put_bool(&mut payload, *force);
             MessageKind::KillSessionRequest
-        }
-        Request::ResolveSessionRuntime { session_id } => {
-            put_string(&mut payload, session_id)?;
-            MessageKind::ResolveSessionRuntimeRequest
         }
         Request::AttachSession { session_id, kind, cols, rows, pixel_width, pixel_height } => {
             put_string(&mut payload, session_id)?;
@@ -504,11 +480,6 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             put_optional_string(&mut payload, source_session_id.as_deref())?;
             MessageKind::SendInputRequest
         }
-        Request::SwitchAttachedSession { source_session_id, target_session_id } => {
-            put_string(&mut payload, source_session_id)?;
-            put_string(&mut payload, target_session_id)?;
-            MessageKind::SwitchAttachedSessionRequest
-        }
         Request::GetSession { session_id } => {
             put_string(&mut payload, session_id)?;
             MessageKind::GetSessionRequest
@@ -538,13 +509,8 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
             agent: cursor.take_string()?,
             model: cursor.take_optional_string()?,
         },
-        MessageKind::KillSessionRequest => Request::KillSession {
-            session_id: cursor.take_string()?,
-            remove: cursor.take_bool()?,
-            force: cursor.take_bool()?,
-        },
-        MessageKind::ResolveSessionRuntimeRequest => {
-            Request::ResolveSessionRuntime { session_id: cursor.take_string()? }
+        MessageKind::KillSessionRequest => {
+            Request::KillSession { session_id: cursor.take_string()?, remove: cursor.take_bool()? }
         }
         MessageKind::AttachSessionRequest => Request::AttachSession {
             session_id: cursor.take_string()?,
@@ -573,10 +539,6 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
             session_id: cursor.take_string()?,
             data: cursor.take_bytes()?,
             source_session_id: cursor.take_optional_string()?,
-        },
-        MessageKind::SwitchAttachedSessionRequest => Request::SwitchAttachedSession {
-            source_session_id: cursor.take_string()?,
-            target_session_id: cursor.take_string()?,
         },
         MessageKind::GetSessionRequest => Request::GetSession { session_id: cursor.take_string()? },
         MessageKind::ListSessionsRequest => Request::ListSessions,
@@ -607,10 +569,6 @@ fn encode_response(response: &Response) -> Result<(MessageKind, Vec<u8>)> {
             put_bool(&mut payload, *removed);
             put_bool(&mut payload, *was_running);
             MessageKind::KillSessionResponse
-        }
-        Response::RuntimeEndpoint { socket_path } => {
-            put_string(&mut payload, socket_path)?;
-            MessageKind::RuntimeEndpointResponse
         }
         Response::Attached { attach_id, snapshot } => {
             put_string(&mut payload, attach_id)?;
@@ -655,10 +613,6 @@ fn encode_response(response: &Response) -> Result<(MessageKind, Vec<u8>)> {
             put_bytes(&mut payload, data)?;
             MessageKind::PtyOutputResponse
         }
-        Response::SwitchSession { session_id } => {
-            put_string(&mut payload, session_id)?;
-            MessageKind::SwitchSessionResponse
-        }
         Response::EndOfStream => MessageKind::EndOfStreamResponse,
         Response::Error { message } => {
             put_string(&mut payload, message)?;
@@ -680,9 +634,6 @@ fn decode_response(kind: MessageKind, payload: &[u8]) -> Result<Response> {
         }
         MessageKind::KillSessionResponse => {
             Response::KillSession { removed: cursor.take_bool()?, was_running: cursor.take_bool()? }
-        }
-        MessageKind::RuntimeEndpointResponse => {
-            Response::RuntimeEndpoint { socket_path: cursor.take_string()? }
         }
         MessageKind::AttachedResponse => {
             Response::Attached { attach_id: cursor.take_string()?, snapshot: cursor.take_bytes()? }
@@ -718,9 +669,6 @@ fn decode_response(kind: MessageKind, payload: &[u8]) -> Result<Response> {
         }
         MessageKind::HistoryResponse => Response::History { data: cursor.take_string()? },
         MessageKind::PtyOutputResponse => Response::PtyOutput { data: cursor.take_bytes()? },
-        MessageKind::SwitchSessionResponse => {
-            Response::SwitchSession { session_id: cursor.take_string()? }
-        }
         MessageKind::EndOfStreamResponse => Response::EndOfStream,
         MessageKind::ErrorResponse => Response::Error { message: cursor.take_string()? },
         MessageKind::OkResponse => Response::Ok,
@@ -829,9 +777,9 @@ fn put_session_status(buf: &mut Vec<u8>, status: SessionStatus) {
     buf.push(match status {
         SessionStatus::Creating => 1,
         SessionStatus::Running => 2,
-        SessionStatus::Exited => 5,
-        SessionStatus::Failed => 6,
-        SessionStatus::UnknownRecovered => 7,
+        SessionStatus::Exited => 3,
+        SessionStatus::Failed => 4,
+        SessionStatus::UnknownRecovered => 5,
     });
 }
 
@@ -1019,10 +967,9 @@ impl<'a> Cursor<'a> {
         Ok(match self.take_u8()? {
             1 => SessionStatus::Creating,
             2 => SessionStatus::Running,
-            3 => SessionStatus::UnknownRecovered,
-            5 => SessionStatus::Exited,
-            6 => SessionStatus::Failed,
-            7 => SessionStatus::UnknownRecovered,
+            3 => SessionStatus::Exited,
+            4 => SessionStatus::Failed,
+            5 => SessionStatus::UnknownRecovered,
             other => bail!("invalid session status `{other}`"),
         })
     }
@@ -1180,17 +1127,6 @@ mod tests {
     }
 
     #[test]
-    fn switch_attached_session_round_trips() {
-        let request = Request::SwitchAttachedSession {
-            source_session_id: "source".to_string(),
-            target_session_id: "target".to_string(),
-        };
-        let (kind, payload) = encode_request(&request).unwrap();
-        let decoded = decode_request(kind, &payload).unwrap();
-        assert_eq!(decoded, request);
-    }
-
-    #[test]
     fn detach_session_round_trips() {
         let request = Request::DetachSession { session_id: "demo".to_string(), all: true };
         let (kind, payload) = encode_request(&request).unwrap();
@@ -1241,9 +1177,21 @@ mod tests {
     }
 
     #[test]
-    fn legacy_paused_status_decodes_as_unknown_recovered() {
-        let mut cursor = Cursor::new(&[3]);
-        assert_eq!(cursor.take_session_status().unwrap(), SessionStatus::UnknownRecovered);
+    fn session_status_round_trips_every_value() {
+        for status in [
+            SessionStatus::Creating,
+            SessionStatus::Running,
+            SessionStatus::Exited,
+            SessionStatus::Failed,
+            SessionStatus::UnknownRecovered,
+        ] {
+            let mut buf = Vec::new();
+            super::put_session_status(&mut buf, status);
+            assert_eq!(Cursor::new(&buf).take_session_status().unwrap(), status);
+        }
+        for invalid in [0_u8, 6, 255] {
+            assert!(Cursor::new(&[invalid]).take_session_status().is_err());
+        }
     }
 
     #[test]
@@ -1260,9 +1208,8 @@ mod tests {
     }
 
     #[test]
-    fn kill_session_round_trips_with_force() {
-        let request =
-            Request::KillSession { session_id: "demo".to_string(), remove: true, force: true };
+    fn kill_session_round_trips() {
+        let request = Request::KillSession { session_id: "demo".to_string(), remove: true };
         let (kind, payload) = encode_request(&request).unwrap();
         let decoded = decode_request(kind, &payload).unwrap();
         assert_eq!(decoded, request);
@@ -1280,14 +1227,6 @@ mod tests {
     #[test]
     fn attach_snapshot_response_round_trips() {
         let response = Response::AttachSnapshot { snapshot: vec![4, 3, 2, 1] };
-        let (kind, payload) = encode_response(&response).unwrap();
-        let decoded = decode_response(kind, &payload).unwrap();
-        assert_eq!(decoded, response);
-    }
-
-    #[test]
-    fn switch_session_response_round_trips() {
-        let response = Response::SwitchSession { session_id: "target".to_string() };
         let (kind, payload) = encode_response(&response).unwrap();
         let decoded = decode_response(kind, &payload).unwrap();
         assert_eq!(decoded, response);
@@ -1442,9 +1381,9 @@ mod tests {
     }
 
     // The golden frames below are the exact bytes go/internal/protocol produces
-    // for the same values (TestAttachSessionGoldenFrame in protocol_test.go, and
-    // the other frames dumped from WriteRequest/WriteResponse). If either side
-    // changes an encoding, one of these tests or the Go tests fails.
+    // for the same values; they are pinned identically in
+    // go/internal/protocol/protocol_test.go. If either side changes an
+    // encoding, one of these tests or the Go tests fails.
 
     async fn request_frame(request: &Request) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -1474,8 +1413,8 @@ mod tests {
     async fn attach_session_matches_go_golden_frame() {
         let golden = [
             0x50, 0x44, 0x47, 0x41, // magic "AGDP" little-endian
-            33, 0, // protocol version
-            7, 0, // AttachSessionRequest
+            1, 0, // protocol version
+            5, 0, // AttachSessionRequest
             0, 0, 0, 0, // flags, reserved
             15, 0, 0, 0, // payload length
             2, 0, 0, 0, b'a', b'b', // session id
@@ -1500,7 +1439,7 @@ mod tests {
     #[tokio::test]
     async fn create_session_matches_go_golden_frame() {
         let golden = [
-            0x50, 0x44, 0x47, 0x41, 0x21, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, //
+            0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, //
             0x18, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x2f, 0x77, 0x01, 0x03, //
             0x00, 0x00, 0x00, 0x66, 0x69, 0x78, 0x05, 0x00, 0x00, 0x00, 0x63, 0x6f, //
             0x64, 0x65, 0x78, 0x00,
@@ -1520,7 +1459,7 @@ mod tests {
     #[tokio::test]
     async fn create_session_result_matches_go_golden_frame() {
         let golden = [
-            0x50, 0x44, 0x47, 0x41, 0x21, 0x00, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, //
+            0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, //
             0x0e, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x61, 0x62, 0x02, 0x00, //
             0x00, 0x00, 0x2f, 0x77, 0x02, 0x02,
         ];
@@ -1541,8 +1480,8 @@ mod tests {
     #[tokio::test]
     async fn session_ended_matches_go_golden_frame() {
         let golden = [
-            0x50, 0x44, 0x47, 0x41, 0x21, 0x00, 0x75, 0x00, 0x00, 0x00, 0x00, 0x00, //
-            0x12, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x61, 0x62, 0x05, 0x01, //
+            0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x6a, 0x00, 0x00, 0x00, 0x00, 0x00, //
+            0x12, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x61, 0x62, 0x03, 0x01, //
             0xff, 0xff, 0xff, 0xff, 0x01, 0x01, 0x00, 0x00, 0x00, 0x65,
         ];
         assert_response_golden(
@@ -1558,12 +1497,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kill_session_matches_go_golden_frame() {
+        let golden = [
+            0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, //
+            0x07, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x61, 0x62, 0x01,
+        ];
+        assert_request_golden(
+            Request::KillSession { session_id: "ab".to_string(), remove: true },
+            &golden,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn error_matches_go_golden_frame() {
+        let golden = [
+            0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x72, 0x00, 0x00, 0x00, 0x00, 0x00, //
+            0x06, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x6e, 0x6f,
+        ];
+        assert_response_golden(Response::Error { message: "no".to_string() }, &golden).await;
+    }
+
+    #[tokio::test]
+    async fn management_shutdown_matches_go_golden_frame() {
+        let mut golden = vec![
+            0x50, 0x44, 0x47, 0x41, // magic
+            0x00, 0x00, // management version
+            0x22, 0x4e, // 20002: shutdown request
+            0x00, 0x00, 0x00, 0x00, // flags, reserved
+            0x0e, 0x00, 0x00, 0x00, // payload length
+        ];
+        golden.extend_from_slice(br#"{"force":true}"#);
+        let request = DaemonManagementRequest::Shutdown { force: true };
+        let mut buf = Vec::new();
+        write_daemon_management_request(&mut buf, &request).await.unwrap();
+        assert_eq!(buf, golden);
+        let incoming = read_incoming_request(&mut golden.as_slice()).await.unwrap().unwrap();
+        assert_eq!(incoming, IncomingRequest::DaemonManagement(request));
+    }
+
+    #[tokio::test]
     async fn session_record_matches_go_golden_frame() {
         let golden = [
-            0x50, 0x44, 0x47, 0x41, 0x21, 0x00, 0x6c, 0x00, 0x00, 0x00, 0x00, 0x00, //
+            0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x6c, 0x00, 0x00, 0x00, 0x00, 0x00, //
             0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x61, 0x62, 0x02, 0x00, //
             0x00, 0x00, 0x73, 0x68, 0x01, 0x01, 0x00, 0x00, 0x00, 0x6d, 0x01, 0x02, //
-            0x00, 0x00, 0x00, 0x2f, 0x77, 0x05, 0x01, 0x07, 0x00, 0x00, 0x00, 0x00, //
+            0x00, 0x00, 0x00, 0x2f, 0x77, 0x03, 0x01, 0x07, 0x00, 0x00, 0x00, 0x00, //
             0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, //
             0x73, 0x00, 0xf1, 0x53, 0x65, 0x00, 0x00, 0x00, 0x00, 0x15, 0xcd, 0x5b, //
             0x07, 0x00, 0xf1, 0x53, 0x65, 0x00, 0x00, 0x00, 0x00, 0x15, 0xcd, 0x5b, //
@@ -1609,28 +1588,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kinds_removed_in_v33_are_rejected() {
-        let payload = [4, 0, 0, 0, b'd', b'e', b'm', b'o'];
-        for kind in [4_u16, 5, 10, 19, 20] {
-            let frame = raw_frame(PROTOCOL_VERSION, kind, &payload);
+    async fn unknown_kinds_are_rejected() {
+        for kind in [0_u16, 16, 99, 116] {
+            let frame = raw_frame(PROTOCOL_VERSION, kind, &[]);
             let err = read_request(&mut frame.as_slice()).await.unwrap_err().to_string();
             assert!(err.contains(&format!("unknown message kind `{kind}`")), "{kind}: {err}");
-        }
-        for kind in [106_u16, 107] {
-            let frame = raw_frame(PROTOCOL_VERSION, kind, &payload);
             let err = super::read_response(&mut frame.as_slice()).await.unwrap_err().to_string();
             assert!(err.contains(&format!("unknown message kind `{kind}`")), "{kind}: {err}");
         }
     }
 
     #[tokio::test]
-    async fn v32_frames_are_rejected_by_version() {
-        let frame = raw_frame(32, 7, &[]);
+    async fn frames_at_another_version_are_rejected() {
+        let other = PROTOCOL_VERSION + 1;
+        let frame = raw_frame(other, 5, &[]);
         let err = read_request(&mut frame.as_slice()).await.unwrap_err().to_string();
-        assert!(err.contains("unsupported protocol version `32`"), "{err}");
-        let frame = raw_frame(32, 101, &[]);
+        assert!(err.contains(&format!("unsupported protocol version `{other}`")), "{err}");
+        let err = read_incoming_request(&mut frame.as_slice()).await.unwrap_err().to_string();
+        assert!(err.contains(&format!("unsupported protocol version `{other}`")), "{err}");
+        let frame = raw_frame(other, 101, &[]);
         let err = super::read_response(&mut frame.as_slice()).await.unwrap_err().to_string();
-        assert!(err.contains("unsupported protocol version `32`"), "{err}");
+        assert!(err.contains(&format!("unsupported protocol version `{other}`")), "{err}");
     }
 
     fn frame_header_declaring(version: u16, kind: u16, len: u32) -> Vec<u8> {

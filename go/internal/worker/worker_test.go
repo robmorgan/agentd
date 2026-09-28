@@ -39,7 +39,7 @@ while IFS= read -r l; do
     size) stty size;;
     stall) stty raw; sleep 3; stty -raw; echo unstalled;;
     bye) i=0; while [ $i -lt 2000 ]; do echo "tail $i"; i=$((i+1)); done; echo final-line; exit 0;;
-    where) echo "pwd:$(pwd -P)"; echo "cwd:$AGENTD_CWD"; echo "ws:$AGENTD_WORKSPACE";;
+    where) echo "pwd:$(pwd -P)"; echo "cwd:$AGENTD_CWD";;
     flood) i=0; while [ $i -lt 20000 ]; do echo "line $i padding padding padding padding"; i=$((i+1)); done; echo flood-done;;
     *) echo "got:$l";;
   esac
@@ -612,7 +612,7 @@ func isConnClosed(err error) bool {
 }
 
 // TestAgentRunsInCwd checks that the agent process starts in Args.Cwd and
-// sees it through AGENTD_CWD and the AGENTD_WORKSPACE alias. The directory is
+// sees it through AGENTD_CWD. The directory is
 // deliberately not a git repository.
 func TestAgentRunsInCwd(t *testing.T) {
 	h := startWorker(t)
@@ -625,7 +625,6 @@ func TestAgentRunsInCwd(t *testing.T) {
 	}
 	c.expectOutput("pwd:" + real)
 	c.expectOutput("cwd:" + h.paths.Root)
-	c.expectOutput("ws:" + h.paths.Root)
 	c.input("done\n")
 	c.expectEnd()
 	h.waitExit()

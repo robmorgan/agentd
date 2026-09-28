@@ -54,13 +54,12 @@ func TestRequestRoundTrips(t *testing.T) {
 	roundTripRequest(t, &Request{SendInput: &SendInput{SessionID: "demo", Data: []byte{0, 1, 2, 255}, SourceSessionID: strp("origin")}})
 	roundTripRequest(t, &Request{AttachResize: &Geometry{Cols: 120, Rows: 48, PixelWidth: 960, PixelHeight: 768}})
 	roundTripRequest(t, &Request{AttachSnapshot: Empty})
-	roundTripRequest(t, &Request{SwitchAttachedSession: &SwitchAttachedSession{SourceSessionID: "source", TargetSessionID: "target"}})
 	roundTripRequest(t, &Request{DetachSession: &DetachSession{SessionID: "demo", All: true}})
 	roundTripRequest(t, &Request{AttachSession: &AttachSession{SessionID: "demo", Kind: session.AttachmentTui, Geometry: Geometry{120, 48, 960, 768}}})
 	roundTripRequest(t, &Request{DetachAttachment: &DetachAttachment{SessionID: "demo", AttachID: "attach-1"}})
 	roundTripRequest(t, &Request{ListAttachments: &SessionRef{"demo"}})
 	roundTripRequest(t, &Request{GetHistory: &GetHistory{SessionID: "demo", VT: true}})
-	roundTripRequest(t, &Request{KillSession: &KillSession{SessionID: "demo", Remove: true, Force: true}})
+	roundTripRequest(t, &Request{KillSession: &KillSession{SessionID: "demo", Remove: true}})
 	roundTripRequest(t, &Request{CreateSession: &CreateSession{Cwd: "/tmp/x", Name: strp("fix"), Agent: "codex", Model: strp("m")}})
 	roundTripRequest(t, &Request{GetDaemonInfo: Empty})
 	roundTripRequest(t, &Request{AttachInput: &Bytes{Data: []byte("hi")}})
@@ -70,7 +69,6 @@ func TestResponseRoundTrips(t *testing.T) {
 	now := time.Unix(1_700_000_000, 123_456_789).UTC()
 	roundTripResponse(t, &Response{Attached: &Attached{AttachID: "attach-1", Snapshot: []byte{0, 1, 2, 3, 4}}})
 	roundTripResponse(t, &Response{AttachSnapshot: &Bytes{Data: []byte{4, 3, 2, 1}}})
-	roundTripResponse(t, &Response{SwitchSession: &SessionRef{"target"}})
 	roundTripResponse(t, &Response{History: &History{Data: "\x1b[31mhello\x1b[0m"}})
 	roundTripResponse(t, &Response{Ok: Empty})
 	roundTripResponse(t, &Response{EndOfStream: Empty})
@@ -94,8 +92,7 @@ func TestResponseRoundTrips(t *testing.T) {
 }
 
 // TestAttachSessionGoldenFrame pins the exact bytes of an AttachSession
-// request. Apart from the version field this is the frame the Rust v32
-// implementation produces, so framing compatibility does not regress silently.
+// request, spelling out the framing field by field.
 func TestAttachSessionGoldenFrame(t *testing.T) {
 	var buf bytes.Buffer
 	err := WriteRequest(&buf, &Request{AttachSession: &AttachSession{
@@ -106,8 +103,8 @@ func TestAttachSessionGoldenFrame(t *testing.T) {
 	}
 	want := []byte{
 		0x50, 0x44, 0x47, 0x41, // magic "AGDP" little-endian
-		33, 0, // protocol version
-		7, 0, // AttachSessionRequest
+		1, 0, // protocol version
+		5, 0, // AttachSessionRequest
 		0, 0, 0, 0, // flags, reserved
 		15, 0, 0, 0, // payload length
 		2, 0, 0, 0, 'a', 'b', // session id
@@ -120,33 +117,23 @@ func TestAttachSessionGoldenFrame(t *testing.T) {
 	}
 }
 
-func TestLegacyStatusValues(t *testing.T) {
-	d := &decoder{buf: []byte{3}}
-	if got := d.status(); got != session.StatusUnknownRecovered || d.err != nil {
-		t.Fatalf("legacy paused status: got %q err %v", got, d.err)
-	}
-}
-
-// TestRemovedKindsAreRejected checks that frames using the kind numbers
-// retired in v33 are refused rather than decoded into something else, and
-// that a v32 frame is refused before its kind is even looked at.
-func TestRemovedKindsAreRejected(t *testing.T) {
+// Unknown kinds are refused rather than decoded into something else, and a
+// frame at another protocol version is refused before its kind is looked at.
+func TestUnknownKindsAndVersionsAreRejected(t *testing.T) {
 	e := &encoder{}
 	e.str("demo")
-	payload := bytes.NewBuffer(e.buf)
+	payload := e.buf
 
-	for _, k := range []uint16{4, 5, 10, 19, 20} {
+	for _, k := range []uint16{0, 16, 99, 100, 116, 999} {
 		var buf bytes.Buffer
-		if err := writeFrame(&buf, ProtocolVersion, k, payload.Bytes()); err != nil {
+		if err := writeFrame(&buf, ProtocolVersion, k, payload); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := ReadRequest(&buf); err == nil {
 			t.Fatalf("request kind %d should be rejected", k)
 		}
-	}
-	for _, k := range []uint16{106, 107} {
-		var buf bytes.Buffer
-		if err := writeFrame(&buf, ProtocolVersion, k, payload.Bytes()); err != nil {
+		buf.Reset()
+		if err := writeFrame(&buf, ProtocolVersion, k, payload); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := ReadResponse(&buf); err == nil {
@@ -155,12 +142,13 @@ func TestRemovedKindsAreRejected(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := writeFrame(&buf, 32, 7, payload.Bytes()); err != nil {
+	if err := writeFrame(&buf, ProtocolVersion+1, uint16(kAttachSessionRequest), payload); err != nil {
 		t.Fatal(err)
 	}
 	_, err := ReadRequest(&buf)
-	if err == nil || !strings.Contains(err.Error(), "unsupported protocol version `32`") {
-		t.Fatalf("v32 frame: got %v", err)
+	var ve *VersionError
+	if !errors.As(err, &ve) || ve.Version != ProtocolVersion+1 {
+		t.Fatalf("other version: got %v", err)
 	}
 }
 
@@ -184,7 +172,7 @@ func TestManagementShutdownGoldenFrame(t *testing.T) {
 	payload := `{"force":true}`
 	want := append([]byte{
 		0x50, 0x44, 0x47, 0x41, // magic
-		0x01, 0x00, // management version 1
+		0x00, 0x00, // management version 0
 		0x22, 0x4e, // kind 20002
 		0, 0, 0, 0,
 		byte(len(payload)), 0, 0, 0,
@@ -215,12 +203,12 @@ func TestManagementStatusResponseRoundTrip(t *testing.T) {
 
 func TestReadIncomingVersionMismatch(t *testing.T) {
 	var buf bytes.Buffer
-	if err := WriteErrorAtVersion(&buf, 32, "nope"); err != nil {
+	if err := WriteErrorAtVersion(&buf, ProtocolVersion+1, "nope"); err != nil {
 		t.Fatal(err)
 	}
 	_, _, err := ReadIncoming(&buf)
 	var ve *VersionError
-	if !errors.As(err, &ve) || ve.Version != 32 {
+	if !errors.As(err, &ve) || ve.Version != ProtocolVersion+1 {
 		t.Fatalf("got %v", err)
 	}
 	// The error frame itself decodes at its own version.
@@ -267,20 +255,28 @@ func assertResponseGolden(t *testing.T, resp *Response, golden []byte) {
 
 func TestSharedGoldenFrames(t *testing.T) {
 	assertRequestGolden(t, &Request{CreateSession: &CreateSession{Cwd: "/w", Name: strp("fix"), Agent: "codex"}}, []byte{
-		0x50, 0x44, 0x47, 0x41, 0x21, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
 		0x18, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x2f, 0x77, 0x01, 0x03,
 		0x00, 0x00, 0x00, 0x66, 0x69, 0x78, 0x05, 0x00, 0x00, 0x00, 0x63, 0x6f,
 		0x64, 0x65, 0x78, 0x00,
 	})
+	assertRequestGolden(t, &Request{KillSession: &KillSession{SessionID: "ab", Remove: true}}, []byte{
+		0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x07, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x61, 0x62, 0x01,
+	})
 	assertResponseGolden(t, &Response{CreateSession: &session.CreateResult{SessionID: "ab", Cwd: "/w", Status: session.StatusRunning, Mode: session.ModePlan}}, []byte{
-		0x50, 0x44, 0x47, 0x41, 0x21, 0x00, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00,
 		0x0e, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x61, 0x62, 0x02, 0x00,
 		0x00, 0x00, 0x2f, 0x77, 0x02, 0x02,
 	})
 	assertResponseGolden(t, &Response{SessionEnded: &SessionEnded{SessionID: "ab", Status: session.StatusExited, ExitCode: i32p(-1), Error: strp("e")}}, []byte{
-		0x50, 0x44, 0x47, 0x41, 0x21, 0x00, 0x75, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x12, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x61, 0x62, 0x05, 0x01,
+		0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x6a, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x12, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x61, 0x62, 0x03, 0x01,
 		0xff, 0xff, 0xff, 0xff, 0x01, 0x01, 0x00, 0x00, 0x00, 0x65,
+	})
+	assertResponseGolden(t, ErrorResponsef("no"), []byte{
+		0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x72, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x06, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x6e, 0x6f,
 	})
 	created := time.Unix(1_700_000_000, 123_456_789).UTC()
 	exited := time.Unix(1_700_000_100, 0).UTC()
@@ -290,10 +286,10 @@ func TestSharedGoldenFrames(t *testing.T) {
 		Attention: session.AttentionNotice, AttentionSummary: strp("s"),
 		CreatedAt: created, UpdatedAt: created, ExitedAt: &exited,
 	}}, []byte{
-		0x50, 0x44, 0x47, 0x41, 0x21, 0x00, 0x6c, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x6c, 0x00, 0x00, 0x00, 0x00, 0x00,
 		0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x61, 0x62, 0x02, 0x00,
 		0x00, 0x00, 0x73, 0x68, 0x01, 0x01, 0x00, 0x00, 0x00, 0x6d, 0x01, 0x02,
-		0x00, 0x00, 0x00, 0x2f, 0x77, 0x05, 0x01, 0x07, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x2f, 0x77, 0x03, 0x01, 0x07, 0x00, 0x00, 0x00, 0x00,
 		0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00,
 		0x73, 0x00, 0xf1, 0x53, 0x65, 0x00, 0x00, 0x00, 0x00, 0x15, 0xcd, 0x5b,
 		0x07, 0x00, 0xf1, 0x53, 0x65, 0x00, 0x00, 0x00, 0x00, 0x15, 0xcd, 0x5b,
@@ -318,7 +314,7 @@ func TestOversizedFrameRejectedBeforeAllocating(t *testing.T) {
 
 func TestReadIncomingDecodeError(t *testing.T) {
 	var buf bytes.Buffer
-	if err := writeFrame(&buf, ProtocolVersion, 4, nil); err != nil { // retired CreateWorktree kind
+	if err := writeFrame(&buf, ProtocolVersion, 99, nil); err != nil { // no such kind
 		t.Fatal(err)
 	}
 	_, _, err := ReadIncoming(&buf)

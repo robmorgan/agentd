@@ -1,10 +1,9 @@
 // Package protocol implements the framed binary wire protocol shared by the
 // agent CLI, the daemon, and session workers.
 //
-// Framing and primitive encodings are identical to
-// crates/agentd-shared/src/protocol.rs. Version 33 drops the worktree, apply,
-// discard and diff messages and the git fields on session records (see
-// docs/drop-worktrees.md), so a v33 peer cannot talk to the Rust v32 daemon.
+// crates/agentd-shared/src/protocol.rs implements the same protocol for the
+// agent CLI; the two must agree byte for byte (golden-frame tests on both
+// sides pin this).
 package protocol
 
 import (
@@ -20,8 +19,11 @@ import (
 )
 
 const (
-	ProtocolVersion         uint16 = 33
-	DaemonManagementVersion uint16 = 1
+	ProtocolVersion uint16 = 1
+	// DaemonManagementVersion frames the daemon management protocol
+	// (management.go). It is not a version of the main protocol and never
+	// changes, so status and shutdown keep working across protocol versions.
+	DaemonManagementVersion uint16 = 0
 
 	frameMagic     uint32 = 0x4147_4450
 	frameHeaderLen        = 16
@@ -36,23 +38,21 @@ const (
 // Request is the union of all client to daemon and daemon to worker requests.
 // Exactly one field is set. The kind is encoded by which pointer is non-nil.
 type Request struct {
-	GetDaemonInfo         *struct{}
-	ShutdownDaemon        *struct{}
-	CreateSession         *CreateSession
-	KillSession           *KillSession
-	ResolveSessionRuntime *SessionRef
-	AttachSession         *AttachSession
-	AttachResize          *Geometry
-	DetachSession         *DetachSession
-	DetachAttachment      *DetachAttachment
-	AttachInput           *Bytes
-	AttachSnapshot        *struct{}
-	SendInput             *SendInput
-	SwitchAttachedSession *SwitchAttachedSession
-	GetSession            *SessionRef
-	ListSessions          *struct{}
-	ListAttachments       *SessionRef
-	GetHistory            *GetHistory
+	GetDaemonInfo    *struct{}
+	ShutdownDaemon   *struct{}
+	CreateSession    *CreateSession
+	KillSession      *KillSession
+	AttachSession    *AttachSession
+	AttachResize     *Geometry
+	DetachSession    *DetachSession
+	DetachAttachment *DetachAttachment
+	AttachInput      *Bytes
+	AttachSnapshot   *struct{}
+	SendInput        *SendInput
+	GetSession       *SessionRef
+	ListSessions     *struct{}
+	ListAttachments  *SessionRef
+	GetHistory       *GetHistory
 }
 
 type SessionRef struct{ SessionID string }
@@ -68,8 +68,8 @@ type CreateSession struct {
 }
 
 type KillSession struct {
-	SessionID     string
-	Remove, Force bool
+	SessionID string
+	Remove    bool
 }
 
 type Geometry struct {
@@ -97,10 +97,6 @@ type SendInput struct {
 	SourceSessionID *string
 }
 
-type SwitchAttachedSession struct {
-	SourceSessionID, TargetSessionID string
-}
-
 type GetHistory struct {
 	SessionID string
 	VT        bool
@@ -108,23 +104,21 @@ type GetHistory struct {
 
 // Response is the union of all responses. Exactly one field is set.
 type Response struct {
-	DaemonInfo      *DaemonInfo
-	CreateSession   *session.CreateResult
-	KillSession     *KillSessionResult
-	RuntimeEndpoint *RuntimeEndpoint
-	Attached        *Attached
-	AttachSnapshot  *Bytes
-	SessionEnded    *SessionEnded
-	InputAccepted   *struct{}
-	Session         *session.Record
-	Sessions        *[]session.Record
-	Attachments     *[]session.AttachmentRecord
-	History         *History
-	PtyOutput       *Bytes
-	SwitchSession   *SessionRef
-	EndOfStream     *struct{}
-	Error           *ErrorResponse
-	Ok              *struct{}
+	DaemonInfo     *DaemonInfo
+	CreateSession  *session.CreateResult
+	KillSession    *KillSessionResult
+	Attached       *Attached
+	AttachSnapshot *Bytes
+	SessionEnded   *SessionEnded
+	InputAccepted  *struct{}
+	Session        *session.Record
+	Sessions       *[]session.Record
+	Attachments    *[]session.AttachmentRecord
+	History        *History
+	PtyOutput      *Bytes
+	EndOfStream    *struct{}
+	Error          *ErrorResponse
+	Ok             *struct{}
 }
 
 type DaemonInfo struct {
@@ -133,7 +127,6 @@ type DaemonInfo struct {
 }
 
 type KillSessionResult struct{ Removed, WasRunning bool }
-type RuntimeEndpoint struct{ SocketPath string }
 type Attached struct {
 	AttachID string
 	Snapshot []byte
@@ -158,46 +151,42 @@ func ErrorResponsef(format string, args ...any) *Response {
 
 type kind uint16
 
-// Kind numbers are stable across versions. Numbers removed in v33 (4, 5, 10,
-// 19, 20, 106, 107: worktree, diff, apply and discard) are left unassigned so
-// a v32 frame can never be misread as something else; 10 and 107 are reserved
-// for a future cwd-based diff.
+// Message kinds. kErrorResponse and its payload (one string) must never
+// change: a peer on another protocol version is refused with an Error frame
+// in its own framing (WriteErrorAtVersion), which it can only decode if both
+// stay fixed.
 const (
-	kGetDaemonInfoRequest         kind = 1
-	kShutdownDaemonRequest        kind = 2
-	kCreateSessionRequest         kind = 3
-	kKillSessionRequest           kind = 6
-	kResolveSessionRuntimeRequest kind = 25
-	kAttachSessionRequest         kind = 7
-	kAttachInputRequest           kind = 8
-	kAttachSnapshotRequest        kind = 24
-	kSendInputRequest             kind = 9
-	kListAttachmentsRequest       kind = 22
-	kDetachAttachmentRequest      kind = 23
-	kAttachResizeRequest          kind = 21
-	kDetachSessionRequest         kind = 17
-	kSwitchAttachedSessionRequest kind = 16
-	kGetSessionRequest            kind = 11
-	kListSessionsRequest          kind = 12
-	kGetHistoryRequest            kind = 14
+	kGetDaemonInfoRequest    kind = 1
+	kShutdownDaemonRequest   kind = 2
+	kCreateSessionRequest    kind = 3
+	kKillSessionRequest      kind = 4
+	kAttachSessionRequest    kind = 5
+	kAttachInputRequest      kind = 6
+	kAttachResizeRequest     kind = 7
+	kAttachSnapshotRequest   kind = 8
+	kDetachSessionRequest    kind = 9
+	kDetachAttachmentRequest kind = 10
+	kSendInputRequest        kind = 11
+	kGetSessionRequest       kind = 12
+	kListSessionsRequest     kind = 13
+	kListAttachmentsRequest  kind = 14
+	kGetHistoryRequest       kind = 15
 
-	kDaemonInfoResponse      kind = 101
-	kCreateSessionResponse   kind = 102
-	kKillSessionResponse     kind = 103
-	kRuntimeEndpointResponse kind = 120
-	kAttachedResponse        kind = 104
-	kAttachSnapshotResponse  kind = 119
-	kSessionEndedResponse    kind = 117
-	kAttachmentsResponse     kind = 118
-	kInputAcceptedResponse   kind = 105
-	kSessionResponse         kind = 108
-	kSessionsResponse        kind = 109
-	kHistoryResponse         kind = 111
-	kPtyOutputResponse       kind = 112
-	kSwitchSessionResponse   kind = 116
-	kEndOfStreamResponse     kind = 113
-	kErrorResponse           kind = 114
-	kOkResponse              kind = 115
+	kDaemonInfoResponse     kind = 101
+	kCreateSessionResponse  kind = 102
+	kKillSessionResponse    kind = 103
+	kAttachedResponse       kind = 104
+	kAttachSnapshotResponse kind = 105
+	kSessionEndedResponse   kind = 106
+	kInputAcceptedResponse  kind = 107
+	kSessionResponse        kind = 108
+	kSessionsResponse       kind = 109
+	kAttachmentsResponse    kind = 110
+	kHistoryResponse        kind = 111
+	kPtyOutputResponse      kind = 112
+	kEndOfStreamResponse    kind = 113
+	kErrorResponse          kind = 114
+	kOkResponse             kind = 115
 )
 
 // ---------------------------------------------------------------------------
@@ -353,11 +342,7 @@ func encodeRequest(req *Request) (kind, []byte, error) {
 	case req.KillSession != nil:
 		e.str(req.KillSession.SessionID)
 		e.bool(req.KillSession.Remove)
-		e.bool(req.KillSession.Force)
 		return kKillSessionRequest, e.buf, e.err
-	case req.ResolveSessionRuntime != nil:
-		e.str(req.ResolveSessionRuntime.SessionID)
-		return kResolveSessionRuntimeRequest, e.buf, e.err
 	case req.AttachSession != nil:
 		a := req.AttachSession
 		e.str(a.SessionID)
@@ -385,10 +370,6 @@ func encodeRequest(req *Request) (kind, []byte, error) {
 		e.bytes(req.SendInput.Data)
 		e.optStr(req.SendInput.SourceSessionID)
 		return kSendInputRequest, e.buf, e.err
-	case req.SwitchAttachedSession != nil:
-		e.str(req.SwitchAttachedSession.SourceSessionID)
-		e.str(req.SwitchAttachedSession.TargetSessionID)
-		return kSwitchAttachedSessionRequest, e.buf, e.err
 	case req.GetSession != nil:
 		e.str(req.GetSession.SessionID)
 		return kGetSessionRequest, e.buf, e.err
@@ -421,9 +402,7 @@ func decodeRequest(k kind, payload []byte) (*Request, error) {
 			Model: d.optStr(),
 		}
 	case kKillSessionRequest:
-		req.KillSession = &KillSession{SessionID: d.str(), Remove: d.bool(), Force: d.bool()}
-	case kResolveSessionRuntimeRequest:
-		req.ResolveSessionRuntime = &SessionRef{d.str()}
+		req.KillSession = &KillSession{SessionID: d.str(), Remove: d.bool()}
 	case kAttachSessionRequest:
 		a := &AttachSession{SessionID: d.str(), Kind: d.attachmentKind()}
 		a.Geometry = d.geometry()
@@ -441,8 +420,6 @@ func decodeRequest(k kind, payload []byte) (*Request, error) {
 		req.AttachSnapshot = Empty
 	case kSendInputRequest:
 		req.SendInput = &SendInput{SessionID: d.str(), Data: d.bytes(), SourceSessionID: d.optStr()}
-	case kSwitchAttachedSessionRequest:
-		req.SwitchAttachedSession = &SwitchAttachedSession{SourceSessionID: d.str(), TargetSessionID: d.str()}
 	case kGetSessionRequest:
 		req.GetSession = &SessionRef{d.str()}
 	case kListSessionsRequest:
@@ -478,9 +455,6 @@ func encodeResponse(resp *Response) (kind, []byte, error) {
 		e.bool(resp.KillSession.Removed)
 		e.bool(resp.KillSession.WasRunning)
 		return kKillSessionResponse, e.buf, e.err
-	case resp.RuntimeEndpoint != nil:
-		e.str(resp.RuntimeEndpoint.SocketPath)
-		return kRuntimeEndpointResponse, e.buf, e.err
 	case resp.Attached != nil:
 		e.str(resp.Attached.AttachID)
 		e.bytes(resp.Attached.Snapshot)
@@ -521,9 +495,6 @@ func encodeResponse(resp *Response) (kind, []byte, error) {
 	case resp.PtyOutput != nil:
 		e.bytes(resp.PtyOutput.Data)
 		return kPtyOutputResponse, e.buf, e.err
-	case resp.SwitchSession != nil:
-		e.str(resp.SwitchSession.SessionID)
-		return kSwitchSessionResponse, e.buf, e.err
 	case resp.EndOfStream != nil:
 		return kEndOfStreamResponse, nil, nil
 	case resp.Error != nil:
@@ -547,8 +518,6 @@ func decodeResponse(k kind, payload []byte) (*Response, error) {
 		}
 	case kKillSessionResponse:
 		resp.KillSession = &KillSessionResult{Removed: d.bool(), WasRunning: d.bool()}
-	case kRuntimeEndpointResponse:
-		resp.RuntimeEndpoint = &RuntimeEndpoint{SocketPath: d.str()}
 	case kAttachedResponse:
 		resp.Attached = &Attached{AttachID: d.str(), Snapshot: d.bytes()}
 	case kAttachSnapshotResponse:
@@ -582,8 +551,6 @@ func decodeResponse(k kind, payload []byte) (*Response, error) {
 		resp.History = &History{Data: d.str()}
 	case kPtyOutputResponse:
 		resp.PtyOutput = &Bytes{d.bytes()}
-	case kSwitchSessionResponse:
-		resp.SwitchSession = &SessionRef{d.str()}
 	case kEndOfStreamResponse:
 		resp.EndOfStream = Empty
 	case kErrorResponse:
@@ -684,11 +651,11 @@ func (e *encoder) status(s session.Status) {
 	case session.StatusRunning:
 		e.u8(2)
 	case session.StatusExited:
-		e.u8(5)
+		e.u8(3)
 	case session.StatusFailed:
-		e.u8(6)
+		e.u8(4)
 	case session.StatusUnknownRecovered:
-		e.u8(7)
+		e.u8(5)
 	default:
 		e.err = fmt.Errorf("invalid session status %q", s)
 	}
@@ -908,12 +875,12 @@ func (d *decoder) status() session.Status {
 		return session.StatusCreating
 	case 2:
 		return session.StatusRunning
-	case 3, 7:
-		return session.StatusUnknownRecovered
-	case 5:
+	case 3:
 		return session.StatusExited
-	case 6:
+	case 4:
 		return session.StatusFailed
+	case 5:
+		return session.StatusUnknownRecovered
 	default:
 		d.fail("invalid session status `%d`", v)
 		return ""

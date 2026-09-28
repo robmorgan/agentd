@@ -8,8 +8,8 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// Config mirrors crates/agentd-shared/src/config.rs. Unknown tables (such as
-// the Rust daemon's [git] section) are ignored.
+// Config mirrors crates/agentd-shared/src/config.rs; the CLI reads the same
+// file. Unknown keys and tables are ignored.
 type Config struct {
 	DefaultAgent string                 `toml:"default_agent"`
 	Agents       map[string]AgentConfig `toml:"agents"`

@@ -39,8 +39,8 @@ func Daemonize(p *paths.AppPaths, exe string) error {
 	return cmd.Process.Release()
 }
 
-// Upgrade replaces the running daemon with exe. Like the Rust daemon it
-// refuses while sessions are running, since their workers run the old binary.
+// Upgrade replaces the running daemon with exe. It refuses while sessions are
+// running, since their workers run the old binary.
 func Upgrade(p *paths.AppPaths, exe string) error {
 	if err := p.EnsureLayout(); err != nil {
 		return err
@@ -72,16 +72,8 @@ func Upgrade(p *paths.AppPaths, exe string) error {
 	}
 }
 
-// runningSessions lists live sessions without migrating the database: a
-// pre-v8 state.db is read as it is.
+// runningSessions lists sessions whose worker still answers.
 func runningSessions(p *paths.AppPaths) ([]string, error) {
-	version, err := db.SchemaVersion(p.Database)
-	if err != nil {
-		return nil, err
-	}
-	if version != 0 && version < db.CurrentSchemaVersion {
-		return legacySessionsStillRunning(p)
-	}
 	store, err := db.Open(p.Database)
 	if err != nil {
 		return nil, err
@@ -121,29 +113,11 @@ func managementStatus(p *paths.AppPaths) (*protocol.ManagementStatus, error) {
 
 // stopDaemon stops the running daemon, if any. The daemon's lock says
 // whether one is running, and it is asked to stop over its own socket, so no
-// pid is ever read from disk and signalled. A daemon from before the lock
-// existed (the Rust agentd) is found by its socket and stopped the same way:
-// the management protocol has not changed.
+// pid is ever read from disk and signalled.
 func stopDaemon(p *paths.AppPaths) error {
 	running, err := daemonRunning(p.LockPath())
-	if err != nil {
+	if err != nil || !running {
 		return err
-	}
-	if !running {
-		if !answers(p.Socket) {
-			return nil
-		}
-		if err := requestShutdown(p); err != nil {
-			return err
-		}
-		deadline := time.Now().Add(10 * time.Second)
-		for answers(p.Socket) {
-			if time.Now().After(deadline) {
-				return errors.New("the previous agentd did not stop")
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-		return nil
 	}
 	if err := requestShutdown(p); err != nil {
 		return err
@@ -176,4 +150,13 @@ func requestShutdown(p *paths.AppPaths) error {
 		return fmt.Errorf("failed to ask agentd to stop: %w", err)
 	}
 	return nil
+}
+
+func answers(socket string) bool {
+	conn, err := net.DialTimeout("unix", socket, workerDialTimeout)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }

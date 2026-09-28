@@ -89,9 +89,6 @@ func New(p *paths.AppPaths, workerBin string) (*Server, error) {
 	if err := p.EnsureLayout(); err != nil {
 		return nil, err
 	}
-	if err := checkLegacyRuntime(p); err != nil {
-		return nil, err
-	}
 	store, err := db.Open(p.Database)
 	if err != nil {
 		return nil, err
@@ -126,12 +123,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 	defer releaseLock(lock)
 
-	// Holding the lock, a socket that still answers can only belong to a
-	// daemon that predates the lock (the previous, Rust agentd); anything
-	// else left at the path belongs to a daemon that is gone.
-	if answers(s.paths.Socket) {
-		return fmt.Errorf("%w: an agentd that does not use %s is listening on %s; stop it first", errDaemonRunning, s.paths.LockPath(), s.paths.Socket)
-	}
+	// Holding the lock, any socket left at the path belongs to a daemon that
+	// is gone.
 	if err := os.Remove(s.paths.Socket); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("failed to remove stale agentd socket: %w", err)
 	}
@@ -350,12 +343,6 @@ func (s *Server) handleRequest(conn net.Conn, reader *bufio.Reader, req *protoco
 			return replyErr(err)
 		}
 		return reply(&protocol.Response{KillSession: result})
-	case req.ResolveSessionRuntime != nil:
-		socket, err := s.runtimeSocket(req.ResolveSessionRuntime.SessionID)
-		if err != nil {
-			return replyErr(err)
-		}
-		return reply(&protocol.Response{RuntimeEndpoint: &protocol.RuntimeEndpoint{SocketPath: socket}})
 	case req.AttachSession != nil:
 		return s.proxyAttach(conn, reader, req.AttachSession)
 	case req.AttachSnapshot != nil:
@@ -364,8 +351,6 @@ func (s *Server) handleRequest(conn net.Conn, reader *bufio.Reader, req *protoco
 		return reply(protocol.ErrorResponsef("attach_input is only valid during an attached session"))
 	case req.AttachResize != nil:
 		return reply(protocol.ErrorResponsef("attach_resize is only valid during an attached session"))
-	case req.SwitchAttachedSession != nil:
-		return reply(protocol.ErrorResponsef("shared attach uses client-local switching; reconnect the local client instead"))
 	case req.DetachSession != nil:
 		return s.proxyRequest(conn, req.DetachSession.SessionID, req)
 	case req.DetachAttachment != nil:
@@ -400,8 +385,6 @@ func requestSessionID(req *protocol.Request) (string, bool) {
 	switch {
 	case req.KillSession != nil:
 		return req.KillSession.SessionID, true
-	case req.ResolveSessionRuntime != nil:
-		return req.ResolveSessionRuntime.SessionID, true
 	case req.AttachSession != nil:
 		return req.AttachSession.SessionID, true
 	case req.DetachSession != nil:

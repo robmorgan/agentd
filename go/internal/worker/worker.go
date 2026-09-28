@@ -140,14 +140,11 @@ func Run(args Args) error {
 	}
 	cmd := exec.Command(args.Command, args.Args...)
 	cmd.Dir = args.Cwd
-	// AGENTD_WORKSPACE is an alias of AGENTD_CWD kept for one release so agent
-	// instructions written against the Rust daemon keep working.
 	cmd.Env = append(os.Environ(),
 		"AGENTD_SESSION_ID="+args.SessionID,
 		"AGENTD_SESSION_NAME="+args.SessionID,
 		"AGENTD_SOCKET="+p.Socket,
 		"AGENTD_CWD="+args.Cwd,
-		"AGENTD_WORKSPACE="+args.Cwd,
 	)
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: defaultPtyRows, Cols: defaultPtyCols})
 	if err != nil {

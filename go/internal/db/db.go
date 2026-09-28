@@ -1,9 +1,7 @@
-// Package db is the SQLite state store for the Go daemon and worker.
-//
-// Schema v8 replaces the git columns of the Rust daemon's v7 layout with a
-// single cwd column (see docs/drop-worktrees.md). Opening a v6 or v7 database
-// migrates it in place, so a runtime root created by the Rust daemon can be
-// reused; the Rust daemon cannot open it afterwards.
+// Package db is the SQLite state store (state.db) for the daemon and its
+// session workers. The agent CLI reads and writes the same file in its local
+// fallback mode (crates/agentd-shared/src/sqlite_schema.rs), so the schema
+// and row formats here are shared with it.
 package db
 
 import (
@@ -19,17 +17,11 @@ import (
 	"github.com/robmorgan/agentd/go/internal/session"
 )
 
-const CurrentSchemaVersion = 8
+const CurrentSchemaVersion = 1
 
-// rfc3339 mirrors chrono's `to_rfc3339()` for UTC values: a `+00:00` offset
-// and fractional seconds only when non-zero.
+// rfc3339 matches chrono's `to_rfc3339()` for UTC values (a `+00:00` offset,
+// fractional seconds only when non-zero), which is what the CLI parses.
 const rfc3339 = "2006-01-02T15:04:05.999999999-07:00"
-
-var expectedSessionsColumns = []string{
-	"session_id", "agent", "model", "mode", "cwd", "status", "worker_pid",
-	"agent_pid", "exit_code", "error", "attention", "attention_summary",
-	"created_at", "updated_at", "exited_at",
-}
 
 const createSessionsTable = `
 CREATE TABLE sessions (
@@ -43,34 +35,6 @@ CREATE TABLE sessions (
     agent_pid INTEGER,
     exit_code INTEGER,
     error TEXT,
-    attention TEXT NOT NULL CHECK (attention IN ('info', 'notice', 'action')),
-    attention_summary TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    exited_at TEXT
-);`
-
-// createSessionsTableV7 is the Rust daemon's layout, kept only so a v6
-// database can be stepped through v7 on its way to v8.
-const createSessionsTableV7 = `
-CREATE TABLE sessions (
-    session_id TEXT PRIMARY KEY,
-    agent TEXT NOT NULL,
-    model TEXT,
-    mode TEXT NOT NULL CHECK (mode IN ('execute', 'plan')),
-    workspace TEXT NOT NULL,
-    repo_path TEXT NOT NULL,
-    repo_name TEXT NOT NULL,
-    base_branch TEXT NOT NULL,
-    branch TEXT NOT NULL,
-    worktree TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('creating', 'running', 'exited', 'failed', 'unknown_recovered')),
-    integration_policy TEXT NOT NULL CHECK (integration_policy IN ('manual_review', 'auto_apply_safe')),
-    worker_pid INTEGER,
-    agent_pid INTEGER,
-    exit_code INTEGER,
-    error TEXT,
-    integration_state TEXT NOT NULL CHECK (integration_state IN ('idle', 'auto_applying', 'applied', 'discarded')),
     attention TEXT NOT NULL CHECK (attention IN ('info', 'notice', 'action')),
     attention_summary TEXT,
     created_at TEXT NOT NULL,
@@ -105,57 +69,6 @@ func Open(path string) (*Database, error) {
 		return nil, fmt.Errorf("failed to restrict %s: %w", path, err)
 	}
 	return d, nil
-}
-
-// SchemaVersion reports a state database's schema version without creating
-// or migrating it: 0 if it does not exist or is empty.
-func SchemaVersion(path string) (int, error) {
-	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		return 0, nil
-	}
-	conn, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(5000)")
-	if err != nil {
-		return 0, err
-	}
-	defer conn.Close()
-	var v int
-	err = conn.QueryRow("PRAGMA user_version").Scan(&v)
-	return v, err
-}
-
-// LegacySession is a running session recorded by an agentd from before
-// schema v8.
-type LegacySession struct {
-	SessionID string
-	WorkerPID *int64
-}
-
-// LegacyRunningSessions lists the sessions a pre-v8 database records as
-// running, reading only columns every schema has and without migrating.
-func LegacyRunningSessions(path string) ([]LegacySession, error) {
-	conn, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(5000)")
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-	rows, err := conn.Query(`SELECT session_id, worker_pid FROM sessions WHERE status = 'running'`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []LegacySession
-	for rows.Next() {
-		var ls LegacySession
-		var pid sql.NullInt64
-		if err := rows.Scan(&ls.SessionID, &pid); err != nil {
-			return nil, err
-		}
-		if pid.Valid {
-			ls.WorkerPID = &pid.Int64
-		}
-		out = append(out, ls)
-	}
-	return out, rows.Err()
 }
 
 // connect opens a connection. _txlock=immediate makes every transaction take
@@ -197,98 +110,13 @@ func (d *Database) init() error {
 	}
 
 	if !hasObjects {
-		if _, err := tx.Exec(createSessionsTable + "\nPRAGMA user_version = 8;"); err != nil {
+		if _, err := tx.Exec(fmt.Sprintf("%s\nPRAGMA user_version = %d;", createSessionsTable, CurrentSchemaVersion)); err != nil {
 			return err
 		}
-	} else {
-		switch schemaVersion {
-		case CurrentSchemaVersion:
-		case 6:
-			if err := migrateV6ToV7(tx); err != nil {
-				return err
-			}
-			if err := migrateV7ToV8(tx); err != nil {
-				return err
-			}
-		case 7:
-			if err := migrateV7ToV8(tx); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("%w: version %d; expected %d. Remove or migrate the runtime root.", errUnsupportedSchema, schemaVersion, CurrentSchemaVersion)
-		}
-		if err := ensureSupportedSchema(tx); err != nil {
-			return fmt.Errorf("%w: %v", errUnsupportedSchema, err)
-		}
+	} else if schemaVersion != CurrentSchemaVersion {
+		return fmt.Errorf("%w: version %d; expected %d. Remove the runtime root to start fresh.", errUnsupportedSchema, schemaVersion, CurrentSchemaVersion)
 	}
 	return tx.Commit()
-}
-
-func ensureSupportedSchema(tx *sql.Tx) error {
-	rows, err := tx.Query("PRAGMA table_info(sessions)")
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	var columns []string
-	for rows.Next() {
-		var (
-			cid     int
-			name    string
-			ctype   string
-			notnull int
-			dflt    sql.NullString
-			pk      int
-		)
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			return err
-		}
-		columns = append(columns, name)
-	}
-	if len(columns) == 0 {
-		return errors.New("unsupported state database schema: missing `sessions` table. Remove or migrate the runtime root.")
-	}
-	if strings.Join(columns, ",") != strings.Join(expectedSessionsColumns, ",") {
-		return errors.New("unsupported state database schema: `sessions` does not match the current layout. Remove or migrate the runtime root.")
-	}
-	return nil
-}
-
-func migrateV6ToV7(tx *sql.Tx) error {
-	_, err := tx.Exec(`ALTER TABLE sessions RENAME TO sessions_v6;` + createSessionsTableV7 + `
-        INSERT INTO sessions (
-            session_id, agent, model, mode, workspace, repo_path, repo_name, base_branch, branch, worktree,
-            status, integration_policy, worker_pid, agent_pid, exit_code, error, integration_state,
-            attention, attention_summary, created_at, updated_at, exited_at
-        )
-        SELECT
-            session_id, agent, model, mode, workspace, repo_path, repo_name, base_branch, branch, worktree,
-            status, integration_policy, NULL, pid, exit_code, error, integration_state,
-            attention, attention_summary, created_at, updated_at, exited_at
-        FROM sessions_v6;
-        DROP TABLE sessions_v6;
-        PRAGMA user_version = 7;`)
-	return err
-}
-
-// migrateV7ToV8 drops the git columns. A v7 session always ran inside its
-// worktree, so that path becomes its cwd; workspace is only a fallback for
-// rows the Rust daemon left half-created.
-func migrateV7ToV8(tx *sql.Tx) error {
-	_, err := tx.Exec(`ALTER TABLE sessions RENAME TO sessions_v7;` + createSessionsTable + `
-        INSERT INTO sessions (
-            session_id, agent, model, mode, cwd, status, worker_pid, agent_pid, exit_code, error,
-            attention, attention_summary, created_at, updated_at, exited_at
-        )
-        SELECT
-            session_id, agent, model, mode,
-            CASE WHEN worktree <> '' THEN worktree ELSE workspace END,
-            status, worker_pid, agent_pid, exit_code, error,
-            attention, attention_summary, created_at, updated_at, exited_at
-        FROM sessions_v7;
-        DROP TABLE sessions_v7;
-        PRAGMA user_version = 8;`)
-	return err
 }
 
 func now() string { return time.Now().UTC().Format(rfc3339) }

@@ -12,9 +12,6 @@ pub struct Config {
     pub default_agent: String,
     #[serde(default)]
     pub agents: IndexMap<String, AgentConfig>,
-    // Config files written before agentd dropped worktree management may still
-    // carry a `[git]` table. Unknown tables are ignored, so they keep parsing;
-    // do not add `deny_unknown_fields` here.
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,27 +190,6 @@ command = "zed"
             vec!["claude", "codex", "zed"]
         );
         assert_eq!(config.default_agent_name(&paths).unwrap(), "claude");
-    }
-
-    #[test]
-    fn legacy_git_table_is_ignored() {
-        let paths = test_paths();
-        let config: Config = toml::from_str(
-            r#"
-default_agent = "claude"
-
-[agents.claude]
-command = "claude"
-
-[git]
-auto_commit_message = "agentd: finalize session {session_id}"
-"#,
-        )
-        .unwrap();
-
-        let config = config.validate(&paths).unwrap();
-        assert_eq!(config.default_agent_name(&paths).unwrap(), "claude");
-        assert!(!toml::to_string_pretty(&config).unwrap().contains("[git]"));
     }
 
     #[test]

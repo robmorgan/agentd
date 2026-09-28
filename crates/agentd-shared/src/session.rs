@@ -42,7 +42,7 @@ pub struct SessionRecord {
     pub model: Option<String>,
     pub mode: SessionMode,
     /// Directory the agent process runs in. It may or may not be a git
-    /// repository; agentd does not manage git state (docs/drop-worktrees.md).
+    /// repository; agentd does not manage git state in it.
     pub cwd: String,
     pub status: SessionStatus,
     pub worker_pid: Option<u32>,

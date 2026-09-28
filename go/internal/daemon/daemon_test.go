@@ -428,7 +428,7 @@ func TestProtocolVersionMismatch(t *testing.T) {
 	conn.SetDeadline(time.Now().Add(testTimeout))
 	var frame [16]byte
 	binary.LittleEndian.PutUint32(frame[0:4], 0x4147_4450)
-	binary.LittleEndian.PutUint16(frame[4:6], 32)
+	binary.LittleEndian.PutUint16(frame[4:6], protocol.ProtocolVersion+1)
 	binary.LittleEndian.PutUint16(frame[6:8], 1) // GetDaemonInfo
 	if _, err := conn.Write(frame[:]); err != nil {
 		t.Fatal(err)
@@ -437,14 +437,14 @@ func TestProtocolVersionMismatch(t *testing.T) {
 	if _, err := io.ReadFull(conn, header[:]); err != nil {
 		t.Fatal(err)
 	}
-	if v, k := binary.LittleEndian.Uint16(header[4:6]), binary.LittleEndian.Uint16(header[6:8]); v != 32 || k != 114 {
-		t.Fatalf("reply version %d kind %d, want 32/114", v, k)
+	if v, k := binary.LittleEndian.Uint16(header[4:6]), binary.LittleEndian.Uint16(header[6:8]); v != protocol.ProtocolVersion+1 || k != 114 {
+		t.Fatalf("reply version %d kind %d, want %d/114", v, k, protocol.ProtocolVersion+1)
 	}
 	payload := make([]byte, binary.LittleEndian.Uint32(header[12:16]))
 	if _, err := io.ReadFull(conn, payload); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(payload, []byte("protocol version 33")) {
+	if !bytes.Contains(payload, []byte(fmt.Sprintf("protocol version %d", protocol.ProtocolVersion))) {
 		t.Fatalf("error payload %q", payload)
 	}
 }
@@ -453,8 +453,8 @@ func TestMalformedFramesDoNotAffectDaemon(t *testing.T) {
 	h := newHarness(t)
 	for _, frame := range [][]byte{
 		[]byte("definitely not a frame"),
-		{0x50, 0x44, 0x47, 0x41, 33, 0, 0xe7, 0x03, 0, 0, 0, 0, 0, 0, 0, 0}, // unknown kind 999
-		{0x50, 0x44, 0x47, 0x41, 33, 0},                                     // truncated header
+		{0x50, 0x44, 0x47, 0x41, 1, 0, 0xe7, 0x03, 0, 0, 0, 0, 0, 0, 0, 0}, // unknown kind 999
+		{0x50, 0x44, 0x47, 0x41, 1, 0},                                     // truncated header
 	} {
 		conn := h.dial()
 		conn.Write(frame)
@@ -802,11 +802,11 @@ func TestRecycledPidsAreNeverSignalled(t *testing.T) {
 
 func TestBadRequestsGetAnError(t *testing.T) {
 	h := newHarness(t)
-	// A retired v32 kind at the current version gets a reply, not a hang-up.
+	// An unknown kind at the current version gets a reply, not a hang-up.
 	conn := h.dial()
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(testTimeout))
-	conn.Write([]byte{0x50, 0x44, 0x47, 0x41, 33, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0})
+	conn.Write([]byte{0x50, 0x44, 0x47, 0x41, 1, 0, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0})
 	resp, err := protocol.ReadResponse(bufio.NewReader(conn))
 	if err != nil || resp == nil || resp.Error == nil || !strings.Contains(resp.Error.Message, "could not decode") {
 		t.Fatalf("got %#v, %v", resp, err)
@@ -879,114 +879,6 @@ func TestLoadConfig(t *testing.T) {
 	}
 	if got := cfg.Agents["z"].modelFlag(); got != "--model" {
 		t.Fatalf("default model_flag = %q", got)
-	}
-}
-
-// writeLegacyDB writes a minimal schema-v7 state.db with one session the old
-// daemon recorded as running. The legacy checks read only these columns.
-func writeLegacyDB(t *testing.T, path string) {
-	t.Helper()
-	raw, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer raw.Close()
-	if _, err := raw.Exec(`CREATE TABLE sessions (session_id TEXT PRIMARY KEY, status TEXT, worker_pid INTEGER);
-		INSERT INTO sessions VALUES ('old', 'running', 4242);
-		PRAGMA user_version = 7;`); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func listenUnix(t *testing.T, path string) net.Listener {
-	t.Helper()
-	l, err := net.Listen("unix", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { l.Close() })
-	go func() {
-		for {
-			conn, err := l.Accept()
-			if err != nil {
-				return
-			}
-			conn.Close()
-		}
-	}()
-	return l
-}
-
-// Upgrading must not migrate state.db out from under the previous agentd or
-// its still-running sessions.
-func TestLegacyRuntimeBlocksMigration(t *testing.T) {
-	root, err := os.MkdirTemp("/tmp", "agdl-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(root) })
-	p := paths.FromRoot(root)
-	if err := p.EnsureLayout(); err != nil {
-		t.Fatal(err)
-	}
-	writeLegacyDB(t, p.Database)
-
-	oldDaemon := listenUnix(t, p.Socket)
-	if _, err := New(p, workerBin); err == nil || !strings.Contains(err.Error(), "previous agentd is still running") {
-		t.Fatalf("with the old daemon up: %v", err)
-	}
-	oldDaemon.Close()
-
-	listenUnix(t, p.SessionSocketPath("old"))
-	if _, err := New(p, workerBin); err == nil || !strings.Contains(err.Error(), "old (worker pid 4242)") {
-		t.Fatalf("with an old session up: %v", err)
-	}
-	if v, _ := db.SchemaVersion(p.Database); v != 7 {
-		t.Fatalf("state.db was migrated to v%d while the old runtime was live", v)
-	}
-}
-
-// `agentd upgrade` stops a previous daemon that predates the lock through
-// the (unchanged) management protocol.
-func TestStopDaemonStopsLegacyDaemon(t *testing.T) {
-	root, err := os.MkdirTemp("/tmp", "agdl-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(root) })
-	p := paths.FromRoot(root)
-	if err := p.EnsureLayout(); err != nil {
-		t.Fatal(err)
-	}
-	l, err := net.Listen("unix", p.Socket)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stopped := make(chan struct{})
-	go func() {
-		defer close(stopped)
-		for {
-			conn, err := l.Accept()
-			if err != nil {
-				return
-			}
-			_, mgmt, _ := protocol.ReadIncoming(bufio.NewReader(conn))
-			if mgmt != nil && mgmt.Shutdown != nil && mgmt.Shutdown.Force {
-				protocol.WriteManagementResponse(conn, &protocol.ManagementResponse{Shutdown: &protocol.ManagementShutdownResult{Stopped: true, Message: "stopping"}})
-				conn.Close()
-				l.Close()
-				return
-			}
-			conn.Close()
-		}
-	}()
-	if err := stopDaemon(p); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-stopped:
-	case <-time.After(testTimeout):
-		t.Fatal("legacy daemon was not asked to stop")
 	}
 }
 

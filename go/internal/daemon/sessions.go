@@ -500,20 +500,3 @@ func (s *Server) waitStopped(id string, timeout time.Duration) bool {
 		time.Sleep(pollInterval)
 	}
 }
-
-func (s *Server) runtimeSocket(id string) (string, error) {
-	rec, err := s.getSession(id)
-	if err != nil {
-		return "", err
-	}
-	if rec == nil {
-		return "", fmt.Errorf("session `%s` not found", id)
-	}
-	if rec.Status != session.StatusRunning {
-		return "", fmt.Errorf("session `%s` is not running", id)
-	}
-	if !s.workerAnswers(id) {
-		return "", fmt.Errorf("session `%s` does not have a live runtime socket", id)
-	}
-	return s.paths.SessionSocketPath(id), nil
-}

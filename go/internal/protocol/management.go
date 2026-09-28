@@ -8,9 +8,9 @@ import (
 
 // The daemon management protocol is a separate, deliberately tiny protocol
 // framed like the main one but at DaemonManagementVersion, with JSON payloads.
-// It exists so `agent daemon status|stop` keep working across main protocol
-// bumps. It mirrors the DaemonManagement* types in
-// crates/agentd-shared/src/protocol.rs.
+// It exists so `agent daemon info|restart|upgrade` keep working when the CLI
+// and daemon speak different versions of the main protocol. It mirrors the
+// DaemonManagement* types in crates/agentd-shared/src/protocol.rs.
 const (
 	kDaemonStatusRequest    uint16 = 20_001
 	kDaemonShutdownRequest  uint16 = 20_002
@@ -52,7 +52,7 @@ type ManagementShutdownResult struct {
 }
 
 // DecodeError reports a well-framed message at a supported version that
-// could not be decoded (an unknown or retired kind, a bad payload). The peer
+// could not be decoded (an unknown kind, a bad payload). The peer
 // is still speaking our framing, so it can be sent an error reply.
 type DecodeError struct {
 	Version uint16

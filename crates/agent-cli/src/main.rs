@@ -147,7 +147,7 @@ enum Command {
     New {
         name: Option<String>,
         /// Directory the agent runs in (default: the current directory)
-        #[arg(long, value_name = "DIR", alias = "workspace")]
+        #[arg(long, value_name = "DIR")]
         cwd: Option<PathBuf>,
         #[arg(long)]
         agent: Option<String>,
@@ -156,16 +156,10 @@ enum Command {
     Kill {
         #[arg(long)]
         rm: bool,
-        /// Accepted for compatibility; it forced worktree removal, which is gone.
-        #[arg(short, long, hide = true)]
-        force: bool,
         session_id: String,
     },
     #[command(about = "Stop and remove a session", display_order = 3)]
     Rm {
-        /// Accepted for compatibility; it forced worktree removal, which is gone.
-        #[arg(short, long, hide = true)]
-        force: bool,
         session_id: String,
     },
     #[command(about = "Attach to a live session PTY", display_order = 4)]
@@ -228,11 +222,7 @@ enum DaemonCommand {
     #[command(about = "Show daemon version, socket, pid, and compatibility", display_order = 1)]
     Info,
     #[command(about = "Restart the daemon", display_order = 2)]
-    Restart {
-        /// Accepted for compatibility; restarts no longer affect running sessions.
-        #[arg(long, hide = true)]
-        force: bool,
-    },
+    Restart,
     #[command(about = "Upgrade the daemon binary when no sessions are live", display_order = 3)]
     Upgrade,
 }
@@ -294,10 +284,10 @@ async fn main() -> Result<()> {
         (Some(Command::New { .. }), ExecutionMode::Local(reason)) => {
             bail_live_command(&reason)?;
         }
-        (Some(Command::Kill { rm, force, session_id }), ExecutionMode::Daemon) => {
+        (Some(Command::Kill { rm, session_id }), ExecutionMode::Daemon) => {
             let response = send_request(
                 &paths,
-                &Request::KillSession { session_id: session_id.clone(), remove: rm, force },
+                &Request::KillSession { session_id: session_id.clone(), remove: rm },
             )
             .await?;
 
@@ -309,16 +299,16 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Some(Command::Kill { rm, force: _, session_id }), ExecutionMode::Local(reason)) => {
+        (Some(Command::Kill { rm, session_id }), ExecutionMode::Local(reason)) => {
             if should_print_degraded_notice(DegradedNoticeCommand::Kill, &reason) {
                 print_degraded_notice(&reason);
             }
             local_kill(&paths, &session_id, rm).await?;
         }
-        (Some(Command::Rm { force, session_id }), ExecutionMode::Daemon) => {
+        (Some(Command::Rm { session_id }), ExecutionMode::Daemon) => {
             let response = send_request(
                 &paths,
-                &Request::KillSession { session_id: session_id.clone(), remove: true, force },
+                &Request::KillSession { session_id: session_id.clone(), remove: true },
             )
             .await?;
 
@@ -330,7 +320,7 @@ async fn main() -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Some(Command::Rm { force: _, session_id }), ExecutionMode::Local(reason)) => {
+        (Some(Command::Rm { session_id }), ExecutionMode::Local(reason)) => {
             if should_print_degraded_notice(DegradedNoticeCommand::Kill, &reason) {
                 print_degraded_notice(&reason);
             }
@@ -446,7 +436,7 @@ async fn main() -> Result<()> {
                 let status = daemon_management_status(&paths).await?;
                 print_daemon_management_status(&status);
             }
-            DaemonCommand::Restart { force: _ } => {
+            DaemonCommand::Restart => {
                 restart_daemon(&paths).await?;
                 let status = daemon_management_status(&paths).await?;
                 print_daemon_management_status(&status);
@@ -1068,10 +1058,6 @@ async fn attach_session_once(
                                     overlay = None;
                                     overlay_events = None;
                                 }
-                                AttachOverlayClose::SwitchSession(target_session_id) => {
-                                    drop(write_half);
-                                    return Ok(AttachOutcome::SwitchSession(target_session_id));
-                                }
                                 AttachOverlayClose::SessionEnded(summary) => {
                                     drop(write_half);
                                     return Ok(AttachOutcome::SessionEnded(summary));
@@ -1096,10 +1082,6 @@ async fn attach_session_once(
                     };
                     match response {
                         Response::PtyOutput { .. } => {}
-                        Response::SwitchSession { session_id } => {
-                            drop(write_half);
-                            return Ok(AttachOutcome::SwitchSession(session_id));
-                        }
                         Response::SessionEnded { session_id, status, exit_code, error } => {
                             drop(write_half);
                             return Ok(AttachOutcome::SessionEnded(SessionEndSummary {
@@ -1184,10 +1166,6 @@ async fn attach_session_once(
                         Response::PtyOutput { data } => {
                             write_attach_bytes(&data)?;
                         }
-                        Response::SwitchSession { session_id } => {
-                            drop(write_half);
-                            return Ok(AttachOutcome::SwitchSession(session_id));
-                        }
                         Response::SessionEnded { session_id, status, exit_code, error } => {
                             drop(write_half);
                             return Ok(AttachOutcome::SessionEnded(SessionEndSummary {
@@ -1215,7 +1193,6 @@ async fn attach_session_once(
 
 enum AttachOverlayClose {
     Restored(Vec<u8>),
-    SwitchSession(String),
     SessionEnded(SessionEndSummary),
 }
 
@@ -1233,9 +1210,6 @@ async fn refresh_attach_snapshot(
                 return Ok(AttachOverlayClose::Restored(snapshot));
             }
             Response::PtyOutput { .. } => {}
-            Response::SwitchSession { session_id } => {
-                return Ok(AttachOverlayClose::SwitchSession(session_id));
-            }
             Response::SessionEnded { session_id, status, exit_code, error } => {
                 return Ok(AttachOverlayClose::SessionEnded(SessionEndSummary {
                     session_id,
@@ -1418,7 +1392,6 @@ fn print_kill_result(session_id: &str, was_running: bool, removed: bool) {
 
 const ATTACH_DETACH_BYTE: u8 = 0x1c;
 const ATTACH_OVERLAY_BYTE: u8 = 0x19;
-const ATTACH_OVERLAY_LEGACY_BYTE: u8 = 0x02;
 const ATTACH_NEXT_SESSION_BYTE: u8 = 0x1d;
 const ATTACH_OVERLAY_CODEPOINT: u32 = 121;
 const ATTACH_PREVIOUS_SESSION_CODEPOINT: u32 = 91;
@@ -1465,7 +1438,7 @@ impl AttachInputParser {
             }
 
             match input[index] {
-                ATTACH_OVERLAY_BYTE | ATTACH_OVERLAY_LEGACY_BYTE => {
+                ATTACH_OVERLAY_BYTE => {
                     flush_attach_bytes(&mut actions, &mut forwarded);
                     actions.push(AttachInputAction::OpenOverlay);
                 }
@@ -1848,7 +1821,7 @@ async fn daemon_get_session(paths: &AppPaths, session_id: &str) -> Result<Sessio
 async fn kill_session(paths: &AppPaths, session_id: &str) -> Result<()> {
     let response = send_request(
         paths,
-        &Request::KillSession { session_id: session_id.to_string(), remove: false, force: false },
+        &Request::KillSession { session_id: session_id.to_string(), remove: false },
     )
     .await?;
     match response {
@@ -1883,8 +1856,7 @@ mod tests {
 
     use super::{
         AGENTD_ATTACH_ENTER_SEQUENCE, AGENTD_ATTACH_EXIT_TITLE, AGENTD_ATTACH_RESTORE_SEQUENCE,
-        ATTACH_DETACH_BYTE, ATTACH_NEXT_SESSION_BYTE, ATTACH_OVERLAY_BYTE,
-        ATTACH_OVERLAY_LEGACY_BYTE, AttachInputAction, AttachInputParser, AttachSessionDirection,
+        ATTACH_DETACH_BYTE, ATTACH_NEXT_SESSION_BYTE, ATTACH_OVERLAY_BYTE, AttachInputAction, AttachInputParser, AttachSessionDirection,
         Cli, Command, DaemonCommand, DegradedNoticeCommand, SessionEndSummary,
         adjacent_live_session_id_in, attach_startup_bytes, cli_command, cli_styles,
         daemon_executable_from, ensure_compatible_daemon, format_attach_title,
@@ -1893,7 +1865,9 @@ mod tests {
         terminal_title_bytes,
     };
     use agentd_shared::session::{AttentionLevel, SessionMode, SessionRecord, SessionStatus};
-    use agentd_shared::{header::AGENTD_PRIMARY_BLUE_RGB, paths::AppPaths};
+    use agentd_shared::{
+        header::AGENTD_PRIMARY_BLUE_RGB, paths::AppPaths, protocol::PROTOCOL_VERSION,
+    };
     use chrono::{Duration, Utc};
     use clap::{
         Parser,
@@ -2016,11 +1990,10 @@ mod tests {
     }
 
     #[test]
-    fn rm_command_parses_force_flag() {
-        let cli = Cli::try_parse_from(["agent", "rm", "--force", "demo"]).unwrap();
+    fn rm_command_parses_session_id() {
+        let cli = Cli::try_parse_from(["agent", "rm", "demo"]).unwrap();
         match cli.command {
-            Some(Command::Rm { force, session_id }) => {
-                assert!(force);
+            Some(Command::Rm { session_id }) => {
                 assert_eq!(session_id, "demo");
             }
             other => panic!("unexpected command: {other:?}"),
@@ -2028,12 +2001,11 @@ mod tests {
     }
 
     #[test]
-    fn kill_command_parses_remove_and_force_flags() {
-        let cli = Cli::try_parse_from(["agent", "kill", "--rm", "--force", "demo"]).unwrap();
+    fn kill_command_parses_remove_flag() {
+        let cli = Cli::try_parse_from(["agent", "kill", "--rm", "demo"]).unwrap();
         match cli.command {
-            Some(Command::Kill { rm, force, session_id }) => {
+            Some(Command::Kill { rm, session_id }) => {
                 assert!(rm);
-                assert!(force);
                 assert_eq!(session_id, "demo");
             }
             other => panic!("unexpected command: {other:?}"),
@@ -2052,29 +2024,6 @@ mod tests {
                 assert_eq!(agent.as_deref(), Some("claude"));
             }
             other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn new_command_accepts_legacy_workspace_flag_as_cwd() {
-        let cli = Cli::try_parse_from(["agent", "new", "--workspace", "/tmp/repo"]).unwrap();
-        match cli.command {
-            Some(Command::New { cwd, .. }) => assert_eq!(cwd, Some(PathBuf::from("/tmp/repo"))),
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn removed_git_commands_are_rejected() {
-        for command in [
-            vec!["agent", "merge", "demo"],
-            vec!["agent", "accept", "demo"],
-            vec!["agent", "discard", "demo"],
-            vec!["agent", "diff", "demo"],
-            vec!["agent", "worktree", "create", "demo"],
-        ] {
-            let err = Cli::try_parse_from(&command).unwrap_err();
-            assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand, "{command:?}");
         }
     }
 
@@ -2137,22 +2086,6 @@ mod tests {
             daemon_executable_from(None, exe).unwrap(),
             PathBuf::from("/opt/agent/bin/agentd")
         );
-    }
-
-    #[test]
-    fn create_command_is_rejected() {
-        let err = Cli::try_parse_from([
-            "agent",
-            "create",
-            "--workspace",
-            "/tmp/repo",
-            "--agent",
-            "codex",
-            "fix",
-        ])
-        .unwrap_err();
-
-        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 
     #[test]
@@ -2276,10 +2209,10 @@ command = "claude"
     }
 
     #[test]
-    fn daemon_restart_parses_force_flag() {
-        let cli = Cli::try_parse_from(["agent", "daemon", "restart", "--force"]).unwrap();
+    fn daemon_restart_parses() {
+        let cli = Cli::try_parse_from(["agent", "daemon", "restart"]).unwrap();
         match cli.command {
-            Some(Command::Daemon { command: DaemonCommand::Restart { force } }) => assert!(force),
+            Some(Command::Daemon { command: DaemonCommand::Restart }) => {}
             other => panic!("unexpected command: {other:?}"),
         }
     }
@@ -2324,8 +2257,8 @@ command = "claude"
     }
 
     /// Serves one connection on the test socket: reads the client's request
-    /// frame header, then either hangs up (what the Rust v32 daemon does when it
-    /// cannot parse a v33 frame) or replies with the given raw bytes.
+    /// frame header, then either hangs up (what a daemon that cannot parse the
+    /// frame may do) or replies with the given raw bytes.
     async fn fake_daemon(paths: &AppPaths, reply: Option<Vec<u8>>) -> tokio::task::JoinHandle<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         paths.ensure_layout().unwrap();
@@ -2341,24 +2274,27 @@ command = "claude"
     }
 
     #[tokio::test]
-    async fn cli_refuses_v32_daemon_that_hangs_up() {
+    async fn cli_refuses_daemon_that_hangs_up() {
         let paths = test_paths();
         let server = fake_daemon(&paths, None).await;
         let err = format!("{:#}", ensure_compatible_daemon(&paths).await.unwrap_err());
         server.await.unwrap();
-        assert!(err.contains("does not speak agent protocol 33"), "{err}");
+        assert!(err.contains(&format!("does not speak agent protocol {PROTOCOL_VERSION}")), "{err}");
         assert!(err.contains("agent daemon upgrade"), "{err}");
     }
 
     #[tokio::test]
-    async fn cli_refuses_daemon_reporting_old_protocol() {
-        // A v32-framed DaemonInfo response: the frame version alone is rejected.
+    async fn cli_refuses_daemon_speaking_another_protocol() {
+        // A DaemonInfo response framed at another version: the frame version
+        // alone is rejected.
+        let other = PROTOCOL_VERSION + 1;
         let mut frame = Vec::new();
         frame.extend_from_slice(&0x4147_4450_u32.to_le_bytes());
-        frame.extend_from_slice(&32_u16.to_le_bytes());
+        frame.extend_from_slice(&other.to_le_bytes());
         frame.extend_from_slice(&101_u16.to_le_bytes());
         frame.extend_from_slice(&[0, 0, 0, 0]);
-        let payload = [5, 0, 0, 0, b'0', b'.', b'1', b'.', b'0', 32, 0];
+        let mut payload = vec![5, 0, 0, 0, b'0', b'.', b'1', b'.', b'0'];
+        payload.extend_from_slice(&other.to_le_bytes());
         frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         frame.extend_from_slice(&payload);
 
@@ -2366,8 +2302,8 @@ command = "claude"
         let server = fake_daemon(&paths, Some(frame)).await;
         let err = format!("{:#}", ensure_compatible_daemon(&paths).await.unwrap_err());
         server.await.unwrap();
-        assert!(err.contains("unsupported protocol version `32`"), "{err}");
-        assert!(err.contains("does not speak agent protocol 33"), "{err}");
+        assert!(err.contains(&format!("unsupported protocol version `{other}`")), "{err}");
+        assert!(err.contains(&format!("does not speak agent protocol {PROTOCOL_VERSION}")), "{err}");
     }
 
     /// The daemon owns stale-socket cleanup (under its agentd.lock), so a
@@ -2513,19 +2449,6 @@ command = "claude"
     }
 
     #[test]
-    fn worktree_era_force_flags_are_hidden() {
-        let mut command = cli_command();
-        for name in ["kill", "rm"] {
-            let sub = command.find_subcommand_mut(name).unwrap();
-            let force = sub.get_arguments().find(|arg| arg.get_id() == "force").unwrap();
-            assert!(force.is_hide_set(), "{name} --force should be hidden");
-        }
-        // `--force` without `--rm` is no longer an error.
-        let cli = Cli::try_parse_from(["agent", "kill", "-f", "demo"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Kill { rm: false, force: true, .. })));
-    }
-
-    #[test]
     fn attach_parser_forwards_regular_bytes() {
         let mut parser = AttachInputParser::default();
         assert_eq!(parser.push_bytes(b"hello"), vec![AttachInputAction::Data(b"hello".to_vec())]);
@@ -2566,15 +2489,6 @@ command = "claude"
     fn attach_parser_opens_overlay_on_ctrl_y_byte() {
         let mut parser = AttachInputParser::default();
         assert_eq!(parser.push_bytes(&[ATTACH_OVERLAY_BYTE]), vec![AttachInputAction::OpenOverlay]);
-    }
-
-    #[test]
-    fn attach_parser_opens_overlay_on_legacy_ctrl_b_byte() {
-        let mut parser = AttachInputParser::default();
-        assert_eq!(
-            parser.push_bytes(&[ATTACH_OVERLAY_LEGACY_BYTE]),
-            vec![AttachInputAction::OpenOverlay]
-        );
     }
 
     #[test]
