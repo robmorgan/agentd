@@ -60,6 +60,16 @@ impl AppPaths {
         self.logs_dir.join(format!("{session_id}.worker.log"))
     }
 
+    /// This machine's key for connecting to remote daemons.
+    pub fn client_key_path(&self) -> Utf8PathBuf {
+        self.root.join("remote").join("client.key")
+    }
+
+    /// Remote daemons this machine knows, with their pinned keys.
+    pub fn hosts_path(&self) -> Utf8PathBuf {
+        self.root.join("hosts.toml")
+    }
+
     pub fn session_socket_path(&self, session_id: &str) -> Utf8PathBuf {
         self.sessions_dir.join(format!("{session_id}.sock"))
     }
@@ -68,7 +78,7 @@ impl AppPaths {
         path.as_str()
     }
 
-    fn from_root(root: Utf8PathBuf) -> Self {
+    pub fn from_root(root: Utf8PathBuf) -> Self {
         Self {
             socket: root.join("agentd.sock"),
             pid_file: root.join("agentd.pid"),

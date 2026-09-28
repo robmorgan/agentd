@@ -575,6 +575,13 @@ func TestCreateValidation(t *testing.T) {
 	// A non-git directory is fine.
 	h.mustCreate("plain")
 
+	// An empty agent means the daemon's default_agent.
+	if resp := h.create("defaulted", "", h.cwd); resp.CreateSession == nil {
+		t.Fatalf("create without an agent = %#v", resp)
+	} else if agent := h.session("defaulted").Agent; agent != "sh" {
+		t.Fatalf("defaulted agent = %q", agent)
+	}
+
 	// Concurrent creates with one name: exactly one wins.
 	var wg sync.WaitGroup
 	results := make(chan *protocol.Response, 4)

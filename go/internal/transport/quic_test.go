@@ -248,3 +248,28 @@ func TestAuthorizedClientsFile(t *testing.T) {
 		t.Fatalf("authorized_clients mode = %v", info.Mode())
 	}
 }
+
+// The same key and fingerprint are pinned in the agent CLI's tests
+// (crates/agent-cli/src/transport.rs), so both sides agree on what a
+// fingerprint is.
+const (
+	parityKeyPEM = `-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIBjksdA/xBFa67gw4s1UxuZHtUs8lCcbF6PTgueUIoCc
+-----END PRIVATE KEY-----
+`
+	parityFingerprint = "SHA256:AOUfC64ic5/SwRe6zJIVSbIBIuiehNsWrqsT/Af5gtY"
+)
+
+func TestFingerprintMatchesTheCLI(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "parity.key")
+	if err := os.WriteFile(path, []byte(parityKeyPEM), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	id, err := LoadOrCreateIdentity(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id.Fingerprint != parityFingerprint {
+		t.Fatalf("fingerprint = %s, want %s", id.Fingerprint, parityFingerprint)
+	}
+}

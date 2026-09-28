@@ -237,6 +237,11 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 			name = &trimmed
 		}
 	}
+	// A client that does not know this daemon's configuration (a remote
+	// `agent --host`) leaves the agent empty to get the daemon's default.
+	if req.Agent == "" {
+		req.Agent = s.config.DefaultAgent
+	}
 	agent, err := s.config.requireAgent(req.Agent, s.paths.Config)
 	if err != nil {
 		return nil, err

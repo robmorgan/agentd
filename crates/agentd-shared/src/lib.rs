@@ -1,5 +1,6 @@
 pub mod config;
 pub mod header;
+pub mod hosts;
 pub mod paths;
 pub mod process;
 pub mod protocol;

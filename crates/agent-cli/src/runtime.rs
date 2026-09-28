@@ -851,6 +851,10 @@ impl SessionPicker {
                 Some(PickerToast::error(format!("invalid session name: {SESSION_NAME_RULES}")));
             return Ok(None);
         }
+        if let Some(host) = crate::transport::remote_name() {
+            self.toast = Some(PickerToast::error(remote_create_hint(host)));
+            return Ok(None);
+        }
         let cwd = crate::resolve_cwd(None)?;
         let response = send_request(
             &self.paths,
@@ -1335,6 +1339,10 @@ impl AttachOverlay {
                     self.toast = Some(format!("invalid session name: {SESSION_NAME_RULES}"));
                     return Ok(None);
                 }
+                if let Some(host) = crate::transport::remote_name() {
+                    self.toast = Some(remote_create_hint(host));
+                    return Ok(None);
+                }
                 let cwd = crate::resolve_cwd(None)?;
                 let response = send_request(
                     &self.paths,
@@ -1655,6 +1663,12 @@ fn session_sort_bucket(session: &SessionRecord) -> u8 {
         RunState::Exited => 4,
         RunState::Running | RunState::Starting => unreachable!(),
     }
+}
+
+/// A new session's directory is on the remote machine, which the picker has
+/// no way to browse, so it points at the command that takes one.
+fn remote_create_hint(host: &str) -> String {
+    format!("start sessions on `{host}` with `agent --host {host} new --cwd DIR`")
 }
 
 fn session_icon(session: &SessionRecord) -> &'static str {
