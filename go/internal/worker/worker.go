@@ -30,6 +30,7 @@ const (
 	maxScrollbackBytes  uint   = 10_000_000
 	shutdownGrace              = 2 * time.Second
 	firstRequestTimeout        = 30 * time.Second
+	pumpDrainTimeout           = 250 * time.Millisecond
 )
 
 // agentKillGrace is how long a killed agent gets between SIGTERM and SIGKILL.
@@ -40,7 +41,10 @@ type Args struct {
 	SessionID string
 	// Cwd is where the agent process is started. It must exist; the worker
 	// does not create it and does not care whether it is a git checkout.
-	Cwd       string
+	Cwd string
+	// CreatedAt identifies the incarnation of the session this worker was
+	// started for (see db.InsertSession).
+	CreatedAt string
 	AgentName string
 	Command   string
 	Model     string
@@ -163,13 +167,30 @@ func Run(args Args) error {
 		signalGroup(cmd.Process.Pid, syscall.SIGKILL)
 		return fail(fmt.Errorf("failed to bind worker socket: %w", err))
 	}
+	// Unlink the socket ourselves, and only while the path is still ours:
+	// after the session is removed its name may be reused, and a new
+	// worker's socket may already sit at the same path.
+	listener.(*net.UnixListener).SetUnlinkOnClose(false)
+	ownSocket, err := os.Stat(socketPath)
+	if err != nil {
+		listener.Close()
+		signalGroup(cmd.Process.Pid, syscall.SIGKILL)
+		return fail(fmt.Errorf("failed to stat worker socket: %w", err))
+	}
+	removeOwnSocket := func() {
+		if cur, err := os.Stat(socketPath); err == nil && os.SameFile(cur, ownSocket) {
+			_ = os.Remove(socketPath)
+		}
+	}
 	if err := os.Chmod(socketPath, 0o600); err != nil {
 		listener.Close()
+		removeOwnSocket()
 		signalGroup(cmd.Process.Pid, syscall.SIGKILL)
 		return fail(fmt.Errorf("failed to restrict worker socket: %w", err))
 	}
-	if err := store.MarkRunning(args.SessionID, os.Getpid(), cmd.Process.Pid); err != nil {
+	if err := store.MarkRunning(args.SessionID, args.CreatedAt, os.Getpid(), cmd.Process.Pid); err != nil {
 		listener.Close()
+		removeOwnSocket()
 		signalGroup(cmd.Process.Pid, syscall.SIGKILL)
 		if errors.Is(err, db.ErrNotCreating) {
 			// The daemon gave up on this worker or the session was
@@ -216,9 +237,21 @@ func Run(args Args) error {
 		rt.owner.run(state)
 		close(ownerDone)
 	}()
-	go pumpPty(ptmx, rt.owner)
+	pumpDone := make(chan struct{})
+	go func() {
+		pumpPty(ptmx, rt.owner)
+		close(pumpDone)
+	}()
 	go func() {
 		err := cmd.Wait()
+		// Let the pump queue the agent's last output before the exit is
+		// handled, so the saved history and SessionEnded include it. The
+		// pump ends once nothing holds the PTY open; a lingering
+		// descendant may keep it open, hence the bound.
+		select {
+		case <-pumpDone:
+		case <-time.After(pumpDrainTimeout):
+		}
 		var code *int32
 		if err == nil {
 			zero := int32(0)
@@ -231,11 +264,21 @@ func Run(args Args) error {
 	}()
 
 	go func() {
+		backoff := time.Duration(0)
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				return
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				// Temporary failures such as running out of file
+				// descriptors must not stop the worker accepting for good.
+				backoff = min(max(2*backoff, 5*time.Millisecond), time.Second)
+				fmt.Fprintf(os.Stderr, "session worker: accept: %v; retrying in %v\n", err, backoff)
+				time.Sleep(backoff)
+				continue
 			}
+			backoff = 0
 			rt.conns.Add(1)
 			go func() {
 				defer rt.conns.Done()
@@ -249,7 +292,7 @@ func Run(args Args) error {
 
 	<-rt.ended.ch
 	listener.Close()
-	_ = os.Remove(socketPath)
+	removeOwnSocket()
 
 	// Give attached clients a moment to receive their SessionEnded frame.
 	finished := make(chan struct{})
@@ -269,6 +312,13 @@ func Run(args Args) error {
 }
 
 func (rt *runtime) onChildExited(s *ownerState, exitCode *int32) {
+	if rt.killed.Load() {
+		// The agent exited, but a descendant that ignored SIGTERM may
+		// still be running (and changing the working directory). A kill
+		// stops the whole process group, so take the rest down now. The
+		// group id cannot be reused while any member is alive.
+		_ = syscall.Kill(-rt.agentPID, syscall.SIGKILL)
+	}
 	plain, _ := s.history(false)
 	vt, _ := s.history(true)
 	if err := os.WriteFile(rt.paths.RenderedLogPath(rt.sessionID), []byte(plain), 0o600); err != nil {
@@ -404,6 +454,22 @@ func (rt *runtime) serveAttach(conn net.Conn, reader *bufio.Reader, kind session
 		s.removeAttachment(att.attachID)
 	})
 
+	// A client that stops reading blocks this handler in a write, where it
+	// cannot notice a detach or the session ending. Once either happens,
+	// give the client shutdownGrace to take its final frames, then fail the
+	// blocked write so the attachment is released.
+	handlerDone := make(chan struct{})
+	defer close(handlerDone)
+	go func() {
+		select {
+		case <-att.detach:
+		case <-rt.ended.ch:
+		case <-handlerDone:
+			return
+		}
+		conn.SetWriteDeadline(time.Now().Add(shutdownGrace))
+	}()
+
 	if err := protocol.WriteResponse(conn, &protocol.Response{Attached: &protocol.Attached{
 		AttachID: att.attachID, Snapshot: att.snapshot,
 	}}); err != nil {
@@ -471,8 +537,13 @@ loop:
 					return err
 				}
 			case in.req.AttachSnapshot != nil:
+				// Output is published on the owner goroutine, so discarding
+				// what is queued for this client and taking the snapshot
+				// there makes the snapshot an exact boundary: everything
+				// before it is in the snapshot, everything after follows it.
 				var snapshot []byte
 				if err := rt.owner.do(func(s *ownerState) error {
+					discardQueued(att.sub)
 					var err error
 					snapshot, err = s.snapshot()
 					return err
@@ -501,6 +572,16 @@ func drainOutput(conn net.Conn, sub *subscriber) error {
 			}
 		default:
 			return nil
+		}
+	}
+}
+
+func discardQueued(sub *subscriber) {
+	for {
+		select {
+		case <-sub.ch:
+		default:
+			return
 		}
 	}
 }

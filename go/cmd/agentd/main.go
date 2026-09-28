@@ -45,7 +45,7 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: agentd serve [--daemonize]")
 	fmt.Fprintln(os.Stderr, "       agentd upgrade")
-	fmt.Fprintln(os.Stderr, "       agentd session-worker --session-id ID --cwd DIR --agent-name NAME --command CMD [--model M] [--arg A]...")
+	fmt.Fprintln(os.Stderr, "       agentd session-worker --session-id ID --cwd DIR --created-at TS --agent-name NAME --command CMD [--model M] [--arg A]...")
 }
 
 func runServe(argv []string) int {
@@ -113,6 +113,7 @@ func runSessionWorker(argv []string) int {
 	var extra multiFlag
 	fs.StringVar(&args.SessionID, "session-id", "", "session id")
 	fs.StringVar(&args.Cwd, "cwd", "", "working directory for the agent process")
+	fs.StringVar(&args.CreatedAt, "created-at", "", "creation timestamp of the session row this worker is for")
 	fs.StringVar(&args.AgentName, "agent-name", "", "agent name")
 	fs.StringVar(&args.Command, "command", "", "agent command")
 	fs.StringVar(&args.Model, "model", "", "model")
@@ -122,7 +123,7 @@ func runSessionWorker(argv []string) int {
 	}
 	args.Args = extra
 	for name, v := range map[string]string{
-		"--session-id": args.SessionID, "--cwd": args.Cwd,
+		"--session-id": args.SessionID, "--cwd": args.Cwd, "--created-at": args.CreatedAt,
 		"--agent-name": args.AgentName, "--command": args.Command,
 	} {
 		if v == "" {

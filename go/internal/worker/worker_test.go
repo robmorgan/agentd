@@ -9,6 +9,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -36,6 +38,7 @@ while IFS= read -r l; do
     done) exit 0;;
     size) stty size;;
     stall) stty raw; sleep 3; stty -raw; echo unstalled;;
+    bye) i=0; while [ $i -lt 2000 ]; do echo "tail $i"; i=$((i+1)); done; echo final-line; exit 0;;
     where) echo "pwd:$(pwd -P)"; echo "cwd:$AGENTD_CWD"; echo "ws:$AGENTD_WORKSPACE";;
     flood) i=0; while [ $i -lt 20000 ]; do echo "line $i padding padding padding padding"; i=$((i+1)); done; echo flood-done;;
     *) echo "got:$l";;
@@ -46,6 +49,7 @@ var defaultGeometry = protocol.Geometry{Cols: 80, Rows: 24}
 
 type harness struct {
 	t         *testing.T
+	createdAt string
 	paths     *paths.AppPaths
 	store     *db.Database
 	sessionID string
@@ -79,9 +83,10 @@ func newRoot(t *testing.T) (string, *harness) {
 		t.Fatal(err)
 	}
 	h := &harness{t: t, paths: p, store: store, sessionID: "test-session", done: make(chan error, 1)}
-	if err := store.InsertSession(db.NewSession{
+	h.createdAt, err = store.InsertSession(db.NewSession{
 		SessionID: h.sessionID, Agent: "sh", Mode: session.ModeExecute, Cwd: dir,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
 	return dir, h
@@ -93,7 +98,7 @@ func startWorkerWith(t *testing.T, script string) *harness {
 	p := h.paths
 	go func() {
 		h.done <- Run(Args{
-			SessionID: h.sessionID, Cwd: dir,
+			SessionID: h.sessionID, Cwd: dir, CreatedAt: h.createdAt,
 			AgentName: "sh", Command: "/bin/sh", Args: []string{"-c", script},
 		})
 	}()
@@ -705,4 +710,128 @@ func TestTerminalQueriesAnsweredWhileDetached(t *testing.T) {
 	c.input("\n")
 	c.expectEnd()
 	attached.waitExit()
+}
+
+func TestInputQueueIsBoundedInBytes(t *testing.T) {
+	block := make(chan struct{})
+	in := newPTYInput(blockingWriter{block})
+	defer func() { close(block); in.close(); <-in.done }()
+	if err := in.enqueue(make([]byte, maxQueuedInput+1)); err != errInputTooLarge {
+		t.Fatalf("oversized input: %v", err)
+	}
+	chunk := make([]byte, 1<<20)
+	accepted := 0
+	for range 16 {
+		if in.enqueue(chunk) != nil {
+			break
+		}
+		accepted++
+	}
+	// The writer holds one chunk; the queue holds at most maxQueuedInput.
+	if accepted*len(chunk) > maxQueuedInput+len(chunk) {
+		t.Fatalf("accepted %d MiB while the agent was not reading", accepted)
+	}
+	if err := in.enqueue(chunk); err != errInputQueueFull {
+		t.Fatalf("got %v, want queue full", err)
+	}
+}
+
+type blockingWriter struct{ block chan struct{} }
+
+func (w blockingWriter) Write(p []byte) (int, error) {
+	<-w.block
+	return len(p), nil
+}
+
+// A kill stops the whole process group, including descendants that ignore
+// SIGTERM and outlive the agent itself.
+func TestKillStopsDescendantsThatIgnoreSIGTERM(t *testing.T) {
+	h := startWorkerWith(t, `(trap '' TERM HUP; exec sleep 300) & echo "child:$!"; wait`)
+	var child int
+	childPID := regexp.MustCompile(`child:(\d+)`)
+	h.eventually("child pid", func() bool {
+		m := childPID.FindStringSubmatch(h.history())
+		if m == nil {
+			return false
+		}
+		child, _ = strconv.Atoi(m[1])
+		return child > 0
+	})
+	h.request(&protocol.Request{KillSession: &protocol.KillSession{SessionID: h.sessionID}})
+	h.waitExit()
+	deadline := time.Now().Add(testTimeout)
+	for syscall.Kill(child, 0) == nil {
+		if time.Now().After(deadline) {
+			syscall.Kill(child, syscall.SIGKILL)
+			t.Fatal("a descendant that ignored SIGTERM survived the kill")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// The agent's last output must reach both the attached client and the saved
+// history even though the agent exits immediately after writing it.
+func TestFinalOutputIsNotLost(t *testing.T) {
+	for i := range 5 {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			h := startWorker(t)
+			c := h.attach(defaultGeometry)
+			c.input("bye\n")
+			if end := c.expectEnd(); end.SessionEnded == nil {
+				t.Fatalf("got %#v", end)
+			}
+			if !strings.Contains(c.output.String(), "final-line") {
+				t.Fatal("attached client missed the final output")
+			}
+			h.waitExit()
+			logged, err := os.ReadFile(h.paths.RenderedLogPath(h.sessionID))
+			if err != nil || !strings.Contains(string(logged), "final-line") {
+				t.Fatalf("saved history missed the final output (%v)", err)
+			}
+		})
+	}
+}
+
+// Detaching a client that has stopped reading releases the attachment even
+// though its handler is blocked writing to it.
+func TestDetachReleasesAStuckAttachment(t *testing.T) {
+	h := startWorker(t)
+	stuck := h.attach(defaultGeometry) // never reads
+	h.sendInput("flood\n")
+	h.eventually("flood to finish", func() bool { return strings.Contains(h.history(), "flood-done") })
+	resp := h.request(&protocol.Request{DetachAttachment: &protocol.DetachAttachment{SessionID: h.sessionID, AttachID: stuck.attachID}})
+	if resp.Ok == nil {
+		t.Fatalf("detach: %#v", resp)
+	}
+	h.eventually("stuck attachment to be released", func() bool { return len(h.attachments()) == 0 })
+	h.sendInput("done\n")
+	h.waitExit()
+}
+
+// After an AttachSnapshot the client must not receive output the snapshot
+// already contains.
+func TestSnapshotIsAnExactBoundary(t *testing.T) {
+	h := startWorker(t)
+	c := h.attach(defaultGeometry)
+	c.input("flood\n")
+	h.eventually("flood to finish", func() bool { return strings.Contains(h.history(), "flood-done") })
+	// Output from the flood is still queued for this client; the snapshot
+	// supersedes it.
+	c.send(&protocol.Request{AttachSnapshot: protocol.Empty})
+	var snap *protocol.Response
+	for snap == nil {
+		resp := c.read()
+		if resp.AttachSnapshot != nil {
+			snap = resp
+		}
+	}
+	c.output.Reset()
+	c.input("after\n")
+	c.expectOutput("got:after")
+	if strings.Contains(c.output.String(), "line ") {
+		t.Fatalf("output already in the snapshot was replayed after it: %.200q", c.output.String())
+	}
+	c.input("done\n")
+	c.expectEnd()
+	h.waitExit()
 }

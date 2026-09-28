@@ -108,6 +108,12 @@ func (p *AppPaths) WorkerLogPath(sessionID string) string {
 	return filepath.Join(p.LogsDir, sessionID+".worker.log")
 }
 
+// DaemonLogPath is where a daemonized `agentd serve` logs. It sits in the
+// root rather than logs/, where any name could collide with a session's.
+func (p *AppPaths) DaemonLogPath() string {
+	return filepath.Join(p.Root, "agentd.log")
+}
+
 // LockPath is held (flock) by the running daemon for its whole lifetime.
 func (p *AppPaths) LockPath() string {
 	return filepath.Join(p.Root, "agentd.lock")

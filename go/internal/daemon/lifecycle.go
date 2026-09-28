@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -19,13 +18,13 @@ import (
 )
 
 // Daemonize starts `<exe> serve` detached from the caller's session and
-// terminal, with output appended to logs/agentd.log, and returns without
+// terminal, with output appended to agentd.log in the root, and returns without
 // waiting. The agent CLI polls the socket to know when it is up.
 func Daemonize(p *paths.AppPaths, exe string) error {
 	if err := p.EnsureLayout(); err != nil {
 		return err
 	}
-	logFile, err := os.OpenFile(filepath.Join(p.LogsDir, "agentd.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	logFile, err := os.OpenFile(p.DaemonLogPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
@@ -46,23 +45,9 @@ func Upgrade(p *paths.AppPaths, exe string) error {
 	if err := p.EnsureLayout(); err != nil {
 		return err
 	}
-	store, err := db.Open(p.Database)
+	running, err := runningSessions(p)
 	if err != nil {
 		return err
-	}
-	recs, err := store.ListSessions()
-	if err != nil {
-		return err
-	}
-	var running []string
-	for _, rec := range recs {
-		if rec.Status != session.StatusRunning {
-			continue
-		}
-		if conn, err := net.DialTimeout("unix", p.SessionSocketPath(rec.SessionID), workerDialTimeout); err == nil {
-			conn.Close()
-			running = append(running, fmt.Sprintf("%s (%s)", rec.SessionID, rec.Agent))
-		}
 	}
 	if len(running) > 0 {
 		return fmt.Errorf("cannot upgrade agentd while sessions are running: %s", strings.Join(running, ", "))
@@ -73,39 +58,95 @@ func Upgrade(p *paths.AppPaths, exe string) error {
 	if err := Daemonize(p, exe); err != nil {
 		return err
 	}
+	// Something answering on the socket is not enough: make sure it is the
+	// new daemon, speaking this protocol.
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		if conn, err := net.Dial("unix", p.Socket); err == nil {
-			conn.Close()
+		if status, err := managementStatus(p); err == nil && status.ProtocolVersion == protocol.ProtocolVersion {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return errors.New("timed out waiting for upgraded agentd to start")
+			return fmt.Errorf("timed out waiting for upgraded agentd to start; see %s", p.DaemonLogPath())
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 }
 
-// stopDaemon stops the running daemon, if any. The daemon's lock says
-// whether one is running, and it is asked to stop over its own socket, so no
-// pid is ever read from disk and signalled.
-func stopDaemon(p *paths.AppPaths) error {
-	running, err := daemonRunning(p.LockPath())
-	if err != nil || !running {
-		return err
+// runningSessions lists live sessions without migrating the database: a
+// pre-v8 state.db is read as it is.
+func runningSessions(p *paths.AppPaths) ([]string, error) {
+	version, err := db.SchemaVersion(p.Database)
+	if err != nil {
+		return nil, err
 	}
+	if version != 0 && version < db.CurrentSchemaVersion {
+		return legacySessionsStillRunning(p)
+	}
+	store, err := db.Open(p.Database)
+	if err != nil {
+		return nil, err
+	}
+	recs, err := store.ListSessions()
+	if err != nil {
+		return nil, err
+	}
+	var running []string
+	for _, rec := range recs {
+		if rec.Status == session.StatusRunning && answers(p.SessionSocketPath(rec.SessionID)) {
+			running = append(running, fmt.Sprintf("%s (%s)", rec.SessionID, rec.Agent))
+		}
+	}
+	return running, nil
+}
+
+func managementStatus(p *paths.AppPaths) (*protocol.ManagementStatus, error) {
 	conn, err := net.DialTimeout("unix", p.Socket, workerDialTimeout)
 	if err != nil {
-		return fmt.Errorf("agentd holds %s but does not answer on %s: %w", p.LockPath(), p.Socket, err)
+		return nil, err
 	}
+	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(workerDialTimeout))
-	err = protocol.WriteManagementRequest(conn, &protocol.ManagementRequest{Shutdown: &protocol.ManagementShutdown{Force: true}})
-	if err == nil {
-		_, err = protocol.ReadManagementResponse(bufio.NewReader(conn))
+	if err := protocol.WriteManagementRequest(conn, &protocol.ManagementRequest{Status: protocol.Empty}); err != nil {
+		return nil, err
 	}
-	conn.Close()
+	resp, err := protocol.ReadManagementResponse(bufio.NewReader(conn))
 	if err != nil {
-		return fmt.Errorf("failed to ask agentd to stop: %w", err)
+		return nil, err
+	}
+	if resp == nil || resp.Status == nil {
+		return nil, errors.New("unexpected management response")
+	}
+	return resp.Status, nil
+}
+
+// stopDaemon stops the running daemon, if any. The daemon's lock says
+// whether one is running, and it is asked to stop over its own socket, so no
+// pid is ever read from disk and signalled. A daemon from before the lock
+// existed (the Rust agentd) is found by its socket and stopped the same way:
+// the management protocol has not changed.
+func stopDaemon(p *paths.AppPaths) error {
+	running, err := daemonRunning(p.LockPath())
+	if err != nil {
+		return err
+	}
+	if !running {
+		if !answers(p.Socket) {
+			return nil
+		}
+		if err := requestShutdown(p); err != nil {
+			return err
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for answers(p.Socket) {
+			if time.Now().After(deadline) {
+				return errors.New("the previous agentd did not stop")
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		return nil
+	}
+	if err := requestShutdown(p); err != nil {
+		return err
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -118,4 +159,21 @@ func stopDaemon(p *paths.AppPaths) error {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+func requestShutdown(p *paths.AppPaths) error {
+	conn, err := net.DialTimeout("unix", p.Socket, workerDialTimeout)
+	if err != nil {
+		return fmt.Errorf("agentd does not answer on %s: %w", p.Socket, err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(workerDialTimeout))
+	err = protocol.WriteManagementRequest(conn, &protocol.ManagementRequest{Shutdown: &protocol.ManagementShutdown{Force: true}})
+	if err == nil {
+		_, err = protocol.ReadManagementResponse(bufio.NewReader(conn))
+	}
+	if err != nil {
+		return fmt.Errorf("failed to ask agentd to stop: %w", err)
+	}
+	return nil
 }

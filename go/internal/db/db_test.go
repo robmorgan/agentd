@@ -40,10 +40,11 @@ func TestFreshDatabaseIsV8AndRoundTrips(t *testing.T) {
 	if got := userVersion(t, path); got != CurrentSchemaVersion {
 		t.Fatalf("user_version = %d, want %d", got, CurrentSchemaVersion)
 	}
-	if err := store.InsertSession(NewSession{SessionID: "demo", Agent: "sh", Mode: session.ModeExecute, Cwd: "/work/demo"}); err != nil {
+	createdAt, err := store.InsertSession(NewSession{SessionID: "demo", Agent: "sh", Mode: session.ModeExecute, Cwd: "/work/demo"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MarkRunning("demo", 10, 11); err != nil {
+	if err := store.MarkRunning("demo", createdAt, 10, 11); err != nil {
 		t.Fatal(err)
 	}
 	code := int32(0)
@@ -183,19 +184,22 @@ func TestStateTransitionGuards(t *testing.T) {
 		}
 		return rec
 	}
+	created := map[string]string{}
 	for _, id := range []string{"a", "b"} {
-		if err := store.InsertSession(NewSession{SessionID: id, Agent: "sh", Mode: session.ModeExecute, Cwd: "/"}); err != nil {
+		at, err := store.InsertSession(NewSession{SessionID: id, Agent: "sh", Mode: session.ModeExecute, Cwd: "/"})
+		if err != nil {
 			t.Fatal(err)
 		}
+		created[id] = at
 	}
 
-	if err := store.MarkRunning("a", 10, 11); err != nil {
+	if err := store.MarkRunning("a", created["a"], 10, 11); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MarkRunning("a", 12, 13); !errors.Is(err, ErrNotCreating) {
+	if err := store.MarkRunning("a", created["a"], 12, 13); !errors.Is(err, ErrNotCreating) {
 		t.Fatalf("second MarkRunning = %v", err)
 	}
-	if err := store.MarkRunning("missing", 1, 2); !errors.Is(err, ErrNotCreating) {
+	if err := store.MarkRunning("missing", created["a"], 1, 2); !errors.Is(err, ErrNotCreating) {
 		t.Fatalf("MarkRunning on missing row = %v", err)
 	}
 	zero := int32(0)
@@ -222,7 +226,42 @@ func TestStateTransitionGuards(t *testing.T) {
 	if rec := get("b"); rec.Status != session.StatusFailed {
 		t.Fatalf("b = %+v", rec)
 	}
-	if err := store.MarkRunning("b", 10, 11); !errors.Is(err, ErrNotCreating) {
+	if err := store.MarkRunning("b", created["b"], 10, 11); !errors.Is(err, ErrNotCreating) {
 		t.Fatalf("MarkRunning after failure = %v", err)
+	}
+
+	// A worker for a removed session cannot claim a new session that
+	// reused its name.
+	if err := store.DeleteSession("b"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertSession(NewSession{SessionID: "b", Agent: "sh", Mode: session.ModeExecute, Cwd: "/other"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkRunning("b", created["b"], 10, 11); !errors.Is(err, ErrNotCreating) {
+		t.Fatalf("stale worker claimed a recreated session: %v", err)
+	}
+}
+
+func TestSchemaVersionAndLegacySessionsDoNotMigrate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	if v, err := SchemaVersion(path); err != nil || v != 0 {
+		t.Fatalf("missing db: %d, %v", v, err)
+	}
+	writeV7Fixture(t, path)
+	raw := openRaw(t, path)
+	if _, err := raw.Exec(`UPDATE sessions SET status = 'running', worker_pid = 42 WHERE session_id = 'wt'`); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+	if v, err := SchemaVersion(path); err != nil || v != 7 {
+		t.Fatalf("v7 db: %d, %v", v, err)
+	}
+	legacy, err := LegacyRunningSessions(path)
+	if err != nil || len(legacy) != 1 || legacy[0].SessionID != "wt" || legacy[0].WorkerPID == nil || *legacy[0].WorkerPID != 42 {
+		t.Fatalf("legacy = %+v, %v", legacy, err)
+	}
+	if v := userVersion(t, path); v != 7 {
+		t.Fatalf("peeking migrated the database to %d", v)
 	}
 }

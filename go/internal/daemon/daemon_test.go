@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/robmorgan/agentd/go/internal/db"
 	"github.com/robmorgan/agentd/go/internal/paths"
 	"github.com/robmorgan/agentd/go/internal/protocol"
 	"github.com/robmorgan/agentd/go/internal/session"
@@ -878,5 +879,150 @@ func TestLoadConfig(t *testing.T) {
 	}
 	if got := cfg.Agents["z"].modelFlag(); got != "--model" {
 		t.Fatalf("default model_flag = %q", got)
+	}
+}
+
+// writeLegacyDB writes a minimal schema-v7 state.db with one session the old
+// daemon recorded as running. The legacy checks read only these columns.
+func writeLegacyDB(t *testing.T, path string) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`CREATE TABLE sessions (session_id TEXT PRIMARY KEY, status TEXT, worker_pid INTEGER);
+		INSERT INTO sessions VALUES ('old', 'running', 4242);
+		PRAGMA user_version = 7;`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func listenUnix(t *testing.T, path string) net.Listener {
+	t.Helper()
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+	return l
+}
+
+// Upgrading must not migrate state.db out from under the previous agentd or
+// its still-running sessions.
+func TestLegacyRuntimeBlocksMigration(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "agdl-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(root) })
+	p := paths.FromRoot(root)
+	if err := p.EnsureLayout(); err != nil {
+		t.Fatal(err)
+	}
+	writeLegacyDB(t, p.Database)
+
+	oldDaemon := listenUnix(t, p.Socket)
+	if _, err := New(p, workerBin); err == nil || !strings.Contains(err.Error(), "previous agentd is still running") {
+		t.Fatalf("with the old daemon up: %v", err)
+	}
+	oldDaemon.Close()
+
+	listenUnix(t, p.SessionSocketPath("old"))
+	if _, err := New(p, workerBin); err == nil || !strings.Contains(err.Error(), "old (worker pid 4242)") {
+		t.Fatalf("with an old session up: %v", err)
+	}
+	if v, _ := db.SchemaVersion(p.Database); v != 7 {
+		t.Fatalf("state.db was migrated to v%d while the old runtime was live", v)
+	}
+}
+
+// `agentd upgrade` stops a previous daemon that predates the lock through
+// the (unchanged) management protocol.
+func TestStopDaemonStopsLegacyDaemon(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "agdl-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(root) })
+	p := paths.FromRoot(root)
+	if err := p.EnsureLayout(); err != nil {
+		t.Fatal(err)
+	}
+	l, err := net.Listen("unix", p.Socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			_, mgmt, _ := protocol.ReadIncoming(bufio.NewReader(conn))
+			if mgmt != nil && mgmt.Shutdown != nil && mgmt.Shutdown.Force {
+				protocol.WriteManagementResponse(conn, &protocol.ManagementResponse{Shutdown: &protocol.ManagementShutdownResult{Stopped: true, Message: "stopping"}})
+				conn.Close()
+				l.Close()
+				return
+			}
+			conn.Close()
+		}
+	}()
+	if err := stopDaemon(p); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-stopped:
+	case <-time.After(testTimeout):
+		t.Fatal("legacy daemon was not asked to stop")
+	}
+}
+
+// Removing a session and immediately creating one with the same name must
+// leave the new session reachable: the old worker's cleanup may not delete
+// the new worker's socket.
+func TestRemoveAndRecreateSameName(t *testing.T) {
+	h := newHarness(t)
+	for i := range 5 {
+		h.mustCreate("reuse")
+		resp := h.request(&protocol.Request{KillSession: &protocol.KillSession{SessionID: "reuse", Remove: true}})
+		if resp.KillSession == nil {
+			t.Fatalf("round %d rm: %v", i, resp.Error)
+		}
+	}
+	h.mustCreate("reuse")
+	time.Sleep(3 * time.Second) // longer than any old worker's shutdown grace
+	h.sendInput("reuse", "still-reachable\n")
+	h.eventually("new session output", func() bool { return strings.Contains(h.history("reuse"), "got:still-reachable") })
+}
+
+func TestGeneratedNamesDoNotRunOut(t *testing.T) {
+	h := newHarness(t)
+	srv, err := New(h.paths, workerBin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range nameAdjectives {
+		for _, b := range nameAnimals {
+			if _, err := srv.db.InsertSession(db.NewSession{SessionID: a + "-" + b, Agent: "sh", Mode: session.ModeExecute, Cwd: h.cwd}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	id := h.mustCreate("")
+	if !validSessionName(id) || strings.Count(id, "-") != 2 {
+		t.Fatalf("generated name %q", id)
 	}
 }

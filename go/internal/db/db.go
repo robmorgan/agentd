@@ -107,6 +107,57 @@ func Open(path string) (*Database, error) {
 	return d, nil
 }
 
+// SchemaVersion reports a state database's schema version without creating
+// or migrating it: 0 if it does not exist or is empty.
+func SchemaVersion(path string) (int, error) {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	conn, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+	var v int
+	err = conn.QueryRow("PRAGMA user_version").Scan(&v)
+	return v, err
+}
+
+// LegacySession is a running session recorded by an agentd from before
+// schema v8.
+type LegacySession struct {
+	SessionID string
+	WorkerPID *int64
+}
+
+// LegacyRunningSessions lists the sessions a pre-v8 database records as
+// running, reading only columns every schema has and without migrating.
+func LegacyRunningSessions(path string) ([]LegacySession, error) {
+	conn, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	rows, err := conn.Query(`SELECT session_id, worker_pid FROM sessions WHERE status = 'running'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []LegacySession
+	for rows.Next() {
+		var ls LegacySession
+		var pid sql.NullInt64
+		if err := rows.Scan(&ls.SessionID, &pid); err != nil {
+			return nil, err
+		}
+		if pid.Valid {
+			ls.WorkerPID = &pid.Int64
+		}
+		out = append(out, ls)
+	}
+	return out, rows.Err()
+}
+
 // connect opens a connection. _txlock=immediate makes every transaction take
 // the write lock when it begins, so concurrent openers (daemon, workers, the
 // CLI's local mode) queue on busy_timeout instead of deadlocking on a lock
@@ -261,23 +312,29 @@ type NewSession struct {
 	Cwd       string
 }
 
-func (d *Database) InsertSession(s NewSession) error {
+// InsertSession creates a session row in `creating`. The returned creation
+// timestamp identifies this incarnation of the session: a worker passes it
+// back to MarkRunning, so a stale worker can never claim a newer session
+// that reused the name.
+func (d *Database) InsertSession(s NewSession) (string, error) {
 	var model any
 	if s.Model != nil {
 		model = *s.Model
 	}
-	return d.exec(`INSERT INTO sessions (
+	createdAt := now()
+	return createdAt, d.exec(`INSERT INTO sessions (
                 session_id, agent, model, mode, cwd, status, attention, attention_summary, created_at, updated_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)`,
 		s.SessionID, s.Agent, model, string(s.Mode), s.Cwd, string(session.StatusCreating),
-		string(session.AttentionInfo), s.SessionID, now())
+		string(session.AttentionInfo), s.SessionID, createdAt)
 }
 
 // MarkRunning records that a worker has its agent running. It only applies
-// to a session still in `creating`, and returns ErrNotCreating otherwise, so
-// a worker the daemon gave up on (or whose session was removed meanwhile)
-// cannot claim the session.
-func (d *Database) MarkRunning(sessionID string, workerPID, agentPID int) error {
+// to the incarnation of the session created at createdAt, and only while it
+// is still in `creating`; otherwise it returns ErrNotCreating, so a worker the
+// daemon gave up on, or whose session was removed (and perhaps recreated
+// under the same name) meanwhile, cannot claim it.
+func (d *Database) MarkRunning(sessionID, createdAt string, workerPID, agentPID int) error {
 	conn, err := d.connect()
 	if err != nil {
 		return err
@@ -287,9 +344,9 @@ func (d *Database) MarkRunning(sessionID string, workerPID, agentPID int) error 
              SET status = ?2, worker_pid = ?3, agent_pid = ?4,
                  exit_code = NULL, error = NULL, attention = ?5, attention_summary = ?6,
                  updated_at = ?7, exited_at = NULL
-             WHERE session_id = ?1 AND status = 'creating'`,
+             WHERE session_id = ?1 AND status = 'creating' AND created_at = ?8`,
 		sessionID, string(session.StatusRunning), workerPID, agentPID,
-		string(session.AttentionInfo), "running", now())
+		string(session.AttentionInfo), "running", now(), createdAt)
 	if err != nil {
 		return err
 	}

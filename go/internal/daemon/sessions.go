@@ -53,28 +53,54 @@ func validSessionName(name string) bool {
 	return true
 }
 
-// workerAnswers reports whether a session's worker accepts connections. This
+type liveness int
+
+const (
+	workerLive    liveness = iota
+	workerGone             // nothing listens on the socket: the worker is dead
+	workerUnknown          // the probe itself failed (fd exhaustion, timeout)
+)
+
+// workerState probes a session's worker by connecting to its socket. This
 // is the liveness test for sessions: unlike a stored pid it cannot be fooled
 // by pid reuse, and unlike the socket file existing it cannot be fooled by a
-// worker that died without cleaning up.
-func (s *Server) workerAnswers(id string) bool {
+// worker that died without cleaning up. Only a refused connection or a
+// missing socket counts as proof of death; any other failure is unknown, so
+// a probe that fails under load never condemns a healthy session.
+func (s *Server) workerState(id string) (liveness, error) {
 	conn, err := net.DialTimeout("unix", s.paths.SessionSocketPath(id), workerDialTimeout)
-	if err != nil {
-		return false
+	switch {
+	case err == nil:
+		conn.Close()
+		return workerLive, nil
+	case errors.Is(err, syscall.ECONNREFUSED), errors.Is(err, syscall.ENOENT):
+		return workerGone, nil
 	}
-	conn.Close()
-	return true
+	return workerUnknown, err
 }
 
-// alive reports whether a running record still has a live worker.
+func (s *Server) workerAnswers(id string) bool {
+	state, _ := s.workerState(id)
+	return state == workerLive
+}
+
+// alive reports whether a running record still has a live worker, counting
+// a worker that could not be probed as live.
 func (s *Server) alive(rec *session.Record) bool {
-	return rec.Status == session.StatusRunning && s.workerAnswers(rec.SessionID)
+	if rec.Status != session.StatusRunning {
+		return false
+	}
+	state, _ := s.workerState(rec.SessionID)
+	return state != workerGone
 }
 
 // refresh downgrades a running record whose worker has vanished, e.g. one
 // that was SIGKILLed while no daemon was supervising it.
 func (s *Server) refresh(rec *session.Record) (*session.Record, error) {
-	if rec.Status != session.StatusRunning || s.alive(rec) {
+	if rec.Status != session.StatusRunning {
+		return rec, nil
+	}
+	if state, _ := s.workerState(rec.SessionID); state != workerGone {
 		return rec, nil
 	}
 	if err := s.db.MarkUnknownRecovered(rec.SessionID); err != nil {
@@ -150,26 +176,24 @@ func (s *Server) reconcileSessions() error {
 	return nil
 }
 
-func (s *Server) allocateSession(name *string, agent string, model *string, cwd string) (string, error) {
+func (s *Server) allocateSession(name *string, agent string, model *string, cwd string) (id, createdAt string, err error) {
 	s.createMu.Lock()
 	defer s.createMu.Unlock()
 
-	id := ""
 	if name != nil {
 		id = *name
 		existing, err := s.db.GetSession(id)
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 		if existing != nil {
-			return "", fmt.Errorf("session `%s` already exists", id)
+			return "", "", fmt.Errorf("session `%s` already exists", id)
 		}
 	} else {
-		for range 16 {
-			candidate := nameAdjectives[rand.IntN(len(nameAdjectives))] + "-" + nameAnimals[rand.IntN(len(nameAnimals))]
+		for _, candidate := range generatedNames() {
 			existing, err := s.db.GetSession(candidate)
 			if err != nil {
-				return "", err
+				return "", "", err
 			}
 			if existing == nil {
 				id = candidate
@@ -177,12 +201,30 @@ func (s *Server) allocateSession(name *string, agent string, model *string, cwd 
 			}
 		}
 		if id == "" {
-			return "", errors.New("failed to allocate a unique session name")
+			return "", "", errors.New("failed to allocate a unique session name")
 		}
 	}
-	return id, s.db.InsertSession(db.NewSession{
+	createdAt, err = s.db.InsertSession(db.NewSession{
 		SessionID: id, Agent: agent, Model: model, Mode: session.ModeExecute, Cwd: cwd,
 	})
+	return id, createdAt, err
+}
+
+// generatedNames yields candidate names for an unnamed session: every
+// adjective-animal pair in random order, then numbered variants, so that
+// allocation keeps succeeding however many sessions are retained.
+func generatedNames() []string {
+	var names []string
+	for _, a := range nameAdjectives {
+		for _, b := range nameAnimals {
+			names = append(names, a+"-"+b)
+		}
+	}
+	rand.Shuffle(len(names), func(i, j int) { names[i], names[j] = names[j], names[i] })
+	for range 64 {
+		names = append(names, fmt.Sprintf("%s-%d", names[rand.IntN(100)], 2+rand.IntN(9998)))
+	}
+	return names
 }
 
 func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResult, error) {
@@ -203,7 +245,7 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 		return nil, fmt.Errorf("working directory `%s` must be an absolute path", req.Cwd)
 	}
 
-	id, err := s.allocateSession(name, req.Agent, req.Model, req.Cwd)
+	id, createdAt, err := s.allocateSession(name, req.Agent, req.Model, req.Cwd)
 	if err != nil {
 		return nil, err
 	}
@@ -225,6 +267,7 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 		"session-worker",
 		"--session-id", id,
 		"--cwd", req.Cwd,
+		"--created-at", createdAt,
 		"--agent-name", req.Agent,
 		"--command", agent.Command,
 	}
@@ -349,7 +392,13 @@ func (s *Server) killSession(id string, remove bool) (*protocol.KillSessionResul
 	if rec == nil {
 		return nil, fmt.Errorf("session `%s` not found", id)
 	}
-	wasRunning := s.alive(rec)
+	state, probeErr := s.workerState(id)
+	if rec.Status == session.StatusRunning && state == workerUnknown {
+		// Refuse rather than guess: removing a session whose worker may be
+		// alive would orphan its agent.
+		return nil, fmt.Errorf("could not reach session `%s`: %v", id, probeErr)
+	}
+	wasRunning := rec.Status == session.StatusRunning && state == workerLive
 	if !wasRunning && !remove {
 		return nil, fmt.Errorf("session `%s` is not running", id)
 	}
@@ -432,13 +481,18 @@ func (s *Server) requestWorkerKill(id string) error {
 	return nil
 }
 
-// waitStopped waits for a session to leave the running state.
+// waitStopped waits for a session to leave the running state and for its
+// worker to stop listening. The worker records its outcome before it closes
+// its socket, so waiting for the status alone would let a removed name be
+// reused while the old worker is still cleaning up.
 func (s *Server) waitStopped(id string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for {
 		rec, err := s.db.GetSession(id)
 		if err == nil && (rec == nil || rec.Status != session.StatusRunning) {
-			return true
+			if state, _ := s.workerState(id); state == workerGone {
+				return true
+			}
 		}
 		if time.Now().After(deadline) {
 			return false

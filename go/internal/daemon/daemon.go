@@ -89,6 +89,9 @@ func New(p *paths.AppPaths, workerBin string) (*Server, error) {
 	if err := p.EnsureLayout(); err != nil {
 		return nil, err
 	}
+	if err := checkLegacyRuntime(p); err != nil {
+		return nil, err
+	}
 	store, err := db.Open(p.Database)
 	if err != nil {
 		return nil, err
@@ -123,8 +126,12 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 	defer releaseLock(lock)
 
-	// Holding the lock, any socket left at the path belongs to a daemon
-	// that is gone.
+	// Holding the lock, a socket that still answers can only belong to a
+	// daemon that predates the lock (the previous, Rust agentd); anything
+	// else left at the path belongs to a daemon that is gone.
+	if answers(s.paths.Socket) {
+		return fmt.Errorf("%w: an agentd that does not use %s is listening on %s; stop it first", errDaemonRunning, s.paths.LockPath(), s.paths.Socket)
+	}
 	if err := os.Remove(s.paths.Socket); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("failed to remove stale agentd socket: %w", err)
 	}
@@ -151,11 +158,21 @@ func (s *Server) Serve(ctx context.Context) error {
 	acceptDone := make(chan struct{})
 	go func() {
 		defer close(acceptDone)
+		backoff := time.Duration(0)
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				return
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				// Temporary failures such as running out of file
+				// descriptors must not stop the daemon accepting for good.
+				backoff = min(max(2*backoff, 5*time.Millisecond), time.Second)
+				fmt.Fprintf(os.Stderr, "agentd: accept: %v; retrying in %v\n", err, backoff)
+				time.Sleep(backoff)
+				continue
 			}
+			backoff = 0
 			if !s.track(conn) {
 				conn.Close()
 				continue
