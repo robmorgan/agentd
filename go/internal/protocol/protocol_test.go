@@ -3,6 +3,7 @@ package protocol
 import (
 	"bytes"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,7 +58,7 @@ func TestRequestRoundTrips(t *testing.T) {
 	roundTripRequest(t, &Request{ListAttachments: &SessionRef{"demo"}})
 	roundTripRequest(t, &Request{GetHistory: &GetHistory{SessionID: "demo", VT: true}})
 	roundTripRequest(t, &Request{KillSession: &KillSession{SessionID: "demo", Remove: true, Force: true}})
-	roundTripRequest(t, &Request{CreateSession: &CreateSession{Workspace: "/tmp/x", Agent: "codex", Model: strp("m"), IntegrationPolicy: session.PolicyAutoApplySafe}})
+	roundTripRequest(t, &Request{CreateSession: &CreateSession{Cwd: "/tmp/x", Name: strp("fix"), Agent: "codex", Model: strp("m")}})
 	roundTripRequest(t, &Request{GetDaemonInfo: Empty})
 	roundTripRequest(t, &Request{AttachInput: &Bytes{Data: []byte("hi")}})
 }
@@ -73,25 +74,25 @@ func TestResponseRoundTrips(t *testing.T) {
 	roundTripResponse(t, &Response{InputAccepted: Empty})
 	roundTripResponse(t, &Response{Error: &ErrorResponse{Message: "boom"}})
 	roundTripResponse(t, &Response{SessionEnded: &SessionEnded{
-		SessionID: "demo", Status: session.StatusExited, ApplyState: session.ApplyIdle, HasCommits: true,
-		Branch: "agent/demo", Worktree: "/tmp/wt", ExitCode: i32p(0), Error: nil,
+		SessionID: "demo", Status: session.StatusExited, ExitCode: i32p(0), Error: nil,
+	}})
+	roundTripResponse(t, &Response{CreateSession: &session.CreateResult{
+		SessionID: "demo", Cwd: "/tmp/demo", Status: session.StatusRunning, Mode: session.ModeExecute,
 	}})
 	roundTripResponse(t, &Response{Attachments: &[]session.AttachmentRecord{{
 		AttachID: "attach-1", SessionID: "demo", Kind: session.AttachmentAttach, ConnectedAt: now,
 	}}})
 	roundTripResponse(t, &Response{Sessions: &[]session.Record{{
 		SessionID: "demo", Agent: "codex", Model: strp("gpt-5.4"), Mode: session.ModeExecute,
-		Workspace: "/tmp/demo", RepoPath: "/tmp/demo", RepoName: "demo", BaseBranch: "main",
-		Branch: "agent/fix", Worktree: "/tmp/worktree", Status: session.StatusRunning,
-		IntegrationPolicy: session.PolicyAutoApplySafe, ApplyState: session.ApplyIdle,
+		Cwd: "/tmp/demo", Status: session.StatusRunning,
 		WorkerPID: u32p(123), AgentPID: u32p(456), Attention: session.AttentionInfo,
 		AttentionSummary: strp("fix"), CreatedAt: now, UpdatedAt: now,
 	}}})
 }
 
-// TestAttachSessionGoldenFrame pins the exact bytes the Rust implementation
-// produces for an AttachSession request so cross-language compatibility does
-// not regress silently.
+// TestAttachSessionGoldenFrame pins the exact bytes of an AttachSession
+// request. Apart from the version field this is the frame the Rust v32
+// implementation produces, so framing compatibility does not regress silently.
 func TestAttachSessionGoldenFrame(t *testing.T) {
 	var buf bytes.Buffer
 	err := WriteRequest(&buf, &Request{AttachSession: &AttachSession{
@@ -102,7 +103,7 @@ func TestAttachSessionGoldenFrame(t *testing.T) {
 	}
 	want := []byte{
 		0x50, 0x44, 0x47, 0x41, // magic "AGDP" little-endian
-		32, 0, // protocol version
+		33, 0, // protocol version
 		7, 0, // AttachSessionRequest
 		0, 0, 0, 0, // flags, reserved
 		15, 0, 0, 0, // payload length
@@ -116,14 +117,47 @@ func TestAttachSessionGoldenFrame(t *testing.T) {
 	}
 }
 
-func TestLegacyStatusAndApplyStateValues(t *testing.T) {
+func TestLegacyStatusValues(t *testing.T) {
 	d := &decoder{buf: []byte{3}}
 	if got := d.status(); got != session.StatusUnknownRecovered || d.err != nil {
 		t.Fatalf("legacy paused status: got %q err %v", got, d.err)
 	}
-	d = &decoder{buf: []byte{3}}
-	if got := d.applyState(); got != session.ApplyIdle || d.err != nil {
-		t.Fatalf("legacy apply state: got %q err %v", got, d.err)
+}
+
+// TestRemovedKindsAreRejected checks that frames using the kind numbers
+// retired in v33 are refused rather than decoded into something else, and
+// that a v32 frame is refused before its kind is even looked at.
+func TestRemovedKindsAreRejected(t *testing.T) {
+	e := &encoder{}
+	e.str("demo")
+	payload := bytes.NewBuffer(e.buf)
+
+	for _, k := range []uint16{4, 5, 10, 19, 20} {
+		var buf bytes.Buffer
+		if err := writeFrame(&buf, ProtocolVersion, k, payload.Bytes()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadRequest(&buf); err == nil {
+			t.Fatalf("request kind %d should be rejected", k)
+		}
+	}
+	for _, k := range []uint16{106, 107} {
+		var buf bytes.Buffer
+		if err := writeFrame(&buf, ProtocolVersion, k, payload.Bytes()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadResponse(&buf); err == nil {
+			t.Fatalf("response kind %d should be rejected", k)
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := writeFrame(&buf, 32, 7, payload.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	_, err := ReadRequest(&buf)
+	if err == nil || !strings.Contains(err.Error(), "unsupported protocol version `32`") {
+		t.Fatalf("v32 frame: got %v", err)
 	}
 }
 

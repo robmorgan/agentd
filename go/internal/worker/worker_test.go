@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -25,13 +26,15 @@ import (
 const testTimeout = 10 * time.Second
 
 // echoAgent echoes each line back as got:<line>. "size" prints the PTY size,
-// "flood" writes a burst of output, "done" exits 0, "quit" exits 3.
+// "where" prints the working directory and cwd environment, "flood" writes a
+// burst of output, "done" exits 0, "quit" exits 3.
 const echoAgent = `stty -echo; echo ready
 while IFS= read -r l; do
   case "$l" in
     quit) exit 3;;
     done) exit 0;;
     size) stty size;;
+    where) echo "pwd:$(pwd -P)"; echo "cwd:$AGENTD_CWD"; echo "ws:$AGENTD_WORKSPACE";;
     flood) i=0; while [ $i -lt 20000 ]; do echo "line $i padding padding padding padding"; i=$((i+1)); done; echo flood-done;;
     *) echo "got:$l";;
   esac
@@ -68,16 +71,14 @@ func startWorker(t *testing.T) *harness {
 	}
 	h := &harness{t: t, paths: p, store: store, sessionID: "test-session", done: make(chan error, 1)}
 	if err := store.InsertSession(db.NewSession{
-		SessionID: h.sessionID, Agent: "sh", Mode: session.ModeExecute,
-		Workspace: dir, RepoPath: dir, RepoName: "repo", BaseBranch: "main",
-		Branch: "agent/test", Worktree: dir, IntegrationPolicy: session.PolicyManualReview,
+		SessionID: h.sessionID, Agent: "sh", Mode: session.ModeExecute, Cwd: dir,
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	go func() {
 		h.done <- Run(Args{
-			SessionID: h.sessionID, RepoRoot: dir, Worktree: dir, Branch: "agent/test",
+			SessionID: h.sessionID, Cwd: dir,
 			AgentName: "sh", Command: "/bin/sh", Args: []string{"-c", echoAgent},
 		})
 	}()
@@ -541,4 +542,46 @@ func TestMalformedFramesDoNotKillWorker(t *testing.T) {
 
 func isConnClosed(err error) bool {
 	return err == io.EOF || strings.Contains(err.Error(), "connection reset")
+}
+
+// TestAgentRunsInCwd checks that the agent process starts in Args.Cwd and
+// sees it through AGENTD_CWD and the AGENTD_WORKSPACE alias. The directory is
+// deliberately not a git repository.
+func TestAgentRunsInCwd(t *testing.T) {
+	h := startWorker(t)
+	c := h.attach(defaultGeometry)
+	c.expectOutput("ready")
+	c.input("where\n")
+	real, err := filepath.EvalSymlinks(h.paths.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.expectOutput("pwd:" + real)
+	c.expectOutput("cwd:" + h.paths.Root)
+	c.expectOutput("ws:" + h.paths.Root)
+	c.input("done\n")
+	c.expectEnd()
+	h.waitExit()
+}
+
+// TestMissingCwdFailsBeforeSpawn checks that a bad cwd is refused up front
+// rather than surfacing as an opaque spawn failure.
+func TestMissingCwdFailsBeforeSpawn(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "agdw-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	t.Setenv("AGENTD_DIR", dir)
+
+	err = Run(Args{
+		SessionID: "missing", Cwd: filepath.Join(dir, "does-not-exist"),
+		AgentName: "sh", Command: "/bin/sh", Args: []string{"-c", "exit 0"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "session cwd") {
+		t.Fatalf("expected cwd error, got %v", err)
+	}
+	if _, statErr := os.Stat(paths.FromRoot(dir).SessionSocketPath("missing")); !os.IsNotExist(statErr) {
+		t.Fatalf("worker socket should not exist after a refused cwd: %v", statErr)
+	}
 }

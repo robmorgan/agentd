@@ -1,6 +1,10 @@
 // Package protocol implements the framed binary wire protocol shared by the
-// agent CLI, the daemon, and session workers. It mirrors
-// crates/agentd-shared/src/protocol.rs byte for byte.
+// agent CLI, the daemon, and session workers.
+//
+// Framing and primitive encodings are identical to
+// crates/agentd-shared/src/protocol.rs. Version 33 drops the worktree, apply,
+// discard and diff messages and the git fields on session records (see
+// docs/drop-worktrees.md), so a v33 peer cannot talk to the Rust v32 daemon.
 package protocol
 
 import (
@@ -15,7 +19,7 @@ import (
 )
 
 const (
-	ProtocolVersion         uint16 = 32
+	ProtocolVersion         uint16 = 33
 	DaemonManagementVersion uint16 = 1
 
 	frameMagic     uint32 = 0x4147_4450
@@ -28,8 +32,6 @@ type Request struct {
 	GetDaemonInfo         *struct{}
 	ShutdownDaemon        *struct{}
 	CreateSession         *CreateSession
-	CreateWorktree        *SessionRef
-	CleanupWorktree       *SessionRef
 	KillSession           *KillSession
 	ResolveSessionRuntime *SessionRef
 	AttachSession         *AttachSession
@@ -39,10 +41,7 @@ type Request struct {
 	AttachInput           *Bytes
 	AttachSnapshot        *struct{}
 	SendInput             *SendInput
-	ApplySession          *SessionRef
-	DiscardSession        *DiscardSession
 	SwitchAttachedSession *SwitchAttachedSession
-	DiffSession           *SessionRef
 	GetSession            *SessionRef
 	ListSessions          *struct{}
 	ListAttachments       *SessionRef
@@ -53,11 +52,12 @@ type SessionRef struct{ SessionID string }
 type Bytes struct{ Data []byte }
 
 type CreateSession struct {
-	Workspace         string
-	Name              *string
-	Agent             string
-	Model             *string
-	IntegrationPolicy session.IntegrationPolicy
+	// Cwd is the directory the agent runs in. The daemon validates that it
+	// exists and nothing more.
+	Cwd   string
+	Name  *string
+	Agent string
+	Model *string
 }
 
 type KillSession struct {
@@ -90,11 +90,6 @@ type SendInput struct {
 	SourceSessionID *string
 }
 
-type DiscardSession struct {
-	SessionID string
-	Force     bool
-}
-
 type SwitchAttachedSession struct {
 	SourceSessionID, TargetSessionID string
 }
@@ -114,8 +109,6 @@ type Response struct {
 	AttachSnapshot  *Bytes
 	SessionEnded    *SessionEnded
 	InputAccepted   *struct{}
-	Worktree        *session.WorktreeRecord
-	Diff            *session.Diff
 	Session         *session.Record
 	Sessions        *[]session.Record
 	Attachments     *[]session.AttachmentRecord
@@ -142,14 +135,10 @@ type History struct{ Data string }
 type ErrorResponse struct{ Message string }
 
 type SessionEnded struct {
-	SessionID  string
-	Status     session.Status
-	ApplyState session.ApplyState
-	HasCommits bool
-	Branch     string
-	Worktree   string
-	ExitCode   *int32
-	Error      *string
+	SessionID string
+	Status    session.Status
+	ExitCode  *int32
+	Error     *string
 }
 
 var Empty = &struct{}{}
@@ -162,12 +151,14 @@ func ErrorResponsef(format string, args ...any) *Response {
 
 type kind uint16
 
+// Kind numbers are stable across versions. Numbers removed in v33 (4, 5, 10,
+// 19, 20, 106, 107: worktree, diff, apply and discard) are left unassigned so
+// a v32 frame can never be misread as something else; 10 and 107 are reserved
+// for a future cwd-based diff.
 const (
 	kGetDaemonInfoRequest         kind = 1
 	kShutdownDaemonRequest        kind = 2
 	kCreateSessionRequest         kind = 3
-	kCreateWorktreeRequest        kind = 4
-	kCleanupWorktreeRequest       kind = 5
 	kKillSessionRequest           kind = 6
 	kResolveSessionRuntimeRequest kind = 25
 	kAttachSessionRequest         kind = 7
@@ -177,11 +168,8 @@ const (
 	kListAttachmentsRequest       kind = 22
 	kDetachAttachmentRequest      kind = 23
 	kAttachResizeRequest          kind = 21
-	kApplySessionRequest          kind = 19
-	kDiscardSessionRequest        kind = 20
 	kDetachSessionRequest         kind = 17
 	kSwitchAttachedSessionRequest kind = 16
-	kDiffSessionRequest           kind = 10
 	kGetSessionRequest            kind = 11
 	kListSessionsRequest          kind = 12
 	kGetHistoryRequest            kind = 14
@@ -195,8 +183,6 @@ const (
 	kSessionEndedResponse    kind = 117
 	kAttachmentsResponse     kind = 118
 	kInputAcceptedResponse   kind = 105
-	kWorktreeResponse        kind = 106
-	kDiffResponse            kind = 107
 	kSessionResponse         kind = 108
 	kSessionsResponse        kind = 109
 	kHistoryResponse         kind = 111
@@ -328,18 +314,11 @@ func encodeRequest(req *Request) (kind, []byte, error) {
 		return kShutdownDaemonRequest, nil, nil
 	case req.CreateSession != nil:
 		c := req.CreateSession
-		e.str(c.Workspace)
+		e.str(c.Cwd)
 		e.optStr(c.Name)
 		e.str(c.Agent)
 		e.optStr(c.Model)
-		e.integrationPolicy(c.IntegrationPolicy)
 		return kCreateSessionRequest, e.buf, e.err
-	case req.CreateWorktree != nil:
-		e.str(req.CreateWorktree.SessionID)
-		return kCreateWorktreeRequest, e.buf, e.err
-	case req.CleanupWorktree != nil:
-		e.str(req.CleanupWorktree.SessionID)
-		return kCleanupWorktreeRequest, e.buf, e.err
 	case req.KillSession != nil:
 		e.str(req.KillSession.SessionID)
 		e.bool(req.KillSession.Remove)
@@ -375,20 +354,10 @@ func encodeRequest(req *Request) (kind, []byte, error) {
 		e.bytes(req.SendInput.Data)
 		e.optStr(req.SendInput.SourceSessionID)
 		return kSendInputRequest, e.buf, e.err
-	case req.ApplySession != nil:
-		e.str(req.ApplySession.SessionID)
-		return kApplySessionRequest, e.buf, e.err
-	case req.DiscardSession != nil:
-		e.str(req.DiscardSession.SessionID)
-		e.bool(req.DiscardSession.Force)
-		return kDiscardSessionRequest, e.buf, e.err
 	case req.SwitchAttachedSession != nil:
 		e.str(req.SwitchAttachedSession.SourceSessionID)
 		e.str(req.SwitchAttachedSession.TargetSessionID)
 		return kSwitchAttachedSessionRequest, e.buf, e.err
-	case req.DiffSession != nil:
-		e.str(req.DiffSession.SessionID)
-		return kDiffSessionRequest, e.buf, e.err
 	case req.GetSession != nil:
 		e.str(req.GetSession.SessionID)
 		return kGetSessionRequest, e.buf, e.err
@@ -415,16 +384,11 @@ func decodeRequest(k kind, payload []byte) (*Request, error) {
 		req.ShutdownDaemon = Empty
 	case kCreateSessionRequest:
 		req.CreateSession = &CreateSession{
-			Workspace:         d.str(),
-			Name:              d.optStr(),
-			Agent:             d.str(),
-			Model:             d.optStr(),
-			IntegrationPolicy: d.integrationPolicy(),
+			Cwd:   d.str(),
+			Name:  d.optStr(),
+			Agent: d.str(),
+			Model: d.optStr(),
 		}
-	case kCreateWorktreeRequest:
-		req.CreateWorktree = &SessionRef{d.str()}
-	case kCleanupWorktreeRequest:
-		req.CleanupWorktree = &SessionRef{d.str()}
 	case kKillSessionRequest:
 		req.KillSession = &KillSession{SessionID: d.str(), Remove: d.bool(), Force: d.bool()}
 	case kResolveSessionRuntimeRequest:
@@ -446,14 +410,8 @@ func decodeRequest(k kind, payload []byte) (*Request, error) {
 		req.AttachSnapshot = Empty
 	case kSendInputRequest:
 		req.SendInput = &SendInput{SessionID: d.str(), Data: d.bytes(), SourceSessionID: d.optStr()}
-	case kApplySessionRequest:
-		req.ApplySession = &SessionRef{d.str()}
-	case kDiscardSessionRequest:
-		req.DiscardSession = &DiscardSession{SessionID: d.str(), Force: d.bool()}
 	case kSwitchAttachedSessionRequest:
 		req.SwitchAttachedSession = &SwitchAttachedSession{SourceSessionID: d.str(), TargetSessionID: d.str()}
-	case kDiffSessionRequest:
-		req.DiffSession = &SessionRef{d.str()}
 	case kGetSessionRequest:
 		req.GetSession = &SessionRef{d.str()}
 	case kListSessionsRequest:
@@ -481,12 +439,9 @@ func encodeResponse(resp *Response) (kind, []byte, error) {
 	case resp.CreateSession != nil:
 		c := resp.CreateSession
 		e.str(c.SessionID)
-		e.str(c.BaseBranch)
-		e.str(c.Branch)
-		e.str(c.Worktree)
+		e.str(c.Cwd)
 		e.status(c.Status)
 		e.mode(c.Mode)
-		e.integrationPolicy(c.IntegrationPolicy)
 		return kCreateSessionResponse, e.buf, e.err
 	case resp.KillSession != nil:
 		e.bool(resp.KillSession.Removed)
@@ -506,31 +461,11 @@ func encodeResponse(resp *Response) (kind, []byte, error) {
 		s := resp.SessionEnded
 		e.str(s.SessionID)
 		e.status(s.Status)
-		e.applyState(s.ApplyState)
-		e.bool(s.HasCommits)
-		e.str(s.Branch)
-		e.str(s.Worktree)
 		e.optI32(s.ExitCode)
 		e.optStr(s.Error)
 		return kSessionEndedResponse, e.buf, e.err
 	case resp.InputAccepted != nil:
 		return kInputAcceptedResponse, nil, nil
-	case resp.Worktree != nil:
-		w := resp.Worktree
-		e.str(w.SessionID)
-		e.str(w.RepoPath)
-		e.str(w.BaseBranch)
-		e.str(w.Branch)
-		e.str(w.Worktree)
-		return kWorktreeResponse, e.buf, e.err
-	case resp.Diff != nil:
-		d := resp.Diff
-		e.str(d.SessionID)
-		e.str(d.BaseBranch)
-		e.str(d.Branch)
-		e.str(d.Worktree)
-		e.str(d.Diff)
-		return kDiffResponse, e.buf, e.err
 	case resp.Session != nil:
 		e.sessionRecord(resp.Session)
 		return kSessionResponse, e.buf, e.err
@@ -577,8 +512,7 @@ func decodeResponse(k kind, payload []byte) (*Response, error) {
 		resp.DaemonInfo = &DaemonInfo{DaemonVersion: d.str(), ProtocolVersion: d.u16()}
 	case kCreateSessionResponse:
 		resp.CreateSession = &session.CreateResult{
-			SessionID: d.str(), BaseBranch: d.str(), Branch: d.str(), Worktree: d.str(),
-			Status: d.status(), Mode: d.mode(), IntegrationPolicy: d.integrationPolicy(),
+			SessionID: d.str(), Cwd: d.str(), Status: d.status(), Mode: d.mode(),
 		}
 	case kKillSessionResponse:
 		resp.KillSession = &KillSessionResult{Removed: d.bool(), WasRunning: d.bool()}
@@ -590,19 +524,10 @@ func decodeResponse(k kind, payload []byte) (*Response, error) {
 		resp.AttachSnapshot = &Bytes{d.bytes()}
 	case kSessionEndedResponse:
 		resp.SessionEnded = &SessionEnded{
-			SessionID: d.str(), Status: d.status(), ApplyState: d.applyState(), HasCommits: d.bool(),
-			Branch: d.str(), Worktree: d.str(), ExitCode: d.optI32(), Error: d.optStr(),
+			SessionID: d.str(), Status: d.status(), ExitCode: d.optI32(), Error: d.optStr(),
 		}
 	case kInputAcceptedResponse:
 		resp.InputAccepted = Empty
-	case kWorktreeResponse:
-		resp.Worktree = &session.WorktreeRecord{
-			SessionID: d.str(), RepoPath: d.str(), BaseBranch: d.str(), Branch: d.str(), Worktree: d.str(),
-		}
-	case kDiffResponse:
-		resp.Diff = &session.Diff{
-			SessionID: d.str(), BaseBranch: d.str(), Branch: d.str(), Worktree: d.str(), Diff: d.str(),
-		}
 	case kSessionResponse:
 		rec := d.sessionRecord()
 		resp.Session = &rec
@@ -762,32 +687,6 @@ func (e *encoder) attention(a session.AttentionLevel) {
 	}
 }
 
-func (e *encoder) applyState(s session.ApplyState) {
-	switch s {
-	case session.ApplyIdle:
-		e.u8(1)
-	case session.ApplyAutoApplying:
-		e.u8(2)
-	case session.ApplyApplied:
-		e.u8(4)
-	case session.ApplyDiscarded:
-		e.u8(5)
-	default:
-		e.err = fmt.Errorf("invalid apply state %q", s)
-	}
-}
-
-func (e *encoder) integrationPolicy(p session.IntegrationPolicy) {
-	switch p {
-	case session.PolicyManualReview:
-		e.u8(1)
-	case session.PolicyAutoApplySafe:
-		e.u8(2)
-	default:
-		e.err = fmt.Errorf("invalid integration policy %q", p)
-	}
-}
-
 func (e *encoder) mode(m session.Mode) {
 	switch m {
 	case session.ModeExecute:
@@ -804,19 +703,8 @@ func (e *encoder) sessionRecord(s *session.Record) {
 	e.str(s.Agent)
 	e.optStr(s.Model)
 	e.mode(s.Mode)
-	e.str(s.Workspace)
-	e.str(s.RepoPath)
-	e.str(s.RepoName)
-	e.str(s.BaseBranch)
-	e.str(s.Branch)
-	e.str(s.Worktree)
+	e.str(s.Cwd)
 	e.status(s.Status)
-	e.integrationPolicy(s.IntegrationPolicy)
-	e.applyState(s.ApplyState)
-	e.u32(s.DirtyCount)
-	e.u32(s.AheadCount)
-	e.bool(s.HasCommits)
-	e.bool(s.HasPendingChanges)
 	e.optU32(s.WorkerPID)
 	e.optU32(s.AgentPID)
 	e.optI32(s.ExitCode)
@@ -1018,34 +906,6 @@ func (d *decoder) attention() session.AttentionLevel {
 	}
 }
 
-func (d *decoder) applyState() session.ApplyState {
-	switch v := d.u8(); v {
-	case 1, 3:
-		return session.ApplyIdle
-	case 2:
-		return session.ApplyAutoApplying
-	case 4:
-		return session.ApplyApplied
-	case 5:
-		return session.ApplyDiscarded
-	default:
-		d.fail("invalid apply state `%d`", v)
-		return ""
-	}
-}
-
-func (d *decoder) integrationPolicy() session.IntegrationPolicy {
-	switch v := d.u8(); v {
-	case 1:
-		return session.PolicyManualReview
-	case 2:
-		return session.PolicyAutoApplySafe
-	default:
-		d.fail("invalid integration policy `%d`", v)
-		return ""
-	}
-}
-
 func (d *decoder) mode() session.Mode {
 	switch v := d.u8(); v {
 	case 1:
@@ -1060,31 +920,20 @@ func (d *decoder) mode() session.Mode {
 
 func (d *decoder) sessionRecord() session.Record {
 	return session.Record{
-		SessionID:         d.str(),
-		Agent:             d.str(),
-		Model:             d.optStr(),
-		Mode:              d.mode(),
-		Workspace:         d.str(),
-		RepoPath:          d.str(),
-		RepoName:          d.str(),
-		BaseBranch:        d.str(),
-		Branch:            d.str(),
-		Worktree:          d.str(),
-		Status:            d.status(),
-		IntegrationPolicy: d.integrationPolicy(),
-		ApplyState:        d.applyState(),
-		DirtyCount:        d.u32(),
-		AheadCount:        d.u32(),
-		HasCommits:        d.bool(),
-		HasPendingChanges: d.bool(),
-		WorkerPID:         d.optU32(),
-		AgentPID:          d.optU32(),
-		ExitCode:          d.optI32(),
-		Error:             d.optStr(),
-		Attention:         d.attention(),
-		AttentionSummary:  d.optStr(),
-		CreatedAt:         d.datetime(),
-		UpdatedAt:         d.datetime(),
-		ExitedAt:          d.optDatetime(),
+		SessionID:        d.str(),
+		Agent:            d.str(),
+		Model:            d.optStr(),
+		Mode:             d.mode(),
+		Cwd:              d.str(),
+		Status:           d.status(),
+		WorkerPID:        d.optU32(),
+		AgentPID:         d.optU32(),
+		ExitCode:         d.optI32(),
+		Error:            d.optStr(),
+		Attention:        d.attention(),
+		AttentionSummary: d.optStr(),
+		CreatedAt:        d.datetime(),
+		UpdatedAt:        d.datetime(),
+		ExitedAt:         d.optDatetime(),
 	}
 }

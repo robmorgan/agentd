@@ -30,9 +30,9 @@ const (
 
 type Args struct {
 	SessionID string
-	RepoRoot  string
-	Worktree  string
-	Branch    string
+	// Cwd is where the agent process is started. It must exist; the worker
+	// does not create it and does not care whether it is a git checkout.
+	Cwd       string
 	AgentName string
 	Command   string
 	Model     string
@@ -40,13 +40,9 @@ type Args struct {
 }
 
 type sessionEnded struct {
-	status     session.Status
-	applyState session.ApplyState
-	hasCommits bool
-	branch     string
-	worktree   string
-	exitCode   *int32
-	err        *string
+	status   session.Status
+	exitCode *int32
+	err      *string
 }
 
 type endedSignal struct {
@@ -88,15 +84,21 @@ func Run(args Args) error {
 		return fmt.Errorf("failed to remove %s: %w", socketPath, err)
 	}
 
+	if info, err := os.Stat(args.Cwd); err != nil {
+		return fmt.Errorf("session cwd: %w", err)
+	} else if !info.IsDir() {
+		return fmt.Errorf("session cwd %s is not a directory", args.Cwd)
+	}
 	cmd := exec.Command(args.Command, args.Args...)
-	cmd.Dir = args.Worktree
+	cmd.Dir = args.Cwd
+	// AGENTD_WORKSPACE is an alias of AGENTD_CWD kept for one release so agent
+	// instructions written against the Rust daemon keep working.
 	cmd.Env = append(os.Environ(),
 		"AGENTD_SESSION_ID="+args.SessionID,
 		"AGENTD_SESSION_NAME="+args.SessionID,
 		"AGENTD_SOCKET="+p.Socket,
-		"AGENTD_WORKSPACE="+args.RepoRoot,
-		"AGENTD_WORKTREE="+args.Worktree,
-		"AGENTD_BRANCH="+args.Branch,
+		"AGENTD_CWD="+args.Cwd,
+		"AGENTD_WORKSPACE="+args.Cwd,
 	)
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: defaultPtyRows, Cols: defaultPtyCols})
 	if err != nil {
@@ -209,15 +211,7 @@ func (rt *runtime) onChildExited(s *ownerState, exitCode *int32) {
 		rt.ended.fire(nil)
 		return
 	}
-	rt.ended.fire(&sessionEnded{
-		status:     rec.Status,
-		applyState: rec.ApplyState,
-		hasCommits: rec.HasCommits,
-		branch:     rec.Branch,
-		worktree:   rec.Worktree,
-		exitCode:   rec.ExitCode,
-		err:        rec.Error,
-	})
+	rt.ended.fire(&sessionEnded{status: rec.Status, exitCode: rec.ExitCode, err: rec.Error})
 }
 
 func (rt *runtime) finalizeExit(exitCode *int32) error {
@@ -229,7 +223,7 @@ func (rt *runtime) finalizeExit(exitCode *int32) error {
 		return nil
 	}
 	if exitCode != nil && *exitCode == 0 {
-		return rt.db.MarkExited(rt.sessionID, exitCode, session.ApplyIdle)
+		return rt.db.MarkExited(rt.sessionID, exitCode)
 	}
 	msg := "agent exited unexpectedly"
 	if exitCode != nil {
@@ -244,14 +238,10 @@ func (rt *runtime) endedResponse() *protocol.Response {
 		return protocol.EndOfStreamResponse()
 	}
 	return &protocol.Response{SessionEnded: &protocol.SessionEnded{
-		SessionID:  rt.sessionID,
-		Status:     info.status,
-		ApplyState: info.applyState,
-		HasCommits: info.hasCommits,
-		Branch:     info.branch,
-		Worktree:   info.worktree,
-		ExitCode:   info.exitCode,
-		Error:      info.err,
+		SessionID: rt.sessionID,
+		Status:    info.status,
+		ExitCode:  info.exitCode,
+		Error:     info.err,
 	}}
 }
 

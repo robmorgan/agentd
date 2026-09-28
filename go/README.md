@@ -1,33 +1,33 @@
 # agentd (Go port)
 
 This directory holds the in-progress Go implementation of the `agentd`
-server side. The Rust crates under `../crates` remain the source of truth
-until the port is complete; the two are wired together so each piece can be
-swapped over independently.
+server side. The Rust crates under `../crates` remain the behavioural
+reference until the port is complete.
+
+The Go side speaks protocol v33 and schema v8, which drop worktree management
+in favour of a per-session working directory (see `../docs/drop-worktrees.md`).
+The Rust daemon is on v32/v7, so the two no longer interoperate on the wire;
+a runtime root created by the Rust daemon is migrated in place the first time
+the Go side opens its `state.db`.
 
 ## Status
 
 | Piece | State |
 |---|---|
-| `internal/protocol` | Complete. Byte-compatible with `crates/agentd-shared/src/protocol.rs` (protocol version 32), round-trip and golden-frame tests. |
-| `internal/session`, `internal/paths` | Complete mirrors of the shared Rust types and runtime-root resolution. |
-| `internal/db` | Schema v7 init/migration plus the session row operations the worker needs. Uses `modernc.org/sqlite` (pure Go). |
+| `internal/protocol` | Complete. Same framing and primitive encodings as `crates/agentd-shared/src/protocol.rs`; version 33 removes the worktree, apply, discard and diff messages. Round-trip, golden-frame and removed-kind tests. |
+| `internal/session`, `internal/paths` | Complete. Session records carry `Cwd` instead of repo/branch/worktree fields. |
+| `internal/db` | Schema v8 init, v6/v7 migration (worktree path becomes `cwd`), and the session row operations the worker needs. Uses `modernc.org/sqlite` (pure Go). |
 | `internal/worker` | Complete session worker: PTY via `creack/pty`, shadow terminal via `go.mitchellh.com/libghostty`, per-session Unix socket speaking the worker protocol. Covered by real-PTY tests (attach/detach/reattach, survival across disconnect, multiple attachers, resize, exit, kill, slow and disconnecting clients, malformed frames) run under `-race`. |
-| `cmd/agentd session-worker` | Done. |
+| `cmd/agentd session-worker` | Done. Takes `--cwd`; injects `AGENTD_CWD` (and `AGENTD_WORKSPACE` as an alias). |
 | `cmd/agentd serve` (daemon) | Not started. |
 
-## Running the Go worker under the Rust daemon
+## Running the Go worker
 
-The Rust daemon spawns whatever `AGENTD_WORKER_BIN` points at instead of its
-own binary:
-
-```sh
-make -C go build
-AGENTD_WORKER_BIN=$PWD/go/bin/agentd agent new my-task
-```
-
-Everything else (`agent attach`, `send-input`, `history`, `attachments`,
-`kill`, `rm`) goes through the daemon unchanged.
+Until `agentd serve` lands the worker is exercised by the tests under
+`internal/worker`, which run it in-process against a real PTY. Pointing the
+Rust daemon's `AGENTD_WORKER_BIN` at `go/bin/agentd` no longer works: the
+worker rejects the old `--repo-root/--worktree/--branch` flags and the two
+sides disagree on the protocol version.
 
 ## Building
 

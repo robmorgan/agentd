@@ -24,7 +24,7 @@ tabs, you supervise work.
 `agentd` is a daemon runtime for supervising coding agents as durable tasks.
 
 Each task runs inside a managed session with:
-* its own git worktree and branch
+* a working directory you choose: a git worktree, a plain checkout, or any directory
 * a dedicated PTY
 * retained terminal history
 * persistent artifacts
@@ -145,12 +145,10 @@ Clients surface tasks based on attention instead of raw output.
 `agentd` focuses purely on agent runtime semantics:
 
 - durable PTY-backed agent sessions that outlive the client connection that started them
-- built-in Git worktree isolation under the resolved runtime root
 - session metadata stored in `state.db` under the resolved runtime root
 - in-memory PTY scrollback retained by the daemon until restart
 - interactive reattach with `agent attach`
 - background PTY input with `agent send`
-- diff inspection against the base branch with `agent diff`
 
 ## Build
 
@@ -184,6 +182,21 @@ make dev-run ARGS="sessions"
 make install
 ```
 
+## Working Directories And Worktrees
+
+A session runs in the directory you give it. `agent new` and `agent run` default to the
+current directory; pass `--cwd DIR` to pick another. `agentd` does not create git worktrees,
+branches, or merge anything back. If you want isolation between agents working on the same
+repository, create the worktree yourself and point the session at it:
+
+```sh
+git worktree add -b agent/auth-refactor ../wt/auth-refactor main
+agent run --cwd ../wt/auth-refactor --name auth-refactor "refactor auth"
+```
+
+A skill or a wrapper script can package this recipe. Two agents started in the same checkout
+will step on each other; that is your call, not the daemon's.
+
 ## Configure Agents
 
 Create `<runtime-root>/config.toml`:
@@ -207,14 +220,13 @@ The daemon injects:
 
 - `AGENTD_SESSION_ID`
 - `AGENTD_SOCKET`
-- `AGENTD_WORKSPACE`
-- `AGENTD_WORKTREE`
-- `AGENTD_BRANCH`
+- `AGENTD_CWD`
+- `AGENTD_WORKSPACE` (alias of `AGENTD_CWD`, kept for one release)
 - `AGENTD_TASK`
 
 Instrumented agents can use the injected session environment to locate the daemon socket, but
-there is no separate structured event channel. Session status, attention, history, diff, and
-worktree state are the supported runtime surfaces.
+there is no separate structured event channel. Session status, attention, and history are the
+supported runtime surfaces.
 
 Runtime paths are resolved in this order:
 
@@ -224,8 +236,7 @@ Runtime paths are resolved in this order:
 - `TMPDIR/agentd-<uid>`
 - `/tmp/agentd-<uid>`
 
-The selected root contains `config.toml`, `agentd.sock`, `agentd.pid`, `state.db`, and
-`worktrees/`.
+The selected root contains `config.toml`, `agentd.sock`, `agentd.pid`, `state.db`, and `logs/`.
 
 macOS typically does not set `XDG_RUNTIME_DIR`, so the default root on macOS becomes `~/.agentd`
 unless `AGENTD_DIR` is set explicitly.
@@ -261,7 +272,6 @@ Current capabilities include:
 - PTY-backed agent processes that outlive client connections
 - SQLite-backed session metadata and event storage
 - in-memory per-session PTY history until daemon restart
-- Git worktree isolation per session
 
 `attach` and `send` only work for sessions created under the current daemon lifetime. If
 `agentd` restarts, previously running sessions still keep their metadata, but their

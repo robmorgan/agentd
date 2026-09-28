@@ -12,14 +12,13 @@ import (
 const AppDirName = "agentd"
 
 type AppPaths struct {
-	Root         string
-	Socket       string
-	PIDFile      string
-	Database     string
-	Config       string
-	LogsDir      string
-	SessionsDir  string
-	WorktreesDir string
+	Root        string
+	Socket      string
+	PIDFile     string
+	Database    string
+	Config      string
+	LogsDir     string
+	SessionsDir string
 }
 
 func Discover() (*AppPaths, error) {
@@ -40,14 +39,13 @@ func Discover() (*AppPaths, error) {
 
 func FromRoot(root string) *AppPaths {
 	return &AppPaths{
-		Root:         root,
-		Socket:       filepath.Join(root, "agentd.sock"),
-		PIDFile:      filepath.Join(root, "agentd.pid"),
-		Database:     filepath.Join(root, "state.db"),
-		Config:       filepath.Join(root, "config.toml"),
-		LogsDir:      filepath.Join(root, "logs"),
-		SessionsDir:  filepath.Join(root, "sessions"),
-		WorktreesDir: filepath.Join(root, "worktrees"),
+		Root:        root,
+		Socket:      filepath.Join(root, "agentd.sock"),
+		PIDFile:     filepath.Join(root, "agentd.pid"),
+		Database:    filepath.Join(root, "state.db"),
+		Config:      filepath.Join(root, "config.toml"),
+		LogsDir:     filepath.Join(root, "logs"),
+		SessionsDir: filepath.Join(root, "sessions"),
 	}
 }
 
@@ -68,7 +66,7 @@ func discoverRoot(agentdDir, xdgRuntimeDir, homeDir, tmpDir string, uid int, pre
 }
 
 func (p *AppPaths) EnsureLayout() error {
-	for _, dir := range []string{p.Root, p.LogsDir, p.SessionsDir, p.WorktreesDir} {
+	for _, dir := range []string{p.Root, p.LogsDir, p.SessionsDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("failed to create %s: %w", dir, err)
 		}
@@ -86,8 +84,4 @@ func (p *AppPaths) RenderedLogPath(sessionID string) string {
 
 func (p *AppPaths) SessionSocketPath(sessionID string) string {
 	return filepath.Join(p.SessionsDir, sessionID+".sock")
-}
-
-func (p *AppPaths) WorktreePath(sessionID string) string {
-	return filepath.Join(p.WorktreesDir, sessionID)
 }

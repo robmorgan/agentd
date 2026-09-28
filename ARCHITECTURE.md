@@ -49,15 +49,20 @@ same socket until either side closes or the daemon emits `EndOfStream`.
 
 When you create a session, the daemon:
 
-1. Creates a new unix socket file 
-2. Resolves the repo root and current branch for the requested workspace.
-3. Allocates a session id, branch name, and isolated git worktree under `<runtime-root>/worktrees/`.
+1. Creates a new unix socket file
+2. Validates the requested working directory (`cwd`). It does not need to be a git repository.
+3. Allocates a session id.
 4. Stores session metadata in `<runtime-root>/state.db`.
-5. Spawns the configured agent inside a PTY with the session environment variables injected.
+5. Spawns the configured agent inside a PTY in `cwd` with the session environment variables injected.
+
+The daemon does not manage git worktrees or branches. That responsibility sits with whatever starts
+the session (the user, a wrapper, a skill, or the agent itself). See `docs/drop-worktrees.md` for the
+reasoning and the migration steps. The Rust daemon still implements worktree lifecycle and is the
+behavioural reference for everything else.
 
 For each running session, the daemon keeps three kinds of state:
 
-- durable metadata in SQLite for status, branch/worktree info, and exit state
+- durable metadata in SQLite for status, working directory, and exit state
 - in-memory PTY scrollback retained until daemon restart
 - an in-memory PTY runtime with the live writer handle and output fan-out used by `attach` and `send`
 
@@ -83,7 +88,6 @@ The selected root contains:
 * `agentd.pid`
 * `state.db`
 * `logs/`
-* `worktrees/`
   
 ## libghostty-vt
 

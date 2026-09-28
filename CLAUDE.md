@@ -69,7 +69,6 @@ The intended architecture is approximately:
               │ process lifecycle│
               │ persistence      │
               │ client fan-out   │
-              │ worktrees        │
               │ attention model  │
               └─────────┬────────┘
                         │
@@ -278,7 +277,6 @@ Preserve and strengthen concepts such as:
 
 - tasks
 - coding agents
-- Git worktrees
 - PTY-backed execution
 - artifacts
 - diffs
@@ -411,7 +409,6 @@ internal/
     quic/
   terminal/
   persistence/
-  worktree/
   attention/
 ```
 

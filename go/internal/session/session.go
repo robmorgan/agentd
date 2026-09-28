@@ -1,6 +1,8 @@
-// Package session holds the shared session model mirrored from
-// crates/agentd-shared/src/session.rs. Wire and database encodings of these
-// types must stay byte-compatible with the Rust implementation.
+// Package session holds the session model used by the Go daemon and worker.
+//
+// It started as a mirror of crates/agentd-shared/src/session.rs. As of
+// protocol v33 it diverges: sessions carry a working directory (Cwd) and no
+// git worktree, branch, or integration state. See docs/drop-worktrees.md.
 package session
 
 import (
@@ -26,22 +28,6 @@ const (
 	AttentionAction AttentionLevel = "action"
 )
 
-type ApplyState string
-
-const (
-	ApplyIdle         ApplyState = "idle"
-	ApplyAutoApplying ApplyState = "auto_applying"
-	ApplyApplied      ApplyState = "applied"
-	ApplyDiscarded    ApplyState = "discarded"
-)
-
-type IntegrationPolicy string
-
-const (
-	PolicyManualReview  IntegrationPolicy = "manual_review"
-	PolicyAutoApplySafe IntegrationPolicy = "auto_apply_safe"
-)
-
 type Mode string
 
 const (
@@ -56,59 +42,33 @@ const (
 	AttachmentTui    AttachmentKind = "tui"
 )
 
+// Record is the durable description of a session. A session belongs to the
+// daemon, not to any client connection: the record outlives every attach.
 type Record struct {
-	SessionID         string
-	Agent             string
-	Model             *string
-	Mode              Mode
-	Workspace         string
-	RepoPath          string
-	RepoName          string
-	BaseBranch        string
-	Branch            string
-	Worktree          string
-	Status            Status
-	IntegrationPolicy IntegrationPolicy
-	ApplyState        ApplyState
-	DirtyCount        uint32
-	AheadCount        uint32
-	HasCommits        bool
-	HasPendingChanges bool
-	WorkerPID         *uint32
-	AgentPID          *uint32
-	ExitCode          *int32
-	Error             *string
-	Attention         AttentionLevel
-	AttentionSummary  *string
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
-	ExitedAt          *time.Time
+	SessionID string
+	Agent     string
+	Model     *string
+	Mode      Mode
+	// Cwd is the directory the agent process runs in. It may or may not be a
+	// git repository; the daemon does not care.
+	Cwd              string
+	Status           Status
+	WorkerPID        *uint32
+	AgentPID         *uint32
+	ExitCode         *int32
+	Error            *string
+	Attention        AttentionLevel
+	AttentionSummary *string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	ExitedAt         *time.Time
 }
 
 type CreateResult struct {
-	SessionID         string
-	BaseBranch        string
-	Branch            string
-	Worktree          string
-	Status            Status
-	Mode              Mode
-	IntegrationPolicy IntegrationPolicy
-}
-
-type WorktreeRecord struct {
-	SessionID  string
-	RepoPath   string
-	BaseBranch string
-	Branch     string
-	Worktree   string
-}
-
-type Diff struct {
-	SessionID  string
-	BaseBranch string
-	Branch     string
-	Worktree   string
-	Diff       string
+	SessionID string
+	Cwd       string
+	Status    Status
+	Mode      Mode
 }
 
 type AttachmentRecord struct {
@@ -134,22 +94,6 @@ func ParseAttention(v string) (AttentionLevel, error) {
 	return "", fmt.Errorf("unknown attention level %q", v)
 }
 
-func ParseApplyState(v string) (ApplyState, error) {
-	switch ApplyState(v) {
-	case ApplyIdle, ApplyAutoApplying, ApplyApplied, ApplyDiscarded:
-		return ApplyState(v), nil
-	}
-	return "", fmt.Errorf("unknown apply state %q", v)
-}
-
-func ParseIntegrationPolicy(v string) (IntegrationPolicy, error) {
-	switch IntegrationPolicy(v) {
-	case PolicyManualReview, PolicyAutoApplySafe:
-		return IntegrationPolicy(v), nil
-	}
-	return "", fmt.Errorf("unknown integration policy %q", v)
-}
-
 func ParseMode(v string) (Mode, error) {
 	switch Mode(v) {
 	case ModeExecute, ModePlan:
@@ -157,5 +101,3 @@ func ParseMode(v string) (Mode, error) {
 	}
 	return "", fmt.Errorf("unknown session mode %q", v)
 }
-
-func BranchNameFromSessionID(id string) string { return "agent/" + id }

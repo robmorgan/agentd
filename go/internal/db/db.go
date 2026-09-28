@@ -1,6 +1,9 @@
-// Package db is the SQLite state store shared with the Rust daemon. It must
-// read and write exactly the schema in crates/agentd-shared/src/sqlite_schema.rs
-// and the row formats in crates/agentd/src/db.rs.
+// Package db is the SQLite state store for the Go daemon and worker.
+//
+// Schema v8 replaces the git columns of the Rust daemon's v7 layout with a
+// single cwd column (see docs/drop-worktrees.md). Opening a v6 or v7 database
+// migrates it in place, so a runtime root created by the Rust daemon can be
+// reused; the Rust daemon cannot open it afterwards.
 package db
 
 import (
@@ -15,20 +18,40 @@ import (
 	"github.com/robmorgan/agentd/go/internal/session"
 )
 
-const CurrentSchemaVersion = 7
+const CurrentSchemaVersion = 8
 
 // rfc3339 mirrors chrono's `to_rfc3339()` for UTC values: a `+00:00` offset
 // and fractional seconds only when non-zero.
 const rfc3339 = "2006-01-02T15:04:05.999999999-07:00"
 
 var expectedSessionsColumns = []string{
-	"session_id", "agent", "model", "mode", "workspace", "repo_path", "repo_name",
-	"base_branch", "branch", "worktree", "status", "integration_policy", "worker_pid",
-	"agent_pid", "exit_code", "error", "integration_state", "attention",
-	"attention_summary", "created_at", "updated_at", "exited_at",
+	"session_id", "agent", "model", "mode", "cwd", "status", "worker_pid",
+	"agent_pid", "exit_code", "error", "attention", "attention_summary",
+	"created_at", "updated_at", "exited_at",
 }
 
 const createSessionsTable = `
+CREATE TABLE sessions (
+    session_id TEXT PRIMARY KEY,
+    agent TEXT NOT NULL,
+    model TEXT,
+    mode TEXT NOT NULL CHECK (mode IN ('execute', 'plan')),
+    cwd TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('creating', 'running', 'exited', 'failed', 'unknown_recovered')),
+    worker_pid INTEGER,
+    agent_pid INTEGER,
+    exit_code INTEGER,
+    error TEXT,
+    attention TEXT NOT NULL CHECK (attention IN ('info', 'notice', 'action')),
+    attention_summary TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    exited_at TEXT
+);`
+
+// createSessionsTableV7 is the Rust daemon's layout, kept only so a v6
+// database can be stepped through v7 on its way to v8.
+const createSessionsTableV7 = `
 CREATE TABLE sessions (
     session_id TEXT PRIMARY KEY,
     agent TEXT NOT NULL,
@@ -101,7 +124,7 @@ func (d *Database) init() error {
 	}
 
 	if !hasObjects {
-		if _, err := tx.Exec(createSessionsTable + "\nPRAGMA user_version = 7;"); err != nil {
+		if _, err := tx.Exec(createSessionsTable + "\nPRAGMA user_version = 8;"); err != nil {
 			return err
 		}
 	} else {
@@ -109,6 +132,13 @@ func (d *Database) init() error {
 		case CurrentSchemaVersion:
 		case 6:
 			if err := migrateV6ToV7(tx); err != nil {
+				return err
+			}
+			if err := migrateV7ToV8(tx); err != nil {
+				return err
+			}
+		case 7:
+			if err := migrateV7ToV8(tx); err != nil {
 				return err
 			}
 		default:
@@ -152,7 +182,7 @@ func ensureSupportedSchema(tx *sql.Tx) error {
 }
 
 func migrateV6ToV7(tx *sql.Tx) error {
-	_, err := tx.Exec(`ALTER TABLE sessions RENAME TO sessions_v6;` + createSessionsTable + `
+	_, err := tx.Exec(`ALTER TABLE sessions RENAME TO sessions_v6;` + createSessionsTableV7 + `
         INSERT INTO sessions (
             session_id, agent, model, mode, workspace, repo_path, repo_name, base_branch, branch, worktree,
             status, integration_policy, worker_pid, agent_pid, exit_code, error, integration_state,
@@ -168,6 +198,26 @@ func migrateV6ToV7(tx *sql.Tx) error {
 	return err
 }
 
+// migrateV7ToV8 drops the git columns. A v7 session always ran inside its
+// worktree, so that path becomes its cwd; workspace is only a fallback for
+// rows the Rust daemon left half-created.
+func migrateV7ToV8(tx *sql.Tx) error {
+	_, err := tx.Exec(`ALTER TABLE sessions RENAME TO sessions_v7;` + createSessionsTable + `
+        INSERT INTO sessions (
+            session_id, agent, model, mode, cwd, status, worker_pid, agent_pid, exit_code, error,
+            attention, attention_summary, created_at, updated_at, exited_at
+        )
+        SELECT
+            session_id, agent, model, mode,
+            CASE WHEN worktree <> '' THEN worktree ELSE workspace END,
+            status, worker_pid, agent_pid, exit_code, error,
+            attention, attention_summary, created_at, updated_at, exited_at
+        FROM sessions_v7;
+        DROP TABLE sessions_v7;
+        PRAGMA user_version = 8;`)
+	return err
+}
+
 func now() string { return time.Now().UTC().Format(rfc3339) }
 
 func (d *Database) exec(query string, args ...any) error {
@@ -180,20 +230,13 @@ func (d *Database) exec(query string, args ...any) error {
 	return err
 }
 
-// NewSession mirrors the Rust daemon's NewSession: the columns known when a
-// session row is first created.
+// NewSession holds the columns known when a session row is first created.
 type NewSession struct {
-	SessionID         string
-	Agent             string
-	Model             *string
-	Mode              session.Mode
-	Workspace         string
-	RepoPath          string
-	RepoName          string
-	BaseBranch        string
-	Branch            string
-	Worktree          string
-	IntegrationPolicy session.IntegrationPolicy
+	SessionID string
+	Agent     string
+	Model     *string
+	Mode      session.Mode
+	Cwd       string
 }
 
 func (d *Database) InsertSession(s NewSession) error {
@@ -202,22 +245,19 @@ func (d *Database) InsertSession(s NewSession) error {
 		model = *s.Model
 	}
 	return d.exec(`INSERT INTO sessions (
-                session_id, agent, model, mode, workspace, repo_path, repo_name, base_branch, branch, worktree,
-                status, integration_policy, attention, attention_summary, integration_state, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)`,
-		s.SessionID, s.Agent, model, string(s.Mode), s.Workspace, s.RepoPath, s.RepoName,
-		s.BaseBranch, s.Branch, s.Worktree, string(session.StatusCreating),
-		string(s.IntegrationPolicy), string(session.AttentionInfo), s.SessionID,
-		string(session.ApplyIdle), now())
+                session_id, agent, model, mode, cwd, status, attention, attention_summary, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)`,
+		s.SessionID, s.Agent, model, string(s.Mode), s.Cwd, string(session.StatusCreating),
+		string(session.AttentionInfo), s.SessionID, now())
 }
 
 func (d *Database) MarkRunning(sessionID string, workerPID, agentPID int) error {
 	return d.exec(`UPDATE sessions
-             SET status = ?2, integration_state = ?3, worker_pid = ?4, agent_pid = ?5,
-                 exit_code = NULL, error = NULL, attention = ?6, attention_summary = ?7,
-                 updated_at = ?8, exited_at = NULL
+             SET status = ?2, worker_pid = ?3, agent_pid = ?4,
+                 exit_code = NULL, error = NULL, attention = ?5, attention_summary = ?6,
+                 updated_at = ?7, exited_at = NULL
              WHERE session_id = ?1`,
-		sessionID, string(session.StatusRunning), string(session.ApplyIdle), workerPID, agentPID,
+		sessionID, string(session.StatusRunning), workerPID, agentPID,
 		string(session.AttentionInfo), "running", now())
 }
 
@@ -229,7 +269,7 @@ func (d *Database) MarkFailed(sessionID, errMsg string) error {
 		sessionID, string(session.StatusFailed), errMsg, string(session.AttentionAction), now())
 }
 
-func (d *Database) MarkExited(sessionID string, exitCode *int32, applyState session.ApplyState) error {
+func (d *Database) MarkExited(sessionID string, exitCode *int32) error {
 	summary := "finished"
 	var code any
 	if exitCode != nil {
@@ -238,10 +278,10 @@ func (d *Database) MarkExited(sessionID string, exitCode *int32, applyState sess
 	}
 	return d.exec(`UPDATE sessions
              SET status = ?2, worker_pid = NULL, agent_pid = NULL, exit_code = ?3,
-                 integration_state = ?4, attention = ?5, attention_summary = ?6,
-                 updated_at = ?7, exited_at = ?7
+                 attention = ?4, attention_summary = ?5,
+                 updated_at = ?6, exited_at = ?6
              WHERE session_id = ?1`,
-		sessionID, string(session.StatusExited), code, string(applyState),
+		sessionID, string(session.StatusExited), code,
 		string(session.AttentionNotice), summary, now())
 }
 
@@ -254,20 +294,12 @@ func (d *Database) MarkUnknownRecovered(sessionID string) error {
 		"daemon lost the live process", now())
 }
 
-func (d *Database) SetApplyState(sessionID string, state session.ApplyState, attention session.AttentionLevel, summary string) error {
-	return d.exec(`UPDATE sessions
-             SET integration_state = ?2, attention = ?3, attention_summary = ?4, updated_at = ?5
-             WHERE session_id = ?1`,
-		sessionID, string(state), string(attention), summary, now())
-}
-
 func (d *Database) DeleteSession(sessionID string) error {
 	return d.exec("DELETE FROM sessions WHERE session_id = ?1", sessionID)
 }
 
-const selectSession = `SELECT session_id, agent, model, mode, workspace, repo_path, repo_name, base_branch, branch,
-        worktree, status, integration_policy, integration_state, worker_pid, agent_pid, exit_code, error, attention, attention_summary,
-        created_at, updated_at, exited_at
+const selectSession = `SELECT session_id, agent, model, mode, cwd, status, worker_pid, agent_pid, exit_code, error,
+        attention, attention_summary, created_at, updated_at, exited_at
  FROM sessions`
 
 // GetSession returns nil, nil when the session does not exist.
@@ -313,14 +345,13 @@ type scanner interface{ Scan(dest ...any) error }
 
 func scanSession(row scanner) (*session.Record, error) {
 	var (
-		rec                                         session.Record
-		model, errText, summary, exitedAt           sql.NullString
-		mode, status, policy, applyState, attention string
-		workerPID, agentPID, exitCode               sql.NullInt64
-		createdAt, updatedAt                        string
+		rec                               session.Record
+		model, errText, summary, exitedAt sql.NullString
+		mode, status, attention           string
+		workerPID, agentPID, exitCode     sql.NullInt64
+		createdAt, updatedAt              string
 	)
-	if err := row.Scan(&rec.SessionID, &rec.Agent, &model, &mode, &rec.Workspace, &rec.RepoPath,
-		&rec.RepoName, &rec.BaseBranch, &rec.Branch, &rec.Worktree, &status, &policy, &applyState,
+	if err := row.Scan(&rec.SessionID, &rec.Agent, &model, &mode, &rec.Cwd, &status,
 		&workerPID, &agentPID, &exitCode, &errText, &attention, &summary, &createdAt, &updatedAt,
 		&exitedAt); err != nil {
 		return nil, err
@@ -330,12 +361,6 @@ func scanSession(row scanner) (*session.Record, error) {
 		return nil, err
 	}
 	if rec.Status, err = session.ParseStatus(status); err != nil {
-		return nil, err
-	}
-	if rec.IntegrationPolicy, err = session.ParseIntegrationPolicy(policy); err != nil {
-		return nil, err
-	}
-	if rec.ApplyState, err = session.ParseApplyState(applyState); err != nil {
 		return nil, err
 	}
 	if rec.Attention, err = session.ParseAttention(attention); err != nil {

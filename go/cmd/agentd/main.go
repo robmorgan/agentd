@@ -1,6 +1,8 @@
 // Command agentd is the Go implementation of the agentd daemon and its
 // session worker. During the port only the session-worker subcommand is
-// implemented; the Rust daemon spawns it when AGENTD_WORKER_BIN points here.
+// implemented. Since protocol v33 the worker no longer speaks the Rust
+// daemon's wire format, so it is driven by the Go daemon (in progress) and by
+// the tests under internal/worker.
 package main
 
 import (
@@ -31,7 +33,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: agentd session-worker --session-id ID --repo-root DIR --worktree DIR --branch NAME --agent-name NAME --command CMD [--model M] [--arg A]...")
+	fmt.Fprintln(os.Stderr, "usage: agentd session-worker --session-id ID --cwd DIR --agent-name NAME --command CMD [--model M] [--arg A]...")
 }
 
 func runSessionWorker(argv []string) int {
@@ -39,9 +41,7 @@ func runSessionWorker(argv []string) int {
 	var args worker.Args
 	var extra multiFlag
 	fs.StringVar(&args.SessionID, "session-id", "", "session id")
-	fs.StringVar(&args.RepoRoot, "repo-root", "", "repository root")
-	fs.StringVar(&args.Worktree, "worktree", "", "session worktree")
-	fs.StringVar(&args.Branch, "branch", "", "session branch")
+	fs.StringVar(&args.Cwd, "cwd", "", "working directory for the agent process")
 	fs.StringVar(&args.AgentName, "agent-name", "", "agent name")
 	fs.StringVar(&args.Command, "command", "", "agent command")
 	fs.StringVar(&args.Model, "model", "", "model")
@@ -51,8 +51,8 @@ func runSessionWorker(argv []string) int {
 	}
 	args.Args = extra
 	for name, v := range map[string]string{
-		"--session-id": args.SessionID, "--repo-root": args.RepoRoot, "--worktree": args.Worktree,
-		"--branch": args.Branch, "--agent-name": args.AgentName, "--command": args.Command,
+		"--session-id": args.SessionID, "--cwd": args.Cwd,
+		"--agent-name": args.AgentName, "--command": args.Command,
 	} {
 		if v == "" {
 			fmt.Fprintf(os.Stderr, "session-worker: %s is required\n", name)

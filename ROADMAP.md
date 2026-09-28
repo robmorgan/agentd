@@ -27,7 +27,6 @@ agent CLI
 │ PTY ownership        │
 │ process supervision  │
 │ terminal state       │
-│ worktrees            │
 │ persistence          │
 │ client fan-out       │
 └──────────┬───────────┘
@@ -53,7 +52,6 @@ If an agent runs on a remote Linux host, that host owns:
 * the PTY
 * the child process
 * terminal state
-* worktree state
 * task metadata
 * attachments
 * session persistence
@@ -225,7 +223,6 @@ The purpose is not merely a language rewrite. The Go implementation should becom
           │ PTY runtime      │
           │ persistence      │
           │ fan-out          │
-          │ worktrees        │
           └────────┬─────────┘
                    │
                    │ C ABI
@@ -249,7 +246,7 @@ The purpose is not merely a language rewrite. The Go implementation should becom
 * [ ] Support interactive reattach
 * [ ] Support PTY resize
 * [ ] Support multiple attached clients
-* [ ] Port worktree lifecycle management
+* [ ] Replace worktree lifecycle with a per-session `cwd` (see `docs/drop-worktrees.md`)
 * [ ] Port SQLite-backed metadata
 * [ ] Preserve compatibility with existing session semantics where practical
 
@@ -914,7 +911,6 @@ PTYs
 processes
 terminal state
 agent execution
-worktrees
 artifacts
 session runtime
 QUIC endpoint
