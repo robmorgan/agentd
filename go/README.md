@@ -1,15 +1,13 @@
 # agentd (Go port)
 
 This directory holds the Go implementation of the `agentd` server side: the
-daemon (`agentd serve`) and the per-session worker it spawns. The Rust daemon
-under `../crates/agentd` stays on disk as the behavioural reference until it
-is deleted (stage 5 of `../docs/drop-worktrees.md`).
+daemon (`agentd serve`) and the per-session worker it spawns. The `agent` CLI
+is Rust (`../crates/agent-cli`) and speaks the same protocol.
 
 The Go side speaks protocol v33 and schema v8, which drop worktree management
 in favour of a per-session working directory (see `../docs/drop-worktrees.md`).
-The Rust daemon is on v32/v7, so the two no longer interoperate on the wire;
-a runtime root created by the Rust daemon is migrated in place the first time
-the Go side opens its `state.db`.
+A runtime root created by the former Rust daemon is migrated in place the first
+time the Go side opens its `state.db`.
 
 ## Status
 
@@ -60,9 +58,8 @@ to the `agent` binary.
 
 The Go bindings link `libghostty-vt` statically and track a specific ghostty
 commit (pinned in `scripts/build-libghostty.sh`, matching the bindings'
-`CMakeLists.txt`). That commit needs **Zig 0.16 or newer**, which is newer than
-the Zig the Rust build uses for `vendor/ghostty`; the script therefore builds
-its own checkout under `go/.build/` and never touches the submodule.
+`CMakeLists.txt`). That commit needs **Zig 0.16 or newer**; the script builds
+its own checkout under `go/.build/`.
 
 ```sh
 make -C go build      # builds libghostty-vt if needed, then bin/agentd

@@ -1,7 +1,7 @@
 # Dropping worktree management from agentd
 
-Status: accepted 2026-09-28. Stages 1 to 4 are implemented on branch `go-port`;
-stage 5 is pending.
+Status: accepted 2026-09-28. All five stages are implemented on branch
+`go-port`.
 
 ## Decision
 
@@ -141,11 +141,17 @@ is where `run`, `ls`, `attach`, `kill` land in Go.
 - Bump the CLI's protocol expectation to v33. The Rust daemon is no longer a
   valid peer for the CLI after this point.
 
-### Stage 5. Retire Rust daemon code (existing Stage G)
+### Stage 5. Retire Rust daemon code (existing Stage G) (done)
 
 `git.rs`, the worktree paths in `app.rs`, `session_worker.rs`, and the 22
 `app.rs` unit tests that exercise merge/discard go with it. Not before
 Stage 4 is shipped and the Go daemon passes the attach/detach/reattach suite.
+
+Done by deleting the whole `crates/agentd` crate, the `vendor/ghostty`
+submodule (the Go worker builds its own pinned libghostty-vt), the
+`third_party/libghostty-vt*` Rust bindings and their `[patch.crates-io]`
+entries, `.cargo/config.toml`, and the workspace dependencies only the Rust
+daemon used.
 
 ## Tests
 
