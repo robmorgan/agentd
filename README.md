@@ -196,19 +196,21 @@ will step on each other; that is your call, not the daemon's.
 Create `<runtime-root>/config.toml`:
 
 ```toml
-default_agent = "codex"
-
-[agents.codex]
-command = "codex"
-args = []
+default_agent = "claude"
 
 [agents.claude]
 command = "claude"
 args = []
+
+[agents.codex]
+command = "codex"
+args = []
 ```
 
 Agent picker order follows the order of the `[agents.*]` tables in this file. `default_agent`
-must name one of those configured agents.
+must name one of those configured agents. Without it, the default is `claude` if configured,
+otherwise the first agent listed. With no `config.toml` at all, `claude` and `codex` are
+configured and `claude` is the default.
 
 The daemon injects:
 

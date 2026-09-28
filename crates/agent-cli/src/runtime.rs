@@ -128,7 +128,7 @@ fn write_screen_bytes(bytes: &[u8]) -> Result<()> {
 fn configured_agent_names(paths: &AppPaths) -> Result<Vec<String>> {
     let mut names = Config::load(paths)?.agents.into_keys().collect::<Vec<_>>();
     if names.is_empty() {
-        names.push("codex".to_string());
+        names.push("claude".to_string());
     }
     Ok(names)
 }
@@ -305,7 +305,7 @@ impl SessionPicker {
     fn new(paths: AppPaths) -> Self {
         let default_agent = configured_default_agent(&paths).ok();
         let create_agents = ordered_create_agents(
-            configured_agent_names(&paths).unwrap_or_else(|_| vec!["codex".to_string()]),
+            configured_agent_names(&paths).unwrap_or_else(|_| vec!["claude".to_string()]),
             default_agent.as_deref(),
         );
         Self {
@@ -764,9 +764,9 @@ impl SessionPicker {
         );
         if self.create_agents.is_empty() {
             self.toast = Some(PickerToast::notice(
-                "no configured agents found; falling back to codex".to_string(),
+                "no configured agents found; falling back to claude".to_string(),
             ));
-            self.create_agents = vec!["codex".to_string()];
+            self.create_agents = vec!["claude".to_string()];
         }
         Ok(())
     }
@@ -1166,7 +1166,8 @@ impl AttachOverlay {
             switcher_query: String::new(),
             switcher_selected: 0,
             name_input: String::new(),
-            agent_input: "codex".to_string(),
+            // Filled with the configured default when the new-session form opens.
+            agent_input: String::new(),
             detail_text: String::new(),
             detail_scroll: 0,
             toast: None,
@@ -1406,7 +1407,8 @@ impl AttachOverlay {
             Command::NewSession => {
                 self.mode = OverlayMode::NewSession { edit_agent: false };
                 self.name_input.clear();
-                self.agent_input = "codex".to_string();
+                self.agent_input =
+                    configured_default_agent(&self.paths).unwrap_or_else(|_| "claude".to_string());
             }
             Command::SessionDetails => {
                 let session = daemon_get_session(&self.paths, &self.session_id).await?;
@@ -2115,7 +2117,7 @@ mod tests {
     #[test]
     fn configured_agent_names_use_default_config_order() {
         let names = configured_agent_names(&test_paths()).unwrap();
-        assert_eq!(names, vec!["codex".to_string(), "claude".to_string()]);
+        assert_eq!(names, vec!["claude".to_string(), "codex".to_string()]);
     }
 
     #[test]

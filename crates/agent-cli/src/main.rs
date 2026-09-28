@@ -159,9 +159,7 @@ enum Command {
         session_id: String,
     },
     #[command(about = "Stop and remove a session", display_order = 3)]
-    Rm {
-        session_id: String,
-    },
+    Rm { session_id: String },
     #[command(about = "Attach to a live session PTY", display_order = 4)]
     Attach { session_id: String },
     #[command(about = "Detach one or more attached clients", display_order = 5)]
@@ -1856,13 +1854,13 @@ mod tests {
 
     use super::{
         AGENTD_ATTACH_ENTER_SEQUENCE, AGENTD_ATTACH_EXIT_TITLE, AGENTD_ATTACH_RESTORE_SEQUENCE,
-        ATTACH_DETACH_BYTE, ATTACH_NEXT_SESSION_BYTE, ATTACH_OVERLAY_BYTE, AttachInputAction, AttachInputParser, AttachSessionDirection,
-        Cli, Command, DaemonCommand, DegradedNoticeCommand, SessionEndSummary,
-        adjacent_live_session_id_in, attach_startup_bytes, cli_command, cli_styles,
-        daemon_executable_from, ensure_compatible_daemon, format_attach_title,
-        format_session_end_summary, resolve_cwd, resolve_detach_session_id,
-        resolve_new_session_options, should_print_degraded_notice, start_daemon,
-        terminal_title_bytes,
+        ATTACH_DETACH_BYTE, ATTACH_NEXT_SESSION_BYTE, ATTACH_OVERLAY_BYTE, AttachInputAction,
+        AttachInputParser, AttachSessionDirection, Cli, Command, DaemonCommand,
+        DegradedNoticeCommand, SessionEndSummary, adjacent_live_session_id_in,
+        attach_startup_bytes, cli_command, cli_styles, daemon_executable_from,
+        ensure_compatible_daemon, format_attach_title, format_session_end_summary, resolve_cwd,
+        resolve_detach_session_id, resolve_new_session_options, should_print_degraded_notice,
+        start_daemon, terminal_title_bytes,
     };
     use agentd_shared::session::{AttentionLevel, SessionMode, SessionRecord, SessionStatus};
     use agentd_shared::{
@@ -2094,7 +2092,7 @@ mod tests {
         let options = resolve_new_session_options(&paths, None, None, None).unwrap();
         assert_eq!(options.cwd, resolve_cwd(None).unwrap());
         assert!(options.name.is_none());
-        assert_eq!(options.agent, "codex");
+        assert_eq!(options.agent, "claude");
     }
 
     #[test]
@@ -2279,7 +2277,10 @@ command = "claude"
         let server = fake_daemon(&paths, None).await;
         let err = format!("{:#}", ensure_compatible_daemon(&paths).await.unwrap_err());
         server.await.unwrap();
-        assert!(err.contains(&format!("does not speak agent protocol {PROTOCOL_VERSION}")), "{err}");
+        assert!(
+            err.contains(&format!("does not speak agent protocol {PROTOCOL_VERSION}")),
+            "{err}"
+        );
         assert!(err.contains("agent daemon upgrade"), "{err}");
     }
 
@@ -2303,7 +2304,10 @@ command = "claude"
         let err = format!("{:#}", ensure_compatible_daemon(&paths).await.unwrap_err());
         server.await.unwrap();
         assert!(err.contains(&format!("unsupported protocol version `{other}`")), "{err}");
-        assert!(err.contains(&format!("does not speak agent protocol {PROTOCOL_VERSION}")), "{err}");
+        assert!(
+            err.contains(&format!("does not speak agent protocol {PROTOCOL_VERSION}")),
+            "{err}"
+        );
     }
 
     /// The daemon owns stale-socket cleanup (under its agentd.lock), so a

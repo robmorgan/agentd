@@ -27,8 +27,13 @@ fn default_model_flag() -> Option<String> {
     Some("--model".to_string())
 }
 
+/// The agent used when a config does not say. An explicit `default_agent`
+/// always wins; without one, `claude` if it is configured, else the first
+/// configured agent (see `resolve_default_agent`).
+const PREFERRED_DEFAULT_AGENT: &str = "claude";
+
 fn default_agent_name() -> String {
-    "codex".to_string()
+    String::new()
 }
 
 impl Config {
@@ -81,23 +86,28 @@ impl Config {
         )
     }
 
-    fn validate(self, paths: &AppPaths) -> Result<Self> {
+    fn validate(mut self, paths: &AppPaths) -> Result<Self> {
+        self.resolve_default_agent();
         self.default_agent_name(paths)?;
         Ok(self)
+    }
+
+    fn resolve_default_agent(&mut self) {
+        if !self.default_agent.is_empty() {
+            return;
+        }
+        self.default_agent =
+            if self.agents.is_empty() || self.agents.contains_key(PREFERRED_DEFAULT_AGENT) {
+                PREFERRED_DEFAULT_AGENT.to_string()
+            } else {
+                self.agents.keys().next().cloned().unwrap_or_default()
+            };
     }
 }
 
 impl Default for Config {
     fn default() -> Self {
         let mut agents = IndexMap::new();
-        agents.insert(
-            "codex".to_string(),
-            AgentConfig {
-                command: "codex".to_string(),
-                args: Vec::new(),
-                model_flag: default_model_flag(),
-            },
-        );
         agents.insert(
             "claude".to_string(),
             AgentConfig {
@@ -106,7 +116,15 @@ impl Default for Config {
                 model_flag: default_model_flag(),
             },
         );
-        Self { default_agent: default_agent_name(), agents }
+        agents.insert(
+            "codex".to_string(),
+            AgentConfig {
+                command: "codex".to_string(),
+                args: Vec::new(),
+                model_flag: default_model_flag(),
+            },
+        );
+        Self { default_agent: PREFERRED_DEFAULT_AGENT.to_string(), agents }
     }
 }
 
@@ -151,17 +169,17 @@ mod tests {
 
         let mode = std::fs::metadata(paths.config.as_std_path()).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
-        assert_eq!(Config::load(&paths).unwrap().default_agent, "codex");
+        assert_eq!(Config::load(&paths).unwrap().default_agent, "claude");
         let _ = std::fs::remove_dir_all(root.as_std_path());
     }
 
     #[test]
-    fn default_config_uses_codex_default_agent_and_order() {
+    fn default_config_uses_claude_default_agent_and_order() {
         let config = Config::default();
-        assert_eq!(config.default_agent, "codex");
+        assert_eq!(config.default_agent, "claude");
         assert_eq!(
             config.agents.keys().map(String::as_str).collect::<Vec<_>>(),
-            vec!["codex", "claude"]
+            vec!["claude", "codex"]
         );
     }
 
@@ -193,7 +211,7 @@ command = "zed"
     }
 
     #[test]
-    fn missing_default_agent_defaults_to_codex() {
+    fn missing_default_agent_falls_back_to_first_agent_without_claude() {
         let paths = test_paths();
         let config: Config = toml::from_str(
             r#"
@@ -206,6 +224,24 @@ command = "codex"
         let config = config.validate(&paths).unwrap();
         assert_eq!(config.default_agent, "codex");
         assert_eq!(config.default_agent_name(&paths).unwrap(), "codex");
+    }
+
+    #[test]
+    fn missing_default_agent_prefers_claude() {
+        let paths = test_paths();
+        let config: Config = toml::from_str(
+            r#"
+[agents.codex]
+command = "codex"
+
+[agents.claude]
+command = "claude"
+"#,
+        )
+        .unwrap();
+
+        let config = config.validate(&paths).unwrap();
+        assert_eq!(config.default_agent_name(&paths).unwrap(), "claude");
     }
 
     #[test]

@@ -861,7 +861,7 @@ func TestValidSessionName(t *testing.T) {
 func TestLoadConfig(t *testing.T) {
 	dir := t.TempDir()
 	cfg, err := LoadConfig(filepath.Join(dir, "missing.toml"))
-	if err != nil || cfg.DefaultAgent != "codex" || cfg.Agents["claude"].Command != "claude" {
+	if err != nil || cfg.DefaultAgent != "claude" || cfg.Agents["codex"].Command != "codex" {
 		t.Fatalf("defaults = %+v, %v", cfg, err)
 	}
 	path := filepath.Join(dir, "config.toml")
@@ -879,6 +879,16 @@ func TestLoadConfig(t *testing.T) {
 	}
 	if got := cfg.Agents["z"].modelFlag(); got != "--model" {
 		t.Fatalf("default model_flag = %q", got)
+	}
+
+	// Without default_agent: claude if configured, else the first agent.
+	os.WriteFile(path, []byte("[agents.codex]\ncommand = \"codex\"\n[agents.claude]\ncommand = \"claude\"\n"), 0o600)
+	if cfg, err := LoadConfig(path); err != nil || cfg.DefaultAgent != "claude" {
+		t.Fatalf("with claude configured: %+v, %v", cfg, err)
+	}
+	os.WriteFile(path, []byte("[agents.zed]\ncommand = \"zed\"\n[agents.codex]\ncommand = \"codex\"\n"), 0o600)
+	if cfg, err := LoadConfig(path); err != nil || cfg.DefaultAgent != "zed" {
+		t.Fatalf("without claude: %+v, %v", cfg, err)
 	}
 }
 

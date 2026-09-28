@@ -25,12 +25,18 @@ type AgentConfig struct {
 
 const defaultModelFlag = "--model"
 
+// preferredDefaultAgent is used when a config does not name default_agent
+// and configures it (or configures no agents); otherwise the first
+// configured agent is the default. crates/agentd-shared resolves it the same
+// way.
+const preferredDefaultAgent = "claude"
+
 func defaultConfig() *Config {
 	return &Config{
-		DefaultAgent: "codex",
+		DefaultAgent: preferredDefaultAgent,
 		Agents: map[string]AgentConfig{
-			"codex":  {Command: "codex"},
 			"claude": {Command: "claude"},
+			"codex":  {Command: "codex"},
 		},
 	}
 }
@@ -46,11 +52,21 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to read %s: %w", path, err)
 	}
 	cfg := &Config{}
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	meta, err := toml.Decode(string(data), cfg)
+	if err != nil {
 		return nil, fmt.Errorf("failed to parse %s: %w", path, err)
 	}
 	if cfg.DefaultAgent == "" {
-		cfg.DefaultAgent = "codex"
+		cfg.DefaultAgent = preferredDefaultAgent
+		if _, ok := cfg.Agents[preferredDefaultAgent]; !ok && len(cfg.Agents) > 0 {
+			// Maps lose file order; the decoder's key list keeps it.
+			for _, key := range meta.Keys() {
+				if len(key) == 2 && key[0] == "agents" {
+					cfg.DefaultAgent = key[1]
+					break
+				}
+			}
+		}
 	}
 	if len(cfg.Agents) > 0 {
 		if _, ok := cfg.Agents[cfg.DefaultAgent]; !ok {
