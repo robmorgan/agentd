@@ -249,6 +249,32 @@ Multiple interactive attachers are allowed per session, and the TUI uses the sam
 path when a worker is focused. Background PTY writes are still available with
 `agent send-input <name> -- <text>`.
 
+## Remote Access (Preview)
+
+`agentd` can accept remote clients over QUIC, so sessions on a devbox can be reached from a laptop
+over a LAN, Tailscale or WireGuard, without any hosted service. The daemon side is in place; the
+`agent --host` client is the next step, so there is nothing to connect with yet.
+
+Remote access is off by default. To enable it, add a listen address to `config.toml`. Prefer a
+Tailscale or WireGuard address over a public one:
+
+```toml
+[remote]
+listen = "100.64.0.5:7433"   # UDP
+```
+
+Both sides authenticate with pinned keys, like SSH host keys and `authorized_keys`:
+
+```sh
+agentd remote id                               # the daemon's key fingerprint, for clients to pin
+agentd remote authorize SHA256:... my-laptop   # allow a client key
+agentd remote list
+agentd remote revoke SHA256:...
+```
+
+Only authorized client keys can connect, and an authorized client has the same access as you have
+locally. Changes to the authorized list apply to new connections immediately.
+
 ## Troubleshooting
 
 Try restarting the daemon:

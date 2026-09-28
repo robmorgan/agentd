@@ -291,7 +291,7 @@ go/
     daemon/            session registry, proxies, lifecycle, supervision
     worker/            one session: PTY, terminal state, fan-out, input queue
     protocol/          framed protocol + daemon management protocol
-    transport/         Stream/Listener seam, accept loop, Unix sockets (QUIC next)
+    transport/         Stream/Listener seam, accept loop, Unix sockets, QUIC + identities
     db/                state.db
     session/           session model
     paths/             runtime root
@@ -505,12 +505,13 @@ Done:
 - Sessions survive client disconnects and daemon restarts.
 - Liveness is checked through the worker sockets, and a flock enforces a single daemon.
 - Attach fan-out and PTY input are bounded, and the runtime root is private to the user.
-- The transport split: the daemon serves `transport.Stream`s from any `transport.Listener`; Unix sockets are the first implementation.
+- The transport split: the daemon serves `transport.Stream`s from any `transport.Listener`.
+- The daemon's QUIC listener (off unless `[remote] listen` is set): one QUIC stream per request or attachment, mutual TLS with pinned Ed25519 keys, managed with `agentd remote id|list|authorize|revoke`.
 
 Next:
-1. QUIC: a listener that yields one `transport.Stream` per QUIC stream (a request or an attachment), using a maintained Go QUIC library.
-2. Remote addressing and authentication (`agent --host`), including per-stream peer identity so remote peers can be limited.
-3. The CLI's client-side transport, alongside the QUIC client design.
+1. The CLI's QUIC client for `agent --host`: quinn + rustls, the same ALPN (`agentd`) and fingerprint pinning, a client key and a known-hosts file.
+2. Host configuration and aliases, so `agent --host devbox` and `devbox/session` work.
+3. Per-client permissions and audit, if remote peers need to be limited.
 
 Known gaps:
 - History is only saved when a session exits.

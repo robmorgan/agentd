@@ -480,11 +480,11 @@ One slow session should not unnecessarily stall unrelated sessions.
 
 ## Deliverables
 
-* [ ] Add QUIC listener to `agentd`
+* [x] Add QUIC listener to `agentd`
 * [ ] Add QUIC client transport
-* [ ] Establish TLS identity model
-* [ ] Authenticate machines/clients
-* [ ] Define stream roles
+* [x] Establish TLS identity model (self-signed Ed25519 keys, pinned by fingerprint)
+* [x] Authenticate machines/clients (mutual TLS: authorized client keys, pinned daemon key)
+* [x] Define stream roles (one bidirectional stream per request or attachment)
 * [ ] Define stream negotiation
 * [ ] Support remote:
 
@@ -501,8 +501,8 @@ One slow session should not unnecessarily stall unrelated sessions.
 * [ ] Handle slow consumers safely
 * [ ] Bound buffering
 * [ ] Implement stream-level backpressure
-* [ ] Implement connection-level resource limits
-* [ ] Add heartbeat/liveness semantics where necessary
+* [x] Implement connection-level resource limits (per-connection stream limit, idle timeout)
+* [x] Add heartbeat/liveness semantics where necessary (QUIC keep-alive)
 
 ## Initial deployment model
 

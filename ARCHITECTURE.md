@@ -40,10 +40,26 @@ session. Sessions whose worker disappeared while no daemon was running are marke
 The protocol runs over any bidirectional byte stream that supports half-close. Each stream carries
 one request/response exchange or one attach session. Everything above `go/internal/transport` sees
 only that `Stream` and a `Listener` that yields streams, so the daemon does not know or care which
-transport a client used. Unix sockets are the only transport today. QUIC will be a second listener,
-with each request or attachment on its own QUIC stream, multiplexed over one long-lived connection.
-The daemon's tests already run a full session over a TCP stand-in to keep that seam honest. The
-daemon-to-worker link is always a local Unix socket.
+transport a client used. The daemon-to-worker link is always a local Unix socket.
+
+Two transports exist:
+
+* **Unix socket** (`agentd.sock`): local clients, always on.
+* **QUIC** (off unless `[remote] listen` is set): remote clients. Each client holds one QUIC
+  connection and opens one bidirectional QUIC stream per request or attachment, so long-lived
+  attachments and short requests are multiplexed without blocking each other. Keep-alives hold
+  idle connections open, and each connection may have at most 256 streams.
+
+QUIC connections authenticate both ways with pinned keys inside TLS 1.3 (ALPN `agentd`), the way
+SSH uses host keys and `authorized_keys`, with no certificate authority:
+
+* The daemon's key is `remote/daemon.key` (Ed25519, created on first use). Its fingerprint is
+  `SHA256:` plus the base64 SHA-256 of the public key, and is what clients pin.
+* `remote/authorized_clients` lists the client key fingerprints allowed in. It is read on every
+  handshake, so authorizing and revoking take effect for new connections without a restart.
+* An authorized client has the same access as the local socket owner.
+
+The daemon's tests run full sessions over QUIC, and over a TCP stand-in, to keep the seam honest.
 
 ## Wire Protocol
 
