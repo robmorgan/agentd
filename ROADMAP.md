@@ -299,9 +299,9 @@ PTY output
 
 ## Deliverables
 
-* [ ] Integrate Go bindings for `libghostty-vt`
-* [ ] Feed every PTY output stream into terminal state
-* [ ] Generate terminal snapshots for newly attached clients
+* [x] Integrate Go bindings for `libghostty-vt` (`go.mitchellh.com/libghostty`)
+* [x] Feed every PTY output stream into terminal state
+* [x] Generate terminal snapshots for newly attached clients
 * [ ] Restore:
 
   * [ ] primary screen

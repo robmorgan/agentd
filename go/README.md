@@ -18,7 +18,7 @@ time the Go side opens its `state.db`.
 | `internal/db` | Schema v8 init, v6/v7 migration (worktree path becomes `cwd`), and the session row operations the daemon and worker need. Uses `modernc.org/sqlite` (pure Go). |
 | `internal/worker` | Complete session worker: PTY via `creack/pty`, shadow terminal via `go.mitchellh.com/libghostty`, per-session Unix socket speaking the worker protocol. Covered by real-PTY tests (attach/detach/reattach, survival across disconnect, multiple attachers, resize, exit, kill, slow and disconnecting clients, malformed frames) run under `-race`. |
 | `cmd/agentd session-worker` | Done. Takes `--cwd`; injects `AGENTD_CWD` (and `AGENTD_WORKSPACE` as an alias). |
-| `internal/daemon` | Complete daemon: socket and pid file lifecycle, create/kill/rm/ls/get, attach and request proxies to workers, history, daemon management protocol, worker supervision and startup reconciliation. Tests run the daemon in-process against real worker processes. |
+| `internal/daemon` | Complete daemon: lock/socket/pid file lifecycle, create/kill/rm/ls/get, attach and request proxies to workers, history, daemon management protocol, worker supervision and startup reconciliation. Tests run the daemon in-process against real worker processes. |
 | `cmd/agentd serve`, `upgrade` | Done. `serve --daemonize` is what the agent CLI runs. |
 
 ## How the daemon and workers fit together
@@ -34,9 +34,14 @@ agent CLI ──unix socket──► agentd serve ──unix socket──► age
 - The daemon supervises the workers it spawned (reaping them and recording a
   crash as a failed session). Sessions whose worker disappeared while no
   daemon was running are marked `unknown_recovered` at startup or on `ls`.
-- `kill` sends the worker SIGTERM; the worker stops the agent's process group
-  (SIGKILL after 5s), writes the history logs, records the session as exited
-  and sends `SessionEnded` to attached clients.
+- A session is live only if its worker answers on its socket; stored pids are
+  never signalled on their own. One daemon per root is enforced by a flock on
+  `agentd.lock`.
+- `kill` asks the worker over its socket to stop; the worker stops the agent's
+  process group (SIGKILL after 5s), writes the history logs, records the
+  session as exited and sends `SessionEnded` to attached clients.
+- PTY input goes through a bounded per-session queue and writer goroutine, so
+  an agent that stops reading input never stalls output.
 - Attach is a byte pipe through the daemon, so the daemon never buffers PTY
   output. Slow-consumer policy lives in the worker
   (`internal/worker/broadcast.go`).

@@ -89,7 +89,7 @@ agent detach fix-tests --attach attach-1
 agent detach fix-tests --all
 ```
 
-Inspect retained session scrollback from daemon memory:
+Inspect a session's scrollback (live from the session, or from its saved log once it has ended):
 
 ```sh
 agent history fix-tests
@@ -146,9 +146,9 @@ Clients surface tasks based on attention instead of raw output.
 
 - durable PTY-backed agent sessions that outlive the client connection that started them
 - session metadata stored in `state.db` under the resolved runtime root
-- in-memory PTY scrollback retained by the daemon until restart
+- PTY scrollback held by each session's worker process and saved to `logs/` when the session ends
 - interactive reattach with `agent attach`
-- background PTY input with `agent send`
+- background PTY input with `agent send-input`
 
 ## Build
 
@@ -216,7 +216,7 @@ The daemon injects:
 - `AGENTD_SOCKET`
 - `AGENTD_CWD`
 - `AGENTD_WORKSPACE` (alias of `AGENTD_CWD`, kept for one release)
-- `AGENTD_TASK`
+- `AGENTD_SESSION_NAME` (same as `AGENTD_SESSION_ID`)
 
 Instrumented agents can use the injected session environment to locate the daemon socket, but
 there is no separate structured event channel. Session status, attention, and history are the
@@ -230,7 +230,9 @@ Runtime paths are resolved in this order:
 - `TMPDIR/agentd-<uid>`
 - `/tmp/agentd-<uid>`
 
-The selected root contains `config.toml`, `agentd.sock`, `agentd.pid`, `state.db`, and `logs/`.
+The selected root contains `config.toml`, `agentd.sock`, `agentd.lock`, `agentd.pid`, `state.db`,
+`sessions/` (one socket per live session), and `logs/`. It is created private to your user (0700),
+and `agentd` refuses a root owned by someone else.
 
 macOS typically does not set `XDG_RUNTIME_DIR`, so the default root on macOS becomes `~/.agentd`
 unless `AGENTD_DIR` is set explicitly.
@@ -256,11 +258,13 @@ agent daemon restart
 agent daemon upgrade
 ```
 
-`agent daemon upgrade` now refuses to run while live sessions are active; stop them first.
+`agent daemon restart` is safe while sessions run: they keep running and reattach to the new
+daemon. `agent daemon upgrade` still refuses while live sessions are active, since their workers
+run the old binary; stop them first.
 
 `agent` starts the daemon on demand with `agentd serve --daemonize`, using the `agentd` binary
-installed next to `agent`. Set `AGENTD_BIN` to use a different daemon binary, for example the Go
-daemon during development:
+installed next to `agent`. Set `AGENTD_BIN` to use a different daemon binary, for example a local
+build:
 
 ```sh
 AGENTD_BIN=$PWD/go/bin/agentd agent daemon restart
@@ -272,9 +276,11 @@ Current capabilities include:
 
 - local `agentd` daemon over a Unix socket
 - PTY-backed agent processes that outlive client connections
-- SQLite-backed session metadata and event storage
-- in-memory per-session PTY history until daemon restart
+- sessions that survive the daemon stopping, restarting, or being upgraded: each runs in its
+  own worker process, and a new daemon picks it up again
+- SQLite-backed session metadata
+- per-session PTY history held by the session while it runs and saved to `logs/` when it ends
 
-`attach` and `send` only work for sessions created under the current daemon lifetime. If
-`agentd` restarts, previously running sessions still keep their metadata, but their
-live PTY can no longer be reattached or written to and their in-memory history is lost.
+Sessions whose worker dies while no daemon is running are shown as `unknown_recovered`.
+Upgrading `state.db` from the former Rust daemon's schema (v7) to v8 happens in place the first
+time the Go daemon opens it and cannot be undone.

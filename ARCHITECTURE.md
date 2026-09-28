@@ -26,6 +26,11 @@ The daemon is disposable too. Each worker runs in its own process session, so st
 or restarting the daemon does not touch running sessions. A new daemon finds them again through
 `state.db` and the per-session sockets. `agent daemon restart` is therefore always safe.
 
+A session counts as live only if its worker accepts a connection on its socket. Pids recorded in
+`state.db` are never trusted on their own: after a crash or reboot they may belong to unrelated
+processes. A single daemon per root is enforced by an exclusive lock on `agentd.lock`, held for
+the daemon's lifetime and released by the kernel however it exits; `agentd.pid` is informational.
+
 The daemon supervises the workers it spawned: it reaps them and records a worker crash as a failed
 session. Sessions whose worker disappeared while no daemon was running are marked
 `unknown_recovered` at startup or on the next `ls`.
@@ -99,9 +104,10 @@ For each session there are three kinds of state:
 PTY input can come from an interactive `attach` or a background `send-input`. Multiple clients may
 attach to the same session concurrently; input is shared and resize is last-writer-wins.
 
-Killing a session sends the worker SIGTERM. The worker stops the agent's whole process group
-(SIGKILL after five seconds), writes the history logs, records the session as exited, and sends
-`SessionEnded` to attached clients.
+Killing a session asks the worker, over its socket, to stop (the worker handles SIGTERM the same
+way). The worker stops the agent's whole process group (SIGKILL after five seconds), writes the
+history logs, records the session as exited, and sends `SessionEnded` to attached clients. The
+daemon signals a worker directly only if it is wedged, and only while its socket still answers.
 
 ## Slow Clients
 
@@ -109,6 +115,10 @@ The PTY is never blocked by a client. Each attachment has a bounded queue in the
 that falls too far behind loses output until it catches up, and its screen is wrong until the
 program repaints or the client reattaches. Resyncing a lagging client from a fresh snapshot is
 planned. See `go/internal/worker/broadcast.go`.
+
+Input goes the other way through one bounded queue per session, drained by a dedicated writer.
+An agent that stops reading its input therefore never stalls PTY output or other requests; once
+the queue is full, further input is refused with an error until the agent catches up.
 
 ## Runtime Root
 
@@ -124,10 +134,14 @@ The selected root contains:
 
 * `config.toml`
 * `agentd.sock`
-* `agentd.pid`
+* `agentd.lock` (held by the running daemon)
+* `agentd.pid` (informational)
 * `state.db` (schema v8; a v6 or v7 database from the former Rust daemon is migrated in place)
 * `sessions/` (one socket per live session)
 * `logs/` (session history, `<id>.worker.log`, and `agentd.log` for a daemonized daemon)
+
+The root and everything in it are private to the user (directories 0700, files and sockets 0600),
+since logs hold full agent transcripts. `agentd` refuses a root owned by another user.
 
 ## libghostty-vt
 

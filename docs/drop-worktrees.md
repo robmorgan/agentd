@@ -19,8 +19,8 @@ skill, or instructions given to the coding agent itself.
   lifecycle is the part of the codebase furthest from that and carries the most
   policy: branch naming, `IntegrationPolicy`, `ApplyState`, merge preview,
   auto-commit on exit, dirty/ahead counts. None of it needs to exist in Go.
-- Git is currently mandatory. Session creation resolves a repo root and fails
-  otherwise, so a shell or an agent in a scratch directory cannot be supervised.
+- Git was mandatory. Session creation resolved a repo root and failed
+  otherwise, so a shell or an agent in a scratch directory could not be supervised.
 - The remote story gets simpler. `agent --host devbox run --cwd /srv/repo` needs
   the daemon to know a directory, not to manage git state on the remote box.
 - Coding agents already create worktrees well when asked. Repo-specific
@@ -28,7 +28,7 @@ skill, or instructions given to the coding agent itself.
 
 ## What is removed
 
-Daemon behaviour (Rust today, not to be ported to Go):
+Daemon behaviour (Rust daemon, not ported to Go):
 
 - `git::create_worktree`, `remove_worktree`, `preview_merge`, `commit_all`,
   auto-commit and "mergeable" finalisation on session exit
@@ -37,7 +37,7 @@ Daemon behaviour (Rust today, not to be ported to Go):
 - `refresh_commit_state` (dirty/ahead counts on `ls`)
 - `<runtime-root>/worktrees/`
 
-Protocol (Rust v32 has these; Go v33 will not):
+Protocol (v32 had these; v33 does not):
 
 | kind | message |
 |------|---------|
@@ -62,8 +62,8 @@ Environment injected into the agent: `AGENTD_WORKTREE`, `AGENTD_BRANCH`.
 ## What replaces it
 
 - `session.Record.Cwd`. `agent new` accepts `--cwd DIR` (the CLI has no `agent run`),
-  defaulting to the caller's current directory. The default session name is
-  derived from the basename of `cwd` instead of the repo name.
+  defaulting to the caller's current directory. Without a name the daemon
+  picks a random adjective-animal name, as the Rust daemon did.
 - Session names are unique per daemon. The branch-existence check in
   `unique_session_id` goes away.
 - `AGENTD_CWD` is injected. `AGENTD_WORKSPACE` is kept as an alias with the
@@ -89,7 +89,7 @@ here is implemented in this plan.
 
 ## Sequencing
 
-The Go worker currently runs under the Rust daemon at protocol v32 via
+The Go worker ran under the Rust daemon at protocol v32 via
 `AGENTD_WORKER_BIN`. Changing the session record or `SessionEnded` breaks that
 bridge. The bridge is a development stepping stone, so the removal is done as
 the first commit of the Go daemon milestone and the bridge is retired with it.
@@ -133,7 +133,7 @@ is where `run`, `ls`, `attach`, `kill` land in Go.
 ### Stage 4. Rust `agent` CLI on v33 (done)
 
 - Remove `Merge`, `Accept`, `Discard`, `Worktree`, `Diff` commands.
-- Add `--cwd` to `New`/`Run`.
+- Add `--cwd` to `New` (the CLI has no `Run`).
 - `session_display.rs`: drop branch, dirty, ahead columns and styles.
 - `local.rs` fallback mode: drop `remove_worktree_if_present` and
   `worktree_dirty_count`, or delete local mode entirely if the Go daemon makes
