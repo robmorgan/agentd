@@ -124,8 +124,13 @@ func TestCheckListen(t *testing.T) {
 	if err := CheckListen(busy, ""); err == nil {
 		t.Fatal("a port in use passed")
 	}
-	// The running daemon holding it is fine.
+	// The running daemon holding it is fine, including when the address
+	// changes but the port stays (the restart releases the port).
 	if err := CheckListen(busy, busy); err != nil {
+		t.Fatal(err)
+	}
+	_, port, _ := net.SplitHostPort(busy)
+	if err := CheckListen(net.JoinHostPort("0.0.0.0", port), busy); err != nil {
 		t.Fatal(err)
 	}
 	if err := CheckListen("127.0.0.1:0", ""); err != nil {

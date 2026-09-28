@@ -7,6 +7,7 @@ require (
 	github.com/creack/pty v1.1.24
 	github.com/quic-go/quic-go v0.63.0
 	go.mitchellh.com/libghostty v0.0.0-20260920220152-31b65cdc24cf
+	golang.org/x/term v0.45.0
 	modernc.org/sqlite v1.59.0
 )
 

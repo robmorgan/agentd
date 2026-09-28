@@ -22,6 +22,7 @@ import (
 	"github.com/robmorgan/agentd/go/internal/paths"
 	"github.com/robmorgan/agentd/go/internal/transport"
 	"github.com/robmorgan/agentd/go/internal/worker"
+	"golang.org/x/term"
 )
 
 type multiFlag []string
@@ -330,7 +331,8 @@ func runRemoteStatus(p *paths.AppPaths) int {
 // confirm asks a yes/no question on the terminal and refuses without one:
 // exposing the daemon on a network is never done by default.
 func confirm(question string) (bool, error) {
-	if info, err := os.Stdin.Stat(); err != nil || info.Mode()&os.ModeCharDevice == 0 {
+	// isatty, not "is a character device": /dev/null is one too.
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
 		return false, errors.New("no terminal to confirm on; pass an ADDRESS or --yes")
 	}
 	fmt.Printf("%s [y/N] ", question)

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -298,20 +299,21 @@ func writeFileAtomic(path string, data []byte) error {
 
 // CheckListen reports whether addr can be bound for QUIC right now, so a
 // typo fails at once instead of leaving remote access silently off.
-// current is the address a running daemon already holds, which is fine.
+// current is the address a running daemon already holds: the port being
+// taken by it is fine, since the restart releases it.
 func CheckListen(addr, current string) error {
 	pc, err := net.ListenPacket("udp", addr)
 	if err == nil {
 		return pc.Close()
 	}
-	if current != "" && sameAddress(addr, current) {
+	if current != "" && errors.Is(err, syscall.EADDRINUSE) && samePort(addr, current) {
 		return nil
 	}
 	return fmt.Errorf("cannot listen on %s: %w", addr, err)
 }
 
-func sameAddress(a, b string) bool {
-	ua, errA := net.ResolveUDPAddr("udp", a)
-	ub, errB := net.ResolveUDPAddr("udp", b)
-	return errA == nil && errB == nil && ua.IP.Equal(ub.IP) && ua.Port == ub.Port
+func samePort(a, b string) bool {
+	_, pa, errA := net.SplitHostPort(a)
+	_, pb, errB := net.SplitHostPort(b)
+	return errA == nil && errB == nil && pa == pb
 }
