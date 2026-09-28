@@ -379,19 +379,19 @@ The protocol should operate over explicit message and stream abstractions rather
 
 ## Deliverables
 
-* [ ] Extract transport-neutral protocol package
+* [x] Extract transport-neutral protocol package (`go/internal/protocol` over the stream/listener seam in `go/internal/transport`)
 * [ ] Define connection handshake
 * [ ] Define protocol capability negotiation
 * [ ] Define protocol version negotiation
 * [ ] Add request IDs
 * [ ] Define request/response messages
 * [ ] Define long-lived event streams
-* [ ] Define bidirectional attachment streams
-* [ ] Define structured error frames
+* [x] Define bidirectional attachment streams
+* [x] Define structured error frames
 * [ ] Add connection-level metrics
-* [ ] Add explicit payload limits
+* [x] Add explicit payload limits
 * [ ] Fuzz protocol decoding
-* [ ] Reject malformed and oversized messages safely
+* [x] Reject malformed and oversized messages safely
 
 ## Protocol concepts
 

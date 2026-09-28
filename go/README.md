@@ -9,6 +9,7 @@ and state schema (version 1).
 
 | Package | What it does |
 |---|---|
+| `internal/transport` | The seam between the protocol and the network: `Stream` (one request or attach session), `Listener`, the shared accept loop, and the Unix socket implementation. |
 | `internal/protocol` | The framed binary protocol and the small daemon management protocol. The same framing and encodings as `crates/agentd-shared/src/protocol.rs`; golden-frame tests on both sides pin identical bytes. |
 | `internal/session`, `internal/paths` | The session model and runtime-root resolution, shared in meaning with `crates/agentd-shared`. |
 | `internal/db` | `state.db`: schema, and the guarded session state transitions the daemon and workers use. Uses `modernc.org/sqlite` (pure Go). |

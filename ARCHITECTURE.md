@@ -35,6 +35,16 @@ The daemon supervises the workers it spawned: it reaps them and records a worker
 session. Sessions whose worker disappeared while no daemon was running are marked
 `unknown_recovered` at startup or on the next `ls`.
 
+## Transports
+
+The protocol runs over any bidirectional byte stream that supports half-close. Each stream carries
+one request/response exchange or one attach session. Everything above `go/internal/transport` sees
+only that `Stream` and a `Listener` that yields streams, so the daemon does not know or care which
+transport a client used. Unix sockets are the only transport today. QUIC will be a second listener,
+with each request or attachment on its own QUIC stream, multiplexed over one long-lived connection.
+The daemon's tests already run a full session over a TCP stand-in to keep that seam honest. The
+daemon-to-worker link is always a local Unix socket.
+
 ## Wire Protocol
 
 `agent` and `agentd` communicate over a custom framed binary protocol, implemented in

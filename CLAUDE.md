@@ -291,6 +291,7 @@ go/
     daemon/            session registry, proxies, lifecycle, supervision
     worker/            one session: PTY, terminal state, fan-out, input queue
     protocol/          framed protocol + daemon management protocol
+    transport/         Stream/Listener seam, accept loop, Unix sockets (QUIC next)
     db/                state.db
     session/           session model
     paths/             runtime root
@@ -298,8 +299,6 @@ crates/
   agent-cli/           the `agent` CLI and TUI
   agentd-shared/       Rust side of the protocol, schema, paths, config
 ```
-
-Transports (Unix sockets today, QUIC next) should get their own package when the transport split happens.
 
 Avoid excessive package fragmentation.
 
@@ -506,11 +505,12 @@ Done:
 - Sessions survive client disconnects and daemon restarts.
 - Liveness is checked through the worker sockets, and a flock enforces a single daemon.
 - Attach fan-out and PTY input are bounded, and the runtime root is private to the user.
+- The transport split: the daemon serves `transport.Stream`s from any `transport.Listener`; Unix sockets are the first implementation.
 
 Next:
-1. Separate protocol semantics from transport framing, behind a small transport interface. Unix sockets are the first implementation.
-2. QUIC: a control stream, plus one stream per attachment, using a maintained Go QUIC library.
-3. Remote addressing and authentication (`agent --host`).
+1. QUIC: a listener that yields one `transport.Stream` per QUIC stream (a request or an attachment), using a maintained Go QUIC library.
+2. Remote addressing and authentication (`agent --host`), including per-stream peer identity so remote peers can be limited.
+3. The CLI's client-side transport, alongside the QUIC client design.
 
 Known gaps:
 - History is only saved when a session exits.
