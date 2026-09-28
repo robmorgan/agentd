@@ -58,15 +58,46 @@ func Upgrade(p *paths.AppPaths, exe string) error {
 	if err := Daemonize(p, exe); err != nil {
 		return err
 	}
-	// Something answering on the socket is not enough: make sure it is the
-	// new daemon, speaking this protocol.
+	_, err = waitForDaemon(p)
+	return err
+}
+
+// Restart stops the running daemon, if any, and starts exe in its place, so
+// that it rereads config.toml. Sessions keep running in their workers and
+// are picked up by the new daemon. It returns the new daemon's status.
+func Restart(p *paths.AppPaths, exe string) (*protocol.ManagementStatus, error) {
+	if err := p.EnsureLayout(); err != nil {
+		return nil, err
+	}
+	if err := stopDaemon(p); err != nil {
+		return nil, err
+	}
+	if err := Daemonize(p, exe); err != nil {
+		return nil, err
+	}
+	return waitForDaemon(p)
+}
+
+// Status returns the running daemon's status, or nil when none is running.
+func Status(p *paths.AppPaths) (*protocol.ManagementStatus, error) {
+	running, err := daemonRunning(p.LockPath())
+	if err != nil || !running {
+		return nil, err
+	}
+	return managementStatus(p)
+}
+
+// waitForDaemon waits for a just-started daemon to answer. Something
+// answering on the socket is not enough: it must be the new daemon, speaking
+// this protocol.
+func waitForDaemon(p *paths.AppPaths) (*protocol.ManagementStatus, error) {
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if status, err := managementStatus(p); err == nil && status.ProtocolVersion == protocol.ProtocolVersion {
-			return nil
+			return status, nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out waiting for upgraded agentd to start; see %s", p.DaemonLogPath())
+			return nil, fmt.Errorf("timed out waiting for agentd to start; see %s", p.DaemonLogPath())
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

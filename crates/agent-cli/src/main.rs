@@ -1099,6 +1099,11 @@ fn print_daemon_management_status(status: &DaemonManagementStatus) {
     println!("root: {}", status.root);
     println!("socket: {}", status.socket);
     println!("running_sessions: {}", status.running_sessions);
+    match (status.remote.as_str(), status.remote_error.as_str()) {
+        ("", "") => println!("remote: off"),
+        ("", error) => println!("remote: not listening ({error})"),
+        (addr, _) => println!("remote: {addr}"),
+    }
 }
 
 async fn print_history(paths: &AppPaths, session_id: &str, vt: bool) -> Result<()> {

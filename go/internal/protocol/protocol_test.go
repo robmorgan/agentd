@@ -188,11 +188,11 @@ func TestManagementShutdownGoldenFrame(t *testing.T) {
 
 func TestManagementStatusResponseRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
-	status := &ManagementStatus{DaemonVersion: "0.1.0", ProtocolVersion: ProtocolVersion, PID: 42, Root: "/r", Socket: "/r/agentd.sock", RunningSessions: true}
+	status := &ManagementStatus{DaemonVersion: "0.1.0", ProtocolVersion: ProtocolVersion, PID: 42, Root: "/r", Socket: "/r/agentd.sock", RunningSessions: true, Remote: "100.64.0.5:7433"}
 	if err := WriteManagementResponse(&buf, &ManagementResponse{Status: status}); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(buf.Bytes(), []byte(`"running_sessions":true`)) {
+	if !bytes.Contains(buf.Bytes(), []byte(`"running_sessions":true`)) || !bytes.Contains(buf.Bytes(), []byte(`"remote":"100.64.0.5:7433"`)) || bytes.Contains(buf.Bytes(), []byte(`remote_error`)) {
 		t.Fatalf("status payload uses unexpected field names: %s", buf.Bytes()[16:])
 	}
 	got, err := ReadManagementResponse(&buf)

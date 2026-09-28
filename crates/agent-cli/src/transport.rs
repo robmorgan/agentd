@@ -108,9 +108,8 @@ async fn remote_connection(paths: &AppPaths, name: &str, host: &Host) -> Result<
                     DialError::KeyChanged { seen } => {
                         anyhow!(key_changed_message(name, host, &seen))
                     }
-                    DialError::Other(err) => {
-                        err.context(format!("could not reach agentd on `{name}` ({})", host.address))
-                    }
+                    DialError::Other(err) => err
+                        .context(format!("could not reach agentd on `{name}` ({})", host.address)),
                 })?;
             Ok::<_, anyhow::Error>((endpoint, conn))
         })

@@ -74,6 +74,8 @@ type Server struct {
 	// remoteAddr is where the QUIC listener is bound, if remote access is
 	// enabled and it started.
 	remoteAddr atomic.Pointer[string]
+	// remoteErr is why a configured QUIC listener is not bound (yet).
+	remoteErr atomic.Pointer[string]
 
 	// createMu serialises session name allocation and row insertion.
 	createMu sync.Mutex
@@ -192,9 +194,18 @@ func (s *Server) Serve(ctx context.Context) error {
 	return nil
 }
 
+// remoteRetryInterval is how often a QUIC listener that failed to bind is
+// retried. Tests shorten it.
+var remoteRetryInterval = 5 * time.Second
+
 // startRemote starts the QUIC listener when remote access is configured. A
 // failure is logged and local service carries on: a bad remote setting must
 // not lock the user out of their local sessions.
+//
+// Binding is retried until it succeeds or the daemon shuts down, since the
+// listen address may not exist yet: a daemon started at login can come up
+// before Tailscale or WireGuard has configured its interface. The retry
+// goroutine is the only one started here and ends with the daemon.
 func (s *Server) startRemote() {
 	addr := s.config.Remote.Listen
 	if addr == "" {
@@ -202,11 +213,14 @@ func (s *Server) startRemote() {
 	}
 	id, err := transport.LoadOrCreateIdentity(s.paths.RemoteKeyPath())
 	if err != nil {
+		s.setRemoteError(err)
 		fmt.Fprintf(os.Stderr, "agentd: remote access disabled: %v\n", err)
 		return
 	}
+	// Read once here, in Serve, rather than from the retry goroutine.
+	retry := remoteRetryInterval
 	authorized := s.paths.AuthorizedClientsPath()
-	l, err := transport.ListenQUIC(addr, id, transport.QUICOptions{
+	opts := transport.QUICOptions{
 		Authorized: func(fp string) bool {
 			ok, err := transport.IsAuthorized(authorized, fp)
 			if err != nil {
@@ -217,22 +231,61 @@ func (s *Server) startRemote() {
 		OnConnect: func(fp string, remote net.Addr) {
 			fmt.Fprintf(os.Stderr, "agentd: remote client %s connected from %s\n", fp, remote)
 		},
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "agentd: remote access disabled: %v\n", err)
+	}
+	listen := func() bool {
+		l, err := transport.ListenQUIC(addr, id, opts)
+		if err != nil {
+			// Logged only when the reason changes, not on every retry.
+			if prev := s.remoteErr.Load(); prev == nil || *prev != err.Error() {
+				fmt.Fprintf(os.Stderr, "agentd: remote access not available yet (retrying every %s): %v\n", retry, err)
+			}
+			s.setRemoteError(err)
+			return false
+		}
+		bound := l.Addr()
+		s.remoteAddr.Store(&bound)
+		s.remoteErr.Store(nil)
+		fmt.Fprintf(os.Stderr, "agentd: accepting remote clients over QUIC on %s (key %s)\n", bound, id.Fingerprint)
+		go s.serveListener(l)
+		return true
+	}
+	if listen() {
 		return
 	}
-	bound := l.Addr()
-	s.remoteAddr.Store(&bound)
-	fmt.Fprintf(os.Stderr, "agentd: accepting remote clients over QUIC on %s (key %s)\n", bound, id.Fingerprint)
-	go s.serveListener(l)
+	go func() {
+		ticker := time.NewTicker(retry)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.shutdown:
+				return
+			case <-ticker.C:
+				if listen() {
+					return
+				}
+			}
+		}
+	}()
+}
+
+func (s *Server) setRemoteError(err error) {
+	msg := err.Error()
+	s.remoteErr.Store(&msg)
 }
 
 // RemoteAddr is the address the QUIC listener is bound to, or "" when
-// remote access is off or failed to start.
+// remote access is off or not listening yet.
 func (s *Server) RemoteAddr() string {
 	if addr := s.remoteAddr.Load(); addr != nil {
 		return *addr
+	}
+	return ""
+}
+
+// remoteError is why remote access is configured but not listening, or "".
+func (s *Server) remoteError() string {
+	if msg := s.remoteErr.Load(); msg != nil {
+		return *msg
 	}
 	return ""
 }
@@ -356,6 +409,8 @@ func (s *Server) handleManagement(conn transport.Stream, req *protocol.Managemen
 			Root:            s.paths.Root,
 			Socket:          s.paths.Socket,
 			RunningSessions: running,
+			Remote:          s.RemoteAddr(),
+			RemoteError:     s.remoteError(),
 		}})
 	case req.Shutdown != nil:
 		if running && !req.Shutdown.Force {
