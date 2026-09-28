@@ -22,6 +22,7 @@ import (
 	"github.com/robmorgan/agentd/go/internal/paths"
 	"github.com/robmorgan/agentd/go/internal/protocol"
 	"github.com/robmorgan/agentd/go/internal/session"
+	"github.com/robmorgan/agentd/go/internal/transport"
 )
 
 // These tests run the daemon in-process (so the race detector covers it)
@@ -85,6 +86,9 @@ type harness struct {
 	srv    *Server
 	cancel context.CancelFunc
 	done   chan error
+	// dialer, when set, replaces the Unix socket for client connections,
+	// so the same tests can run over another transport.
+	dialer func() (net.Conn, error)
 }
 
 func newHarness(t *testing.T) *harness {
@@ -191,7 +195,11 @@ func (h *harness) eventually(what string, cond func() bool) {
 
 func (h *harness) dial() net.Conn {
 	h.t.Helper()
-	conn, err := net.Dial("unix", h.paths.Socket)
+	dial := h.dialer
+	if dial == nil {
+		dial = func() (net.Conn, error) { return net.Dial("unix", h.paths.Socket) }
+	}
+	conn, err := dial()
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -926,5 +934,68 @@ func TestGeneratedNamesDoNotRunOut(t *testing.T) {
 	id := h.mustCreate("")
 	if !validSessionName(id) || strings.Count(id, "-") != 2 {
 		t.Fatalf("generated name %q", id)
+	}
+}
+
+// tcpListener adapts a TCP listener to transport.Listener. It stands in for
+// a second transport (QUIC, later) to show that nothing above the transport
+// seam assumes Unix sockets.
+type tcpListener struct{ l *net.TCPListener }
+
+func (t tcpListener) Accept() (transport.Stream, error) {
+	conn, err := t.l.AcceptTCP()
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
+func (t tcpListener) Close() error { return t.l.Close() }
+func (t tcpListener) Addr() string { return t.l.Addr().String() }
+
+// The same daemon serves a full session lifecycle over a second transport:
+// create, attach, detach, reattach with a snapshot, session end, listing,
+// and a management request.
+func TestServesSessionsOverAnotherTransport(t *testing.T) {
+	h := newHarness(t)
+	l, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := make(chan struct{})
+	go func() {
+		h.srv.serveListener(tcpListener{l})
+		close(served)
+	}()
+	addr := l.Addr().String()
+	h.dialer = func() (net.Conn, error) { return net.Dial("tcp", addr) }
+
+	id := h.mustCreate("over-tcp")
+	c := h.attach(id)
+	c.input("one\n")
+	c.expectOutput("got:one")
+	c.conn.Close() // disconnect without detaching
+	h.eventually("attachment release", func() bool { return len(h.attachments(id)) == 0 })
+
+	c2 := h.attach(id)
+	if !bytes.Contains(c2.snapshot, []byte("got:one")) {
+		t.Fatalf("reattach snapshot over tcp missing earlier output: %q", c2.snapshot)
+	}
+	c2.input("done\n")
+	if end := c2.expectEnd(); end.SessionEnded == nil || end.SessionEnded.Status != session.StatusExited {
+		t.Fatalf("end = %#v", end)
+	}
+	if resp := h.request(&protocol.Request{ListSessions: protocol.Empty}); resp.Sessions == nil || len(*resp.Sessions) != 1 {
+		t.Fatalf("list over tcp = %#v", resp)
+	}
+	if st := h.management(&protocol.ManagementRequest{Status: protocol.Empty}).Status; st == nil || st.ProtocolVersion != protocol.ProtocolVersion {
+		t.Fatalf("management status over tcp = %#v", st)
+	}
+
+	// Shutdown closes every listener, not just the Unix socket.
+	h.stop()
+	select {
+	case <-served:
+	case <-time.After(testTimeout):
+		t.Fatal("tcp listener still served after shutdown")
 	}
 }

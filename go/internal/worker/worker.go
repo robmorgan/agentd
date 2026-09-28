@@ -7,7 +7,6 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -22,6 +21,7 @@ import (
 	"github.com/robmorgan/agentd/go/internal/paths"
 	"github.com/robmorgan/agentd/go/internal/protocol"
 	"github.com/robmorgan/agentd/go/internal/session"
+	"github.com/robmorgan/agentd/go/internal/transport"
 )
 
 const (
@@ -159,15 +159,14 @@ func Run(args Args) error {
 	}
 	defer terminal.close()
 
-	listener, err := net.Listen("unix", socketPath)
+	// Unlink the socket ourselves, and only while the path is still ours:
+	// after the session is removed its name may be reused, and a new
+	// worker's socket may already sit at the same path.
+	listener, err := transport.ListenUnix(socketPath, transport.UnixOptions{KeepSocketOnClose: true})
 	if err != nil {
 		signalGroup(cmd.Process.Pid, syscall.SIGKILL)
 		return fail(fmt.Errorf("failed to bind worker socket: %w", err))
 	}
-	// Unlink the socket ourselves, and only while the path is still ours:
-	// after the session is removed its name may be reused, and a new
-	// worker's socket may already sit at the same path.
-	listener.(*net.UnixListener).SetUnlinkOnClose(false)
 	ownSocket, err := os.Stat(socketPath)
 	if err != nil {
 		listener.Close()
@@ -178,12 +177,6 @@ func Run(args Args) error {
 		if cur, err := os.Stat(socketPath); err == nil && os.SameFile(cur, ownSocket) {
 			_ = os.Remove(socketPath)
 		}
-	}
-	if err := os.Chmod(socketPath, 0o600); err != nil {
-		listener.Close()
-		removeOwnSocket()
-		signalGroup(cmd.Process.Pid, syscall.SIGKILL)
-		return fail(fmt.Errorf("failed to restrict worker socket: %w", err))
 	}
 	if err := store.MarkRunning(args.SessionID, args.CreatedAt, os.Getpid(), cmd.Process.Pid); err != nil {
 		listener.Close()
@@ -260,35 +253,21 @@ func Run(args Args) error {
 		rt.owner.post(func(s *ownerState) { rt.onChildExited(s, code) })
 	}()
 
+	acceptDone := make(chan struct{})
 	go func() {
-		backoff := time.Duration(0)
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				if errors.Is(err, net.ErrClosed) {
-					return
-				}
-				// Temporary failures such as running out of file
-				// descriptors must not stop the worker accepting for good.
-				backoff = min(max(2*backoff, 5*time.Millisecond), time.Second)
-				fmt.Fprintf(os.Stderr, "session worker: accept: %v; retrying in %v\n", err, backoff)
-				time.Sleep(backoff)
-				continue
+		defer close(acceptDone)
+		transport.Serve(listener, "session worker", &rt.conns, func(conn transport.Stream) {
+			defer conn.Close()
+			if err := rt.handleConnection(conn); err != nil {
+				fmt.Fprintf(os.Stderr, "session worker connection error: %v\n", err)
 			}
-			backoff = 0
-			rt.conns.Add(1)
-			go func() {
-				defer rt.conns.Done()
-				defer conn.Close()
-				if err := rt.handleConnection(conn); err != nil {
-					fmt.Fprintf(os.Stderr, "session worker connection error: %v\n", err)
-				}
-			}()
-		}
+		})
 	}()
 
 	<-rt.ended.ch
 	listener.Close()
+	// Every handler Serve started is counted in rt.conns once it returns.
+	<-acceptDone
 	removeOwnSocket()
 
 	// Give attached clients a moment to receive their SessionEnded frame.
@@ -367,7 +346,7 @@ func (rt *runtime) endedResponse() *protocol.Response {
 	}}
 }
 
-func (rt *runtime) handleConnection(conn net.Conn) error {
+func (rt *runtime) handleConnection(conn transport.Stream) error {
 	reader := bufio.NewReader(conn)
 	// A peer that connects and never sends a request must not hold a
 	// handler forever.
@@ -436,7 +415,7 @@ func (rt *runtime) handleConnection(conn net.Conn) error {
 	}
 }
 
-func (rt *runtime) serveAttach(conn net.Conn, reader *bufio.Reader, kind session.AttachmentKind, g protocol.Geometry) error {
+func (rt *runtime) serveAttach(conn transport.Stream, reader *bufio.Reader, kind session.AttachmentKind, g protocol.Geometry) error {
 	var att *attachResult
 	if err := rt.owner.do(func(s *ownerState) error {
 		var err error
@@ -560,7 +539,7 @@ loop:
 	return protocol.WriteResponse(conn, final)
 }
 
-func drainOutput(conn net.Conn, sub *subscriber) error {
+func drainOutput(conn transport.Stream, sub *subscriber) error {
 	for {
 		select {
 		case data := <-sub.ch:

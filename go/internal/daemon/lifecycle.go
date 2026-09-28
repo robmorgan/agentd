@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -15,6 +14,7 @@ import (
 	"github.com/robmorgan/agentd/go/internal/paths"
 	"github.com/robmorgan/agentd/go/internal/protocol"
 	"github.com/robmorgan/agentd/go/internal/session"
+	"github.com/robmorgan/agentd/go/internal/transport"
 )
 
 // Daemonize starts `<exe> serve` detached from the caller's session and
@@ -92,7 +92,7 @@ func runningSessions(p *paths.AppPaths) ([]string, error) {
 }
 
 func managementStatus(p *paths.AppPaths) (*protocol.ManagementStatus, error) {
-	conn, err := net.DialTimeout("unix", p.Socket, workerDialTimeout)
+	conn, err := transport.DialUnix(p.Socket, workerDialTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +136,7 @@ func stopDaemon(p *paths.AppPaths) error {
 }
 
 func requestShutdown(p *paths.AppPaths) error {
-	conn, err := net.DialTimeout("unix", p.Socket, workerDialTimeout)
+	conn, err := transport.DialUnix(p.Socket, workerDialTimeout)
 	if err != nil {
 		return fmt.Errorf("agentd does not answer on %s: %w", p.Socket, err)
 	}
@@ -153,7 +153,7 @@ func requestShutdown(p *paths.AppPaths) error {
 }
 
 func answers(socket string) bool {
-	conn, err := net.DialTimeout("unix", socket, workerDialTimeout)
+	conn, err := transport.DialUnix(socket, workerDialTimeout)
 	if err != nil {
 		return false
 	}

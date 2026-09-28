@@ -44,6 +44,7 @@ import (
 	"github.com/robmorgan/agentd/go/internal/db"
 	"github.com/robmorgan/agentd/go/internal/paths"
 	"github.com/robmorgan/agentd/go/internal/protocol"
+	"github.com/robmorgan/agentd/go/internal/transport"
 )
 
 // Version is reported by GetDaemonInfo and daemon status.
@@ -75,8 +76,11 @@ type Server struct {
 	shutdownOnce sync.Once
 	shutdown     chan struct{}
 
-	connsMu sync.Mutex
-	conns   map[net.Conn]struct{}
+	// connsMu guards conns, listeners and closing, and orders every
+	// handlers.Add before shutdown's handlers.Wait.
+	connsMu   sync.Mutex
+	conns     map[transport.Stream]struct{}
+	listeners []transport.Listener
 	// closing is set under connsMu once shutdown starts, so no connection
 	// accepted afterwards is left untracked.
 	closing  bool
@@ -104,7 +108,7 @@ func New(p *paths.AppPaths, workerBin string) (*Server, error) {
 		workerBin: workerBin,
 		lockWait:  defaultLockWait,
 		shutdown:  make(chan struct{}),
-		conns:     make(map[net.Conn]struct{}),
+		conns:     make(map[transport.Stream]struct{}),
 	}, nil
 }
 
@@ -132,13 +136,9 @@ func (s *Server) Serve(ctx context.Context) error {
 		return err
 	}
 
-	listener, err := net.Listen("unix", s.paths.Socket)
+	listener, err := transport.ListenUnix(s.paths.Socket, transport.UnixOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to bind agentd socket: %w", err)
-	}
-	if err := os.Chmod(s.paths.Socket, 0o600); err != nil {
-		listener.Close()
-		return fmt.Errorf("failed to restrict agentd socket: %w", err)
 	}
 	// The pid file is informational (agent daemon info); the lock, not the
 	// pid file, decides whether a daemon is running.
@@ -151,34 +151,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	acceptDone := make(chan struct{})
 	go func() {
 		defer close(acceptDone)
-		backoff := time.Duration(0)
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				if errors.Is(err, net.ErrClosed) {
-					return
-				}
-				// Temporary failures such as running out of file
-				// descriptors must not stop the daemon accepting for good.
-				backoff = min(max(2*backoff, 5*time.Millisecond), time.Second)
-				fmt.Fprintf(os.Stderr, "agentd: accept: %v; retrying in %v\n", err, backoff)
-				time.Sleep(backoff)
-				continue
-			}
-			backoff = 0
-			if !s.track(conn) {
-				conn.Close()
-				continue
-			}
-			s.handlers.Add(1)
-			go func() {
-				defer s.handlers.Done()
-				defer s.untrack(conn)
-				if err := s.handleConnection(conn); err != nil && !isDisconnect(err) {
-					fmt.Fprintf(os.Stderr, "agentd: connection error: %v\n", err)
-				}
-			}()
-		}
+		s.serveListener(listener)
 	}()
 
 	select {
@@ -193,7 +166,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	if data, err := os.ReadFile(s.paths.PIDFile); err == nil && strings.TrimSpace(string(data)) == pid {
 		_ = os.Remove(s.paths.PIDFile)
 	}
-	listener.Close()
+	s.closeListeners()
 	<-acceptDone
 	s.closeConnections()
 	drained := make(chan struct{})
@@ -212,33 +185,77 @@ func (s *Server) Serve(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) track(conn net.Conn) bool {
+// serveListener serves streams from l until it is closed. Serve runs the
+// Unix socket through it; further transports (and tests) add theirs the same
+// way and are closed along with it at shutdown.
+func (s *Server) serveListener(l transport.Listener) {
+	s.connsMu.Lock()
+	if s.closing {
+		s.connsMu.Unlock()
+		l.Close()
+		return
+	}
+	s.listeners = append(s.listeners, l)
+	s.connsMu.Unlock()
+	// Handlers are counted in track, under connsMu, rather than by Serve:
+	// that orders them before shutdown's Wait for every listener, including
+	// ones still winding down.
+	transport.Serve(l, "agentd", nil, s.handleStream)
+}
+
+func (s *Server) handleStream(stream transport.Stream) {
+	if !s.track(stream) {
+		stream.Close()
+		return
+	}
+	defer s.handlers.Done()
+	defer s.untrack(stream)
+	if err := s.handleConnection(stream); err != nil && !isDisconnect(err) {
+		fmt.Fprintf(os.Stderr, "agentd: connection error: %v\n", err)
+	}
+}
+
+// track registers a stream and counts its handler, unless shutdown has
+// begun. Counting under connsMu orders it before shutdown's handlers.Wait.
+func (s *Server) track(stream transport.Stream) bool {
 	s.connsMu.Lock()
 	defer s.connsMu.Unlock()
 	if s.closing {
 		return false
 	}
-	s.conns[conn] = struct{}{}
+	s.conns[stream] = struct{}{}
+	s.handlers.Add(1)
 	return true
 }
 
-func (s *Server) untrack(conn net.Conn) {
+func (s *Server) untrack(stream transport.Stream) {
 	s.connsMu.Lock()
-	delete(s.conns, conn)
+	delete(s.conns, stream)
 	s.connsMu.Unlock()
-	conn.Close()
+	stream.Close()
+}
+
+// closeListeners stops every listener; their serveListener calls return.
+func (s *Server) closeListeners() {
+	s.connsMu.Lock()
+	listeners := s.listeners
+	s.listeners = nil
+	s.connsMu.Unlock()
+	for _, l := range listeners {
+		l.Close()
+	}
 }
 
 func (s *Server) closeConnections() {
 	s.connsMu.Lock()
 	defer s.connsMu.Unlock()
 	s.closing = true
-	for conn := range s.conns {
-		conn.Close()
+	for stream := range s.conns {
+		stream.Close()
 	}
 }
 
-func (s *Server) handleConnection(conn net.Conn) error {
+func (s *Server) handleConnection(conn transport.Stream) error {
 	reader := bufio.NewReader(conn)
 	// A client that connects and never sends a request must not hold a
 	// handler (and a file descriptor) until shutdown.
@@ -273,7 +290,7 @@ func (s *Server) handleConnection(conn net.Conn) error {
 	return nil
 }
 
-func (s *Server) handleManagement(conn net.Conn, req *protocol.ManagementRequest) error {
+func (s *Server) handleManagement(conn transport.Stream, req *protocol.ManagementRequest) error {
 	running, err := s.hasRunningSessions()
 	if err != nil {
 		return protocol.WriteManagementResponse(conn, &protocol.ManagementResponse{Error: &protocol.ErrorResponse{Message: err.Error()}})
@@ -303,7 +320,7 @@ func (s *Server) handleManagement(conn net.Conn, req *protocol.ManagementRequest
 	return nil
 }
 
-func (s *Server) handleRequest(conn net.Conn, reader *bufio.Reader, req *protocol.Request) error {
+func (s *Server) handleRequest(conn transport.Stream, reader *bufio.Reader, req *protocol.Request) error {
 	reply := func(resp *protocol.Response) error { return protocol.WriteResponse(conn, resp) }
 	replyErr := func(err error) error { return reply(protocol.ErrorResponsef("%v", err)) }
 
