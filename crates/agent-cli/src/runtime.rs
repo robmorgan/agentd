@@ -2529,6 +2529,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             exited_at: None,
+            workspace: None,
         }
     }
 

@@ -521,6 +521,23 @@ func (s *Server) handleRequest(conn transport.Stream, reader *bufio.Reader, req 
 			return replyErr(err)
 		}
 		return reply(&protocol.Response{Sessions: &recs})
+	case req.ListWorkspaces != nil:
+		ws, err := s.db.ListWorkspaces()
+		if err != nil {
+			return replyErr(err)
+		}
+		return reply(&protocol.Response{Workspaces: &ws})
+	case req.AddWorkspace != nil:
+		w, err := s.addWorkspace(req.AddWorkspace)
+		if err != nil {
+			return replyErr(err)
+		}
+		return reply(&protocol.Response{Workspace: w})
+	case req.RemoveWorkspace != nil:
+		if err := s.removeWorkspace(req.RemoveWorkspace.Name); err != nil {
+			return replyErr(err)
+		}
+		return reply(protocol.OkResponse())
 	}
 	return reply(protocol.ErrorResponsef("unsupported request"))
 }

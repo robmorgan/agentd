@@ -110,8 +110,7 @@ func newHarnessWithConfig(t *testing.T, extra string) *harness {
 		t.Fatal(err)
 	}
 	p := paths.FromRoot(root)
-	config := testConfig + fmt.Sprintf("\n[workspaces]\nproj = %q\n", cwd) + extra
-	if err := os.WriteFile(p.Config, []byte(config), 0o644); err != nil {
+	if err := os.WriteFile(p.Config, []byte(testConfig+extra), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	h := &harness{t: t, paths: p, cwd: cwd}
@@ -254,6 +253,20 @@ func (h *harness) create(name, agent, cwd string) *protocol.Response {
 		n = &name
 	}
 	return h.request(&protocol.Request{CreateSession: &protocol.CreateSession{Cwd: cwd, Name: n, Agent: agent}})
+}
+
+func (h *harness) addWorkspace(name, path string) *protocol.Response {
+	h.t.Helper()
+	return h.request(&protocol.Request{AddWorkspace: &protocol.AddWorkspace{Name: name, Path: path}})
+}
+
+func (h *harness) workspaces() []session.Workspace {
+	h.t.Helper()
+	resp := h.request(&protocol.Request{ListWorkspaces: protocol.Empty})
+	if resp.Workspaces == nil {
+		h.t.Fatalf("list workspaces: %#v", resp.Error)
+	}
+	return *resp.Workspaces
 }
 
 func (h *harness) createIn(name, workspace, cwd string) *protocol.Response {
@@ -618,6 +631,39 @@ func TestCreateValidation(t *testing.T) {
 	}
 }
 
+// TestWorkspaceManagement covers adding, listing and removing workspaces
+// over the protocol, and that they survive a daemon restart.
+func TestWorkspaceManagement(t *testing.T) {
+	h := newHarness(t)
+	t.Setenv("HOME", filepath.Dir(h.cwd))
+
+	if ws := h.workspaces(); len(ws) != 0 {
+		t.Fatalf("initial workspaces = %+v", ws)
+	}
+	resp := h.addWorkspace("proj", "~/work/")
+	if resp.Workspace == nil || resp.Workspace.Name != "proj" || resp.Workspace.Path != h.cwd {
+		t.Fatalf("add = %#v, %#v", resp.Workspace, resp.Error)
+	}
+	wantError(t, h.addWorkspace("proj", h.cwd), "workspace `proj` already exists")
+	wantError(t, h.addWorkspace("Bad_Name", h.cwd), "invalid workspace name")
+	wantError(t, h.addWorkspace("rel", "work"), "must be an absolute path")
+	wantError(t, h.addWorkspace("gone", filepath.Join(h.cwd, "missing")), "does not exist")
+
+	h.stop()
+	h.start()
+	if ws := h.workspaces(); len(ws) != 1 || ws[0].Name != "proj" || ws[0].Path != h.cwd {
+		t.Fatalf("workspaces after restart = %+v", ws)
+	}
+
+	if resp := h.request(&protocol.Request{RemoveWorkspace: &protocol.WorkspaceRef{Name: "proj"}}); resp.Ok == nil {
+		t.Fatalf("remove = %#v", resp.Error)
+	}
+	wantError(t, h.request(&protocol.Request{RemoveWorkspace: &protocol.WorkspaceRef{Name: "proj"}}), "workspace `proj` not found")
+	if ws := h.workspaces(); len(ws) != 0 {
+		t.Fatalf("workspaces after remove = %+v", ws)
+	}
+}
+
 // TestCreateInWorkspace checks that cwds are resolved on the daemon's
 // machine: relative to a named workspace, or from `~/`, never against the
 // client's filesystem.
@@ -626,6 +672,9 @@ func TestCreateInWorkspace(t *testing.T) {
 	sub := filepath.Join(h.cwd, "sub")
 	if err := os.Mkdir(sub, 0o755); err != nil {
 		t.Fatal(err)
+	}
+	if resp := h.addWorkspace("proj", h.cwd); resp.Workspace == nil {
+		t.Fatalf("add workspace: %#v", resp.Error)
 	}
 
 	for _, tc := range []struct{ name, cwd, want string }{
@@ -640,8 +689,9 @@ func TestCreateInWorkspace(t *testing.T) {
 		if got := resp.CreateSession.Cwd; got != tc.want {
 			t.Fatalf("%s: cwd = %q, want %q", tc.name, got, tc.want)
 		}
-		if got := h.session(tc.name).Cwd; got != tc.want {
-			t.Fatalf("%s: recorded cwd = %q, want %q", tc.name, got, tc.want)
+		rec := h.session(tc.name)
+		if rec.Cwd != tc.want || rec.Workspace == nil || *rec.Workspace != "proj" {
+			t.Fatalf("%s: record cwd = %q, workspace = %v; want %q in proj", tc.name, rec.Cwd, rec.Workspace, tc.want)
 		}
 	}
 
@@ -651,7 +701,7 @@ func TestCreateInWorkspace(t *testing.T) {
 	real, _ := filepath.EvalSymlinks(sub)
 	c.expectOutput("pwd:" + real)
 
-	wantError(t, h.createIn("a", "nope", ""), "workspace `nope` is not configured")
+	wantError(t, h.createIn("a", "nope", ""), "workspace `nope` not found")
 	wantError(t, h.createIn("b", "proj", "/etc"), "must be relative to workspace `proj`")
 	wantError(t, h.createIn("c", "proj", "~/x"), "must be relative to workspace `proj`")
 	wantError(t, h.createIn("d", "proj", "../escape"), "outside workspace `proj`")
@@ -663,6 +713,15 @@ func TestCreateInWorkspace(t *testing.T) {
 	resp := h.create("home", "sh", "~/work")
 	if resp.CreateSession == nil || resp.CreateSession.Cwd != h.cwd {
 		t.Fatalf("~ create = %#v, %#v", resp.CreateSession, resp.Error)
+	}
+	if rec := h.session("home"); rec.Workspace != nil {
+		t.Fatalf("session without a workspace recorded %q", *rec.Workspace)
+	}
+
+	// Removing the workspace leaves running sessions where they are.
+	h.request(&protocol.Request{RemoveWorkspace: &protocol.WorkspaceRef{Name: "proj"}})
+	if rec := h.session("sub"); rec.Cwd != sub || rec.Status != session.StatusRunning {
+		t.Fatalf("session after workspace removal = %#v", rec)
 	}
 }
 
@@ -967,18 +1026,6 @@ func TestLoadConfig(t *testing.T) {
 	os.WriteFile(path, []byte("[agents.zed]\ncommand = \"zed\"\n[agents.codex]\ncommand = \"codex\"\n"), 0o600)
 	if cfg, err := LoadConfig(path); err != nil || cfg.DefaultAgent != "zed" {
 		t.Fatalf("without claude: %+v, %v", cfg, err)
-	}
-
-	// Workspaces: `~/` expands on load, relative paths are refused.
-	t.Setenv("HOME", "/home/me")
-	os.WriteFile(path, []byte("[workspaces]\nmono = \"~/src/mono/\"\nabs = \"/srv/x\"\n"), 0o600)
-	cfg, err = LoadConfig(path)
-	if err != nil || cfg.Workspaces["mono"] != "/home/me/src/mono" || cfg.Workspaces["abs"] != "/srv/x" {
-		t.Fatalf("workspaces = %+v, %v", cfg, err)
-	}
-	os.WriteFile(path, []byte("[workspaces]\nrel = \"src/mono\"\n"), 0o600)
-	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "workspace `rel`") {
-		t.Fatalf("relative workspace: %v", err)
 	}
 }
 

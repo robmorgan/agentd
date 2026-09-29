@@ -12,11 +12,6 @@ pub struct Config {
     pub default_agent: String,
     #[serde(default)]
     pub agents: IndexMap<String, AgentConfig>,
-    /// Named directories on the daemon's machine, for `agent new --workspace`.
-    /// The daemon resolves them (see go/internal/daemon/config.go); the CLI
-    /// only sends the name, since it may not share the daemon's filesystem.
-    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
-    pub workspaces: IndexMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,11 +124,7 @@ impl Default for Config {
                 model_flag: default_model_flag(),
             },
         );
-        Self {
-            default_agent: PREFERRED_DEFAULT_AGENT.to_string(),
-            agents,
-            workspaces: IndexMap::new(),
-        }
+        Self { default_agent: PREFERRED_DEFAULT_AGENT.to_string(), agents }
     }
 }
 
@@ -251,20 +242,6 @@ command = "claude"
 
         let config = config.validate(&paths).unwrap();
         assert_eq!(config.default_agent_name(&paths).unwrap(), "claude");
-    }
-
-    #[test]
-    fn workspaces_parse_and_are_omitted_when_empty() {
-        let config: Config = toml::from_str(
-            r#"
-[workspaces]
-mono = "~/src/mono"
-"#,
-        )
-        .unwrap();
-        assert_eq!(config.workspaces.get("mono").map(String::as_str), Some("~/src/mono"));
-        let written = toml::to_string_pretty(&Config::default()).unwrap();
-        assert!(!written.contains("workspaces"), "{written}");
     }
 
     #[test]

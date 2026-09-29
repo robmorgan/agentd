@@ -78,6 +78,78 @@ func TestUnknownSchemaVersionIsRefused(t *testing.T) {
 	_ = os.Remove(path)
 }
 
+// A version 1 database (from before workspaces) is migrated in place and
+// keeps its sessions; a worker that opened it at version 1 can keep writing.
+func TestMigrateFromVersion1(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	raw := openRaw(t, path)
+	if _, err := raw.Exec(createSessionsTable + `
+INSERT INTO sessions (session_id, agent, mode, cwd, status, attention, created_at, updated_at)
+VALUES ('old', 'sh', 'execute', '/w', 'running', 'info', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+PRAGMA user_version = 1;`); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := userVersion(t, path); got != CurrentSchemaVersion {
+		t.Fatalf("user_version = %d", got)
+	}
+	rec, err := store.GetSession("old")
+	if err != nil || rec == nil || rec.Cwd != "/w" || rec.Workspace != nil {
+		t.Fatalf("migrated record = %+v, %v", rec, err)
+	}
+	if err := store.MarkExited("old", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddWorkspace("mono", "/src/mono"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWorkspaces(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws, err := store.ListWorkspaces(); err != nil || len(ws) != 0 {
+		t.Fatalf("empty list = %v, %v", ws, err)
+	}
+	w, err := store.AddWorkspace("mono", "/src/mono")
+	if err != nil || w.Name != "mono" || w.Path != "/src/mono" || w.CreatedAt.IsZero() {
+		t.Fatalf("add = %+v, %v", w, err)
+	}
+	if _, err := store.AddWorkspace("mono", "/elsewhere"); !errors.Is(err, ErrWorkspaceExists) {
+		t.Fatalf("duplicate add: %v", err)
+	}
+	store.AddWorkspace("api", "/src/api")
+	ws, err := store.ListWorkspaces()
+	if err != nil || len(ws) != 2 || ws[0].Name != "api" || ws[1].Name != "mono" || ws[1].Path != "/src/mono" {
+		t.Fatalf("list = %+v, %v", ws, err)
+	}
+
+	name := "mono"
+	if _, err := store.InsertSession(NewSession{SessionID: "s", Agent: "sh", Mode: session.ModeExecute, Cwd: "/src/mono", Workspace: &name}); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := store.RemoveWorkspace("mono"); err != nil || !removed {
+		t.Fatalf("remove = %v, %v", removed, err)
+	}
+	if removed, _ := store.RemoveWorkspace("mono"); removed {
+		t.Fatal("second remove reported a removal")
+	}
+	if w, err := store.GetWorkspace("mono"); err != nil || w != nil {
+		t.Fatalf("get removed = %+v, %v", w, err)
+	}
+	// The session keeps the workspace it was started in.
+	if rec, _ := store.GetSession("s"); rec == nil || rec.Workspace == nil || *rec.Workspace != "mono" {
+		t.Fatalf("session after remove = %+v", rec)
+	}
+}
+
 // The daemon, its workers and the CLI's local mode can all open a new
 // database at once; exactly one creates the schema and the rest must wait,
 // not fail.

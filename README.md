@@ -193,23 +193,25 @@ will step on each other; that is your call, not the daemon's.
 
 ### Workspaces
 
-Working directories are resolved on the machine running `agentd`, not the client. Name the
-directories you work in under `[workspaces]` in `config.toml`, and start sessions by name:
-
-```toml
-[workspaces]
-mono = "~/src/mono"
-```
+Working directories are resolved on the machine running `agentd`, not the client. Give the
+directories you work in a name, then start sessions by name:
 
 ```sh
+agent workspace add mono '~/src/mono'                         # or: agent workspace add mono .
+agent workspace ls
 agent new --workspace mono auth-refactor                      # runs in ~/src/mono
 agent new --workspace mono --cwd services/api api-fix         # runs in ~/src/mono/services/api
+agent workspace rm mono
 ```
 
-With `--workspace`, `--cwd` is relative to the workspace root and may not leave it. Paths may
-start with `~/`, which expands to the daemon user's home. `agentd` does not clone, create, or
-sync workspaces: the repository has to be on that machine already. The daemon reads
-`[workspaces]` at startup, so restart it (`agent daemon restart`) after editing them.
+Workspaces are stored by the daemon in `state.db`, so they take effect immediately and are
+managed entirely from the CLI. A quoted `~/` path is expanded by the daemon against its own
+user's home; other paths are resolved by the CLI, which today always shares the daemon's
+filesystem. The directory must exist: `agentd` does not clone, create, or sync workspaces.
+
+With `--workspace`, `--cwd` is relative to the workspace root and may not leave it. A session
+records the workspace it was started in (`agent status` shows it); removing or re-adding a
+workspace does not move sessions that are already running.
 
 This is the addressing a remote client will use: once `agent --host` exists, a laptop can start
 a session in a devbox's checkout without knowing the devbox's paths.
@@ -229,8 +231,6 @@ args = []
 command = "codex"
 args = []
 ```
-
-`[workspaces]` is described under [Workspaces](#workspaces).
 
 Agent picker order follows the order of the `[agents.*]` tables in this file. `default_agent`
 must name one of those configured agents. Without it, the default is `claude` if configured,
@@ -320,7 +320,8 @@ Now any command can run on the devbox, with `--host` or a `host/session` address
 
 ```sh
 agent --host devbox new --cwd ~/repo auth-refactor      # a path on the devbox (absolute or ~/...)
-agent --host devbox new --workspace mono auth-tests      # or a workspace named on the devbox
+agent --host devbox workspace add mono ~/src/mono       # name a directory on the devbox
+agent --host devbox new --workspace mono auth-tests      # and start sessions in it
 agent --host devbox ls
 agent attach devbox/auth-refactor
 agent send-input devbox/auth-refactor -- "run the tests"

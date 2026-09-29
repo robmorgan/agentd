@@ -7,7 +7,6 @@ import (
 	"math/rand/v2"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -176,7 +175,7 @@ func (s *Server) reconcileSessions() error {
 	return nil
 }
 
-func (s *Server) allocateSession(name *string, agent string, model *string, cwd string) (id, createdAt string, err error) {
+func (s *Server) allocateSession(name *string, agent string, model *string, cwd string, workspace *string) (id, createdAt string, err error) {
 	s.createMu.Lock()
 	defer s.createMu.Unlock()
 
@@ -205,7 +204,7 @@ func (s *Server) allocateSession(name *string, agent string, model *string, cwd 
 		}
 	}
 	createdAt, err = s.db.InsertSession(db.NewSession{
-		SessionID: id, Agent: agent, Model: model, Mode: session.ModeExecute, Cwd: cwd,
+		SessionID: id, Agent: agent, Model: model, Mode: session.ModeExecute, Cwd: cwd, Workspace: workspace,
 	})
 	return id, createdAt, err
 }
@@ -246,12 +245,12 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 	if err != nil {
 		return nil, err
 	}
-	cwd, err := s.resolveCwd(req)
+	cwd, workspace, err := s.resolveCwd(req)
 	if err != nil {
 		return nil, err
 	}
 
-	id, createdAt, err := s.allocateSession(name, req.Agent, req.Model, cwd)
+	id, createdAt, err := s.allocateSession(name, req.Agent, req.Model, cwd, workspace)
 	if err != nil {
 		return nil, err
 	}
@@ -298,43 +297,6 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 	return &session.CreateResult{
 		SessionID: id, Cwd: cwd, Status: session.StatusRunning, Mode: session.ModeExecute,
 	}, nil
-}
-
-// resolveCwd turns a create request's Cwd and Workspace into the absolute
-// directory the agent runs in. Everything is resolved on this machine: the
-// client may be elsewhere, so its paths mean nothing here unless they are
-// absolute or relative to a named workspace.
-func (s *Server) resolveCwd(req *protocol.CreateSession) (string, error) {
-	var workspace string
-	if req.Workspace != nil {
-		workspace = strings.TrimSpace(*req.Workspace)
-	}
-	if workspace == "" {
-		cwd, err := expandHome(req.Cwd)
-		if err != nil {
-			return "", err
-		}
-		if !filepath.IsAbs(cwd) {
-			return "", fmt.Errorf("working directory `%s` must be an absolute path", req.Cwd)
-		}
-		return filepath.Clean(cwd), nil
-	}
-
-	root, ok := s.config.Workspaces[workspace]
-	if !ok {
-		return "", fmt.Errorf("workspace `%s` is not configured in %s", workspace, s.paths.Config)
-	}
-	if req.Cwd == "" {
-		return root, nil
-	}
-	if filepath.IsAbs(req.Cwd) || strings.HasPrefix(req.Cwd, "~") {
-		return "", fmt.Errorf("working directory `%s` must be relative to workspace `%s`", req.Cwd, workspace)
-	}
-	cwd := filepath.Join(root, req.Cwd)
-	if rel, err := filepath.Rel(root, cwd); err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
-		return "", fmt.Errorf("working directory `%s` is outside workspace `%s`", req.Cwd, workspace)
-	}
-	return cwd, nil
 }
 
 // spawnWorker starts a session worker in its own process session, so it is

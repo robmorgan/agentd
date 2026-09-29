@@ -501,7 +501,7 @@ Document architectural decisions that would otherwise be difficult to infer from
 # Current state and next milestone
 
 Done:
-- The Go daemon and per-session workers, on protocol v1 and state schema v1.
+- The Go daemon and per-session workers, on protocol v1 and state schema v2.
 - Sessions survive client disconnects and daemon restarts.
 - Liveness is checked through the worker sockets, and a flock enforces a single daemon.
 - Attach fan-out and PTY input are bounded, and the runtime root is private to the user.

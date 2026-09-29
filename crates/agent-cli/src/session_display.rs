@@ -233,6 +233,7 @@ mod tests {
             created_at,
             updated_at: created_at,
             exited_at,
+            workspace: None,
         }
     }
 }

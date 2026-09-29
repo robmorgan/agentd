@@ -39,7 +39,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 const SELECT_SESSION: &str =
     "SELECT session_id, agent, model, mode, cwd, status, worker_pid, agent_pid,
-        exit_code, error, attention, attention_summary, created_at, updated_at, exited_at
+        exit_code, error, attention, attention_summary, created_at, updated_at, exited_at,
+        workspace
  FROM sessions";
 
 #[derive(Debug)]
@@ -322,6 +323,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         created_at: parse_time(row.get::<_, String>(12)?)?,
         updated_at: parse_time(row.get::<_, String>(13)?)?,
         exited_at: row.get::<_, Option<String>>(14)?.map(parse_time).transpose()?,
+        workspace: row.get(15)?,
     })
 }
 
@@ -457,6 +459,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             exited_at: None,
+            workspace: None,
         }
     }
 

@@ -53,6 +53,9 @@ type Request struct {
 	ListSessions     *struct{}
 	ListAttachments  *SessionRef
 	GetHistory       *GetHistory
+	ListWorkspaces   *struct{}
+	AddWorkspace     *AddWorkspace
+	RemoveWorkspace  *WorkspaceRef
 }
 
 type SessionRef struct{ SessionID string }
@@ -70,6 +73,14 @@ type CreateSession struct {
 	// Workspace names a directory in the daemon's config (`[workspaces]`).
 	Workspace *string
 }
+
+// AddWorkspace registers Path under Name. Path is resolved on the daemon's
+// machine: it must be absolute or start with `~/`, and exist.
+type AddWorkspace struct {
+	Name, Path string
+}
+
+type WorkspaceRef struct{ Name string }
 
 type KillSession struct {
 	SessionID string
@@ -123,6 +134,8 @@ type Response struct {
 	EndOfStream    *struct{}
 	Error          *ErrorResponse
 	Ok             *struct{}
+	Workspaces     *[]session.Workspace
+	Workspace      *session.Workspace
 }
 
 type DaemonInfo struct {
@@ -175,6 +188,9 @@ const (
 	kListSessionsRequest     kind = 13
 	kListAttachmentsRequest  kind = 14
 	kGetHistoryRequest       kind = 15
+	kListWorkspacesRequest   kind = 16
+	kAddWorkspaceRequest     kind = 17
+	kRemoveWorkspaceRequest  kind = 18
 
 	kDaemonInfoResponse     kind = 101
 	kCreateSessionResponse  kind = 102
@@ -191,6 +207,8 @@ const (
 	kEndOfStreamResponse    kind = 113
 	kErrorResponse          kind = 114
 	kOkResponse             kind = 115
+	kWorkspacesResponse     kind = 116
+	kWorkspaceResponse      kind = 117
 )
 
 // ---------------------------------------------------------------------------
@@ -387,6 +405,15 @@ func encodeRequest(req *Request) (kind, []byte, error) {
 		e.str(req.GetHistory.SessionID)
 		e.bool(req.GetHistory.VT)
 		return kGetHistoryRequest, e.buf, e.err
+	case req.ListWorkspaces != nil:
+		return kListWorkspacesRequest, nil, nil
+	case req.AddWorkspace != nil:
+		e.str(req.AddWorkspace.Name)
+		e.str(req.AddWorkspace.Path)
+		return kAddWorkspaceRequest, e.buf, e.err
+	case req.RemoveWorkspace != nil:
+		e.str(req.RemoveWorkspace.Name)
+		return kRemoveWorkspaceRequest, e.buf, e.err
 	}
 	return 0, nil, errors.New("empty request")
 }
@@ -434,6 +461,12 @@ func decodeRequest(k kind, payload []byte) (*Request, error) {
 		req.ListAttachments = &SessionRef{d.str()}
 	case kGetHistoryRequest:
 		req.GetHistory = &GetHistory{SessionID: d.str(), VT: d.bool()}
+	case kListWorkspacesRequest:
+		req.ListWorkspaces = Empty
+	case kAddWorkspaceRequest:
+		req.AddWorkspace = &AddWorkspace{Name: d.str(), Path: d.str()}
+	case kRemoveWorkspaceRequest:
+		req.RemoveWorkspace = &WorkspaceRef{Name: d.str()}
 	default:
 		return nil, fmt.Errorf("unexpected message kind `%d` while decoding request", k)
 	}
@@ -508,6 +541,15 @@ func encodeResponse(resp *Response) (kind, []byte, error) {
 		return kErrorResponse, e.buf, e.err
 	case resp.Ok != nil:
 		return kOkResponse, nil, nil
+	case resp.Workspaces != nil:
+		e.length(len(*resp.Workspaces))
+		for i := range *resp.Workspaces {
+			e.workspace(&(*resp.Workspaces)[i])
+		}
+		return kWorkspacesResponse, e.buf, e.err
+	case resp.Workspace != nil:
+		e.workspace(resp.Workspace)
+		return kWorkspaceResponse, e.buf, e.err
 	}
 	return 0, nil, errors.New("empty response")
 }
@@ -563,6 +605,16 @@ func decodeResponse(k kind, payload []byte) (*Response, error) {
 		resp.Error = &ErrorResponse{Message: d.str()}
 	case kOkResponse:
 		resp.Ok = Empty
+	case kWorkspacesResponse:
+		n := d.length()
+		workspaces := make([]session.Workspace, 0, n)
+		for i := 0; i < n && d.err == nil; i++ {
+			workspaces = append(workspaces, d.workspace())
+		}
+		resp.Workspaces = &workspaces
+	case kWorkspaceResponse:
+		w := d.workspace()
+		resp.Workspace = &w
 	default:
 		return nil, fmt.Errorf("unexpected message kind `%d` while decoding response", k)
 	}
@@ -718,6 +770,13 @@ func (e *encoder) sessionRecord(s *session.Record) {
 	e.datetime(s.CreatedAt)
 	e.datetime(s.UpdatedAt)
 	e.optDatetime(s.ExitedAt)
+	e.optStr(s.Workspace)
+}
+
+func (e *encoder) workspace(w *session.Workspace) {
+	e.str(w.Name)
+	e.str(w.Path)
+	e.datetime(w.CreatedAt)
 }
 
 // ---------------------------------------------------------------------------
@@ -948,5 +1007,10 @@ func (d *decoder) sessionRecord() session.Record {
 		CreatedAt:        d.datetime(),
 		UpdatedAt:        d.datetime(),
 		ExitedAt:         d.optDatetime(),
+		Workspace:        d.optStr(),
 	}
+}
+
+func (d *decoder) workspace() session.Workspace {
+	return session.Workspace{Name: d.str(), Path: d.str(), CreatedAt: d.datetime()}
 }

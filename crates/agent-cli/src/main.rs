@@ -49,7 +49,7 @@ use agentd_shared::{
     },
     session::{
         AttachmentKind, AttachmentRecord, AttentionLevel, SESSION_NAME_RULES, SessionRecord,
-        SessionStatus, validate_session_name,
+        SessionStatus, WorkspaceRecord, validate_session_name,
     },
 };
 
@@ -209,6 +209,14 @@ enum Command {
     Attachments { session_id: String },
     #[command(about = "Show detailed session status", display_order = 13)]
     Status { session_id: String },
+    #[command(
+        about = "Manage named working directories on the daemon's machine",
+        display_order = 14
+    )]
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
     #[command(about = "Inspect or control the local agent daemon", display_order = 16)]
     Daemon {
         #[command(subcommand)]
@@ -262,6 +270,24 @@ enum HostCommand {
 enum RemoteCommand {
     #[command(about = "Print this machine's key fingerprint", display_order = 1)]
     Id,
+}
+
+#[derive(Debug, Subcommand)]
+#[command(
+    name = "agent workspace",
+    help_template = GROUP_HELP_TEMPLATE,
+    before_help = "agent workspace\nName directories on the daemon's machine, then start sessions in them\nwith `agent new --workspace NAME`.",
+    after_help = "Notes:\n  Paths are resolved by the daemon; `~/` is its user's home. The directory must\n  already exist: agentd does not clone, create, or sync workspaces.\n  Removing a workspace does not affect sessions already running in it.",
+    styles = cli_styles(),
+    next_display_order = 1
+)]
+enum WorkspaceCommand {
+    #[command(about = "Add a workspace", display_order = 1)]
+    Add { name: String, path: PathBuf },
+    #[command(visible_alias = "ls", about = "List workspaces", display_order = 2)]
+    List,
+    #[command(about = "Remove a workspace", display_order = 3)]
+    Rm { name: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -514,6 +540,35 @@ async fn run(mut cli: Cli, paths: AppPaths) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("session `{session_id}` not found"))?;
             print_session(&session);
         }
+        (Some(Command::Workspace { command }), ExecutionMode::Daemon) => {
+            let request = match command {
+                WorkspaceCommand::Add { name, path } => Request::AddWorkspace {
+                    name,
+                    path: match transport::remote_name() {
+                        Some(host) => remote_workspace_path(host, path)?,
+                        None => workspace_path(path)?,
+                    },
+                },
+                WorkspaceCommand::List => Request::ListWorkspaces,
+                WorkspaceCommand::Rm { name } => Request::RemoveWorkspace { name },
+            };
+            match send_request(&paths, &request).await? {
+                Response::Workspace { workspace } => {
+                    println!(
+                        "added workspace {} at {}",
+                        workspace.name,
+                        crate::session_display::escape_controls(&workspace.path)
+                    );
+                }
+                Response::Workspaces { workspaces } => print_workspaces(&workspaces),
+                Response::Ok => {}
+                Response::Error { message } => bail!(message),
+                other => bail!("unexpected response: {:?}", other),
+            }
+        }
+        (Some(Command::Workspace { .. }), ExecutionMode::Local(reason)) => {
+            bail!("{reason}. `agent workspace` requires a compatible daemon");
+        }
         (Some(Command::Daemon { command }), ExecutionMode::Daemon) => match command {
             DaemonCommand::Info => {
                 let status = daemon_management_status(&paths).await?;
@@ -556,7 +611,11 @@ fn take_session_host(command: &mut Command) -> Result<Option<String>> {
         | Command::History { session_id, .. }
         | Command::Attachments { session_id }
         | Command::Status { session_id } => ids.push(session_id),
-        Command::List | Command::Daemon { .. } | Command::Host { .. } | Command::Remote { .. } => {}
+        Command::List
+        | Command::Daemon { .. }
+        | Command::Host { .. }
+        | Command::Remote { .. }
+        | Command::Workspace { .. } => {}
     }
     let mut host: Option<String> = None;
     for id in ids {
@@ -1647,6 +1706,43 @@ fn print_attachments(attachments: &[AttachmentRecord]) {
     }
 }
 
+/// The path sent for `agent workspace add`. A `~` path is sent as given, for
+/// the daemon to expand against its own home. Anything else is resolved here,
+/// so `agent workspace add mono .` works; that relies on the CLI sharing the
+/// daemon's filesystem. For a remote host see remote_workspace_path.
+fn workspace_path(path: PathBuf) -> Result<String> {
+    if path.starts_with("~") {
+        return path
+            .into_os_string()
+            .into_string()
+            .map_err(|path| anyhow!("workspace path `{}` is not valid UTF-8", path.display()));
+    }
+    resolve_cwd(Some(path))
+}
+
+/// A remote workspace's path is on the remote machine, so it is sent as
+/// given for that daemon to check: absolute, or `~/...` for its user's home.
+fn remote_workspace_path(host: &str, path: PathBuf) -> Result<String> {
+    let path = path
+        .into_os_string()
+        .into_string()
+        .map_err(|path| anyhow!("workspace path `{}` is not valid UTF-8", path.display()))?;
+    if !(path.starts_with('/') || path == "~" || path.starts_with("~/")) {
+        bail!("workspace path `{path}` must be absolute or start with `~/` on `{host}`");
+    }
+    Ok(path)
+}
+
+fn print_workspaces(workspaces: &[WorkspaceRecord]) {
+    for workspace in workspaces {
+        println!(
+            "{}\t{}",
+            workspace.name,
+            crate::session_display::escape_controls(&workspace.path)
+        );
+    }
+}
+
 fn print_session(session: &SessionRecord) {
     println!("name: {}", session.session_id);
     println!("agent: {}", session.agent);
@@ -1659,6 +1755,9 @@ fn print_session(session: &SessionRecord) {
         println!("attention_summary: {summary}");
     }
     println!("cwd: {}", crate::session_display::escape_controls(&session.cwd));
+    if let Some(workspace) = &session.workspace {
+        println!("workspace: {}", crate::session_display::escape_controls(workspace));
+    }
     if let Some(worker_pid) = session.worker_pid {
         println!("worker_pid: {worker_pid}");
     }
@@ -2150,11 +2249,12 @@ mod tests {
         AGENTD_ATTACH_ENTER_SEQUENCE, AGENTD_ATTACH_EXIT_TITLE, AGENTD_ATTACH_RESTORE_SEQUENCE,
         ATTACH_DETACH_BYTE, ATTACH_NEXT_SESSION_BYTE, ATTACH_OVERLAY_BYTE, AttachInputAction,
         AttachInputParser, AttachSessionDirection, Cli, Command, DaemonCommand,
-        DegradedNoticeCommand, SessionEndSummary, adjacent_live_session_id_in,
+        DegradedNoticeCommand, SessionEndSummary, WorkspaceCommand, adjacent_live_session_id_in,
         attach_startup_bytes, cli_command, cli_styles, daemon_executable_from,
         ensure_compatible_daemon, format_attach_title, format_session_end_summary, remote_cwd,
-        resolve_cwd, resolve_detach_session_id, resolve_new_session_options,
+        remote_workspace_path, resolve_cwd, resolve_detach_session_id, resolve_new_session_options,
         should_print_degraded_notice, start_daemon, take_session_host, terminal_title_bytes,
+        workspace_path,
     };
     use agentd_shared::session::{AttentionLevel, SessionMode, SessionRecord, SessionStatus};
     use agentd_shared::{
@@ -2555,6 +2655,49 @@ command = "claude"
             Some(Command::Attachments { session_id }) => assert_eq!(session_id, "demo"),
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn workspace_commands_parse() {
+        let cli = Cli::try_parse_from(["agent", "workspace", "add", "mono", "~/src/mono"]).unwrap();
+        match cli.command {
+            Some(Command::Workspace { command: WorkspaceCommand::Add { name, path } }) => {
+                assert_eq!(name, "mono");
+                assert_eq!(path, PathBuf::from("~/src/mono"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["agent", "workspace", "ls"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Workspace { command: WorkspaceCommand::List })
+        ));
+        let cli = Cli::try_parse_from(["agent", "workspace", "rm", "mono"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Workspace { command: WorkspaceCommand::Rm { name } }) if name == "mono"
+        ));
+    }
+
+    #[test]
+    fn remote_workspace_paths_are_sent_as_given() {
+        assert_eq!(remote_workspace_path("devbox", "/srv/mono".into()).unwrap(), "/srv/mono");
+        assert_eq!(remote_workspace_path("devbox", "~/src/mono".into()).unwrap(), "~/src/mono");
+        let err = remote_workspace_path("devbox", ".".into()).unwrap_err();
+        assert!(err.to_string().contains("on `devbox`"), "{err}");
+    }
+
+    #[test]
+    fn workspace_path_keeps_tilde_and_resolves_the_rest() {
+        assert_eq!(workspace_path(PathBuf::from("~/src/mono")).unwrap(), "~/src/mono");
+        let paths = test_paths();
+        let dir = paths.root.join("ws");
+        fs::create_dir_all(dir.as_std_path()).unwrap();
+        assert_eq!(
+            workspace_path(dir.clone().into_std_path_buf()).unwrap(),
+            resolve_cwd(Some(dir.into_std_path_buf())).unwrap()
+        );
+        assert!(workspace_path(PathBuf::from("/definitely/missing")).is_err());
     }
 
     #[test]
@@ -3086,6 +3229,7 @@ command = "claude"
             created_at: now - Duration::minutes(updated_minutes_ago + 5),
             updated_at: now - Duration::minutes(updated_minutes_ago),
             exited_at: None,
+            workspace: None,
         }
     }
 
