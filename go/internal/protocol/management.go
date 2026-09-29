@@ -43,6 +43,10 @@ type ManagementStatus struct {
 	Root            string `json:"root"`
 	Socket          string `json:"socket"`
 	RunningSessions bool   `json:"running_sessions"`
+	// Remote is where the QUIC listener is bound; empty when remote access
+	// is off or not listening yet, in which case RemoteError says why.
+	Remote      string `json:"remote,omitempty"`
+	RemoteError string `json:"remote_error,omitempty"`
 }
 
 type ManagementShutdownResult struct {

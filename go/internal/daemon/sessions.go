@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +15,7 @@ import (
 	"github.com/robmorgan/agentd/go/internal/db"
 	"github.com/robmorgan/agentd/go/internal/protocol"
 	"github.com/robmorgan/agentd/go/internal/session"
+	"github.com/robmorgan/agentd/go/internal/transport"
 )
 
 const (
@@ -68,7 +68,7 @@ const (
 // missing socket counts as proof of death; any other failure is unknown, so
 // a probe that fails under load never condemns a healthy session.
 func (s *Server) workerState(id string) (liveness, error) {
-	conn, err := net.DialTimeout("unix", s.paths.SessionSocketPath(id), workerDialTimeout)
+	conn, err := transport.DialUnix(s.paths.SessionSocketPath(id), workerDialTimeout)
 	switch {
 	case err == nil:
 		conn.Close()
@@ -236,6 +236,11 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 			}
 			name = &trimmed
 		}
+	}
+	// A client that does not know this daemon's configuration (a remote
+	// `agent --host`) leaves the agent empty to get the daemon's default.
+	if req.Agent == "" {
+		req.Agent = s.config.DefaultAgent
 	}
 	agent, err := s.config.requireAgent(req.Agent, s.paths.Config)
 	if err != nil {
@@ -460,7 +465,7 @@ func (s *Server) stopWorker(rec *session.Record) error {
 }
 
 func (s *Server) requestWorkerKill(id string) error {
-	conn, err := net.DialTimeout("unix", s.paths.SessionSocketPath(id), workerDialTimeout)
+	conn, err := transport.DialUnix(s.paths.SessionSocketPath(id), workerDialTimeout)
 	if err != nil {
 		return err
 	}

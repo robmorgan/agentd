@@ -7,7 +7,7 @@
   </p>
 </p>
 
-Developers are starting to run **multiple coding agents** in parallel including Claude Code and Codex.
+Developers are running **multiple coding agents** in parallel including Claude Code and Codex.
 But once you run more than one, things get messy:
 
 * terminals everywhere
@@ -223,20 +223,14 @@ Instrumented agents can use the injected session environment to locate the daemo
 there is no separate structured event channel. Session status, attention, and history are the
 supported runtime surfaces.
 
-Runtime paths are resolved in this order:
+Everything lives under one root, `~/.agentd` on macOS and Linux alike, unless `AGENTD_DIR` names
+another. Without a home directory, `XDG_RUNTIME_DIR/agentd`, `TMPDIR/agentd-<uid>` and then
+`/tmp/agentd-<uid>` are used instead; those may not survive a reboot.
 
-- `AGENTD_DIR` as the exact runtime root
-- `XDG_RUNTIME_DIR/agentd`
-- on macOS, `~/.agentd`
-- `TMPDIR/agentd-<uid>`
-- `/tmp/agentd-<uid>`
-
-The selected root contains `config.toml`, `agentd.sock`, `agentd.lock`, `agentd.pid`, `state.db`,
-`sessions/` (one socket per live session), and `logs/`. It is created private to your user (0700),
-and `agentd` refuses a root owned by someone else.
-
-macOS typically does not set `XDG_RUNTIME_DIR`, so the default root on macOS becomes `~/.agentd`
-unless `AGENTD_DIR` is set explicitly.
+The root contains `config.toml`, `state.db`, `logs/`, `remote/` (keys for remote access),
+`hosts.toml`, and the runtime files `agentd.sock`, `agentd.lock`, `agentd.pid` and `sessions/` (one
+socket per live session). It is created private to your user (0700), and `agentd` refuses a root
+owned by someone else.
 
 Interactive PTY attach is available with `agent attach <name>`. Detach with `Ctrl-\`, switch to
 the previous running session with `Ctrl-[`, or switch to the next running session with `Ctrl-]`, or
@@ -248,6 +242,93 @@ restored session was using the alternate screen, replay restores that state natu
 Multiple interactive attachers are allowed per session, and the TUI uses the same shared attach
 path when a worker is focused. Background PTY writes are still available with
 `agent send-input <name> -- <text>`.
+
+## Remote Access (Preview)
+
+`agentd` can accept remote clients over QUIC, so sessions on a devbox can be reached from a laptop
+over a LAN, Tailscale or WireGuard, without any hosted service. Both sides authenticate with pinned
+keys, like SSH host keys and `authorized_keys`.
+
+**On the devbox**, remote access is off by default. Turn it on:
+
+```sh
+agentd remote enable
+```
+
+This finds the devbox's Tailscale address and listens on UDP port 7433 there. It sets
+`[remote] listen` in `config.toml`, restarts the daemon (sessions keep running), and prints the
+`agent host add` command to run on the laptop, with the daemon's key fingerprint included.
+
+Without Tailscale, it offers the address of the interface holding the default route and asks first.
+A private LAN address is only reachable on that network and may change with DHCP; a public address
+is reachable from the whole internet, so it gets a stronger warning. To choose the address
+yourself (for example a WireGuard one), or to skip the question in a script:
+
+```sh
+agentd remote enable 10.8.0.2          # port 7433
+agentd remote enable 10.8.0.2:9000
+agentd remote enable --yes             # accept the detected address
+agentd remote status
+agentd remote disable
+```
+
+If the address does not exist yet when the daemon starts (say, Tailscale is still coming up at
+boot), the daemon keeps retrying every few seconds. `agentd remote status` and `agent daemon info`
+show why it is not listening.
+
+**On the laptop**, run the command `enable` printed:
+
+```sh
+agent host add devbox 100.64.0.5:7433 --fingerprint SHA256:...
+```
+
+Without `--fingerprint`, `agent host add` shows the key the daemon presents and asks you to confirm
+it against `agentd remote id`. Either way it then prints the command that authorizes the laptop.
+
+**Back on the devbox**, run the command it printed:
+
+```sh
+agentd remote authorize SHA256:... my-laptop
+```
+
+Now any command can run on the devbox, with `--host` or a `host/session` address:
+
+```sh
+agent --host devbox new --cwd /srv/repo auth-refactor   # --cwd is a path on the devbox
+agent --host devbox ls
+agent attach devbox/auth-refactor
+agent send-input devbox/auth-refactor -- "run the tests"
+agent history devbox/auth-refactor
+agent rm devbox/auth-refactor
+```
+
+Closing the laptop or losing the network leaves the session running; `agent attach` again, from any
+authorized machine, restores the screen. Without `--agent`, `new` uses the devbox's `default_agent`.
+
+Managing keys and hosts:
+
+```sh
+agent remote id                  # this machine's client key fingerprint
+agent host ls
+agent host rm devbox
+agentd remote list               # on the devbox: authorized clients
+agentd remote revoke SHA256:...
+```
+
+An authorized client has the same access as you have locally, except that only the devbox itself
+can stop its daemon. Authorizing takes effect immediately; revoking a key also disconnects that
+client within a few seconds, ending any attachment it has open. `agent daemon info` works remotely; `restart` and `upgrade` only
+manage the local daemon.
+
+Troubleshooting:
+
+- **"refused this machine's key"**: the laptop is not authorized; run the `agentd remote authorize`
+  command from the error on the devbox.
+- **"the key of host ... has changed"**: the devbox presented a different key from the pinned one.
+  If you know why (for example `remote/daemon.key` was recreated), run `agent host rm` and
+  `agent host add` again. Otherwise, treat it as a possible interception.
+- **"timed out connecting"**: check `[remote] listen` on the devbox, that the daemon was restarted,
+  and that UDP reaches the port (firewalls often allow TCP only).
 
 ## Troubleshooting
 
@@ -276,6 +357,7 @@ AGENTD_BIN=$PWD/go/bin/agentd agent daemon restart
 Current capabilities include:
 
 - local `agentd` daemon over a Unix socket
+- remote sessions over QUIC with `agent --host` and pinned keys (preview)
 - PTY-backed agent processes that outlive client connections
 - sessions that survive the daemon stopping, restarting, or being upgraded: each runs in its
   own worker process, and a new daemon picks it up again

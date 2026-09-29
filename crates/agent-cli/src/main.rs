@@ -35,10 +35,12 @@ use tokio::{
 mod local;
 mod runtime;
 mod session_display;
+mod transport;
 
 use agentd_shared::{
     config::Config,
     header::{AGENTD_PRIMARY_BLUE_RGB, agentd_header},
+    hosts::{self, Host},
     paths::AppPaths,
     protocol::{
         DaemonInfo, DaemonManagementRequest, DaemonManagementResponse, DaemonManagementStatus,
@@ -135,6 +137,9 @@ fn cli_styles() -> Styles {
     next_display_order = 1
 )]
 struct Cli {
+    /// Talk to the agentd on a remote host (see `agent host add`)
+    #[arg(long, global = true, value_name = "NAME")]
+    host: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -205,6 +210,54 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    #[command(about = "Manage remote hosts this machine can reach", display_order = 17)]
+    Host {
+        #[command(subcommand)]
+        command: HostCommand,
+    },
+    #[command(about = "Show this machine's key for remote access", display_order = 18)]
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+#[command(
+    name = "agent host",
+    help_template = GROUP_HELP_TEMPLATE,
+    before_help = "agent host\nRemote hosts running agentd with `[remote] listen` set.",
+    after_help = "Examples:\n  agent host add devbox 100.64.0.5:7433\n  agent --host devbox ls\n  agent attach devbox/auth-refactor",
+    styles = cli_styles(),
+    next_display_order = 1
+)]
+enum HostCommand {
+    #[command(about = "Add a host and pin its daemon key", display_order = 1)]
+    Add {
+        name: String,
+        /// HOST:PORT of the remote agentd's QUIC listener
+        address: String,
+        /// Expected daemon key (from `agentd remote id` on the host); skips the prompt
+        #[arg(long, value_name = "FP")]
+        fingerprint: Option<String>,
+    },
+    #[command(visible_alias = "ls", about = "List configured hosts", display_order = 2)]
+    List,
+    #[command(about = "Forget a host", display_order = 3)]
+    Rm { name: String },
+}
+
+#[derive(Debug, Subcommand)]
+#[command(
+    name = "agent remote",
+    help_template = GROUP_HELP_TEMPLATE,
+    before_help = "agent remote\nThis machine's identity when connecting to remote hosts.",
+    styles = cli_styles(),
+    next_display_order = 1
+)]
+enum RemoteCommand {
+    #[command(about = "Print this machine's key fingerprint", display_order = 1)]
+    Id,
 }
 
 #[derive(Debug, Subcommand)]
@@ -235,6 +288,29 @@ async fn main() -> Result<()> {
     let paths = AppPaths::discover()?;
     paths.ensure_layout()?;
     ensure_config(&paths)?;
+    let result = run(cli, paths.clone()).await;
+    transport::close().await;
+    result.map_err(|err| transport::explain(err, &paths))
+}
+
+async fn run(mut cli: Cli, paths: AppPaths) -> Result<()> {
+    match cli.command {
+        Some(Command::Host { command }) => return run_host_command(&paths, command).await,
+        Some(Command::Remote { command: RemoteCommand::Id }) => {
+            println!("{}", transport::ClientIdentity::load_or_create(&paths)?.fingerprint);
+            return Ok(());
+        }
+        _ => {}
+    }
+    let prefixed = match cli.command.as_mut() {
+        Some(command) => take_session_host(command)?,
+        None => None,
+    };
+    transport::set_target(transport::resolve_target(
+        &paths,
+        cli.host.as_deref(),
+        prefixed.as_deref(),
+    )?);
     // Validate `new` before a daemon may be started, so a bad --cwd or name
     // fails fast with its own error.
     let mut new_session = match &cli.command {
@@ -446,9 +522,125 @@ async fn main() -> Result<()> {
         (Some(Command::Daemon { .. }), ExecutionMode::Local(reason)) => {
             bail!("{reason}. daemon management requires a reachable daemon");
         }
+        (Some(Command::Host { .. } | Command::Remote { .. }), _) => {
+            unreachable!("handled before choosing a daemon")
+        }
     }
 
     Ok(())
+}
+
+/// Strips a `host/` prefix from the command's session arguments and returns
+/// the host it names. Session names cannot contain `/`, so the prefix is
+/// unambiguous.
+fn take_session_host(command: &mut Command) -> Result<Option<String>> {
+    let mut ids: Vec<&mut String> = Vec::new();
+    match command {
+        Command::Runtime { session_id } | Command::Detach { session_id, .. } => {
+            ids.extend(session_id.as_mut())
+        }
+        Command::New { name, .. } => ids.extend(name.as_mut()),
+        Command::Kill { session_id, .. }
+        | Command::Rm { session_id }
+        | Command::Attach { session_id }
+        | Command::SendInput { session_id, .. }
+        | Command::History { session_id, .. }
+        | Command::Attachments { session_id }
+        | Command::Status { session_id } => ids.push(session_id),
+        Command::List | Command::Daemon { .. } | Command::Host { .. } | Command::Remote { .. } => {}
+    }
+    let mut host: Option<String> = None;
+    for id in ids {
+        let (Some(prefix), session) = transport::split_host(id) else {
+            continue;
+        };
+        if prefix.is_empty() || session.is_empty() {
+            bail!("`{id}` is not a session address (expected HOST/SESSION)");
+        }
+        match &host {
+            Some(host) if host != prefix => {
+                bail!("session addresses name different hosts: `{host}` and `{prefix}`")
+            }
+            _ => host = Some(prefix.to_string()),
+        }
+        *id = session.to_string();
+    }
+    Ok(host)
+}
+
+async fn run_host_command(paths: &AppPaths, command: HostCommand) -> Result<()> {
+    match command {
+        HostCommand::Add { name, address, fingerprint } => {
+            hosts::validate_host_name(&name)?;
+            if hosts::load(paths)?.contains_key(&name) {
+                bail!("host `{name}` already exists; remove it first with `agent host rm {name}`");
+            }
+            if let Some(fingerprint) = &fingerprint
+                && !hosts::valid_fingerprint(fingerprint)
+            {
+                bail!("`{fingerprint}` is not a key fingerprint (expected SHA256:...)");
+            }
+            let identity = transport::ClientIdentity::load_or_create(paths)?;
+            let presented = transport::probe_fingerprint(&address, &identity).await?;
+            match &fingerprint {
+                Some(expected) if *expected != presented => bail!(
+                    "{address} presented key {presented}, not the expected {expected}; not adding `{name}`"
+                ),
+                Some(_) => {}
+                None => {
+                    println!("The agentd at {address} presents this key:");
+                    println!("  {presented}");
+                    println!("Compare it with `agentd remote id` on that machine.");
+                    if !confirm("Trust this key?")? {
+                        bail!("not adding `{name}`");
+                    }
+                }
+            }
+            hosts::add(paths, &name, Host { address: address.clone(), fingerprint: presented })?;
+            println!("added host `{name}` ({address})");
+            println!();
+            println!("If this machine is not authorized there yet, run on `{name}`:");
+            println!(
+                "  agentd remote authorize {} {}",
+                identity.fingerprint,
+                transport::local_hostname()
+            );
+            Ok(())
+        }
+        HostCommand::List => {
+            let file = hosts::load(paths)?;
+            if file.is_empty() {
+                println!("no hosts; add one with `agent host add NAME HOST:PORT`");
+            }
+            for (name, host) in &file {
+                println!("{name}\t{}\t{}", host.address, host.fingerprint);
+            }
+            Ok(())
+        }
+        HostCommand::Rm { name } => {
+            if !hosts::remove(paths, &name)? {
+                bail!("no host `{name}`");
+            }
+            println!("removed host `{name}`");
+            Ok(())
+        }
+    }
+}
+
+/// Asks a yes/no question on the terminal; refuses without one, since trust
+/// must never be granted by default.
+fn confirm(question: &str) -> Result<bool> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "no terminal to confirm on; pass --fingerprint (from `agentd remote id` on the host)"
+        );
+    }
+    print!("{question} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"))
 }
 
 async fn run_runtime(paths: &AppPaths, initial_session_id: Option<&str>) -> Result<()> {
@@ -478,6 +670,25 @@ async fn resolve_execution_mode(
     paths: &AppPaths,
     command: Option<&Command>,
 ) -> Result<ExecutionMode> {
+    // A remote daemon is never started, restarted or replaced from here, and
+    // there is no local state to fall back on.
+    if let Some(name) = transport::remote_name() {
+        if let Some(Command::Daemon {
+            command: command @ (DaemonCommand::Restart | DaemonCommand::Upgrade),
+        }) = command
+        {
+            let verb =
+                if matches!(command, DaemonCommand::Restart) { "restart" } else { "upgrade" };
+            bail!(
+                "`agent daemon {verb}` only manages the local daemon; run `agentd` on `{name}` instead"
+            );
+        }
+        if !matches!(command, Some(Command::Daemon { .. })) {
+            ensure_compatible_daemon(paths).await?;
+        }
+        return Ok(ExecutionMode::Daemon);
+    }
+
     if matches!(command, Some(Command::Daemon { command: DaemonCommand::Upgrade })) {
         return Ok(ExecutionMode::Daemon);
     }
@@ -556,6 +767,26 @@ fn resolve_new_session_options(
     name: Option<String>,
     agent: Option<String>,
 ) -> Result<NewSessionOptions> {
+    if let Some(host) = transport::remote_name() {
+        // The directory is on the remote machine: it cannot be checked or
+        // canonicalized here, and the remote daemon picks its own default
+        // agent.
+        let cwd = cwd.with_context(|| {
+            format!("`agent new` on `{host}` needs --cwd: a directory on that machine")
+        })?;
+        if !cwd.is_absolute() {
+            bail!("--cwd `{}` must be an absolute path on `{host}`", cwd.display());
+        }
+        let cwd = cwd
+            .into_os_string()
+            .into_string()
+            .map_err(|path| anyhow!("--cwd `{}` is not valid UTF-8", path.display()))?;
+        return Ok(NewSessionOptions {
+            cwd,
+            name: normalize_requested_name(name)?,
+            agent: agent.unwrap_or_default(),
+        });
+    }
     let config = Config::load(paths)?;
     Ok(NewSessionOptions {
         cwd: resolve_cwd(cwd)?,
@@ -705,7 +936,7 @@ async fn ensure_compatible_daemon(paths: &AppPaths) -> Result<()> {
 
 async fn daemon_info(paths: &AppPaths) -> Result<DaemonInfo> {
     let binary_result = tokio::time::timeout(
-        Duration::from_millis(250),
+        control_timeout(),
         send_request_no_bootstrap(paths, &Request::GetDaemonInfo),
     )
     .await;
@@ -713,14 +944,26 @@ async fn daemon_info(paths: &AppPaths) -> Result<DaemonInfo> {
         Ok(Ok(Response::DaemonInfo { info })) => Ok(info),
         Ok(Ok(Response::Error { message })) => bail!(message),
         Ok(Ok(other)) => bail!("unexpected response: {:?}", other),
+        // Remote connect errors already say what to do.
+        Ok(Err(err)) if transport::remote_name().is_some() => Err(err),
         Ok(Err(err)) => Err(err).context(incompatible_daemon_message()),
         Err(_) => bail!(incompatible_daemon_message()),
     }
 }
 
+/// How long a control request may take: the local daemon answers at once,
+/// while a remote one may first need a QUIC handshake over a slow link.
+fn control_timeout() -> Duration {
+    if transport::remote_name().is_some() {
+        Duration::from_secs(15)
+    } else {
+        Duration::from_millis(250)
+    }
+}
+
 async fn daemon_management_status(paths: &AppPaths) -> Result<DaemonManagementStatus> {
     let response = tokio::time::timeout(
-        Duration::from_millis(250),
+        control_timeout(),
         send_daemon_management_request(paths, &DaemonManagementRequest::Status),
     )
     .await;
@@ -815,10 +1058,10 @@ async fn send_request(paths: &AppPaths, request: &Request) -> Result<Response> {
 }
 
 async fn send_request_no_bootstrap(paths: &AppPaths, request: &Request) -> Result<Response> {
-    let mut stream = try_connect(paths).await?;
-    write_request(&mut stream, request).await?;
+    let mut stream = transport::connect(paths).await?;
+    write_request(&mut stream.writer, request).await?;
 
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream.reader);
     let Some(response) = read_response(&mut reader).await? else {
         bail!("agentd closed the connection");
     };
@@ -836,10 +1079,10 @@ async fn send_daemon_management_request(
     paths: &AppPaths,
     request: &DaemonManagementRequest,
 ) -> Result<DaemonManagementResponse> {
-    let mut stream = try_connect(paths).await?;
-    write_daemon_management_request(&mut stream, request).await?;
+    let mut stream = transport::connect(paths).await?;
+    write_daemon_management_request(&mut stream.writer, request).await?;
 
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream.reader);
     let Some(response) = read_daemon_management_response(&mut reader).await? else {
         bail!("agentd closed the management connection");
     };
@@ -856,14 +1099,22 @@ fn print_daemon_management_status(status: &DaemonManagementStatus) {
     println!("root: {}", status.root);
     println!("socket: {}", status.socket);
     println!("running_sessions: {}", status.running_sessions);
+    match (status.remote.as_str(), status.remote_error.as_str()) {
+        ("", "") => println!("remote: off"),
+        ("", error) => println!("remote: not listening ({error})"),
+        (addr, _) => println!("remote: {addr}"),
+    }
 }
 
 async fn print_history(paths: &AppPaths, session_id: &str, vt: bool) -> Result<()> {
-    let mut stream = try_connect(paths).await?;
-    write_request(&mut stream, &Request::GetHistory { session_id: session_id.to_string(), vt })
-        .await?;
+    let mut stream = transport::connect(paths).await?;
+    write_request(
+        &mut stream.writer,
+        &Request::GetHistory { session_id: session_id.to_string(), vt },
+    )
+    .await?;
 
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream.reader);
     let Some(response) = read_response(&mut reader).await? else {
         bail!("agentd closed the history connection");
     };
@@ -924,8 +1175,8 @@ async fn attach_session(paths: &AppPaths, session_id: &str) -> Result<()> {
 pub(crate) struct AttachedSessionStream {
     pub(crate) attach_id: String,
     pub(crate) snapshot: Vec<u8>,
-    pub(crate) reader: BufReader<tokio::net::unix::OwnedReadHalf>,
-    pub(crate) write_half: tokio::net::unix::OwnedWriteHalf,
+    pub(crate) reader: BufReader<transport::StreamReader>,
+    pub(crate) write_half: transport::StreamWriter,
 }
 
 pub(crate) enum AttachHandshake {
@@ -961,9 +1212,9 @@ pub(crate) async fn connect_attached_session(
     kind: AttachmentKind,
     geometry: AttachGeometry,
 ) -> Result<AttachHandshake> {
-    let mut stream = try_connect(paths).await?;
+    let transport::DaemonStream { reader, mut writer } = transport::connect(paths).await?;
     write_request(
-        &mut stream,
+        &mut writer,
         &Request::AttachSession {
             session_id: session_id.to_string(),
             kind,
@@ -975,8 +1226,7 @@ pub(crate) async fn connect_attached_session(
     )
     .await?;
 
-    let (read_half, write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
+    let mut reader = BufReader::new(reader);
     let Some(response) = read_response(&mut reader).await? else {
         bail!("agentd closed the connection");
     };
@@ -987,7 +1237,7 @@ pub(crate) async fn connect_attached_session(
                 attach_id,
                 snapshot,
                 reader,
-                write_half,
+                write_half: writer,
             }))
         }
         Response::SessionEnded { session_id, status, exit_code, error } => {
@@ -1195,8 +1445,8 @@ enum AttachOverlayClose {
 }
 
 async fn refresh_attach_snapshot(
-    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
-    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    reader: &mut BufReader<transport::StreamReader>,
+    write_half: &mut transport::StreamWriter,
 ) -> Result<AttachOverlayClose> {
     write_request(write_half, &Request::AttachSnapshot).await?;
     loop {
@@ -1224,7 +1474,7 @@ async fn refresh_attach_snapshot(
 }
 
 async fn send_attach_resize(
-    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    write_half: &mut transport::StreamWriter,
     geometry: AttachGeometry,
 ) -> Result<()> {
     write_request(
@@ -1860,7 +2110,7 @@ mod tests {
         attach_startup_bytes, cli_command, cli_styles, daemon_executable_from,
         ensure_compatible_daemon, format_attach_title, format_session_end_summary, resolve_cwd,
         resolve_detach_session_id, resolve_new_session_options, should_print_degraded_notice,
-        start_daemon, terminal_title_bytes,
+        start_daemon, take_session_host, terminal_title_bytes,
     };
     use agentd_shared::session::{AttentionLevel, SessionMode, SessionRecord, SessionStatus};
     use agentd_shared::{
@@ -2054,6 +2304,26 @@ mod tests {
             err.to_string(),
             "working directory `/definitely/not/here/agentd` does not exist"
         );
+    }
+
+    #[test]
+    fn session_addresses_select_a_host() {
+        let mut command = Command::Attach { session_id: "devbox/auth".to_string() };
+        assert_eq!(take_session_host(&mut command).unwrap().as_deref(), Some("devbox"));
+        assert!(matches!(&command, Command::Attach { session_id } if session_id == "auth"));
+
+        let mut command = Command::Attach { session_id: "auth".to_string() };
+        assert_eq!(take_session_host(&mut command).unwrap(), None);
+
+        let mut command =
+            Command::New { name: Some("devbox/t1".to_string()), cwd: None, agent: None };
+        assert_eq!(take_session_host(&mut command).unwrap().as_deref(), Some("devbox"));
+        assert!(matches!(&command, Command::New { name: Some(name), .. } if name == "t1"));
+
+        for bad in ["/auth", "devbox/"] {
+            let mut command = Command::Status { session_id: bad.to_string() };
+            assert!(take_session_host(&mut command).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -2714,7 +2984,7 @@ command = "claude"
         }
     }
 
-    fn test_paths() -> AppPaths {
+    pub(crate) fn test_paths() -> AppPaths {
         let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
             + u128::from(TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed));
         let root = camino::Utf8PathBuf::from(format!("/tmp/agent-cli-test-{suffix}"));

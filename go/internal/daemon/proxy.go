@@ -5,12 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"time"
 
 	"github.com/robmorgan/agentd/go/internal/protocol"
 	"github.com/robmorgan/agentd/go/internal/session"
+	"github.com/robmorgan/agentd/go/internal/transport"
 )
 
 // workerRequestTimeout bounds a one-shot request to a worker so a wedged
@@ -19,10 +19,10 @@ const workerRequestTimeout = 30 * time.Second
 
 // dialWorker connects to a session's worker, explaining failures in terms of
 // the session rather than the socket.
-func (s *Server) dialWorker(id string) (*net.UnixConn, error) {
-	conn, err := net.Dial("unix", s.paths.SessionSocketPath(id))
+func (s *Server) dialWorker(id string) (transport.Stream, error) {
+	conn, err := transport.DialUnix(s.paths.SessionSocketPath(id), workerDialTimeout)
 	if err == nil {
-		return conn.(*net.UnixConn), nil
+		return conn, nil
 	}
 	rec, lookupErr := s.getSession(id)
 	switch {
@@ -38,7 +38,7 @@ func (s *Server) dialWorker(id string) (*net.UnixConn, error) {
 
 // proxyRequest forwards a single request to the session's worker and relays
 // its single response.
-func (s *Server) proxyRequest(client net.Conn, id string, req *protocol.Request) error {
+func (s *Server) proxyRequest(client transport.Stream, id string, req *protocol.Request) error {
 	worker, err := s.dialWorker(id)
 	if err != nil {
 		return protocol.WriteResponse(client, protocol.ErrorResponsef("%v", err))
@@ -54,9 +54,9 @@ func (s *Server) proxyRequest(client net.Conn, id string, req *protocol.Request)
 // history serves live history from the worker, falling back to the logs a
 // worker writes when its session ends (including when the worker exits
 // between the lookup and the request).
-func (s *Server) history(client net.Conn, req *protocol.Request) error {
+func (s *Server) history(client transport.Stream, req *protocol.Request) error {
 	id := req.GetHistory.SessionID
-	if worker, err := net.DialTimeout("unix", s.paths.SessionSocketPath(id), workerDialTimeout); err == nil {
+	if worker, err := transport.DialUnix(s.paths.SessionSocketPath(id), workerDialTimeout); err == nil {
 		resp, err := exchange(worker, req)
 		worker.Close()
 		if err == nil {
@@ -85,7 +85,7 @@ func (s *Server) history(client net.Conn, req *protocol.Request) error {
 }
 
 // exchange sends one request to a worker and reads its one response.
-func exchange(worker net.Conn, req *protocol.Request) (*protocol.Response, error) {
+func exchange(worker transport.Stream, req *protocol.Request) (*protocol.Response, error) {
 	worker.SetDeadline(time.Now().Add(workerRequestTimeout))
 	if err := protocol.WriteRequest(worker, req); err != nil {
 		return nil, err
@@ -105,7 +105,7 @@ func exchange(worker net.Conn, req *protocol.Request) (*protocol.Response, error
 // worker side is half-closed so the worker drops the attachment and ends its
 // stream. When the worker's stream ends (detach, session end, worker exit)
 // both connections are closed, which also unblocks the client->worker copy.
-func (s *Server) proxyAttach(client net.Conn, clientReader *bufio.Reader, req *protocol.AttachSession) error {
+func (s *Server) proxyAttach(client transport.Stream, clientReader *bufio.Reader, req *protocol.AttachSession) error {
 	worker, err := s.dialWorker(req.SessionID)
 	if err != nil {
 		return protocol.WriteResponse(client, protocol.ErrorResponsef("%v", err))
@@ -125,9 +125,7 @@ func (s *Server) proxyAttach(client net.Conn, clientReader *bufio.Reader, req *p
 	}()
 
 	_, copyErr := io.Copy(client, worker)
-	if uc, ok := client.(*net.UnixConn); ok {
-		_ = uc.CloseWrite()
-	}
+	_ = client.CloseWrite()
 	client.Close()
 	worker.Close()
 	<-clientDone

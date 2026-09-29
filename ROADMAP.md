@@ -379,19 +379,19 @@ The protocol should operate over explicit message and stream abstractions rather
 
 ## Deliverables
 
-* [ ] Extract transport-neutral protocol package
+* [x] Extract transport-neutral protocol package (`go/internal/protocol` over the stream/listener seam in `go/internal/transport`)
 * [ ] Define connection handshake
 * [ ] Define protocol capability negotiation
 * [ ] Define protocol version negotiation
 * [ ] Add request IDs
 * [ ] Define request/response messages
 * [ ] Define long-lived event streams
-* [ ] Define bidirectional attachment streams
-* [ ] Define structured error frames
+* [x] Define bidirectional attachment streams
+* [x] Define structured error frames
 * [ ] Add connection-level metrics
-* [ ] Add explicit payload limits
+* [x] Add explicit payload limits
 * [ ] Fuzz protocol decoding
-* [ ] Reject malformed and oversized messages safely
+* [x] Reject malformed and oversized messages safely
 
 ## Protocol concepts
 
@@ -480,29 +480,30 @@ One slow session should not unnecessarily stall unrelated sessions.
 
 ## Deliverables
 
-* [ ] Add QUIC listener to `agentd`
-* [ ] Add QUIC client transport
-* [ ] Establish TLS identity model
-* [ ] Authenticate machines/clients
-* [ ] Define stream roles
+* [x] Add QUIC listener to `agentd`
+* [x] Add QUIC client transport (`agent --host`)
+* [x] One-command setup (`agentd remote enable`, detecting a Tailscale address)
+* [x] Establish TLS identity model (self-signed Ed25519 keys, pinned by fingerprint)
+* [x] Authenticate machines/clients (mutual TLS: authorized client keys, pinned daemon key)
+* [x] Define stream roles (one bidirectional stream per request or attachment)
 * [ ] Define stream negotiation
 * [ ] Support remote:
 
-  * [ ] `ls`
-  * [ ] `run`
-  * [ ] `attach`
-  * [ ] `send`
-  * [ ] `history`
+  * [x] `ls`
+  * [x] `new` (`agent --host H new --cwd DIR`)
+  * [x] `attach`
+  * [x] `send`
+  * [x] `history`
   * [ ] `diff`
-  * [ ] `kill`
+  * [x] `kill`
 * [ ] Preserve sessions across network loss
 * [ ] Reconnect cleanly
 * [ ] Restore terminal state after reconnect
 * [ ] Handle slow consumers safely
 * [ ] Bound buffering
 * [ ] Implement stream-level backpressure
-* [ ] Implement connection-level resource limits
-* [ ] Add heartbeat/liveness semantics where necessary
+* [x] Implement connection-level resource limits (per-connection stream limit, idle timeout)
+* [x] Add heartbeat/liveness semantics where necessary (QUIC keep-alive)
 
 ## Initial deployment model
 
@@ -873,7 +874,7 @@ gpu-01      offline    0
 Potential commands:
 
 ```sh
-agent --host devbox-1 run "fix auth tests"
+agent --host devbox-1 new --cwd /srv/repo auth-tests
 
 agent sessions --all
 
@@ -882,8 +883,8 @@ agent attach devbox-1/auth-tests
 
 ## Deliverables
 
-* [ ] Host configuration
-* [ ] Host aliases
+* [x] Host configuration (`agent host add|ls|rm`, `hosts.toml`)
+* [x] Host aliases (`--host NAME`, `NAME/session`)
 * [ ] Host health
 * [ ] Cross-host session discovery
 * [ ] Stable global session identifiers
@@ -1214,12 +1215,10 @@ Until that flow is excellent, avoid adding unnecessary infrastructure around it.
 `agentd` should eventually make this ordinary:
 
 ```sh
-agent --host devbox run \
-  --name auth-refactor \
-  "refactor the authentication middleware and run the test suite"
+agent --host devbox new --cwd /srv/repo auth-refactor
 ```
 
-Close the laptop.
+Ask the agent to refactor the authentication middleware and run the test suite. Close the laptop.
 
 Come back later from another machine:
 

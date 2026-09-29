@@ -44,6 +44,12 @@ pub struct DaemonManagementStatus {
     pub root: String,
     pub socket: String,
     pub running_sessions: bool,
+    /// Where the QUIC listener is bound; empty when remote access is off or
+    /// not listening yet, in which case `remote_error` says why.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub remote: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub remote_error: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1331,6 +1337,8 @@ mod tests {
                 root: "/tmp/agentd".to_string(),
                 socket: "/tmp/agentd/agentd.sock".to_string(),
                 running_sessions: false,
+                remote: "100.64.0.5:7433".to_string(),
+                remote_error: String::new(),
             },
         };
         write_daemon_management_response(&mut writer, &response).await.unwrap();

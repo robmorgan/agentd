@@ -35,6 +35,69 @@ The daemon supervises the workers it spawned: it reaps them and records a worker
 session. Sessions whose worker disappeared while no daemon was running are marked
 `unknown_recovered` at startup or on the next `ls`.
 
+## Transports
+
+The protocol runs over any bidirectional byte stream that supports half-close. Each stream carries
+one request/response exchange or one attach session. Everything above `go/internal/transport` sees
+only that `Stream` and a `Listener` that yields streams, so the daemon does not know or care which
+transport a client used. The daemon-to-worker link is always a local Unix socket.
+
+Two transports exist:
+
+* **Unix socket** (`agentd.sock`): local clients, always on.
+* **QUIC** (off unless `[remote] listen` is set): remote clients. Each client holds one QUIC
+  connection and opens one bidirectional QUIC stream per request or attachment, so long-lived
+  attachments and short requests are multiplexed without blocking each other. Keep-alives hold
+  idle connections open, and each connection may have at most 256 streams. The daemon's first
+  datagrams are 1200 bytes, QUIC's minimum, rather than quic-go's default 1280: Tailscale's
+  interface MTU is 1280 including IP and UDP headers, so larger ones never leave it and the
+  handshake times out. Path MTU discovery raises the size afterwards where the path allows.
+
+QUIC connections authenticate both ways with pinned keys inside TLS 1.3 (ALPN `agentd`), the way
+SSH uses host keys and `authorized_keys`, with no certificate authority:
+
+* The daemon's key is `remote/daemon.key` (Ed25519, created on first use). Its fingerprint is
+  `SHA256:` plus the base64 SHA-256 of the public key, and is what clients pin.
+* `remote/authorized_clients` lists the client key fingerprints allowed in. It is checked on every
+  handshake, on every new stream, and every 5 seconds for each open connection, so revoking a key
+  also closes that client's live connections, attachments included. TLS session tickets are
+  disabled: a resumed session would skip the check. `agentd remote authorize|revoke` edit the file
+  under a lock and replace it atomically, so concurrent edits are never lost.
+* An authorized client has the same access as the local socket owner, except that only a local
+  client may stop the daemon: a remote one could not start it again.
+* Keys are created without ever replacing one that exists (written to a temporary file, then
+  linked into place), so processes creating a key at the same moment all end up using the same one.
+
+The `agent` CLI is the client (`crates/agent-cli/src/transport.rs`, quinn and rustls). Its key is
+`remote/client.key`, in the same format as the daemon's, and `hosts.toml` maps host names to an
+address and the daemon fingerprint pinned by `agent host add`. One CLI process opens at most one
+QUIC connection and one stream per request or attachment, so an attachment and the overlay's
+requests share a connection. A remote host is never started, restarted or upgraded from the CLI,
+and there is no local fallback for it. With TLS 1.3 a client can finish its half of the handshake
+before the daemon rejects its key, so a refusal may only surface on the first stream; the CLI
+recognises the TLS alert there and says how to authorize the machine. Both sides' tests pin one
+key and its fingerprint, so the Go and Rust fingerprint definitions cannot drift apart.
+
+`agentd remote enable` picks the listen address when none is given: first a Tailscale address,
+used without asking; otherwise the source address of the default route, found by connecting a UDP
+socket (which sends nothing), which it asks about first, since that is a LAN address that may
+change, a shared carrier-grade NAT address, or a public one. An address in Tailscale's ranges
+(`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) only counts as Tailscale's when Tailscale confirms it: it is
+on the `tailscale0` interface, or `tailscale ip` reports it (macOS names the interface `utunN`).
+Carriers and other VPNs hand out `100.64.0.0/10` addresses too.
+
+`enable` edits only the `listen` line of `config.toml`, keeping comments and following a symlinked
+file. The edit is checked before it is written: it must parse and leave every other setting as it
+was, or the file is left alone. If the restarted daemon does not listen on the new address, the
+previous setting is restored. A daemon whose listen address cannot be bound, or whose listener
+stops, keeps local service and binds again every 5 seconds until shutdown, reporting the reason in
+its management status.
+
+A client that disappears without closing (a laptop lid, a lost network) is noticed by the daemon's
+60-second idle timeout; until then its attachment is still listed. The session is unaffected.
+
+The daemon's tests run full sessions over QUIC, and over a TCP stand-in, to keep the seam honest.
+
 ## Wire Protocol
 
 `agent` and `agentd` communicate over a custom framed binary protocol, implemented in
@@ -124,13 +187,20 @@ the queue is full, further input is refused with an error until the agent catche
 
 ## Runtime Root
 
-All runtime state lives under a single root directory. The root is resolved in this priority order:
+All state lives under a single root directory. The root is resolved in this priority order:
 
 * AGENTD_DIR => uses exact path (e.g., /custom/path)
-* XDG_RUNTIME_DIR => uses `{XDG_RUNTIME_DIR}/agentd` (recommended on Linux, typically `/run/user/{uid}/agentd`)
-* macOS default => uses `~/.agentd` when `AGENTD_DIR` and `XDG_RUNTIME_DIR` are unset
+* home => uses `~/.agentd`, on every platform
+* XDG_RUNTIME_DIR => uses `{XDG_RUNTIME_DIR}/agentd`, only without a home directory
 * TMPDIR => uses `{TMPDIR}/agentd-{uid}` (appends uid for multi-user safety)
 * /tmp => uses `/tmp/agentd-{uid}` (default fallback, appends uid for multi-user safety)
+
+The root is deliberately not a per-boot runtime directory by default. `XDG_RUNTIME_DIR` (typically
+`/run/user/{uid}`, a tmpfs) is wiped on reboot, and on Linux also once the user's last session
+ends, which would take `state.db`, session history and the daemon's remote key with it; every
+remote client would then see a changed key. The runtime files in the root (the sockets, lock and
+pid file) are harmless after a reboot: a starting daemon removes a stale socket while holding the
+lock, and session liveness is judged by connecting to the session's socket.
 
 The selected root contains:
 
@@ -141,6 +211,8 @@ The selected root contains:
 * `state.db` (schema v1; the daemon refuses any other version)
 * `sessions/` (one socket per live session)
 * `agentd.log` (output of a daemonized daemon)
+* `remote/` (`daemon.key`, `authorized_clients`, and the CLI's `client.key`)
+* `hosts.toml` (remote hosts known to the CLI, with pinned daemon keys)
 * `logs/` (session history and `<id>.worker.log`)
 
 The root and everything in it are private to the user (directories 0700, files and sockets 0600),

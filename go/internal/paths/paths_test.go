@@ -11,17 +11,17 @@ func TestDiscoverRootPriority(t *testing.T) {
 	cases := []struct {
 		name                   string
 		agentd, xdg, home, tmp string
-		preferHome             bool
 		want                   string
 	}{
-		{"agentd dir wins", "/custom", "/run/user/501", "/Users/t", "/var/tmp", true, "/custom"},
-		{"xdg next", "", "/run/user/501", "/Users/t", "/var/tmp", true, "/run/user/501/agentd"},
-		{"macos home", "", "", "/Users/t", "/var/tmp", true, "/Users/t/.agentd"},
-		{"tmpdir uid", "", "", "/Users/t", "/var/tmp", false, "/var/tmp/agentd-501"},
-		{"tmp fallback", "", "", "", "", true, "/tmp/agentd-501"},
+		{"agentd dir wins", "/custom", "/run/user/501", "/home/t", "/var/tmp", "/custom"},
+		// Home wins over XDG_RUNTIME_DIR: /run/user is wiped on reboot.
+		{"home next", "", "/run/user/501", "/home/t", "/var/tmp", "/home/t/.agentd"},
+		{"xdg without home", "", "/run/user/501", "", "/var/tmp", "/run/user/501/agentd"},
+		{"tmpdir uid", "", "", "", "/var/tmp", "/var/tmp/agentd-501"},
+		{"tmp fallback", "", "", "", "", "/tmp/agentd-501"},
 	}
 	for _, c := range cases {
-		got, err := discoverRoot(c.agentd, c.xdg, c.home, c.tmp, 501, c.preferHome)
+		got, err := discoverRoot(c.agentd, c.xdg, c.home, c.tmp, 501)
 		if err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}

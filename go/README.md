@@ -9,12 +9,13 @@ and state schema (version 1).
 
 | Package | What it does |
 |---|---|
+| `internal/transport` | The seam between the protocol and the network: `Stream` (one request or attach session), `Listener`, the shared accept loop, the Unix socket transport, and the QUIC transport with pinned-key identities (`quic-go`). |
 | `internal/protocol` | The framed binary protocol and the small daemon management protocol. The same framing and encodings as `crates/agentd-shared/src/protocol.rs`; golden-frame tests on both sides pin identical bytes. |
 | `internal/session`, `internal/paths` | The session model and runtime-root resolution, shared in meaning with `crates/agentd-shared`. |
 | `internal/db` | `state.db`: schema, and the guarded session state transitions the daemon and workers use. Uses `modernc.org/sqlite` (pure Go). |
 | `internal/daemon` | `agentd serve`: lock/socket/pid file lifecycle, create/kill/rm/ls/get, attach and request proxies to workers, history, daemon management, worker supervision and startup reconciliation. Tests run the daemon in-process against real worker processes. |
 | `internal/worker` | One session: PTY via `creack/pty`, shadow terminal via `go.mitchellh.com/libghostty`, per-session Unix socket. Real-PTY tests run under `-race`. |
-| `cmd/agentd` | `serve [--daemonize]`, `upgrade`, `session-worker`. The agent CLI runs `serve --daemonize`. |
+| `cmd/agentd` | `serve [--daemonize]`, `upgrade`, `remote enable|disable|status` (set `[remote] listen` and restart the daemon), `remote id|list|authorize|revoke`, `session-worker`. The agent CLI runs `serve --daemonize`. |
 
 ## How the daemon and workers fit together
 
