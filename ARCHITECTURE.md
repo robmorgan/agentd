@@ -58,9 +58,15 @@ SSH uses host keys and `authorized_keys`, with no certificate authority:
 
 * The daemon's key is `remote/daemon.key` (Ed25519, created on first use). Its fingerprint is
   `SHA256:` plus the base64 SHA-256 of the public key, and is what clients pin.
-* `remote/authorized_clients` lists the client key fingerprints allowed in. It is read on every
-  handshake, so authorizing and revoking take effect for new connections without a restart.
-* An authorized client has the same access as the local socket owner.
+* `remote/authorized_clients` lists the client key fingerprints allowed in. It is checked on every
+  handshake, on every new stream, and every 5 seconds for each open connection, so revoking a key
+  also closes that client's live connections, attachments included. TLS session tickets are
+  disabled: a resumed session would skip the check. `agentd remote authorize|revoke` edit the file
+  under a lock and replace it atomically, so concurrent edits are never lost.
+* An authorized client has the same access as the local socket owner, except that only a local
+  client may stop the daemon: a remote one could not start it again.
+* Keys are created without ever replacing one that exists (written to a temporary file, then
+  linked into place), so processes creating a key at the same moment all end up using the same one.
 
 The `agent` CLI is the client (`crates/agent-cli/src/transport.rs`, quinn and rustls). Its key is
 `remote/client.key`, in the same format as the daemon's, and `hosts.toml` maps host names to an
@@ -72,13 +78,20 @@ before the daemon rejects its key, so a refusal may only surface on the first st
 recognises the TLS alert there and says how to authorize the machine. Both sides' tests pin one
 key and its fingerprint, so the Go and Rust fingerprint definitions cannot drift apart.
 
-`agentd remote enable` picks the listen address when none is given: first a Tailscale address
-(`100.64.0.0/10` or `fd7a:115c:a1e0::/48` on an interface, or `tailscale ip -4`), used without
-asking; otherwise the source address of the default route, found by connecting a UDP socket (which
-sends nothing), which it asks about first, since that is a LAN address that may change or a public
-one. It edits only the `listen` line of `config.toml`, keeping comments, and refuses layouts it
-cannot edit safely. A daemon whose listen address cannot be bound keeps local service and retries
-the bind every 5 seconds until shutdown, reporting the reason in its management status.
+`agentd remote enable` picks the listen address when none is given: first a Tailscale address,
+used without asking; otherwise the source address of the default route, found by connecting a UDP
+socket (which sends nothing), which it asks about first, since that is a LAN address that may
+change, a shared carrier-grade NAT address, or a public one. An address in Tailscale's ranges
+(`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) only counts as Tailscale's when Tailscale confirms it: it is
+on the `tailscale0` interface, or `tailscale ip` reports it (macOS names the interface `utunN`).
+Carriers and other VPNs hand out `100.64.0.0/10` addresses too.
+
+`enable` edits only the `listen` line of `config.toml`, keeping comments and following a symlinked
+file. The edit is checked before it is written: it must parse and leave every other setting as it
+was, or the file is left alone. If the restarted daemon does not listen on the new address, the
+previous setting is restored. A daemon whose listen address cannot be bound, or whose listener
+stops, keeps local service and binds again every 5 seconds until shutdown, reporting the reason in
+its management status.
 
 A client that disappears without closing (a laptop lid, a lost network) is noticed by the daemon's
 60-second idle timeout; until then its attachment is still listed. The session is unaffected.

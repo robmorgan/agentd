@@ -15,7 +15,7 @@ and state schema (version 1).
 | `internal/db` | `state.db`: schema, and the guarded session state transitions the daemon and workers use. Uses `modernc.org/sqlite` (pure Go). |
 | `internal/daemon` | `agentd serve`: lock/socket/pid file lifecycle, create/kill/rm/ls/get, attach and request proxies to workers, history, daemon management, worker supervision and startup reconciliation. Tests run the daemon in-process against real worker processes. |
 | `internal/worker` | One session: PTY via `creack/pty`, shadow terminal via `go.mitchellh.com/libghostty`, per-session Unix socket. Real-PTY tests run under `-race`. |
-| `cmd/agentd` | `serve [--daemonize]`, `upgrade`, `remote id|list|authorize|revoke`, `session-worker`. The agent CLI runs `serve --daemonize`. |
+| `cmd/agentd` | `serve [--daemonize]`, `upgrade`, `remote enable|disable|status` (set `[remote] listen` and restart the daemon), `remote id|list|authorize|revoke`, `session-worker`. The agent CLI runs `serve --daemonize`. |
 
 ## How the daemon and workers fit together
 

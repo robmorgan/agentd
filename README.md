@@ -315,8 +315,9 @@ agentd remote list               # on the devbox: authorized clients
 agentd remote revoke SHA256:...
 ```
 
-An authorized client has the same access as you have locally. Changes to the authorized list apply
-to new connections immediately. `agent daemon info` works remotely; `restart` and `upgrade` only
+An authorized client has the same access as you have locally, except that only the devbox itself
+can stop its daemon. Authorizing takes effect immediately; revoking a key also disconnects that
+client within a few seconds, ending any attachment it has open. `agent daemon info` works remotely; `restart` and `upgrade` only
 manage the local daemon.
 
 Troubleshooting:
