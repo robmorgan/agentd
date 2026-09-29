@@ -23,7 +23,7 @@ indexmap = { version = "2.12", features = ["serde"] }
 libc = "0.2"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
-nix = { version = "0.30", features = ["hostname", "poll", "signal", "term", "user"] }
+nix = { version = "0.30", features = ["fs", "hostname", "poll", "signal", "term", "user"] }
 ratatui = "0.29"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }

@@ -1,4 +1,5 @@
 pub mod config;
+pub mod files;
 pub mod header;
 pub mod hosts;
 pub mod paths;

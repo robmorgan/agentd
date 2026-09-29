@@ -13,9 +13,8 @@
 
 use std::{
     fs,
-    io::Write,
     net::SocketAddr,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::PermissionsExt,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -188,7 +187,18 @@ impl ClientIdentity {
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)?;
-                write_private(&path, key_pair.serialize_pem().as_bytes())?;
+                let dir = path.parent().context("key path has no parent directory")?;
+                fs::create_dir_all(dir.as_std_path())
+                    .with_context(|| format!("failed to create {dir}"))?;
+                fs::set_permissions(dir.as_std_path(), fs::Permissions::from_mode(0o700))?;
+                // Another agent process may create the key at the same
+                // moment; exactly one key is published, and everyone uses it.
+                if !agentd_shared::files::create_private(
+                    &path,
+                    key_pair.serialize_pem().as_bytes(),
+                )? {
+                    return Self::load_or_create(paths);
+                }
                 key_pair
             }
             Err(err) => return Err(err).with_context(|| format!("failed to read {path}")),
@@ -203,24 +213,6 @@ impl ClientIdentity {
         let fingerprint = fingerprint(&cert)?;
         Ok(Self { cert, key: PrivatePkcs8KeyDer::from(key_pair.serialize_der()), fingerprint })
     }
-}
-
-fn write_private(path: &camino::Utf8Path, contents: &[u8]) -> Result<()> {
-    let dir = path.parent().context("key path has no parent directory")?;
-    fs::create_dir_all(dir.as_std_path()).with_context(|| format!("failed to create {dir}"))?;
-    fs::set_permissions(dir.as_std_path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
-    let tmp = path.with_extension("tmp");
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(tmp.as_std_path())
-        .with_context(|| format!("failed to write {tmp}"))?;
-    file.write_all(contents)?;
-    file.sync_all()?;
-    fs::rename(tmp.as_std_path(), path.as_std_path())
-        .with_context(|| format!("failed to write {path}"))
 }
 
 /// `SHA256:` and the unpadded base64 SHA-256 of the certificate's
@@ -304,46 +296,72 @@ pub enum DialError {
 
 /// Connects to a daemon at `address`, accepting only the daemon key
 /// `pinned`. Returns the endpoint (which must outlive the connection) and
-/// the connection.
+/// the connection. Every address the name resolves to is tried in turn (say
+/// an unreachable IPv6 one before a working IPv4 one) within one overall
+/// time limit.
 pub async fn dial(
     address: &str,
     identity: &ClientIdentity,
     pinned: &str,
 ) -> Result<(quinn::Endpoint, quinn::Connection), DialError> {
-    let (endpoint, verifier, addr) =
-        client_endpoint(address, identity, Some(pinned)).await.map_err(DialError::Other)?;
-    let result = handshake(&endpoint, addr, address).await;
-    if let Some(seen) = verifier.seen()
-        && seen != pinned
-    {
-        return Err(DialError::KeyChanged { seen });
+    let addrs = resolve(address).await.map_err(DialError::Other)?;
+    let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+    let mut last = None;
+    for (i, addr) in addrs.iter().enumerate() {
+        let (endpoint, verifier) =
+            client_endpoint(*addr, identity, Some(pinned)).map_err(DialError::Other)?;
+        let result =
+            handshake(&endpoint, *addr, address, attempt_limit(deadline, addrs.len() - i)).await;
+        if let Some(seen) = verifier.seen()
+            && seen != pinned
+        {
+            return Err(DialError::KeyChanged { seen });
+        }
+        match result {
+            Ok(conn) => return Ok((endpoint, conn)),
+            Err(err) => last = Some(err),
+        }
     }
-    result.map(|conn| (endpoint, conn)).map_err(DialError::Other)
+    Err(DialError::Other(
+        last.unwrap_or_else(|| anyhow!("`{address}` did not resolve to an address")),
+    ))
 }
 
 /// Learns the key a daemon presents, without trusting it. Works even before
 /// this machine is authorized there: the daemon's certificate arrives before
 /// the daemon judges ours.
 pub async fn probe_fingerprint(address: &str, identity: &ClientIdentity) -> Result<String> {
-    let (endpoint, verifier, addr) = client_endpoint(address, identity, None).await?;
-    let result = handshake(&endpoint, addr, address).await;
-    if let Ok(conn) = &result {
-        conn.close(0u32.into(), b"probe");
+    let addrs = resolve(address).await?;
+    let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+    let mut last = None;
+    for (i, addr) in addrs.iter().enumerate() {
+        let (endpoint, verifier) = client_endpoint(*addr, identity, None)?;
+        let result =
+            handshake(&endpoint, *addr, address, attempt_limit(deadline, addrs.len() - i)).await;
+        if let Ok(conn) = &result {
+            conn.close(0u32.into(), b"probe");
+        }
+        endpoint.close(0u32.into(), b"probe");
+        if let Some(seen) = verifier.seen() {
+            return Ok(seen);
+        }
+        last = Some(result.err().unwrap_or_else(|| anyhow!("{address} presented no key")));
     }
-    endpoint.close(0u32.into(), b"probe");
-    match (verifier.seen(), result) {
-        (Some(seen), _) => Ok(seen),
-        (None, Err(err)) => Err(err),
-        (None, Ok(_)) => bail!("{address} presented no key"),
-    }
+    Err(last.unwrap_or_else(|| anyhow!("`{address}` did not resolve to an address")))
 }
 
-async fn client_endpoint(
-    address: &str,
+/// How long one of `remaining` connection attempts may take: an equal share
+/// of the time left, so one unreachable address cannot use it all up.
+fn attempt_limit(deadline: tokio::time::Instant, remaining: usize) -> Duration {
+    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+    left / remaining.max(1) as u32
+}
+
+fn client_endpoint(
+    addr: SocketAddr,
     identity: &ClientIdentity,
     pinned: Option<&str>,
-) -> Result<(quinn::Endpoint, Arc<PinnedDaemonKey>, SocketAddr)> {
-    let addr = resolve(address).await?;
+) -> Result<(quinn::Endpoint, Arc<PinnedDaemonKey>)> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = Arc::new(PinnedDaemonKey {
         pinned: pinned.map(str::to_string),
@@ -358,19 +376,22 @@ async fn client_endpoint(
     };
     let mut endpoint = quinn::Endpoint::client(bind).context("failed to open a UDP socket")?;
     endpoint.set_default_client_config(config);
-    Ok((endpoint, verifier, addr))
+    Ok((endpoint, verifier))
 }
 
 async fn handshake(
     endpoint: &quinn::Endpoint,
     addr: SocketAddr,
     address: &str,
+    limit: Duration,
 ) -> Result<quinn::Connection> {
     let connecting = endpoint.connect(addr, "agentd")?;
-    match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
+    match tokio::time::timeout(limit, connecting).await {
         Ok(Ok(conn)) => Ok(conn),
-        Ok(Err(err)) => Err(anyhow!(err).context(format!("could not connect to {address}"))),
-        Err(_) => bail!("timed out connecting to {address}"),
+        Ok(Err(err)) => {
+            Err(anyhow!(err).context(format!("could not connect to {address} ({addr})")))
+        }
+        Err(_) => bail!("timed out connecting to {address} ({addr})"),
     }
 }
 
@@ -405,12 +426,15 @@ fn client_config(
     Ok(config)
 }
 
-async fn resolve(address: &str) -> Result<SocketAddr> {
-    tokio::net::lookup_host(address)
+async fn resolve(address: &str) -> Result<Vec<SocketAddr>> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(address)
         .await
         .with_context(|| format!("failed to resolve `{address}` (expected HOST:PORT)"))?
-        .next()
-        .with_context(|| format!("`{address}` did not resolve to an address"))
+        .collect();
+    if addrs.is_empty() {
+        bail!("`{address}` did not resolve to an address");
+    }
+    Ok(addrs)
 }
 
 /// Splits `host/session` into its parts; a plain session name has no host.
@@ -620,6 +644,18 @@ MC4CAQAwBQYDK2VwBCIEIBjksdA/xBFa67gw4s1UxuZHtUs8lCcbF6PTgueUIoCc
         for msg in ["one", "two", "three"] {
             assert_eq!(round_trip(&conn, msg).await.unwrap(), msg.to_uppercase());
         }
+    }
+
+    #[tokio::test]
+    async fn every_resolved_address_is_tried() {
+        // "localhost" usually resolves to ::1 as well as 127.0.0.1; the
+        // daemon only listens on the IPv4 one.
+        let (server, client) = (identity(), identity());
+        let (_endpoint, address) = start_echo(&server, &[&client.fingerprint]);
+        let port = address.rsplit(':').next().unwrap();
+        let (_client_endpoint, conn) =
+            dial(&format!("localhost:{port}"), &client, &server.fingerprint).await.unwrap();
+        assert_eq!(round_trip(&conn, "hi").await.unwrap(), "HI");
     }
 
     #[tokio::test]

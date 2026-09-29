@@ -5,7 +5,7 @@
 //! must present. The daemon side (which client keys a daemon accepts) lives
 //! with the daemon, in `remote/authorized_clients`.
 
-use std::{fs, io::Write, os::unix::fs::OpenOptionsExt};
+use std::fs;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -83,6 +83,7 @@ pub fn add(paths: &AppPaths, name: &str, host: Host) -> Result<()> {
     if !valid_fingerprint(&host.fingerprint) {
         bail!("`{}` is not a key fingerprint (expected SHA256:...)", host.fingerprint);
     }
+    let _lock = crate::files::lock(&paths.hosts_path())?;
     let mut hosts = load(paths)?;
     if hosts.contains_key(name) {
         bail!("host `{name}` already exists; remove it first with `agent host rm {name}`");
@@ -93,6 +94,7 @@ pub fn add(paths: &AppPaths, name: &str, host: Host) -> Result<()> {
 
 /// Removes a host. Reports whether it existed.
 pub fn remove(paths: &AppPaths, name: &str) -> Result<bool> {
+    let _lock = crate::files::lock(&paths.hosts_path())?;
     let mut hosts = load(paths)?;
     if hosts.shift_remove(name).is_none() {
         return Ok(false);
@@ -101,21 +103,12 @@ pub fn remove(paths: &AppPaths, name: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Writes hosts.toml atomically. Callers hold its lock across the load,
+/// change and save, so concurrent `agent host` commands never lose each
+/// other's changes.
 fn save(paths: &AppPaths, hosts: IndexMap<String, Host>) -> Result<()> {
-    let path = paths.hosts_path();
     let contents = toml::to_string_pretty(&HostsFile { hosts })?;
-    let tmp = path.with_extension("toml.tmp");
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(tmp.as_std_path())
-        .with_context(|| format!("failed to write {tmp}"))?;
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()?;
-    fs::rename(tmp.as_std_path(), path.as_std_path())
-        .with_context(|| format!("failed to write {path}"))
+    crate::files::replace_private(&paths.hosts_path(), contents.as_bytes())
 }
 
 #[cfg(test)]
@@ -170,6 +163,29 @@ mod tests {
         assert!(remove(&paths, "devbox").unwrap());
         assert!(!remove(&paths, "devbox").unwrap());
         assert!(get(&paths, "devbox").unwrap_err().to_string().contains("agent host add"));
+        let _ = fs::remove_dir_all(paths.root.as_std_path());
+    }
+
+    #[test]
+    fn concurrent_adds_are_all_kept() {
+        let paths = test_paths();
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let paths = paths.clone();
+                scope.spawn(move || {
+                    add(
+                        &paths,
+                        &format!("host-{i}"),
+                        Host {
+                            address: format!("10.0.0.{i}:7433"),
+                            fingerprint: format_fingerprint(&[i as u8; 32]),
+                        },
+                    )
+                    .unwrap()
+                });
+            }
+        });
+        assert_eq!(load(&paths).unwrap().len(), 8);
         let _ = fs::remove_dir_all(paths.root.as_std_path());
     }
 }
