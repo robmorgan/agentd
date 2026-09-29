@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -95,8 +96,10 @@ func createIdentity(path string) (*Identity, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("failed to create %s: %w", filepath.Dir(path), err)
 	}
-	// Write to a temporary file and rename, so a crash never leaves a
-	// truncated key that would change the identity on the next start.
+	// Write a temporary file, then link it into place. Unlike a rename, the
+	// link fails if the key already exists, so when two processes create it
+	// at once (the daemon starting and `agentd remote id`, say) both end up
+	// using the one that was published, never a key that was replaced.
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".key-*")
 	if err != nil {
 		return nil, err
@@ -110,10 +113,17 @@ func createIdentity(path string) (*Identity, error) {
 		tmp.Close()
 		return nil, err
 	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return nil, err
+	}
 	if err := tmp.Close(); err != nil {
 		return nil, err
 	}
-	if err := os.Rename(tmp.Name(), path); err != nil {
+	if err := os.Link(tmp.Name(), path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return LoadOrCreateIdentity(path)
+		}
 		return nil, fmt.Errorf("failed to write %s: %w", path, err)
 	}
 	return identityFromKey(key)
@@ -201,50 +211,109 @@ func Authorize(path, fp, name string) (bool, error) {
 	if !ValidFingerprint(fp) {
 		return false, fmt.Errorf("%q is not a key fingerprint (expected SHA256:...)", fp)
 	}
-	if ok, err := IsAuthorized(path, fp); err != nil || ok {
-		return false, err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return false, err
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
-	line := fp
-	if name = strings.TrimSpace(name); name != "" {
-		line += " " + name
-	}
-	_, err = fmt.Fprintln(f, line)
-	return err == nil, err
+	added := false
+	err := editAuthorized(path, func(lines []string) []string {
+		for _, line := range lines {
+			if first, _, _ := strings.Cut(strings.TrimSpace(line), " "); first == fp {
+				return lines
+			}
+		}
+		entry := fp
+		if name = strings.TrimSpace(name); name != "" {
+			entry += " " + name
+		}
+		added = true
+		return append(lines, entry)
+	})
+	return added, err
 }
 
 // Revoke removes a client from the authorized-clients file. It reports
-// whether the fingerprint was listed.
+// whether the fingerprint was listed. A running daemon ends that client's
+// open connections within seconds (see QUICOptions.Authorized).
 func Revoke(path, fp string) (bool, error) {
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	var kept []string
 	removed := false
-	for _, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
-		if first, _, _ := strings.Cut(strings.TrimSpace(line), " "); first == fp {
-			removed = true
-			continue
+	err := editAuthorized(path, func(lines []string) []string {
+		kept := lines[:0:0]
+		for _, line := range lines {
+			if first, _, _ := strings.Cut(strings.TrimSpace(line), " "); first == fp {
+				removed = true
+				continue
+			}
+			kept = append(kept, line)
 		}
-		kept = append(kept, line)
+		return kept
+	})
+	return removed, err
+}
+
+// editAuthorized rewrites the authorized-clients file under an exclusive
+// lock, so concurrent authorize and revoke commands cannot lose each
+// other's changes, and replaces it atomically, so a crash never leaves it
+// truncated. Readers (the daemon, once per handshake) see the old or the new
+// file, never a partial one.
+func editAuthorized(path string, edit func([]string) []string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
 	}
-	if !removed {
-		return false, nil
+	unlock, err := lockFile(path + ".lock")
+	if err != nil {
+		return err
 	}
-	out := strings.Join(kept, "\n")
+	defer unlock()
+	data, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	var lines []string
+	if text := strings.TrimRight(string(data), "\n"); text != "" {
+		lines = strings.Split(text, "\n")
+	}
+	updated := edit(lines)
+	if strings.Join(updated, "\n") == strings.Join(lines, "\n") {
+		return nil
+	}
+	out := strings.Join(updated, "\n")
 	if out != "" {
 		out += "\n"
 	}
-	return true, os.WriteFile(path, []byte(out), 0o600)
+	return replaceFile(path, []byte(out))
+}
+
+// lockFile takes an exclusive flock on path, creating it if needed.
+func lockFile(path string) (func(), error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("failed to lock %s: %w", path, err)
+	}
+	return func() { f.Close() }, nil
+}
+
+// replaceFile atomically replaces path with data (mode 0600).
+func replaceFile(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }

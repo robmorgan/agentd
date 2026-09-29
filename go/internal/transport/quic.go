@@ -46,14 +46,22 @@ func quicConfig() *quic.Config {
 // QUICOptions configures a QUIC listener.
 type QUICOptions struct {
 	// Authorized decides whether a client key may connect. It is called
-	// during every handshake, so changes to the authorized set apply to new
-	// connections without restarting the listener.
+	// during every handshake, on every new stream, and periodically for
+	// every open connection, so revoking a key also ends its live
+	// connections, attachments included.
 	Authorized func(fingerprint string) bool
 	// OnConnect, if set, is told about each authenticated connection.
 	OnConnect func(fingerprint string, remote net.Addr)
+	// RecheckInterval is how often open connections are checked against
+	// Authorized; zero means every 5 seconds.
+	RecheckInterval time.Duration
 }
 
 // QUICListener yields the streams clients open on their QUIC connections.
+//
+// It owns one goroutine that accepts connections, one per connection that
+// accepts its streams, and one that rechecks open connections against
+// Authorized. All of them end when the listener is closed.
 type QUICListener struct {
 	l       *quic.Listener
 	opts    QUICOptions
@@ -61,8 +69,9 @@ type QUICListener struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 
-	mu    sync.Mutex
-	conns map[*quic.Conn]struct{}
+	mu sync.Mutex
+	// conns maps each open connection to its client key's fingerprint.
+	conns map[*quic.Conn]string
 }
 
 // ListenQUIC listens for QUIC connections on addr (a UDP host:port) with the
@@ -71,6 +80,9 @@ func ListenQUIC(addr string, id *Identity, opts QUICOptions) (*QUICListener, err
 	if opts.Authorized == nil {
 		return nil, errors.New("QUIC listener needs an Authorized check")
 	}
+	if opts.RecheckInterval <= 0 {
+		opts.RecheckInterval = 5 * time.Second
+	}
 	tlsConf := &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{id.cert},
@@ -78,11 +90,17 @@ func ListenQUIC(addr string, id *Identity, opts QUICOptions) (*QUICListener, err
 		// Any certificate is requested, and then judged by its key's
 		// fingerprint alone.
 		ClientAuth: tls.RequireAnyClientCert,
-		VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
-			fp, err := leafFingerprint(raw)
-			if err != nil {
-				return err
+		// A resumed session skips certificate verification, so a revoked
+		// client holding a ticket could come back without being checked.
+		// A full handshake costs one round trip; always do one.
+		SessionTicketsDisabled: true,
+		// VerifyConnection runs on every handshake (VerifyPeerCertificate
+		// would not run on a resumed one).
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return errors.New("client sent no certificate")
 			}
+			fp := Fingerprint(cs.PeerCertificates[0])
 			if !opts.Authorized(fp) {
 				return fmt.Errorf("client key %s is not authorized", fp)
 			}
@@ -100,42 +118,55 @@ func ListenQUIC(addr string, id *Identity, opts QUICOptions) (*QUICListener, err
 		streams: make(chan Stream),
 		ctx:     ctx,
 		cancel:  cancel,
-		conns:   make(map[*quic.Conn]struct{}),
+		conns:   make(map[*quic.Conn]string),
 	}
 	go q.acceptConns()
+	go q.recheck()
 	return q, nil
 }
 
 // acceptConns runs until the listener closes, starting one goroutine per
-// connection.
+// connection. If accepting fails for any other reason the listener is
+// closed too, so Accept reports it rather than waiting forever.
 func (q *QUICListener) acceptConns() {
+	defer q.Close()
 	for {
 		conn, err := q.l.Accept(q.ctx)
 		if err != nil {
 			return
 		}
-		if !q.track(conn) {
+		fp, err := leafFingerprintOf(conn)
+		if err != nil {
+			conn.CloseWithError(0, "no client certificate")
+			continue
+		}
+		if !q.track(conn, fp) {
 			conn.CloseWithError(0, "agentd is shutting down")
 			return
 		}
 		if q.opts.OnConnect != nil {
-			if fp, err := leafFingerprintOf(conn); err == nil {
-				q.opts.OnConnect(fp, conn.RemoteAddr())
-			}
+			q.opts.OnConnect(fp, conn.RemoteAddr())
 		}
-		go q.acceptStreams(conn)
+		go q.acceptStreams(conn, fp)
 	}
 }
 
-// acceptStreams hands each stream a client opens to Accept. The channel is
-// unbuffered: a client cannot get ahead of the daemon accepting its
-// streams, and QUIC's stream limit bounds what it can have open. It ends
-// when the connection or the listener closes.
-func (q *QUICListener) acceptStreams(conn *quic.Conn) {
+// acceptStreams hands each stream a client opens to Accept, after checking
+// that the client's key is still authorized. The channel is unbuffered: a
+// client cannot get ahead of the daemon accepting its streams, and QUIC's
+// stream limit bounds what it can have open. It ends when the connection or
+// the listener closes.
+func (q *QUICListener) acceptStreams(conn *quic.Conn, fp string) {
 	defer q.untrack(conn)
 	for {
 		s, err := conn.AcceptStream(q.ctx)
 		if err != nil {
+			return
+		}
+		if !q.opts.Authorized(fp) {
+			s.CancelRead(0)
+			s.CancelWrite(0)
+			conn.CloseWithError(0, "client key revoked")
 			return
 		}
 		select {
@@ -148,13 +179,47 @@ func (q *QUICListener) acceptStreams(conn *quic.Conn) {
 	}
 }
 
-func (q *QUICListener) track(conn *quic.Conn) bool {
+// recheck closes connections whose key has been revoked since they
+// connected, ending their attachments too. It runs until the listener
+// closes.
+func (q *QUICListener) recheck() {
+	ticker := time.NewTicker(q.opts.RecheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-q.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		q.mu.Lock()
+		open := make(map[*quic.Conn]string, len(q.conns))
+		for conn, fp := range q.conns {
+			open[conn] = fp
+		}
+		q.mu.Unlock()
+		// Authorized reads a file, so it is called outside the lock, once
+		// per key rather than per connection.
+		verdict := map[string]bool{}
+		for conn, fp := range open {
+			ok, seen := verdict[fp]
+			if !seen {
+				ok = q.opts.Authorized(fp)
+				verdict[fp] = ok
+			}
+			if !ok {
+				conn.CloseWithError(0, "client key revoked")
+			}
+		}
+	}
+}
+
+func (q *QUICListener) track(conn *quic.Conn, fp string) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.ctx.Err() != nil {
 		return false
 	}
-	q.conns[conn] = struct{}{}
+	q.conns[conn] = fp
 	return true
 }
 
@@ -173,12 +238,13 @@ func (q *QUICListener) Accept() (Stream, error) {
 	}
 }
 
-// Close stops accepting and closes every client connection.
+// Close stops accepting and closes every client connection. It is safe to
+// call more than once.
 func (q *QUICListener) Close() error {
 	q.mu.Lock()
 	q.cancel()
 	conns := q.conns
-	q.conns = map[*quic.Conn]struct{}{}
+	q.conns = map[*quic.Conn]string{}
 	q.mu.Unlock()
 	for conn := range conns {
 		conn.CloseWithError(0, "agentd is shutting down")

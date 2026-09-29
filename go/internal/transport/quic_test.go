@@ -283,3 +283,145 @@ func TestFirstDatagramFitsTailscaleMTU(t *testing.T) {
 		t.Fatalf("InitialPacketSize %d does not fit a %d-byte MTU", size, tailscaleMTU)
 	}
 }
+
+// Revoking a key ends that client's open connections, attachments
+// included, and it cannot come back through session resumption either.
+func TestQUICRevokeEndsLiveConnections(t *testing.T) {
+	server, client, other := mustIdentity(t), mustIdentity(t), mustIdentity(t)
+	var mu sync.Mutex
+	allowed := map[string]bool{client.Fingerprint: true, other.Fingerprint: true}
+	authorized := func(fp string) bool { mu.Lock(); defer mu.Unlock(); return allowed[fp] }
+	l, err := ListenQUIC("127.0.0.1:0", server, QUICOptions{Authorized: authorized, RecheckInterval: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go Serve(l, "test", nil, func(s Stream) {
+		defer s.Close()
+		io.Copy(s, s) // an attachment: open until either side ends it
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), quicTestTimeout)
+	defer cancel()
+	c, err := DialQUIC(ctx, l.Addr(), client, server.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	stay, err := DialQUIC(ctx, l.Addr(), other, server.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stay.Close()
+	s, err := c.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetDeadline(time.Now().Add(quicTestTimeout))
+	s.Write([]byte("x"))
+	if _, err := io.ReadFull(s, make([]byte, 1)); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	delete(allowed, client.Fingerprint)
+	mu.Unlock()
+	if _, err := io.ReadAll(s); err == nil {
+		t.Fatal("revoked client's attachment stayed open")
+	}
+	// With TLS 1.3 the client may finish its side of the handshake before
+	// the refusal arrives; the connection must then be unusable.
+	if again, err := DialQUIC(ctx, l.Addr(), client, server.Fingerprint); err == nil {
+		defer again.Close()
+		if roundTripErr(ctx, again) == nil {
+			t.Fatal("revoked client reconnected")
+		}
+	}
+	// Other clients are untouched.
+	s2, err := stay.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2.SetDeadline(time.Now().Add(quicTestTimeout))
+	s2.Write([]byte("y"))
+	if _, err := io.ReadFull(s2, make([]byte, 1)); err != nil {
+		t.Fatalf("authorized client lost its connection: %v", err)
+	}
+}
+
+func roundTripErr(ctx context.Context, c *QUICClient) error {
+	s, err := c.OpenStream(ctx)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	s.SetDeadline(time.Now().Add(2 * time.Second))
+	s.Write([]byte("z"))
+	_, err = io.ReadFull(s, make([]byte, 1))
+	return err
+}
+
+// Concurrent first use publishes one key that everyone ends up using.
+func TestConcurrentIdentityCreationAgrees(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "remote", "daemon.key")
+	const n = 8
+	fps := make(chan string, n)
+	var wg sync.WaitGroup
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			id, err := LoadOrCreateIdentity(path)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			fps <- id.Fingerprint
+		}()
+	}
+	wg.Wait()
+	close(fps)
+	onDisk, err := LoadOrCreateIdentity(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for fp := range fps {
+		if fp != onDisk.Fingerprint {
+			t.Fatalf("a process uses %s but the key on disk is %s", fp, onDisk.Fingerprint)
+		}
+	}
+}
+
+// Concurrent authorize and revoke commands never lose each other's changes.
+func TestConcurrentAuthorizedEdits(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "authorized_clients")
+	var fps []string
+	for range 10 {
+		fps = append(fps, mustIdentity(t).Fingerprint)
+	}
+	var wg sync.WaitGroup
+	for _, fp := range fps {
+		wg.Add(1)
+		go func() { defer wg.Done(); Authorize(path, fp, "") }()
+	}
+	wg.Wait()
+	if clients, _ := ReadAuthorized(path); len(clients) != len(fps) {
+		t.Fatalf("%d of %d authorizations kept", len(clients), len(fps))
+	}
+	for _, fp := range fps[:5] {
+		wg.Add(1)
+		go func() { defer wg.Done(); Revoke(path, fp) }()
+	}
+	wg.Wait()
+	clients, _ := ReadAuthorized(path)
+	if len(clients) != 5 {
+		t.Fatalf("after 5 concurrent revokes, %d clients remain", len(clients))
+	}
+	for _, c := range clients {
+		for _, gone := range fps[:5] {
+			if c.Fingerprint == gone {
+				t.Fatalf("revoked %s came back", gone)
+			}
+		}
+	}
+}
