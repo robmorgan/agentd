@@ -490,7 +490,7 @@ One slow session should not unnecessarily stall unrelated sessions.
 * [ ] Support remote:
 
   * [x] `ls`
-  * [x] `run` (`agent --host H new --cwd DIR`)
+  * [x] `new` (`agent --host H new --cwd DIR`)
   * [x] `attach`
   * [x] `send`
   * [x] `history`
@@ -874,7 +874,7 @@ gpu-01      offline    0
 Potential commands:
 
 ```sh
-agent --host devbox-1 run "fix auth tests"
+agent --host devbox-1 new --cwd /srv/repo auth-tests
 
 agent sessions --all
 
@@ -1215,12 +1215,10 @@ Until that flow is excellent, avoid adding unnecessary infrastructure around it.
 `agentd` should eventually make this ordinary:
 
 ```sh
-agent --host devbox run \
-  --name auth-refactor \
-  "refactor the authentication middleware and run the test suite"
+agent --host devbox new --cwd /srv/repo auth-refactor
 ```
 
-Close the laptop.
+Ask the agent to refactor the authentication middleware and run the test suite. Close the laptop.
 
 Come back later from another machine:
 

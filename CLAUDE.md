@@ -527,12 +527,10 @@ Do not begin QUIC before the transport split: the session and ownership model ha
 Keep this future workflow in mind when making architectural decisions:
 
 ```sh
-agent --host devbox run \
-  --name auth-refactor \
-  "refactor authentication and run the tests"
+agent --host devbox new --cwd /srv/repo auth-refactor
 ```
 
-The remote machine runs:
+The user asks Claude Code to refactor authentication and run the tests. The remote machine runs:
 
 ```text
 agentd
