@@ -174,13 +174,20 @@ the queue is full, further input is refused with an error until the agent catche
 
 ## Runtime Root
 
-All runtime state lives under a single root directory. The root is resolved in this priority order:
+All state lives under a single root directory. The root is resolved in this priority order:
 
 * AGENTD_DIR => uses exact path (e.g., /custom/path)
-* XDG_RUNTIME_DIR => uses `{XDG_RUNTIME_DIR}/agentd` (recommended on Linux, typically `/run/user/{uid}/agentd`)
-* macOS default => uses `~/.agentd` when `AGENTD_DIR` and `XDG_RUNTIME_DIR` are unset
+* home => uses `~/.agentd`, on every platform
+* XDG_RUNTIME_DIR => uses `{XDG_RUNTIME_DIR}/agentd`, only without a home directory
 * TMPDIR => uses `{TMPDIR}/agentd-{uid}` (appends uid for multi-user safety)
 * /tmp => uses `/tmp/agentd-{uid}` (default fallback, appends uid for multi-user safety)
+
+The root is deliberately not a per-boot runtime directory by default. `XDG_RUNTIME_DIR` (typically
+`/run/user/{uid}`, a tmpfs) is wiped on reboot, and on Linux also once the user's last session
+ends, which would take `state.db`, session history and the daemon's remote key with it; every
+remote client would then see a changed key. The runtime files in the root (the sockets, lock and
+pid file) are harmless after a reboot: a starting daemon removes a stale socket while holding the
+lock, and session liveness is judged by connecting to the session's socket.
 
 The selected root contains:
 

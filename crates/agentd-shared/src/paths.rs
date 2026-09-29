@@ -28,7 +28,6 @@ impl AppPaths {
             dirs::home_dir(),
             std::env::var_os("TMPDIR"),
             getuid().as_raw(),
-            cfg!(target_os = "macos"),
         )?;
         Ok(Self::from_root(root))
     }
@@ -121,25 +120,29 @@ fn ensure_private_dir(path: &Utf8Path, recursive: bool) -> Result<()> {
     Ok(())
 }
 
+/// Picks the root: `AGENTD_DIR`, else `~/.agentd`. The root holds state that
+/// must survive reboots (state.db, logs, the remote keys), so a per-boot
+/// runtime directory such as `XDG_RUNTIME_DIR` (`/run/user/UID`, a tmpfs) is
+/// only a fallback for an account without a home directory, as are the temp
+/// directories. go/internal/paths discoverRoot makes the same choice.
 fn discover_root(
     agentd_dir: Option<std::ffi::OsString>,
     xdg_runtime_dir: Option<std::ffi::OsString>,
     home_dir: Option<std::path::PathBuf>,
     tmpdir: Option<std::ffi::OsString>,
     uid: u32,
-    prefer_home_root: bool,
 ) -> Result<Utf8PathBuf> {
     if let Some(root) = utf8_env_path("AGENTD_DIR", agentd_dir)? {
         return Ok(root);
     }
 
-    if let Some(runtime_dir) = utf8_env_path("XDG_RUNTIME_DIR", xdg_runtime_dir)? {
-        return Ok(runtime_dir.join(APP_DIR_NAME));
-    }
-
-    if prefer_home_root && let Some(home_dir) = home_dir {
+    if let Some(home_dir) = home_dir {
         return Utf8PathBuf::from_path_buf(home_dir.join(format!(".{APP_DIR_NAME}")))
             .map_err(|_| anyhow::anyhow!("HOME is not valid UTF-8"));
+    }
+
+    if let Some(runtime_dir) = utf8_env_path("XDG_RUNTIME_DIR", xdg_runtime_dir)? {
+        return Ok(runtime_dir.join(APP_DIR_NAME));
     }
 
     if let Some(tmpdir) = utf8_env_path("TMPDIR", tmpdir)? {
@@ -215,77 +218,54 @@ mod tests {
         let _ = fs::remove_dir_all(target.as_std_path());
     }
 
+    fn home(path: &str) -> Option<std::path::PathBuf> {
+        Some(std::path::PathBuf::from(path))
+    }
+
     #[test]
     fn agentd_dir_is_used_as_exact_root() {
         let root = discover_root(
             Some("/custom/agentd-root".into()),
             Some("/run/user/501".into()),
-            Some(std::path::PathBuf::from("/Users/tester")),
+            home("/home/tester"),
             Some("/var/tmp".into()),
             501,
-            true,
         )
         .unwrap();
         assert_eq!(root, Utf8PathBuf::from("/custom/agentd-root"));
     }
 
     #[test]
-    fn xdg_runtime_dir_is_used_when_agentd_dir_is_unset() {
+    fn home_root_wins_over_xdg_runtime_dir() {
+        // /run/user is a tmpfs wiped on reboot; the root holds state and keys.
         let root = discover_root(
             None,
             Some("/run/user/501".into()),
-            Some(std::path::PathBuf::from("/Users/tester")),
+            home("/home/tester"),
             Some("/var/tmp".into()),
             501,
-            true,
         )
         .unwrap();
+        assert_eq!(root, Utf8PathBuf::from("/home/tester/.agentd"));
+    }
+
+    #[test]
+    fn xdg_runtime_dir_is_used_without_a_home() {
+        let root =
+            discover_root(None, Some("/run/user/501".into()), None, Some("/var/tmp".into()), 501)
+                .unwrap();
         assert_eq!(root, Utf8PathBuf::from("/run/user/501").join(APP_DIR_NAME));
     }
 
     #[test]
-    fn macos_prefers_home_root_when_higher_priority_env_vars_are_unset() {
-        let root = discover_root(
-            None,
-            None,
-            Some(std::path::PathBuf::from("/Users/tester")),
-            Some("/var/tmp".into()),
-            501,
-            true,
-        )
-        .unwrap();
-        assert_eq!(root, Utf8PathBuf::from("/Users/tester/.agentd"));
-    }
-
-    #[test]
-    fn tmpdir_uses_uid_suffix_when_home_root_is_not_preferred() {
-        let root = discover_root(
-            None,
-            None,
-            Some(std::path::PathBuf::from("/Users/tester")),
-            Some("/var/tmp".into()),
-            501,
-            false,
-        )
-        .unwrap();
-        assert_eq!(root, Utf8PathBuf::from("/var/tmp").join(format!("{APP_DIR_NAME}-501")));
-    }
-
-    #[test]
-    fn tmpdir_uses_uid_suffix_when_home_root_is_unavailable() {
-        let root = discover_root(None, None, None, Some("/var/tmp".into()), 501, true).unwrap();
+    fn tmpdir_uses_uid_suffix_without_a_home() {
+        let root = discover_root(None, None, None, Some("/var/tmp".into()), 501).unwrap();
         assert_eq!(root, Utf8PathBuf::from("/var/tmp").join(format!("{APP_DIR_NAME}-501")));
     }
 
     #[test]
     fn tmp_fallback_uses_uid_suffix() {
-        let root = discover_root(None, None, None, None, 501, false).unwrap();
-        assert_eq!(root, Utf8PathBuf::from(format!("/tmp/{APP_DIR_NAME}-501")));
-    }
-
-    #[test]
-    fn tmp_fallback_uses_uid_suffix_when_home_root_is_preferred_but_unavailable() {
-        let root = discover_root(None, None, None, None, 501, true).unwrap();
+        let root = discover_root(None, None, None, None, 501).unwrap();
         assert_eq!(root, Utf8PathBuf::from(format!("/tmp/{APP_DIR_NAME}-501")));
     }
 

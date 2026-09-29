@@ -223,20 +223,14 @@ Instrumented agents can use the injected session environment to locate the daemo
 there is no separate structured event channel. Session status, attention, and history are the
 supported runtime surfaces.
 
-Runtime paths are resolved in this order:
+Everything lives under one root, `~/.agentd` on macOS and Linux alike, unless `AGENTD_DIR` names
+another. Without a home directory, `XDG_RUNTIME_DIR/agentd`, `TMPDIR/agentd-<uid>` and then
+`/tmp/agentd-<uid>` are used instead; those may not survive a reboot.
 
-- `AGENTD_DIR` as the exact runtime root
-- `XDG_RUNTIME_DIR/agentd`
-- on macOS, `~/.agentd`
-- `TMPDIR/agentd-<uid>`
-- `/tmp/agentd-<uid>`
-
-The selected root contains `config.toml`, `agentd.sock`, `agentd.lock`, `agentd.pid`, `state.db`,
-`sessions/` (one socket per live session), and `logs/`. It is created private to your user (0700),
-and `agentd` refuses a root owned by someone else.
-
-macOS typically does not set `XDG_RUNTIME_DIR`, so the default root on macOS becomes `~/.agentd`
-unless `AGENTD_DIR` is set explicitly.
+The root contains `config.toml`, `state.db`, `logs/`, `remote/` (keys for remote access),
+`hosts.toml`, and the runtime files `agentd.sock`, `agentd.lock`, `agentd.pid` and `sessions/` (one
+socket per live session). It is created private to your user (0700), and `agentd` refuses a root
+owned by someone else.
 
 Interactive PTY attach is available with `agent attach <name>`. Detach with `Ctrl-\`, switch to
 the previous running session with `Ctrl-[`, or switch to the next running session with `Ctrl-]`, or

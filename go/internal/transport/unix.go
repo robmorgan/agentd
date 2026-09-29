@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"syscall"
 	"time"
 )
 
@@ -24,6 +25,11 @@ type UnixOptions struct {
 // ListenUnix binds a Unix socket at path, private to the current user
 // (0600). Any file already at path must have been removed by the caller.
 func ListenUnix(path string, opts UnixOptions) (*UnixListener, error) {
+	// The kernel's limit (sun_path, including its NUL) otherwise surfaces
+	// as a bare "invalid argument".
+	if limit := len(syscall.RawSockaddrUnix{}.Path) - 1; len(path) > limit {
+		return nil, fmt.Errorf("cannot create socket %s: the path is %d bytes, over this system's limit of %d; use a shorter session name, or set AGENTD_DIR to a shorter directory", path, len(path), limit)
+	}
 	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
 	if err != nil {
 		return nil, fmt.Errorf("failed to bind %s: %w", path, err)

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"syscall"
 )
 
@@ -30,7 +29,6 @@ func Discover() (*AppPaths, error) {
 		home,
 		os.Getenv("TMPDIR"),
 		os.Getuid(),
-		runtime.GOOS == "darwin",
 	)
 	if err != nil {
 		return nil, err
@@ -50,15 +48,20 @@ func FromRoot(root string) *AppPaths {
 	}
 }
 
-func discoverRoot(agentdDir, xdgRuntimeDir, homeDir, tmpDir string, uid int, preferHomeRoot bool) (string, error) {
+// discoverRoot picks the root: AGENTD_DIR, else ~/.agentd. The root holds
+// state that must survive reboots (state.db, logs, the remote keys), so a
+// per-boot runtime directory such as XDG_RUNTIME_DIR (/run/user/UID, a
+// tmpfs) is only a fallback for an account without a home directory, as are
+// the temp directories.
+func discoverRoot(agentdDir, xdgRuntimeDir, homeDir, tmpDir string, uid int) (string, error) {
 	if agentdDir != "" {
 		return agentdDir, nil
 	}
+	if homeDir != "" {
+		return filepath.Join(homeDir, "."+AppDirName), nil
+	}
 	if xdgRuntimeDir != "" {
 		return filepath.Join(xdgRuntimeDir, AppDirName), nil
-	}
-	if preferHomeRoot && homeDir != "" {
-		return filepath.Join(homeDir, "."+AppDirName), nil
 	}
 	if tmpDir != "" {
 		return filepath.Join(tmpDir, fmt.Sprintf("%s-%d", AppDirName, uid)), nil

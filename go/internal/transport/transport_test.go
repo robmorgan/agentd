@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -138,5 +139,12 @@ func TestServeRetriesTemporaryErrorsAndReturnsOnClose(t *testing.T) {
 	handlers.Wait()
 	if handled != 2 {
 		t.Fatalf("handled %d streams, want 2", handled)
+	}
+}
+
+func TestListenUnixExplainsOverlongPaths(t *testing.T) {
+	path := "/tmp/" + strings.Repeat("x", 200) + ".sock"
+	if _, err := ListenUnix(path, UnixOptions{}); err == nil || !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("ListenUnix(overlong) = %v", err)
 	}
 }
