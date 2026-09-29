@@ -59,12 +59,16 @@ type SessionRef struct{ SessionID string }
 type Bytes struct{ Data []byte }
 
 type CreateSession struct {
-	// Cwd is the directory the agent runs in. The daemon validates that it
-	// exists and nothing more.
+	// Cwd is the directory the agent runs in, resolved on the daemon's
+	// machine. Without a Workspace it must be absolute or start with `~/`.
+	// With one, it is empty (the workspace root) or relative to the root.
+	// The daemon checks that it exists and nothing more.
 	Cwd   string
 	Name  *string
 	Agent string
 	Model *string
+	// Workspace names a directory in the daemon's config (`[workspaces]`).
+	Workspace *string
 }
 
 type KillSession struct {
@@ -338,6 +342,7 @@ func encodeRequest(req *Request) (kind, []byte, error) {
 		e.optStr(c.Name)
 		e.str(c.Agent)
 		e.optStr(c.Model)
+		e.optStr(c.Workspace)
 		return kCreateSessionRequest, e.buf, e.err
 	case req.KillSession != nil:
 		e.str(req.KillSession.SessionID)
@@ -396,10 +401,11 @@ func decodeRequest(k kind, payload []byte) (*Request, error) {
 		req.ShutdownDaemon = Empty
 	case kCreateSessionRequest:
 		req.CreateSession = &CreateSession{
-			Cwd:   d.str(),
-			Name:  d.optStr(),
-			Agent: d.str(),
-			Model: d.optStr(),
+			Cwd:       d.str(),
+			Name:      d.optStr(),
+			Agent:     d.str(),
+			Model:     d.optStr(),
+			Workspace: d.optStr(),
 		}
 	case kKillSessionRequest:
 		req.KillSession = &KillSession{SessionID: d.str(), Remove: d.bool()}

@@ -76,10 +76,14 @@ pub enum Request {
     GetDaemonInfo,
     ShutdownDaemon,
     CreateSession {
+        /// Resolved on the daemon's machine: absolute or `~/...` without a
+        /// workspace; empty or relative to the workspace root with one.
         cwd: String,
         name: Option<String>,
         agent: String,
         model: Option<String>,
+        /// A name from the daemon's `[workspaces]` config.
+        workspace: Option<String>,
     },
     KillSession {
         session_id: String,
@@ -437,11 +441,12 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
     let kind = match request {
         Request::GetDaemonInfo => MessageKind::GetDaemonInfoRequest,
         Request::ShutdownDaemon => MessageKind::ShutdownDaemonRequest,
-        Request::CreateSession { cwd, name, agent, model } => {
+        Request::CreateSession { cwd, name, agent, model, workspace } => {
             put_string(&mut payload, cwd)?;
             put_optional_string(&mut payload, name.as_deref())?;
             put_string(&mut payload, agent)?;
             put_optional_string(&mut payload, model.as_deref())?;
+            put_optional_string(&mut payload, workspace.as_deref())?;
             MessageKind::CreateSessionRequest
         }
         Request::KillSession { session_id, remove } => {
@@ -514,6 +519,7 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
             name: cursor.take_optional_string()?,
             agent: cursor.take_string()?,
             model: cursor.take_optional_string()?,
+            workspace: cursor.take_optional_string()?,
         },
         MessageKind::KillSessionRequest => {
             Request::KillSession { session_id: cursor.take_string()?, remove: cursor.take_bool()? }
@@ -1207,10 +1213,21 @@ mod tests {
             name: Some("fix".to_string()),
             agent: "codex".to_string(),
             model: Some("m".to_string()),
+            workspace: None,
         };
         let (kind, payload) = encode_request(&request).unwrap();
         let decoded = decode_request(kind, &payload).unwrap();
         assert_eq!(decoded, request);
+
+        let request = Request::CreateSession {
+            cwd: "sub".to_string(),
+            name: None,
+            agent: "claude".to_string(),
+            model: None,
+            workspace: Some("isara".to_string()),
+        };
+        let (kind, payload) = encode_request(&request).unwrap();
+        assert_eq!(decode_request(kind, &payload).unwrap(), request);
     }
 
     #[test]
@@ -1448,9 +1465,9 @@ mod tests {
     async fn create_session_matches_go_golden_frame() {
         let golden = [
             0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, //
-            0x18, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x2f, 0x77, 0x01, 0x03, //
+            0x1f, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x2f, 0x77, 0x01, 0x03, //
             0x00, 0x00, 0x00, 0x66, 0x69, 0x78, 0x05, 0x00, 0x00, 0x00, 0x63, 0x6f, //
-            0x64, 0x65, 0x78, 0x00,
+            0x64, 0x65, 0x78, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x77, 0x73,
         ];
         assert_request_golden(
             Request::CreateSession {
@@ -1458,6 +1475,7 @@ mod tests {
                 name: Some("fix".to_string()),
                 agent: "codex".to_string(),
                 model: None,
+                workspace: Some("ws".to_string()),
             },
             &golden,
         )

@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 )
@@ -14,6 +16,12 @@ type Config struct {
 	DefaultAgent string                 `toml:"default_agent"`
 	Agents       map[string]AgentConfig `toml:"agents"`
 	Remote       RemoteConfig           `toml:"remote"`
+	// Workspaces names directories on this machine, so a client can start a
+	// session by name (`agent new --workspace NAME`) without knowing local
+	// paths. That matters once the client is on another machine. agentd
+	// does not create, clone or sync them; the directories are the user's.
+	// Paths may start with `~/`; LoadConfig expands them.
+	Workspaces map[string]string `toml:"workspaces"`
 }
 
 // RemoteConfig enables remote access over QUIC. It is off unless Listen is
@@ -78,6 +86,16 @@ func LoadConfig(path string) (*Config, error) {
 			}
 		}
 	}
+	for name, dir := range cfg.Workspaces {
+		expanded, err := expandHome(dir)
+		if err != nil {
+			return nil, fmt.Errorf("workspace `%s` in %s: %w", name, path, err)
+		}
+		if !filepath.IsAbs(expanded) {
+			return nil, fmt.Errorf("workspace `%s` in %s must be an absolute path or start with `~/`", name, path)
+		}
+		cfg.Workspaces[name] = filepath.Clean(expanded)
+	}
 	if len(cfg.Agents) > 0 {
 		if _, ok := cfg.Agents[cfg.DefaultAgent]; !ok {
 			return nil, fmt.Errorf("default_agent `%s` is not configured under [agents] in %s", cfg.DefaultAgent, path)
@@ -99,4 +117,18 @@ func (a AgentConfig) modelFlag() string {
 		return defaultModelFlag
 	}
 	return *a.ModelFlag
+}
+
+// expandHome replaces a leading `~` or `~/` with the daemon user's home
+// directory. Paths are resolved on the daemon's machine, never the client's.
+// `~user` is not supported and is returned unchanged.
+func expandHome(path string) (string, error) {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot expand `%s`: %w", path, err)
+	}
+	return filepath.Join(home, path[1:]), nil
 }

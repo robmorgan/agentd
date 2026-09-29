@@ -110,7 +110,8 @@ func newHarnessWithConfig(t *testing.T, extra string) *harness {
 		t.Fatal(err)
 	}
 	p := paths.FromRoot(root)
-	if err := os.WriteFile(p.Config, []byte(testConfig+extra), 0o644); err != nil {
+	config := testConfig + fmt.Sprintf("\n[workspaces]\nproj = %q\n", cwd) + extra
+	if err := os.WriteFile(p.Config, []byte(config), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	h := &harness{t: t, paths: p, cwd: cwd}
@@ -253,6 +254,13 @@ func (h *harness) create(name, agent, cwd string) *protocol.Response {
 		n = &name
 	}
 	return h.request(&protocol.Request{CreateSession: &protocol.CreateSession{Cwd: cwd, Name: n, Agent: agent}})
+}
+
+func (h *harness) createIn(name, workspace, cwd string) *protocol.Response {
+	h.t.Helper()
+	return h.request(&protocol.Request{CreateSession: &protocol.CreateSession{
+		Cwd: cwd, Name: &name, Agent: "sh", Workspace: &workspace,
+	}})
 }
 
 func (h *harness) mustCreate(name string) string {
@@ -610,6 +618,54 @@ func TestCreateValidation(t *testing.T) {
 	}
 }
 
+// TestCreateInWorkspace checks that cwds are resolved on the daemon's
+// machine: relative to a named workspace, or from `~/`, never against the
+// client's filesystem.
+func TestCreateInWorkspace(t *testing.T) {
+	h := newHarness(t)
+	sub := filepath.Join(h.cwd, "sub")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct{ name, cwd, want string }{
+		{"root", "", h.cwd},
+		{"sub", "sub", sub},
+		{"dotted", "sub/../sub/.", sub},
+	} {
+		resp := h.createIn(tc.name, "proj", tc.cwd)
+		if resp.CreateSession == nil {
+			t.Fatalf("%s: create failed: %#v", tc.name, resp.Error)
+		}
+		if got := resp.CreateSession.Cwd; got != tc.want {
+			t.Fatalf("%s: cwd = %q, want %q", tc.name, got, tc.want)
+		}
+		if got := h.session(tc.name).Cwd; got != tc.want {
+			t.Fatalf("%s: recorded cwd = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+
+	// The agent really runs there.
+	c := h.attach("sub")
+	c.input("where\n")
+	real, _ := filepath.EvalSymlinks(sub)
+	c.expectOutput("pwd:" + real)
+
+	wantError(t, h.createIn("a", "nope", ""), "workspace `nope` is not configured")
+	wantError(t, h.createIn("b", "proj", "/etc"), "must be relative to workspace `proj`")
+	wantError(t, h.createIn("c", "proj", "~/x"), "must be relative to workspace `proj`")
+	wantError(t, h.createIn("d", "proj", "../escape"), "outside workspace `proj`")
+	wantError(t, h.createIn("e", "proj", "sub/../.."), "outside workspace `proj`")
+	wantError(t, h.createIn("f", "proj", "missing"), "does not exist")
+
+	// Without a workspace, `~/` expands to the daemon user's home.
+	t.Setenv("HOME", filepath.Dir(h.cwd))
+	resp := h.create("home", "sh", "~/work")
+	if resp.CreateSession == nil || resp.CreateSession.Cwd != h.cwd {
+		t.Fatalf("~ create = %#v, %#v", resp.CreateSession, resp.Error)
+	}
+}
+
 func TestKillAndRemove(t *testing.T) {
 	h := newHarness(t)
 	id := h.mustCreate("")
@@ -911,6 +967,18 @@ func TestLoadConfig(t *testing.T) {
 	os.WriteFile(path, []byte("[agents.zed]\ncommand = \"zed\"\n[agents.codex]\ncommand = \"codex\"\n"), 0o600)
 	if cfg, err := LoadConfig(path); err != nil || cfg.DefaultAgent != "zed" {
 		t.Fatalf("without claude: %+v, %v", cfg, err)
+	}
+
+	// Workspaces: `~/` expands on load, relative paths are refused.
+	t.Setenv("HOME", "/home/me")
+	os.WriteFile(path, []byte("[workspaces]\nmono = \"~/src/mono/\"\nabs = \"/srv/x\"\n"), 0o600)
+	cfg, err = LoadConfig(path)
+	if err != nil || cfg.Workspaces["mono"] != "/home/me/src/mono" || cfg.Workspaces["abs"] != "/srv/x" {
+		t.Fatalf("workspaces = %+v, %v", cfg, err)
+	}
+	os.WriteFile(path, []byte("[workspaces]\nrel = \"src/mono\"\n"), 0o600)
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "workspace `rel`") {
+		t.Fatalf("relative workspace: %v", err)
 	}
 }
 

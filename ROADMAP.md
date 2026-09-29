@@ -380,6 +380,8 @@ The protocol should operate over explicit message and stream abstractions rather
 ## Deliverables
 
 * [x] Extract transport-neutral protocol package (`go/internal/protocol` over the stream/listener seam in `go/internal/transport`)
+* [x] Resolve session working directories on the daemon (`~/` paths and named `[workspaces]`), so
+      a remote client does not need the host's paths
 * [ ] Define connection handshake
 * [ ] Define protocol capability negotiation
 * [ ] Define protocol version negotiation

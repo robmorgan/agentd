@@ -246,11 +246,12 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 	if err != nil {
 		return nil, err
 	}
-	if !filepath.IsAbs(req.Cwd) {
-		return nil, fmt.Errorf("working directory `%s` must be an absolute path", req.Cwd)
+	cwd, err := s.resolveCwd(req)
+	if err != nil {
+		return nil, err
 	}
 
-	id, createdAt, err := s.allocateSession(name, req.Agent, req.Model, req.Cwd)
+	id, createdAt, err := s.allocateSession(name, req.Agent, req.Model, cwd)
 	if err != nil {
 		return nil, err
 	}
@@ -262,16 +263,16 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 	// Checked here as well as in the worker so a bad cwd is refused before
 	// any process is spawned. The record is kept, failed, so `agent ls`
 	// shows what happened.
-	if info, err := os.Stat(req.Cwd); err != nil {
-		return fail(fmt.Errorf("working directory `%s` does not exist", req.Cwd))
+	if info, err := os.Stat(cwd); err != nil {
+		return fail(fmt.Errorf("working directory `%s` does not exist", cwd))
 	} else if !info.IsDir() {
-		return fail(fmt.Errorf("working directory `%s` is not a directory", req.Cwd))
+		return fail(fmt.Errorf("working directory `%s` is not a directory", cwd))
 	}
 
 	args := []string{
 		"session-worker",
 		"--session-id", id,
-		"--cwd", req.Cwd,
+		"--cwd", cwd,
 		"--created-at", createdAt,
 		"--agent-name", req.Agent,
 		"--command", agent.Command,
@@ -295,8 +296,45 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 		return nil, err
 	}
 	return &session.CreateResult{
-		SessionID: id, Cwd: req.Cwd, Status: session.StatusRunning, Mode: session.ModeExecute,
+		SessionID: id, Cwd: cwd, Status: session.StatusRunning, Mode: session.ModeExecute,
 	}, nil
+}
+
+// resolveCwd turns a create request's Cwd and Workspace into the absolute
+// directory the agent runs in. Everything is resolved on this machine: the
+// client may be elsewhere, so its paths mean nothing here unless they are
+// absolute or relative to a named workspace.
+func (s *Server) resolveCwd(req *protocol.CreateSession) (string, error) {
+	var workspace string
+	if req.Workspace != nil {
+		workspace = strings.TrimSpace(*req.Workspace)
+	}
+	if workspace == "" {
+		cwd, err := expandHome(req.Cwd)
+		if err != nil {
+			return "", err
+		}
+		if !filepath.IsAbs(cwd) {
+			return "", fmt.Errorf("working directory `%s` must be an absolute path", req.Cwd)
+		}
+		return filepath.Clean(cwd), nil
+	}
+
+	root, ok := s.config.Workspaces[workspace]
+	if !ok {
+		return "", fmt.Errorf("workspace `%s` is not configured in %s", workspace, s.paths.Config)
+	}
+	if req.Cwd == "" {
+		return root, nil
+	}
+	if filepath.IsAbs(req.Cwd) || strings.HasPrefix(req.Cwd, "~") {
+		return "", fmt.Errorf("working directory `%s` must be relative to workspace `%s`", req.Cwd, workspace)
+	}
+	cwd := filepath.Join(root, req.Cwd)
+	if rel, err := filepath.Rel(root, cwd); err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
+		return "", fmt.Errorf("working directory `%s` is outside workspace `%s`", req.Cwd, workspace)
+	}
+	return cwd, nil
 }
 
 // spawnWorker starts a session worker in its own process session, so it is

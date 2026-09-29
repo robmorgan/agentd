@@ -863,6 +863,7 @@ impl SessionPicker {
                 name,
                 agent: agent.to_string(),
                 model: if agent == "codex" { Some(CODEX_MODELS[0].to_string()) } else { None },
+                workspace: None,
             },
         )
         .await?;
@@ -1355,6 +1356,7 @@ impl AttachOverlay {
                         } else {
                             None
                         },
+                        workspace: None,
                     },
                 )
                 .await?;

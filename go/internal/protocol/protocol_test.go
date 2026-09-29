@@ -61,6 +61,7 @@ func TestRequestRoundTrips(t *testing.T) {
 	roundTripRequest(t, &Request{GetHistory: &GetHistory{SessionID: "demo", VT: true}})
 	roundTripRequest(t, &Request{KillSession: &KillSession{SessionID: "demo", Remove: true}})
 	roundTripRequest(t, &Request{CreateSession: &CreateSession{Cwd: "/tmp/x", Name: strp("fix"), Agent: "codex", Model: strp("m")}})
+	roundTripRequest(t, &Request{CreateSession: &CreateSession{Cwd: "sub", Agent: "claude", Workspace: strp("isara")}})
 	roundTripRequest(t, &Request{GetDaemonInfo: Empty})
 	roundTripRequest(t, &Request{AttachInput: &Bytes{Data: []byte("hi")}})
 }
@@ -254,11 +255,11 @@ func assertResponseGolden(t *testing.T, resp *Response, golden []byte) {
 }
 
 func TestSharedGoldenFrames(t *testing.T) {
-	assertRequestGolden(t, &Request{CreateSession: &CreateSession{Cwd: "/w", Name: strp("fix"), Agent: "codex"}}, []byte{
+	assertRequestGolden(t, &Request{CreateSession: &CreateSession{Cwd: "/w", Name: strp("fix"), Agent: "codex", Workspace: strp("ws")}}, []byte{
 		0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x18, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x2f, 0x77, 0x01, 0x03,
+		0x1f, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x2f, 0x77, 0x01, 0x03,
 		0x00, 0x00, 0x00, 0x66, 0x69, 0x78, 0x05, 0x00, 0x00, 0x00, 0x63, 0x6f,
-		0x64, 0x65, 0x78, 0x00,
+		0x64, 0x65, 0x78, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x77, 0x73,
 	})
 	assertRequestGolden(t, &Request{KillSession: &KillSession{SessionID: "ab", Remove: true}}, []byte{
 		0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,

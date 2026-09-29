@@ -191,6 +191,29 @@ agent new --cwd ../wt/auth-refactor auth-refactor
 A skill or a wrapper script can package this recipe. Two agents started in the same checkout
 will step on each other; that is your call, not the daemon's.
 
+### Workspaces
+
+Working directories are resolved on the machine running `agentd`, not the client. Name the
+directories you work in under `[workspaces]` in `config.toml`, and start sessions by name:
+
+```toml
+[workspaces]
+mono = "~/src/mono"
+```
+
+```sh
+agent new --workspace mono auth-refactor                      # runs in ~/src/mono
+agent new --workspace mono --cwd services/api api-fix         # runs in ~/src/mono/services/api
+```
+
+With `--workspace`, `--cwd` is relative to the workspace root and may not leave it. Paths may
+start with `~/`, which expands to the daemon user's home. `agentd` does not clone, create, or
+sync workspaces: the repository has to be on that machine already. The daemon reads
+`[workspaces]` at startup, so restart it (`agent daemon restart`) after editing them.
+
+This is the addressing a remote client will use: once `agent --host` exists, a laptop can start
+a session in a devbox's checkout without knowing the devbox's paths.
+
 ## Configure Agents
 
 Create `<runtime-root>/config.toml`:
@@ -206,6 +229,8 @@ args = []
 command = "codex"
 args = []
 ```
+
+`[workspaces]` is described under [Workspaces](#workspaces).
 
 Agent picker order follows the order of the `[agents.*]` tables in this file. `default_agent`
 must name one of those configured agents. Without it, the default is `claude` if configured,
@@ -294,7 +319,8 @@ agentd remote authorize SHA256:... my-laptop
 Now any command can run on the devbox, with `--host` or a `host/session` address:
 
 ```sh
-agent --host devbox new --cwd /srv/repo auth-refactor   # --cwd is a path on the devbox
+agent --host devbox new --cwd ~/repo auth-refactor      # a path on the devbox (absolute or ~/...)
+agent --host devbox new --workspace mono auth-tests      # or a workspace named on the devbox
 agent --host devbox ls
 agent attach devbox/auth-refactor
 agent send-input devbox/auth-refactor -- "run the tests"
