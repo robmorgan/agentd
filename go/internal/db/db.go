@@ -1,7 +1,6 @@
 // Package db is the SQLite state store (state.db) for the daemon and its
-// session workers. The agent CLI reads and writes the same file in its local
-// fallback mode (crates/agentd-shared/src/sqlite_schema.rs), so the schema
-// and row formats here are shared with it.
+// session workers. Only they open it: the agent CLI goes through the daemon
+// protocol for all session state.
 package db
 
 import (

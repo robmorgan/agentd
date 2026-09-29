@@ -72,8 +72,8 @@ The `agent` CLI is the client (`crates/agent-cli/src/transport.rs`, quinn and ru
 `remote/client.key`, in the same format as the daemon's, and `hosts.toml` maps host names to an
 address and the daemon fingerprint pinned by `agent host add`. One CLI process opens at most one
 QUIC connection and one stream per request or attachment, so an attachment and the overlay's
-requests share a connection. A remote host is never started, restarted or upgraded from the CLI,
-and there is no local fallback for it. With TLS 1.3 a client can finish its half of the handshake
+requests share a connection. A remote host is never started, restarted or upgraded from the CLI.
+With TLS 1.3 a client can finish its half of the handshake
 before the daemon rejects its key, so a refusal may only surface on the first stream; the CLI
 recognises the TLS alert there and says how to authorize the machine. Both sides' tests pin one
 key and its fingerprint, so the Go and Rust fingerprint definitions cannot drift apart.
