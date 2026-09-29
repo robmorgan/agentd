@@ -5,6 +5,7 @@ package paths
 import (
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"syscall"
 )
@@ -23,6 +24,14 @@ type AppPaths struct {
 
 func Discover() (*AppPaths, error) {
 	home, _ := os.UserHomeDir()
+	if home == "" {
+		// Without $HOME (cron, some service managers), fall back to the
+		// passwd entry, as the Rust CLI's dirs::home_dir does, so both
+		// pick the same root.
+		if u, err := user.Current(); err == nil {
+			home = u.HomeDir
+		}
+	}
 	root, err := discoverRoot(
 		os.Getenv("AGENTD_DIR"),
 		os.Getenv("XDG_RUNTIME_DIR"),

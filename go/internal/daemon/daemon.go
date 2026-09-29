@@ -90,8 +90,11 @@ type Server struct {
 	listeners []transport.Listener
 	// closing is set under connsMu once shutdown starts, so no connection
 	// accepted afterwards is left untracked.
-	closing  bool
-	handlers sync.WaitGroup
+	closing bool
+	// listenersClosed is set under connsMu once shutdown has closed the
+	// listeners; serveListener then refuses (and closes) late ones.
+	listenersClosed bool
+	handlers        sync.WaitGroup
 }
 
 // New opens the state database and config under p. workerBin is normally
@@ -204,8 +207,11 @@ var remoteRetryInterval = 5 * time.Second
 //
 // Binding is retried until it succeeds or the daemon shuts down, since the
 // listen address may not exist yet: a daemon started at login can come up
-// before Tailscale or WireGuard has configured its interface. The retry
-// goroutine is the only one started here and ends with the daemon.
+// before Tailscale or WireGuard has configured its interface. A listener
+// that stops on its own is bound again the same way. The first attempt is
+// made here, before the daemon answers requests, so its status is accurate
+// from the start; after that one goroutine owns the listener and ends with
+// the daemon.
 func (s *Server) startRemote() {
 	addr := s.config.Remote.Listen
 	if addr == "" {
@@ -232,7 +238,7 @@ func (s *Server) startRemote() {
 			fmt.Fprintf(os.Stderr, "agentd: remote client %s connected from %s\n", fp, remote)
 		},
 	}
-	listen := func() bool {
+	listen := func() *transport.QUICListener {
 		l, err := transport.ListenQUIC(addr, id, opts)
 		if err != nil {
 			// Logged only when the reason changes, not on every retry.
@@ -240,29 +246,35 @@ func (s *Server) startRemote() {
 				fmt.Fprintf(os.Stderr, "agentd: remote access not available yet (retrying every %s): %v\n", retry, err)
 			}
 			s.setRemoteError(err)
-			return false
+			return nil
 		}
 		bound := l.Addr()
 		s.remoteAddr.Store(&bound)
 		s.remoteErr.Store(nil)
 		fmt.Fprintf(os.Stderr, "agentd: accepting remote clients over QUIC on %s (key %s)\n", bound, id.Fingerprint)
-		go s.serveListener(l)
-		return true
+		return l
 	}
-	if listen() {
-		return
-	}
+	l := listen()
 	go func() {
 		ticker := time.NewTicker(retry)
 		defer ticker.Stop()
 		for {
+			if l != nil {
+				s.serveListener(l) // returns once the listener closes
+				select {
+				case <-s.shutdown:
+					return
+				default:
+				}
+				s.remoteAddr.Store(nil)
+				s.setRemoteError(errors.New("the QUIC listener stopped; binding it again"))
+				fmt.Fprintf(os.Stderr, "agentd: the QUIC listener stopped; binding it again\n")
+			}
 			select {
 			case <-s.shutdown:
 				return
 			case <-ticker.C:
-				if listen() {
-					return
-				}
+				l = listen()
 			}
 		}
 	}()
@@ -295,7 +307,7 @@ func (s *Server) remoteError() string {
 // way and are closed along with it at shutdown.
 func (s *Server) serveListener(l transport.Listener) {
 	s.connsMu.Lock()
-	if s.closing {
+	if s.listenersClosed {
 		s.connsMu.Unlock()
 		l.Close()
 		return
@@ -340,9 +352,13 @@ func (s *Server) untrack(stream transport.Stream) {
 	stream.Close()
 }
 
-// closeListeners stops every listener; their serveListener calls return.
+// closeListeners stops every listener; their serveListener calls return. A
+// listener registered afterwards (one whose goroutine had not reached
+// serveListener yet, or a QUIC listener bound by the retry loop) is closed
+// by serveListener itself.
 func (s *Server) closeListeners() {
 	s.connsMu.Lock()
+	s.listenersClosed = true
 	listeners := s.listeners
 	s.listeners = nil
 	s.connsMu.Unlock()
@@ -413,6 +429,11 @@ func (s *Server) handleManagement(conn transport.Stream, req *protocol.Managemen
 			RemoteError:     s.remoteError(),
 		}})
 	case req.Shutdown != nil:
+		// A remote client can stop the daemon but not start it again, so
+		// only a local one may stop it.
+		if _, local := conn.(*net.UnixConn); !local {
+			return protocol.WriteManagementResponse(conn, &protocol.ManagementResponse{Error: &protocol.ErrorResponse{Message: "agentd can only be stopped from its own machine"}})
+		}
 		if running && !req.Shutdown.Force {
 			return protocol.WriteManagementResponse(conn, &protocol.ManagementResponse{Shutdown: &protocol.ManagementShutdownResult{
 				Stopped: false, RunningSessions: true, Message: "cannot shut down agentd while sessions are running",

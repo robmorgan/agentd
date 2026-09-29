@@ -1138,6 +1138,31 @@ func TestRemoteAccessRequiresAuthorizedKey(t *testing.T) {
 
 // A remote setting that cannot be honoured disables remote access but must
 // not take local service down with it.
+// A remote client could stop the daemon but never start it again, so only
+// local clients may stop it; status stays available remotely.
+func TestRemoteClientCannotStopTheDaemon(t *testing.T) {
+	h := newHarnessWithConfig(t, remoteConfig)
+	client := newClientIdentity(t)
+	if _, err := transport.Authorize(h.paths.AuthorizedClientsPath(), client.Fingerprint, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.dialRemote(client); err != nil {
+		t.Fatal(err)
+	}
+	resp := h.management(&protocol.ManagementRequest{Shutdown: &protocol.ManagementShutdown{Force: true}})
+	if resp.Error == nil || !strings.Contains(resp.Error.Message, "own machine") {
+		t.Fatalf("remote shutdown = %#v", resp)
+	}
+	if resp := h.management(&protocol.ManagementRequest{Status: protocol.Empty}); resp.Status == nil {
+		t.Fatalf("remote status = %#v", resp)
+	}
+	select {
+	case err := <-h.done:
+		t.Fatalf("daemon stopped after a remote shutdown request: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
 func TestBadRemoteListenStillServesLocally(t *testing.T) {
 	h := newHarnessWithConfig(t, `
 [remote]

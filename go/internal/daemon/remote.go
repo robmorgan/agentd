@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"syscall"
@@ -31,6 +32,10 @@ const (
 	// KindPrivate is a LAN address: reachable only from the same network,
 	// and liable to change with DHCP.
 	KindPrivate
+	// KindShared is in the carrier-grade NAT range that Tailscale also uses,
+	// but not confirmed as Tailscale's: a mobile carrier, ISP or other VPN
+	// may have handed it out, so others on that network can reach it.
+	KindShared
 	// KindPublic is reachable from the internet.
 	KindPublic
 )
@@ -41,13 +46,16 @@ func (k AddressKind) String() string {
 		return "Tailscale"
 	case KindPrivate:
 		return "private LAN"
+	case KindShared:
+		return "shared carrier-grade NAT"
 	default:
 		return "public"
 	}
 }
 
 // Tailscale assigns each machine an address in the CGNAT range and one in
-// its own IPv6 ULA prefix.
+// its own IPv6 ULA prefix. Other networks use the CGNAT range too, so an
+// address in it only counts as Tailscale's when Tailscale confirms it.
 var (
 	tailscaleV4 = mustCIDR("100.64.0.0/10")
 	tailscaleV6 = mustCIDR("fd7a:115c:a1e0::/48")
@@ -72,10 +80,7 @@ type ListenCandidate struct {
 // address of the interface holding the default route. The caller decides
 // whether a non-Tailscale address needs confirming.
 func DetectListenAddress() (ListenCandidate, error) {
-	if ip := interfaceTailscaleAddress(); ip != nil {
-		return ListenCandidate{IP: ip, Kind: KindTailscale}, nil
-	}
-	if ip := cliTailscaleAddress(); ip != nil {
+	if ip := pickTailscale(interfaceAddresses(), cliTailscaleAddresses()); ip != nil {
 		return ListenCandidate{IP: ip, Kind: KindTailscale}, nil
 	}
 	ip, err := defaultRouteAddress()
@@ -85,61 +90,89 @@ func DetectListenAddress() (ListenCandidate, error) {
 	return ListenCandidate{IP: ip, Kind: classifyAddress(ip)}, nil
 }
 
-// interfaceTailscaleAddress finds a Tailscale address on this machine's
-// interfaces, preferring IPv4.
-func interfaceTailscaleAddress() net.IP {
+type interfaceAddress struct {
+	iface string
+	ip    net.IP
+}
+
+func interfaceAddresses() []interfaceAddress {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil
 	}
-	var addrs []net.Addr
+	var out []interfaceAddress
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 {
 			continue
 		}
-		if a, err := iface.Addrs(); err == nil {
-			addrs = append(addrs, a...)
-		}
-	}
-	return pickTailscale(addrs)
-}
-
-func pickTailscale(addrs []net.Addr) net.IP {
-	var v6 net.IP
-	for _, a := range addrs {
-		ipnet, ok := a.(*net.IPNet)
-		if !ok {
+		addrs, err := iface.Addrs()
+		if err != nil {
 			continue
 		}
+		for _, a := range addrs {
+			if ipnet, ok := a.(*net.IPNet); ok {
+				out = append(out, interfaceAddress{iface: iface.Name, ip: ipnet.IP})
+			}
+		}
+	}
+	return out
+}
+
+// pickTailscale returns this machine's Tailscale address, preferring IPv4.
+// An address in Tailscale's ranges counts only when Tailscale vouches for
+// it: it is on Tailscale's own interface (tailscale0 on Linux), or the
+// tailscale CLI reports it (macOS names the interface utunN). An address the
+// CLI reports but no interface holds (userspace networking) cannot be bound,
+// so it is not used either.
+func pickTailscale(addrs []interfaceAddress, fromCLI []net.IP) net.IP {
+	confirmed := func(a interfaceAddress) bool {
+		if strings.HasPrefix(a.iface, "tailscale") {
+			return true
+		}
+		for _, ip := range fromCLI {
+			if ip.Equal(a.ip) {
+				return true
+			}
+		}
+		return false
+	}
+	var v6 net.IP
+	for _, a := range addrs {
 		switch {
-		case tailscaleV4.Contains(ipnet.IP):
-			return ipnet.IP.To4()
-		case v6 == nil && tailscaleV6.Contains(ipnet.IP):
-			v6 = ipnet.IP
+		case !confirmed(a):
+		case tailscaleV4.Contains(a.ip):
+			return a.ip.To4()
+		case v6 == nil && tailscaleV6.Contains(a.ip):
+			v6 = a.ip
 		}
 	}
 	return v6
 }
 
-// cliTailscaleAddress asks the tailscale CLI, which also covers userspace
-// networking, where no interface carries the address.
-func cliTailscaleAddress() net.IP {
+// cliTailscaleAddresses asks the tailscale CLI for this machine's addresses,
+// or returns nothing when Tailscale is not installed or not running.
+func cliTailscaleAddresses() []net.IP {
 	bin, err := exec.LookPath("tailscale")
 	if err != nil {
-		return nil
+		// The macOS app does not put its CLI on PATH.
+		bin = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+		if _, err := os.Stat(bin); err != nil {
+			return nil
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, bin, "ip", "-4").Output()
+	out, err := exec.CommandContext(ctx, bin, "ip").Output()
 	if err != nil {
 		return nil
 	}
-	for _, line := range strings.Fields(string(out)) {
-		if ip := net.ParseIP(line); ip != nil && tailscaleV4.Contains(ip) {
-			return ip.To4()
+	var ips []net.IP
+	for _, field := range strings.Fields(string(out)) {
+		if ip := net.ParseIP(field); ip != nil {
+			ips = append(ips, ip)
 		}
 	}
-	return nil
+	return ips
 }
 
 // defaultRouteAddress is the source address the kernel would use to reach
@@ -161,7 +194,9 @@ func defaultRouteAddress() (net.IP, error) {
 func classifyAddress(ip net.IP) AddressKind {
 	switch {
 	case tailscaleV4.Contains(ip) || tailscaleV6.Contains(ip):
-		return KindTailscale
+		// Not confirmed by Tailscale (see pickTailscale), so it may be a
+		// carrier's or another VPN's.
+		return KindShared
 	case ip.IsPrivate() || ip.IsLinkLocalUnicast():
 		return KindPrivate
 	default:
@@ -207,9 +242,11 @@ var (
 
 // SetRemoteListen sets `listen` under [remote] in the config file at path,
 // or removes it when listen is empty. The rest of the file, comments
-// included, is kept as it is. The result is parsed before it is written, and
-// a file this cannot edit safely (say, one using an inline table) is left
-// alone with an error.
+// included, is kept as it is. The edit is line-based, so it is checked
+// before anything is written: the result must parse, have the new listen
+// value, and leave every other setting exactly as it was. A file it cannot
+// edit safely (an inline table, dotted keys, a "[remote]" line inside a
+// multi-line string) is left alone with an error.
 func SetRemoteListen(path, listen string) error {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -220,19 +257,38 @@ func SetRemoteListen(path, listen string) error {
 	} else if err != nil {
 		return fmt.Errorf("failed to read %s: %w", path, err)
 	}
-	var cfg Config
-	if _, err := toml.Decode(string(data), &cfg); err != nil {
+	before := map[string]any{}
+	if _, err := toml.Decode(string(data), &before); err != nil {
 		return fmt.Errorf("failed to parse %s: %w", path, err)
 	}
 	updated := editRemoteListen(string(data), listen)
-	cfg = Config{}
-	if _, err := toml.Decode(updated, &cfg); err != nil || cfg.Remote.Listen != listen {
+	after := map[string]any{}
+	var cfg Config
+	_, errMap := toml.Decode(updated, &after)
+	_, errCfg := toml.Decode(updated, &cfg)
+	if errMap != nil || errCfg != nil || cfg.Remote.Listen != listen || !sameApartFromListen(before, after) {
 		return fmt.Errorf("could not update [remote] listen in %s automatically; edit it by hand", path)
 	}
 	if updated == string(data) {
 		return nil
 	}
 	return writeFileAtomic(path, []byte(updated))
+}
+
+// sameApartFromListen reports whether two decoded configs differ only in
+// remote.listen (an empty [remote] table counts as no table).
+func sameApartFromListen(a, b map[string]any) bool {
+	strip := func(m map[string]any) {
+		if remote, ok := m["remote"].(map[string]any); ok {
+			delete(remote, "listen")
+			if len(remote) == 0 {
+				delete(m, "remote")
+			}
+		}
+	}
+	strip(a)
+	strip(b)
+	return reflect.DeepEqual(a, b)
 }
 
 func editRemoteListen(text, listen string) string {
@@ -261,6 +317,9 @@ func editRemoteListen(text, listen string) string {
 		return text
 	}
 	if header >= 0 {
+		if !strings.HasSuffix(lines[header], "\n") {
+			lines[header] += "\n" // [remote] was the last line
+		}
 		lines = append(lines[:header+1], append([]string{entry}, lines[header+1:]...)...)
 		return strings.Join(lines, "")
 	}
@@ -274,17 +333,31 @@ func editRemoteListen(text, listen string) string {
 	return out + "[remote]\n" + entry
 }
 
+// writeFileAtomic replaces the file at path with data. A symlinked config
+// (say, from a dotfiles repository) is followed, so the link survives, and
+// the file keeps its mode (0600 for a new one).
 func writeFileAtomic(path string, data []byte) error {
+	mode := os.FileMode(0o600)
+	if target, err := filepath.EvalSymlinks(path); err == nil {
+		path = target
+		if info, err := os.Stat(path); err == nil {
+			mode = info.Mode().Perm()
+		}
+	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".config-*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(0o600); err != nil {
+	if err := tmp.Chmod(mode); err != nil {
 		tmp.Close()
 		return err
 	}
 	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		return err
 	}

@@ -210,6 +210,9 @@ func runRemoteEnable(p *paths.AppPaths, argv []string) int {
 		switch candidate.Kind {
 		case daemon.KindTailscale:
 			fmt.Printf("Using this machine's Tailscale address, %s.\n", candidate.IP)
+		case daemon.KindShared:
+			fmt.Printf("No Tailscale address found. %s is in the shared carrier-grade NAT range: a mobile carrier,\n", candidate.IP)
+			fmt.Println("ISP or VPN may have assigned it, and others on that network may reach the listener.")
 		case daemon.KindPrivate:
 			fmt.Printf("No Tailscale address found. %s is a private LAN address: only machines on this network\n", candidate.IP)
 			fmt.Println("can reach it, and it may change if it was assigned by DHCP.")
@@ -240,6 +243,11 @@ func runRemoteEnable(p *paths.AppPaths, argv []string) int {
 	if err := daemon.CheckListen(addr, current); err != nil {
 		return fail(err)
 	}
+	cfg, err := daemon.LoadConfig(p.Config)
+	if err != nil {
+		return fail(err)
+	}
+	previous := cfg.Remote.Listen
 	if err := daemon.SetRemoteListen(p.Config, addr); err != nil {
 		return fail(err)
 	}
@@ -247,11 +255,21 @@ func runRemoteEnable(p *paths.AppPaths, argv []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	if status, err = daemon.Restart(p, exe); err != nil {
-		return fail(err)
+	// If the daemon does not come up listening on the new address, put the
+	// previous setting back (and restart again, so a listener that worked
+	// before keeps working) rather than leave a broken config behind.
+	status, err = daemon.Restart(p, exe)
+	if err == nil && status.Remote == "" {
+		err = fmt.Errorf("the daemon is not listening on %s: %s", addr, status.RemoteError)
 	}
-	if status.Remote == "" {
-		return fail(fmt.Errorf("saved [remote] listen = %q, but the daemon is not listening: %s", addr, status.RemoteError))
+	if err != nil {
+		if rerr := daemon.SetRemoteListen(p.Config, previous); rerr != nil {
+			return fail(fmt.Errorf("%v; restoring the previous setting also failed: %v", err, rerr))
+		}
+		if _, rerr := daemon.Restart(p, exe); rerr != nil {
+			return fail(fmt.Errorf("%v; restarting with the previous setting also failed: %v", err, rerr))
+		}
+		return fail(fmt.Errorf("%v; the previous setting was restored", err))
 	}
 	id, err := transport.LoadOrCreateIdentity(p.RemoteKeyPath())
 	if err != nil {
