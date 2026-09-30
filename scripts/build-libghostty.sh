@@ -53,7 +53,10 @@ fi
 git -C "${SRC}" checkout -q --detach "${GHOSTTY_COMMIT}"
 
 rm -rf "${OUT}"
-(cd "${SRC}" && "${ZIG}" build -Demit-lib-vt -Doptimize="${OPTIMIZE}" --prefix "${OUT}")
+# Only the static library is linked, never ghostty's xcframework. Its build
+# defaults to on whenever an xcodebuild is on PATH, which on a machine with
+# only the Command Line Tools is a stub that fails without Xcode.
+(cd "${SRC}" && "${ZIG}" build -Demit-lib-vt -Demit-xcframework=false -Doptimize="${OPTIMIZE}" --prefix "${OUT}")
 echo "${STAMP}" > "${OUT}/.commit"
 
 echo "libghostty-vt ready: ${OUT}" >&2
