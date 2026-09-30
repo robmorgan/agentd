@@ -187,7 +187,9 @@ When you create a session (`agent new [--cwd DIR] [NAME]`), the daemon:
 4. Waits for the worker to report the session running and bind its socket.
 
 The worker spawns the configured agent inside a PTY in `cwd`, with `AGENTD_SESSION_ID`,
-`AGENTD_SOCKET` and `AGENTD_CWD` injected.
+`AGENTD_SESSION_NAME` and `AGENTD_CWD` injected. The daemon socket is deliberately not passed in.
+That is not a boundary: agents run as the socket owner and can still find the socket at its
+well-known path, so isolating them needs a sandbox around the agent process.
 
 The daemon does not manage git worktrees or branches. That responsibility sits with whatever starts
 the session (the user, a wrapper, a skill, or the agent itself); the README shows the worktree

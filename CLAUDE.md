@@ -518,7 +518,7 @@ Next:
 Known gaps:
 - History is only saved when a session exits.
 - A lagging attach client loses output until the program repaints. The fix is an unsolicited snapshot resync, which needs CLI support.
-- Agents receive `AGENTD_SOCKET` and are trusted peers of the daemon.
+- Agents are not sandboxed: they run as the daemon's user and can reach its socket, although `AGENTD_SOCKET` is no longer injected.
 
 Do not begin QUIC before the transport split: the session and ownership model has to be clean first.
 

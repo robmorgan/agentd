@@ -254,12 +254,12 @@ configured and `claude` is the default.
 The daemon injects:
 
 - `AGENTD_SESSION_ID`
-- `AGENTD_SOCKET`
 - `AGENTD_CWD`
 - `AGENTD_SESSION_NAME` (same as `AGENTD_SESSION_ID`)
 
-Instrumented agents can use the injected session environment to locate the daemon socket, but
-there is no separate structured event channel. Session status, attention, and history are the
+The daemon socket is not passed to agents. They are not sandboxed, though: an agent runs as your
+user, so it can still reach the daemon at its usual path. There is no structured event channel for
+agents. Session status, attention, and history are the
 supported runtime surfaces.
 
 Everything lives under one root, `~/.agentd` on macOS and Linux alike, unless `AGENTD_DIR` names
