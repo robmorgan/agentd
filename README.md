@@ -152,17 +152,29 @@ Clients surface tasks based on attention instead of raw output.
 
 ## Build
 
-`agentd` is two binaries: the `agent` CLI (Rust) and the `agentd` daemon (Go). The daemon
-links `libghostty-vt`, which needs **Zig 0.16 or newer**; `go/scripts/build-libghostty.sh`
-fetches the pinned ghostty commit and builds it under `go/.build/` (point `ZIG=` at a 0.16
-toolchain if the one on `PATH` is older). See `go/README.md` for details.
+`agentd` is two Go binaries, built from one module at the repository root: the `agent` CLI and
+the `agentd` daemon.
 
 ```sh
-make build    # go/bin/agentd and target/debug/agent
-make test     # Go tests (with -race) and cargo test
+make build    # builds libghostty-vt if needed, then bin/agentd and bin/agent
+make agent    # just the CLI: pure Go, no cgo or Zig needed
+make test     # Go tests, with -race
 ```
 
-For local development, run the debug CLI against the freshly built daemon without reinstalling:
+The daemon's session workers link `libghostty-vt` statically, tracking the ghostty commit pinned in
+`scripts/build-libghostty.sh` (matching the Go bindings' `CMakeLists.txt`). That commit needs
+**Zig 0.16 or newer**; the script fetches it and builds it under `.build/`. Point `ZIG=` at a 0.16
+toolchain if the one on `PATH` is older. Zig is only needed when the library is (re)built; an
+up-to-date build under `.build/` is reused as is.
+
+libghostty-vt is built `ReleaseFast` by default (`GHOSTTY_OPTIMIZE` overrides it). Zig's default
+Debug build parses PTY output at roughly 50 KB/s, which is slow enough to throttle a busy agent;
+`BenchmarkTerminalFeed` shows ~640 MB/s with ReleaseFast.
+
+Only libghostty needs cgo; `modernc.org/sqlite` is pure Go, so cross compiling `agentd` is `zig cc`
+plus `CGO_ENABLED=1` as described in the go-libghostty README.
+
+For local development, run the freshly built CLI against the freshly built daemon without reinstalling:
 
 ```sh
 make dev-run ARGS="list"
@@ -174,7 +186,9 @@ make dev-run ARGS="list"
 make install
 ```
 
-This installs `agent` with `cargo install` and copies `agentd` next to it.
+This installs `agent` and `agentd` side by side in `$GOBIN` (or `$(go env GOPATH)/bin`); set
+`BINDIR` to choose another directory. If an older `agent` from `cargo install` is still in
+`~/.cargo/bin`, remove it (`cargo uninstall agent-cli`) so the new one is found first.
 
 ## Working Directories And Worktrees
 
@@ -376,7 +390,7 @@ installed next to `agent`. Set `AGENTD_BIN` to use a different daemon binary, fo
 build:
 
 ```sh
-AGENTD_BIN=$PWD/go/bin/agentd agent daemon restart
+AGENTD_BIN=$PWD/bin/agentd agent daemon restart
 ```
 
 ## Status And Limitations

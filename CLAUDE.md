@@ -1,6 +1,6 @@
-You are working in the `agentd` repository: a daemon runtime for supervising coding agents as durable tasks. It is a Go daemon (`go/`: `agentd serve` plus one `agentd session-worker` per session) and a Rust `agent` CLI (`crates/`), with QUIC planned as the primary remote transport.
+You are working in the `agentd` repository: a daemon runtime for supervising coding agents as durable tasks. It is one Go module: the daemon (`agentd serve` plus one `agentd session-worker` per session) and the `agent` CLI (`cmd/agent`, `internal/cli`), with QUIC as the remote transport.
 
-Before larger changes, read `README.md`, `ARCHITECTURE.md`, `ROADMAP.md` and `go/README.md`. The code is the source of truth for current behavior.
+Before larger changes, read `README.md`, `ARCHITECTURE.md` and `ROADMAP.md`. The code is the source of truth for current behavior.
 
 # Product direction
 
@@ -114,7 +114,7 @@ The daemon and its per-session workers are Go. Go owns:
 - PTY fan-out
 - task/agent lifecycle
 
-The `agent` CLI is Rust and speaks the same protocol. Keep the two codecs in step; golden-frame tests on both sides pin identical bytes.
+The `agent` CLI is Go too and uses the same protocol and transport packages. It must stay pure Go (no cgo, no Zig): it never imports `worker`, `daemon` or `db`, and a test in `cmd/agent` enforces that. It reaches session state only through the protocol. Golden-frame tests pin the protocol's bytes, since CLIs and daemons of different builds talk to each other.
 
 Preserve existing user-visible behavior unless there is a compelling reason to change it.
 
@@ -285,19 +285,19 @@ rather than merely:
 # Package layout
 
 ```text
-go/
-  cmd/agentd/          serve, upgrade, session-worker
-  internal/
-    daemon/            session registry, proxies, lifecycle, supervision
-    worker/            one session: PTY, terminal state, fan-out, input queue
-    protocol/          framed protocol + daemon management protocol
-    transport/         Stream/Listener seam, accept loop, Unix sockets, QUIC + identities
-    db/                state.db
-    session/           session model
-    paths/             runtime root
-crates/
-  agent-cli/           the `agent` CLI and TUI
-  agentd-shared/       Rust side of the protocol, schema, paths, config
+cmd/agentd/          serve, upgrade, session-worker
+cmd/agent/           the `agent` CLI (and its end-to-end PTY tests)
+internal/
+  cli/               the CLI: commands, picker, attach, overlay
+  daemon/            session registry, proxies, lifecycle, supervision
+  worker/            one session: PTY, terminal state, fan-out, input queue
+  protocol/          framed protocol + daemon management protocol
+  transport/         Stream/Listener seam, accept loop, Unix sockets, QUIC + identities
+  db/                state.db
+  session/           session model and name rules
+  paths/             runtime root
+  config/            config.toml
+scripts/             libghostty-vt build helper
 ```
 
 Avoid excessive package fragmentation.
@@ -308,7 +308,7 @@ Interfaces should exist where there are real boundaries such as transports or te
 
 # Protocol direction
 
-Keep the framed binary protocol (version 1; `go/internal/protocol` and `crates/agentd-shared/src/protocol.rs`).
+Keep the framed binary protocol (version 1; `internal/protocol`).
 
 Do not prematurely replace it with:
 

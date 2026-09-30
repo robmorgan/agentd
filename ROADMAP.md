@@ -239,8 +239,8 @@ The purpose is not merely a language rewrite. The Go implementation should becom
 * [x] Implement daemon lifecycle in Go
 * [x] Implement local Unix socket listener
 * [x] Implement existing framed protocol in Go
-* [ ] Implement client library
-* [ ] Implement CLI transport using Go client (the Rust CLI speaks the protocol directly for now)
+* [x] Implement client library
+* [x] Implement CLI transport using Go client (the `agent` CLI is Go, in `internal/cli`)
 * [x] Spawn agent processes under PTYs
 * [x] Support detach without process termination
 * [x] Support interactive reattach
@@ -379,7 +379,7 @@ The protocol should operate over explicit message and stream abstractions rather
 
 ## Deliverables
 
-* [x] Extract transport-neutral protocol package (`go/internal/protocol` over the stream/listener seam in `go/internal/transport`)
+* [x] Extract transport-neutral protocol package (`internal/protocol` over the stream/listener seam in `internal/transport`)
 * [x] Resolve session working directories on the daemon (`~/` paths and named workspaces managed
       with `agent workspace`), so a remote client does not need the host's paths
 * [ ] Define connection handshake
