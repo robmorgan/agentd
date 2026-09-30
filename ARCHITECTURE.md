@@ -10,12 +10,40 @@ agent (Go CLI) ──unix socket──► agentd serve (Go) ──unix socket─
                                 request/attach proxy                shadow terminal, client fan-out
 ```
 
-* The daemon (`go/internal/daemon`) owns the session registry in SQLite, spawns one worker per
+* The daemon (`internal/daemon`) owns the session registry in SQLite, spawns one worker per
   session, and proxies client requests and attach streams to it.
-* Each session worker (`go/internal/worker`) owns one PTY and child process, feeds the output
+* Each session worker (`internal/worker`) owns one PTY and child process, feeds the output
   through `libghostty-vt`, and fans it out to attached clients over its own socket in
   `<runtime-root>/sessions/<id>.sock`.
 * Control traffic and attach streams use a framed binary protocol.
+
+## Code Layout
+
+Both binaries are one Go module at the repository root.
+
+| Package | What it does |
+|---|---|
+| `cmd/agentd` | `serve [--daemonize]`, `upgrade`, `remote enable\|disable\|status` (set `[remote] listen` and restart the daemon), `remote id\|list\|authorize\|revoke`, `session-worker`. The agent CLI runs `serve --daemonize`. |
+| `cmd/agent`, `internal/cli` | The `agent` CLI: commands, the session picker, attach and the Ctrl-Y overlay (plain ANSI), and `hosts.toml` for remote hosts. Pure Go: it never imports `worker`, `daemon` or `db`, and `cmd/agent`'s tests check that, then drive both real binaries through PTYs. |
+| `internal/daemon` | `agentd serve`: lock/socket/pid file lifecycle, create/kill/rm/ls/get, attach and request proxies to workers, history, daemon management, worker supervision and startup reconciliation. Tests run the daemon in-process against real worker processes. |
+| `internal/worker` | One session: PTY via `creack/pty`, shadow terminal via `go.mitchellh.com/libghostty`, per-session Unix socket. Real-PTY tests run under `-race`. |
+| `internal/transport` | The seam between the protocol and the network: `Stream` (one request or attach session), `Listener`, the shared accept loop, the Unix socket transport, and the QUIC transport with pinned-key identities (`quic-go`). |
+| `internal/protocol` | The framed binary protocol and the small daemon management protocol, used by both binaries. Golden-frame tests pin the bytes. |
+| `internal/session`, `internal/paths`, `internal/config` | The session model (and name rules), runtime-root resolution, and `config.toml`, shared by both binaries. |
+| `internal/db` | `state.db`: schema, and the guarded session state transitions the daemon and workers use. Uses `modernc.org/sqlite` (pure Go). Only the daemon and its workers open it. |
+| `scripts/` | The libghostty-vt build helper. |
+
+A few details of the daemon and workers that the sections below do not cover:
+
+* `kill` asks the worker over its socket to stop; the worker stops the agent's process group
+  (SIGKILL after 5s), writes the history logs, records the session as exited and sends
+  `SessionEnded` to attached clients.
+* PTY input goes through a bounded per-session queue and writer goroutine, so an agent that stops
+  reading input never stalls output.
+* Attach is a byte pipe through the daemon, so the daemon never buffers PTY output. Slow-consumer
+  policy lives in the worker (`internal/worker/broadcast.go`).
+* Worker stderr goes to `logs/<id>.worker.log`; a daemonized `serve` logs to `agentd.log` in the
+  root (not `logs/`, where it could collide with a session named `agentd`).
 
 ## Sessions Belong To The Daemon, Not To Connections
 
@@ -38,7 +66,7 @@ session. Sessions whose worker disappeared while no daemon was running are marke
 ## Transports
 
 The protocol runs over any bidirectional byte stream that supports half-close. Each stream carries
-one request/response exchange or one attach session. Everything above `go/internal/transport` sees
+one request/response exchange or one attach session. Everything above `internal/transport` sees
 only that `Stream` and a `Listener` that yields streams, so the daemon does not know or care which
 transport a client used. The daemon-to-worker link is always a local Unix socket.
 
@@ -68,7 +96,7 @@ SSH uses host keys and `authorized_keys`, with no certificate authority:
 * Keys are created without ever replacing one that exists (written to a temporary file, then
   linked into place), so processes creating a key at the same moment all end up using the same one.
 
-The `agent` CLI is the client (`go/internal/cli/client.go`, over the same `go/internal/transport`
+The `agent` CLI is the client (`internal/cli/client.go`, over the same `internal/transport`
 QUIC code as the daemon). Its key is
 `remote/client.key`, in the same format as the daemon's, and `hosts.toml` maps host names to an
 address and the daemon fingerprint pinned by `agent host add`. One CLI process opens at most one
@@ -104,7 +132,7 @@ The daemon's tests run full sessions over QUIC, and over a TCP stand-in, to keep
 ## Wire Protocol
 
 `agent` and `agentd` communicate over a custom framed binary protocol, implemented in
-`go/internal/protocol` and used by both binaries. Golden-frame tests pin its bytes, so a CLI and a
+`internal/protocol` and used by both binaries. Golden-frame tests pin its bytes, so a CLI and a
 daemon of different builds, possibly on different machines, stay compatible. The current version
 is 1.
 
@@ -195,7 +223,7 @@ daemon signals a worker directly only if it is wedged, and only while its socket
 The PTY is never blocked by a client. Each attachment has a bounded queue in the worker; a client
 that falls too far behind loses output until it catches up, and its screen is wrong until the
 program repaints or the client reattaches. Resyncing a lagging client from a fresh snapshot is
-planned. See `go/internal/worker/broadcast.go`.
+planned. See `internal/worker/broadcast.go`.
 
 Input goes the other way through one bounded queue per session, drained by a dedicated writer.
 An agent that stops reading its input therefore never stalls PTY output or other requests; once
@@ -255,7 +283,7 @@ the client receives so it can re-hydrate clients that connect to the session. Th
 left off as if they didn't disconnect from the terminal session at all.
 
 The worker uses `go.mitchellh.com/libghostty`, whose pinned `libghostty-vt` needs Zig 0.16 and is
-built `ReleaseFast` under `go/.build/` by `go/scripts/build-libghostty.sh`. The FFI boundary is
+built `ReleaseFast` under `.build/` by `scripts/build-libghostty.sh`. The FFI boundary is
 coarse: whole PTY reads go in, whole snapshots come out. Only the worker links it: the `agent` CLI
 never imports the worker (or the daemon and its SQLite store), and a test keeps it buildable with
 `CGO_ENABLED=0`.

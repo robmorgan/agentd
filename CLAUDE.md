@@ -1,6 +1,6 @@
-You are working in the `agentd` repository: a daemon runtime for supervising coding agents as durable tasks. It is a Go daemon (`go/`: `agentd serve` plus one `agentd session-worker` per session) and a Go `agent` CLI (`go/cmd/agent`, `go/internal/cli`), with QUIC as the remote transport.
+You are working in the `agentd` repository: a daemon runtime for supervising coding agents as durable tasks. It is one Go module: the daemon (`agentd serve` plus one `agentd session-worker` per session) and the `agent` CLI (`cmd/agent`, `internal/cli`), with QUIC as the remote transport.
 
-Before larger changes, read `README.md`, `ARCHITECTURE.md`, `ROADMAP.md` and `go/README.md`. The code is the source of truth for current behavior.
+Before larger changes, read `README.md`, `ARCHITECTURE.md` and `ROADMAP.md`. The code is the source of truth for current behavior.
 
 # Product direction
 
@@ -285,19 +285,19 @@ rather than merely:
 # Package layout
 
 ```text
-go/
-  cmd/agentd/          serve, upgrade, session-worker
-  cmd/agent/           the `agent` CLI (and its end-to-end PTY tests)
-  internal/
-    cli/               the CLI: commands, picker, attach, overlay
-    daemon/            session registry, proxies, lifecycle, supervision
-    worker/            one session: PTY, terminal state, fan-out, input queue
-    protocol/          framed protocol + daemon management protocol
-    transport/         Stream/Listener seam, accept loop, Unix sockets, QUIC + identities
-    db/                state.db
-    session/           session model and name rules
-    paths/             runtime root
-    config/            config.toml
+cmd/agentd/          serve, upgrade, session-worker
+cmd/agent/           the `agent` CLI (and its end-to-end PTY tests)
+internal/
+  cli/               the CLI: commands, picker, attach, overlay
+  daemon/            session registry, proxies, lifecycle, supervision
+  worker/            one session: PTY, terminal state, fan-out, input queue
+  protocol/          framed protocol + daemon management protocol
+  transport/         Stream/Listener seam, accept loop, Unix sockets, QUIC + identities
+  db/                state.db
+  session/           session model and name rules
+  paths/             runtime root
+  config/            config.toml
+scripts/             libghostty-vt build helper
 ```
 
 Avoid excessive package fragmentation.
@@ -308,7 +308,7 @@ Interfaces should exist where there are real boundaries such as transports or te
 
 # Protocol direction
 
-Keep the framed binary protocol (version 1; `go/internal/protocol`).
+Keep the framed binary protocol (version 1; `internal/protocol`).
 
 Do not prematurely replace it with:
 
