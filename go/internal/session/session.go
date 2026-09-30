@@ -61,6 +61,20 @@ type Record struct {
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 	ExitedAt         *time.Time
+	// Workspace is the workspace the session was started in, if any. Cwd was
+	// resolved from it at creation; later changes to the workspace do not
+	// move the session.
+	Workspace *string
+}
+
+// Workspace names a directory on the daemon's machine, so clients can start
+// sessions there without knowing its paths. Workspaces live in state.db and
+// are managed through the protocol (`agent workspace add|ls|rm`). agentd does
+// not create, clone or sync the directory.
+type Workspace struct {
+	Name      string
+	Path      string
+	CreatedAt time.Time
 }
 
 type CreateResult struct {

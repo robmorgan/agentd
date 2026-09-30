@@ -6,7 +6,9 @@
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, TransactionBehavior};
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 1;
+/// Version 2 added workspaces. Changes must be additive migrations: session
+/// workers open the database once and keep writing across upgrades.
+pub const CURRENT_SCHEMA_VERSION: i32 = 2;
 
 const CREATE_SESSIONS_TABLE: &str = "
 CREATE TABLE sessions (
@@ -27,8 +29,21 @@ CREATE TABLE sessions (
     exited_at TEXT
 );";
 
+/// Version 2. Fresh databases are created at version 1 and migrated, so every
+/// database has the same layout.
+const MIGRATE_TO_V2: &str = "
+ALTER TABLE sessions ADD COLUMN workspace TEXT;
+CREATE TABLE workspaces (
+    name TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);";
+
+/// `MIGRATIONS[v - 1]` upgrades a database from version `v` to `v + 1`.
+const MIGRATIONS: &[&str] = &[MIGRATE_TO_V2];
+
 /// Creates the schema in an empty database, or checks the version of an
-/// existing one. The version read and the table creation run in one
+/// existing one and migrates it forward. The version read and the table creation run in one
 /// IMMEDIATE transaction, so they happen under SQLite's write lock: a second
 /// process (the Go daemon, another CLI) opening the same file waits on the
 /// connection's busy timeout instead of racing the creation. A DEFERRED
@@ -54,14 +69,23 @@ pub fn init_state_db(conn: &mut Connection) -> Result<()> {
         |row| row.get(0),
     )?;
 
+    let mut schema_version = schema_version;
     if !has_objects {
-        tx.execute_batch(&format!(
-            "{CREATE_SESSIONS_TABLE}\nPRAGMA user_version = {CURRENT_SCHEMA_VERSION};"
-        ))?;
-    } else if schema_version != CURRENT_SCHEMA_VERSION {
+        tx.execute_batch(CREATE_SESSIONS_TABLE)?;
+        schema_version = 1;
+    }
+    if !(1..=CURRENT_SCHEMA_VERSION).contains(&schema_version) {
         bail!(
             "unsupported state database schema version {schema_version}; remove the runtime root to start fresh"
         );
+    }
+    if schema_version < CURRENT_SCHEMA_VERSION {
+        for version in schema_version..CURRENT_SCHEMA_VERSION {
+            tx.execute_batch(MIGRATIONS[(version - 1) as usize]).with_context(|| {
+                format!("failed to migrate state database to version {}", version + 1)
+            })?;
+        }
+        tx.execute_batch(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION};"))?;
     }
 
     tx.commit().context("failed to commit state database schema")?;
@@ -94,6 +118,7 @@ mod tests {
         "created_at",
         "updated_at",
         "exited_at",
+        "workspace",
     ];
 
     static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -125,7 +150,7 @@ mod tests {
         init_state_db(&mut conn).unwrap();
 
         assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 1);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 2);
         assert_eq!(columns(&conn), EXPECTED_SESSIONS_COLUMNS);
 
         // Reopening an already-current database leaves it alone.
@@ -163,6 +188,32 @@ mod tests {
             .to_string();
 
         assert!(err.contains("CHECK constraint failed"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn version_1_database_is_migrated_and_keeps_sessions() {
+        let path = temp_db_path();
+        let mut conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "{}
+            INSERT INTO sessions (session_id, agent, mode, cwd, status, attention, created_at, updated_at)
+            VALUES ('old', 'sh', 'execute', '/w', 'running', 'info', 't', 't');
+            PRAGMA user_version = 1;",
+            super::CREATE_SESSIONS_TABLE
+        ))
+        .unwrap();
+
+        init_state_db(&mut conn).unwrap();
+
+        assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
+        assert_eq!(columns(&conn), EXPECTED_SESSIONS_COLUMNS);
+        let cwd: String = conn
+            .query_row("SELECT cwd FROM sessions WHERE session_id = 'old'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cwd, "/w");
+        conn.execute("INSERT INTO workspaces (name, path, created_at) VALUES ('m', '/m', 't')", [])
+            .unwrap();
         let _ = std::fs::remove_file(path);
     }
 

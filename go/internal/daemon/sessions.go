@@ -7,7 +7,6 @@ import (
 	"math/rand/v2"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -176,7 +175,7 @@ func (s *Server) reconcileSessions() error {
 	return nil
 }
 
-func (s *Server) allocateSession(name *string, agent string, model *string, cwd string) (id, createdAt string, err error) {
+func (s *Server) allocateSession(name *string, agent string, model *string, cwd string, workspace *string) (id, createdAt string, err error) {
 	s.createMu.Lock()
 	defer s.createMu.Unlock()
 
@@ -205,7 +204,7 @@ func (s *Server) allocateSession(name *string, agent string, model *string, cwd 
 		}
 	}
 	createdAt, err = s.db.InsertSession(db.NewSession{
-		SessionID: id, Agent: agent, Model: model, Mode: session.ModeExecute, Cwd: cwd,
+		SessionID: id, Agent: agent, Model: model, Mode: session.ModeExecute, Cwd: cwd, Workspace: workspace,
 	})
 	return id, createdAt, err
 }
@@ -246,11 +245,12 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 	if err != nil {
 		return nil, err
 	}
-	if !filepath.IsAbs(req.Cwd) {
-		return nil, fmt.Errorf("working directory `%s` must be an absolute path", req.Cwd)
+	cwd, workspace, err := s.resolveCwd(req)
+	if err != nil {
+		return nil, err
 	}
 
-	id, createdAt, err := s.allocateSession(name, req.Agent, req.Model, req.Cwd)
+	id, createdAt, err := s.allocateSession(name, req.Agent, req.Model, cwd, workspace)
 	if err != nil {
 		return nil, err
 	}
@@ -262,16 +262,16 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 	// Checked here as well as in the worker so a bad cwd is refused before
 	// any process is spawned. The record is kept, failed, so `agent ls`
 	// shows what happened.
-	if info, err := os.Stat(req.Cwd); err != nil {
-		return fail(fmt.Errorf("working directory `%s` does not exist", req.Cwd))
+	if info, err := os.Stat(cwd); err != nil {
+		return fail(fmt.Errorf("working directory `%s` does not exist", cwd))
 	} else if !info.IsDir() {
-		return fail(fmt.Errorf("working directory `%s` is not a directory", req.Cwd))
+		return fail(fmt.Errorf("working directory `%s` is not a directory", cwd))
 	}
 
 	args := []string{
 		"session-worker",
 		"--session-id", id,
-		"--cwd", req.Cwd,
+		"--cwd", cwd,
 		"--created-at", createdAt,
 		"--agent-name", req.Agent,
 		"--command", agent.Command,
@@ -295,7 +295,7 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 		return nil, err
 	}
 	return &session.CreateResult{
-		SessionID: id, Cwd: req.Cwd, Status: session.StatusRunning, Mode: session.ModeExecute,
+		SessionID: id, Cwd: cwd, Status: session.StatusRunning, Mode: session.ModeExecute,
 	}, nil
 }
 

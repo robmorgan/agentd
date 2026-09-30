@@ -5,7 +5,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::session::{
     AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult, SessionMode,
-    SessionRecord, SessionStatus,
+    SessionRecord, SessionStatus, WorkspaceRecord,
 };
 
 /// Version of the session protocol. The encoding must stay byte for byte
@@ -76,10 +76,14 @@ pub enum Request {
     GetDaemonInfo,
     ShutdownDaemon,
     CreateSession {
+        /// Resolved on the daemon's machine: absolute or `~/...` without a
+        /// workspace; empty or relative to the workspace root with one.
         cwd: String,
         name: Option<String>,
         agent: String,
         model: Option<String>,
+        /// A name from the daemon's `[workspaces]` config.
+        workspace: Option<String>,
     },
     KillSession {
         session_id: String,
@@ -126,6 +130,15 @@ pub enum Request {
     GetHistory {
         session_id: String,
         vt: bool,
+    },
+    ListWorkspaces,
+    /// `path` is resolved on the daemon's machine: absolute or `~/...`.
+    AddWorkspace {
+        name: String,
+        path: String,
+    },
+    RemoveWorkspace {
+        name: String,
     },
 }
 
@@ -175,6 +188,12 @@ pub enum Response {
         message: String,
     },
     Ok,
+    Workspaces {
+        workspaces: Vec<WorkspaceRecord>,
+    },
+    Workspace {
+        workspace: WorkspaceRecord,
+    },
 }
 
 // Requests are numbered from 1 and responses from 101. The ErrorResponse kind
@@ -199,6 +218,9 @@ enum MessageKind {
     ListSessionsRequest = 13,
     ListAttachmentsRequest = 14,
     GetHistoryRequest = 15,
+    ListWorkspacesRequest = 16,
+    AddWorkspaceRequest = 17,
+    RemoveWorkspaceRequest = 18,
     DaemonInfoResponse = 101,
     CreateSessionResponse = 102,
     KillSessionResponse = 103,
@@ -214,6 +236,8 @@ enum MessageKind {
     EndOfStreamResponse = 113,
     ErrorResponse = 114,
     OkResponse = 115,
+    WorkspacesResponse = 116,
+    WorkspaceResponse = 117,
 }
 
 impl MessageKind {
@@ -234,6 +258,9 @@ impl MessageKind {
             13 => Self::ListSessionsRequest,
             14 => Self::ListAttachmentsRequest,
             15 => Self::GetHistoryRequest,
+            16 => Self::ListWorkspacesRequest,
+            17 => Self::AddWorkspaceRequest,
+            18 => Self::RemoveWorkspaceRequest,
             101 => Self::DaemonInfoResponse,
             102 => Self::CreateSessionResponse,
             103 => Self::KillSessionResponse,
@@ -249,6 +276,8 @@ impl MessageKind {
             113 => Self::EndOfStreamResponse,
             114 => Self::ErrorResponse,
             115 => Self::OkResponse,
+            116 => Self::WorkspacesResponse,
+            117 => Self::WorkspaceResponse,
             other => bail!("unknown message kind `{other}`"),
         })
     }
@@ -437,11 +466,12 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
     let kind = match request {
         Request::GetDaemonInfo => MessageKind::GetDaemonInfoRequest,
         Request::ShutdownDaemon => MessageKind::ShutdownDaemonRequest,
-        Request::CreateSession { cwd, name, agent, model } => {
+        Request::CreateSession { cwd, name, agent, model, workspace } => {
             put_string(&mut payload, cwd)?;
             put_optional_string(&mut payload, name.as_deref())?;
             put_string(&mut payload, agent)?;
             put_optional_string(&mut payload, model.as_deref())?;
+            put_optional_string(&mut payload, workspace.as_deref())?;
             MessageKind::CreateSessionRequest
         }
         Request::KillSession { session_id, remove } => {
@@ -500,6 +530,16 @@ fn encode_request(request: &Request) -> Result<(MessageKind, Vec<u8>)> {
             put_bool(&mut payload, *vt);
             MessageKind::GetHistoryRequest
         }
+        Request::ListWorkspaces => MessageKind::ListWorkspacesRequest,
+        Request::AddWorkspace { name, path } => {
+            put_string(&mut payload, name)?;
+            put_string(&mut payload, path)?;
+            MessageKind::AddWorkspaceRequest
+        }
+        Request::RemoveWorkspace { name } => {
+            put_string(&mut payload, name)?;
+            MessageKind::RemoveWorkspaceRequest
+        }
     };
     Ok((kind, payload))
 }
@@ -514,6 +554,7 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
             name: cursor.take_optional_string()?,
             agent: cursor.take_string()?,
             model: cursor.take_optional_string()?,
+            workspace: cursor.take_optional_string()?,
         },
         MessageKind::KillSessionRequest => {
             Request::KillSession { session_id: cursor.take_string()?, remove: cursor.take_bool()? }
@@ -553,6 +594,13 @@ fn decode_request(kind: MessageKind, payload: &[u8]) -> Result<Request> {
         }
         MessageKind::GetHistoryRequest => {
             Request::GetHistory { session_id: cursor.take_string()?, vt: cursor.take_bool()? }
+        }
+        MessageKind::ListWorkspacesRequest => Request::ListWorkspaces,
+        MessageKind::AddWorkspaceRequest => {
+            Request::AddWorkspace { name: cursor.take_string()?, path: cursor.take_string()? }
+        }
+        MessageKind::RemoveWorkspaceRequest => {
+            Request::RemoveWorkspace { name: cursor.take_string()? }
         }
         other => bail!("unexpected response message kind `{other:?}` while decoding request"),
     };
@@ -625,6 +673,17 @@ fn encode_response(response: &Response) -> Result<(MessageKind, Vec<u8>)> {
             MessageKind::ErrorResponse
         }
         Response::Ok => MessageKind::OkResponse,
+        Response::Workspaces { workspaces } => {
+            put_len(&mut payload, workspaces.len())?;
+            for workspace in workspaces {
+                put_workspace_record(&mut payload, workspace)?;
+            }
+            MessageKind::WorkspacesResponse
+        }
+        Response::Workspace { workspace } => {
+            put_workspace_record(&mut payload, workspace)?;
+            MessageKind::WorkspaceResponse
+        }
     };
     Ok((kind, payload))
 }
@@ -678,6 +737,17 @@ fn decode_response(kind: MessageKind, payload: &[u8]) -> Result<Response> {
         MessageKind::EndOfStreamResponse => Response::EndOfStream,
         MessageKind::ErrorResponse => Response::Error { message: cursor.take_string()? },
         MessageKind::OkResponse => Response::Ok,
+        MessageKind::WorkspacesResponse => {
+            let len = cursor.take_len()?;
+            let mut workspaces = Vec::with_capacity(len);
+            for _ in 0..len {
+                workspaces.push(cursor.take_workspace_record()?);
+            }
+            Response::Workspaces { workspaces }
+        }
+        MessageKind::WorkspaceResponse => {
+            Response::Workspace { workspace: cursor.take_workspace_record()? }
+        }
         other => bail!("unexpected request message kind `{other:?}` while decoding response"),
     };
     cursor.finish()?;
@@ -835,6 +905,14 @@ fn put_session_record(buf: &mut Vec<u8>, session: &SessionRecord) -> Result<()> 
     put_datetime(buf, &session.created_at);
     put_datetime(buf, &session.updated_at);
     put_optional_datetime(buf, session.exited_at.as_ref());
+    put_optional_string(buf, session.workspace.as_deref())?;
+    Ok(())
+}
+
+fn put_workspace_record(buf: &mut Vec<u8>, workspace: &WorkspaceRecord) -> Result<()> {
+    put_string(buf, &workspace.name)?;
+    put_string(buf, &workspace.path)?;
+    put_datetime(buf, &workspace.created_at);
     Ok(())
 }
 
@@ -1045,6 +1123,15 @@ impl<'a> Cursor<'a> {
             created_at: self.take_datetime()?,
             updated_at: self.take_datetime()?,
             exited_at: self.take_optional_datetime()?,
+            workspace: self.take_optional_string()?,
+        })
+    }
+
+    fn take_workspace_record(&mut self) -> Result<WorkspaceRecord> {
+        Ok(WorkspaceRecord {
+            name: self.take_string()?,
+            path: self.take_string()?,
+            created_at: self.take_datetime()?,
         })
     }
 
@@ -1098,7 +1185,7 @@ mod tests {
     };
     use crate::session::{
         AttachmentKind, AttachmentRecord, AttentionLevel, CreateSessionResult, SessionMode,
-        SessionRecord, SessionStatus,
+        SessionRecord, SessionStatus, WorkspaceRecord,
     };
     use chrono::{TimeZone, Utc};
     use tokio::io::AsyncWriteExt;
@@ -1207,10 +1294,21 @@ mod tests {
             name: Some("fix".to_string()),
             agent: "codex".to_string(),
             model: Some("m".to_string()),
+            workspace: None,
         };
         let (kind, payload) = encode_request(&request).unwrap();
         let decoded = decode_request(kind, &payload).unwrap();
         assert_eq!(decoded, request);
+
+        let request = Request::CreateSession {
+            cwd: "sub".to_string(),
+            name: None,
+            agent: "claude".to_string(),
+            model: None,
+            workspace: Some("isara".to_string()),
+        };
+        let (kind, payload) = encode_request(&request).unwrap();
+        assert_eq!(decode_request(kind, &payload).unwrap(), request);
     }
 
     #[test]
@@ -1266,6 +1364,7 @@ mod tests {
                 created_at: now,
                 updated_at: now,
                 exited_at: None,
+                workspace: None,
             }],
         };
         let (kind, payload) = encode_response(&response).unwrap();
@@ -1448,9 +1547,9 @@ mod tests {
     async fn create_session_matches_go_golden_frame() {
         let golden = [
             0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, //
-            0x18, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x2f, 0x77, 0x01, 0x03, //
+            0x1f, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x2f, 0x77, 0x01, 0x03, //
             0x00, 0x00, 0x00, 0x66, 0x69, 0x78, 0x05, 0x00, 0x00, 0x00, 0x63, 0x6f, //
-            0x64, 0x65, 0x78, 0x00,
+            0x64, 0x65, 0x78, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x77, 0x73,
         ];
         assert_request_golden(
             Request::CreateSession {
@@ -1458,6 +1557,7 @@ mod tests {
                 name: Some("fix".to_string()),
                 agent: "codex".to_string(),
                 model: None,
+                workspace: Some("ws".to_string()),
             },
             &golden,
         )
@@ -1548,14 +1648,14 @@ mod tests {
     async fn session_record_matches_go_golden_frame() {
         let golden = [
             0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x6c, 0x00, 0x00, 0x00, 0x00, 0x00, //
-            0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x61, 0x62, 0x02, 0x00, //
+            0x59, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x61, 0x62, 0x02, 0x00, //
             0x00, 0x00, 0x73, 0x68, 0x01, 0x01, 0x00, 0x00, 0x00, 0x6d, 0x01, 0x02, //
             0x00, 0x00, 0x00, 0x2f, 0x77, 0x03, 0x01, 0x07, 0x00, 0x00, 0x00, 0x00, //
             0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, //
             0x73, 0x00, 0xf1, 0x53, 0x65, 0x00, 0x00, 0x00, 0x00, 0x15, 0xcd, 0x5b, //
             0x07, 0x00, 0xf1, 0x53, 0x65, 0x00, 0x00, 0x00, 0x00, 0x15, 0xcd, 0x5b, //
             0x07, 0x01, 0x64, 0xf1, 0x53, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
-            0x00, 0x00,
+            0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x77, 0x73,
         ];
         let created = Utc.timestamp_opt(1_700_000_000, 123_456_789).single().unwrap();
         let exited = Utc.timestamp_opt(1_700_000_100, 0).single().unwrap();
@@ -1577,9 +1677,48 @@ mod tests {
                     created_at: created,
                     updated_at: created,
                     exited_at: Some(exited),
+                    workspace: Some("ws".to_string()),
                 },
             },
             &golden,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn workspace_messages_match_go_golden_frames() {
+        assert_request_golden(
+            Request::AddWorkspace { name: "m".to_string(), path: "/w".to_string() },
+            &[
+                0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, //
+                0x0b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x6d, 0x02, 0x00, 0x00, //
+                0x00, 0x2f, 0x77,
+            ],
+        )
+        .await;
+        assert_request_golden(
+            Request::RemoveWorkspace { name: "m".to_string() },
+            &[
+                0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, //
+                0x05, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x6d,
+            ],
+        )
+        .await;
+        let created = Utc.timestamp_opt(1_700_000_000, 123_456_789).single().unwrap();
+        assert_response_golden(
+            Response::Workspaces {
+                workspaces: vec![WorkspaceRecord {
+                    name: "m".to_string(),
+                    path: "/w".to_string(),
+                    created_at: created,
+                }],
+            },
+            &[
+                0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, //
+                0x1b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, //
+                0x6d, 0x02, 0x00, 0x00, 0x00, 0x2f, 0x77, 0x00, 0xf1, 0x53, 0x65, 0x00, //
+                0x00, 0x00, 0x00, 0x15, 0xcd, 0x5b, 0x07,
+            ],
         )
         .await;
     }
@@ -1597,7 +1736,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_kinds_are_rejected() {
-        for kind in [0_u16, 16, 99, 116] {
+        for kind in [0_u16, 19, 99, 118] {
             let frame = raw_frame(PROTOCOL_VERSION, kind, &[]);
             let err = read_request(&mut frame.as_slice()).await.unwrap_err().to_string();
             assert!(err.contains(&format!("unknown message kind `{kind}`")), "{kind}: {err}");

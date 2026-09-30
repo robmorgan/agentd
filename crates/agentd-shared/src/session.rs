@@ -54,6 +54,18 @@ pub struct SessionRecord {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub exited_at: Option<DateTime<Utc>>,
+    /// The workspace the session was started in, if any. `cwd` was resolved
+    /// from it when the session was created.
+    pub workspace: Option<String>,
+}
+
+/// A named directory on the daemon's machine (`agent workspace add`). The
+/// daemon resolves and stores the path; agentd does not create or sync it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceRecord {
+    pub name: String,
+    pub path: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

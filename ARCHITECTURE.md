@@ -146,8 +146,10 @@ buffers PTY output itself.
 
 When you create a session (`agent new [--cwd DIR] [NAME]`), the daemon:
 
-1. Validates the name and agent, and that `cwd` is an existing absolute directory. It does not need
-   to be a git repository.
+1. Validates the name and agent, and resolves `cwd` on its own machine: an absolute path, a
+   `~/` path expanded against the daemon user's home, or a path relative to a named workspace
+   (stored in `state.db`, managed with `agent workspace`). The directory must exist; it does not
+   need to be a git repository.
 2. Allocates a session id and stores the record in `<runtime-root>/state.db`.
 3. Spawns `agentd session-worker` in a new process session.
 4. Waits for the worker to report the session running and bind its socket.
@@ -158,6 +160,16 @@ The worker spawns the configured agent inside a PTY in `cwd`, with `AGENTD_SESSI
 The daemon does not manage git worktrees or branches. That responsibility sits with whatever starts
 the session (the user, a wrapper, a skill, or the agent itself); the README shows the worktree
 recipe.
+
+Working directories are resolved by the daemon, never the client, because the client may be on
+another machine. The local CLI still canonicalizes a plain `--cwd` itself, since it shares the
+daemon's filesystem; with `--workspace` it sends the name and the relative path unchanged.
+
+Workspaces are daemon state, not configuration: they live in the `workspaces` table of
+`state.db` and clients add, list and remove them over the protocol, so a remote client can manage
+them without touching the host's files. A session stores the workspace name next to the cwd
+resolved from it at creation. Workspaces are addressing only: agentd does not clone, create or
+sync them.
 
 For each session there are three kinds of state:
 
@@ -208,7 +220,8 @@ The selected root contains:
 * `agentd.sock`
 * `agentd.lock` (held by the running daemon)
 * `agentd.pid` (informational)
-* `state.db` (schema v1; the daemon refuses any other version)
+* `state.db` (schema v2; older versions are migrated forward, newer ones refused. Migrations
+  must be additive, because session workers keep writing to the file across daemon upgrades)
 * `sessions/` (one socket per live session)
 * `agentd.log` (output of a daemonized daemon)
 * `remote/` (`daemon.key`, `authorized_clients`, and the CLI's `client.key`)

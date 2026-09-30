@@ -3,7 +3,7 @@
 This directory holds the `agentd` daemon (`agentd serve`) and the
 per-session worker it spawns (`agentd session-worker`). The `agent` CLI is
 Rust (`../crates/agent-cli`) and speaks the same framed protocol (version 1)
-and state schema (version 1).
+and state schema (version 2).
 
 ## Layout at a glance
 
