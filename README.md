@@ -152,17 +152,18 @@ Clients surface tasks based on attention instead of raw output.
 
 ## Build
 
-`agentd` is two binaries: the `agent` CLI (Rust) and the `agentd` daemon (Go). The daemon
-links `libghostty-vt`, which needs **Zig 0.16 or newer**; `go/scripts/build-libghostty.sh`
-fetches the pinned ghostty commit and builds it under `go/.build/` (point `ZIG=` at a 0.16
-toolchain if the one on `PATH` is older). See `go/README.md` for details.
+`agentd` is two Go binaries: the `agent` CLI and the `agentd` daemon. The daemon links
+`libghostty-vt`, which needs **Zig 0.16 or newer**; `go/scripts/build-libghostty.sh` fetches the
+pinned ghostty commit and builds it under `go/.build/` (point `ZIG=` at a 0.16 toolchain if the one
+on `PATH` is older). The CLI is pure Go and needs neither cgo nor Zig
+(`make -C go agent`). See `go/README.md` for details.
 
 ```sh
-make build    # go/bin/agentd and target/debug/agent
-make test     # Go tests (with -race) and cargo test
+make build    # go/bin/agentd and go/bin/agent
+make test     # Go tests, with -race
 ```
 
-For local development, run the debug CLI against the freshly built daemon without reinstalling:
+For local development, run the freshly built CLI against the freshly built daemon without reinstalling:
 
 ```sh
 make dev-run ARGS="list"
@@ -174,7 +175,9 @@ make dev-run ARGS="list"
 make install
 ```
 
-This installs `agent` with `cargo install` and copies `agentd` next to it.
+This installs `agent` and `agentd` side by side in `$GOBIN` (or `$(go env GOPATH)/bin`); set
+`BINDIR` to choose another directory. If an older `agent` from `cargo install` is still in
+`~/.cargo/bin`, remove it (`cargo uninstall agent-cli`) so the new one is found first.
 
 ## Working Directories And Worktrees
 

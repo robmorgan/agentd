@@ -5,9 +5,9 @@ and metadata. `agent` is a thin client that sends requests over the resolved run
 `agentd.sock` and prints or streams the responses.
 
 ```text
-agent (Rust CLI) ──unix socket──► agentd serve (Go) ──unix socket──► agentd session-worker (Go) ──PTY──► agent process
-                                  session registry,                   one per session: PTY owner,
-                                  request/attach proxy                shadow terminal, client fan-out
+agent (Go CLI) ──unix socket──► agentd serve (Go) ──unix socket──► agentd session-worker (Go) ──PTY──► agent process
+                                session registry,                   one per session: PTY owner,
+                                request/attach proxy                shadow terminal, client fan-out
 ```
 
 * The daemon (`go/internal/daemon`) owns the session registry in SQLite, spawns one worker per
@@ -68,15 +68,18 @@ SSH uses host keys and `authorized_keys`, with no certificate authority:
 * Keys are created without ever replacing one that exists (written to a temporary file, then
   linked into place), so processes creating a key at the same moment all end up using the same one.
 
-The `agent` CLI is the client (`crates/agent-cli/src/transport.rs`, quinn and rustls). Its key is
+The `agent` CLI is the client (`go/internal/cli/client.go`, over the same `go/internal/transport`
+QUIC code as the daemon). Its key is
 `remote/client.key`, in the same format as the daemon's, and `hosts.toml` maps host names to an
 address and the daemon fingerprint pinned by `agent host add`. One CLI process opens at most one
 QUIC connection and one stream per request or attachment, so an attachment and the overlay's
 requests share a connection. A remote host is never started, restarted or upgraded from the CLI.
 With TLS 1.3 a client can finish its half of the handshake
 before the daemon rejects its key, so a refusal may only surface on the first stream; the CLI
-recognises the TLS alert there and says how to authorize the machine. Both sides' tests pin one
-key and its fingerprint, so the Go and Rust fingerprint definitions cannot drift apart.
+recognises the TLS alert there and says how to authorize the machine. A name that resolves to
+several addresses (`localhost` is often `::1` and `127.0.0.1`) is dialled at each in turn within a
+10-second budget. A test pins one key's fingerprint, since `hosts.toml` and `authorized_clients`
+store fingerprints and they must never change.
 
 `agentd remote enable` picks the listen address when none is given: first a Tailscale address,
 used without asking; otherwise the source address of the default route, found by connecting a UDP
@@ -101,8 +104,9 @@ The daemon's tests run full sessions over QUIC, and over a TCP stand-in, to keep
 ## Wire Protocol
 
 `agent` and `agentd` communicate over a custom framed binary protocol, implemented in
-`go/internal/protocol` and `crates/agentd-shared/src/protocol.rs`. Golden-frame tests on both sides
-keep the two byte-for-byte compatible. The current version is 33.
+`go/internal/protocol` and used by both binaries. Golden-frame tests pin its bytes, so a CLI and a
+daemon of different builds, possibly on different machines, stay compatible. The current version
+is 1.
 
 Each frame has a fixed 16-byte header followed by a payload:
 
@@ -252,4 +256,6 @@ left off as if they didn't disconnect from the terminal session at all.
 
 The worker uses `go.mitchellh.com/libghostty`, whose pinned `libghostty-vt` needs Zig 0.16 and is
 built `ReleaseFast` under `go/.build/` by `go/scripts/build-libghostty.sh`. The FFI boundary is
-coarse: whole PTY reads go in, whole snapshots come out.
+coarse: whole PTY reads go in, whole snapshots come out. Only the worker links it: the `agent` CLI
+never imports the worker (or the daemon and its SQLite store), and a test keeps it buildable with
+`CGO_ENABLED=0`.

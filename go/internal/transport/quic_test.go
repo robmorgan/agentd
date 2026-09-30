@@ -286,9 +286,8 @@ func TestAuthorizedClientsFile(t *testing.T) {
 	}
 }
 
-// The same key and fingerprint are pinned in the agent CLI's tests
-// (crates/agent-cli/src/transport.rs), so both sides agree on what a
-// fingerprint is.
+// A fixed key and its fingerprint. The fingerprint is what users compare and
+// what hosts.toml and authorized_clients store, so it must never change.
 const (
 	parityKeyPEM = `-----BEGIN PRIVATE KEY-----
 MC4CAQAwBQYDK2VwBCIEIBjksdA/xBFa67gw4s1UxuZHtUs8lCcbF6PTgueUIoCc

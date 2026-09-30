@@ -150,8 +150,7 @@ func TestWorkspaces(t *testing.T) {
 	}
 }
 
-// The daemon, its workers and the CLI's local mode can all open a new
-// database at once; exactly one creates the schema and the rest must wait,
+// The daemon and its workers can all open a new database at once; exactly one creates the schema and the rest must wait,
 // not fail.
 func TestConcurrentOpenOfNewDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")

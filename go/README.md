@@ -1,21 +1,22 @@
 # agentd (Go)
 
-This directory holds the `agentd` daemon (`agentd serve`) and the
-per-session worker it spawns (`agentd session-worker`). The `agent` CLI is
-Rust (`../crates/agent-cli`) and speaks the same framed protocol (version 1)
-and state schema (version 2).
+This directory holds both binaries: the `agentd` daemon (`agentd serve`)
+with the per-session worker it spawns (`agentd session-worker`), and the
+`agent` CLI. They speak the framed protocol (version 1); only the daemon and
+its workers open `state.db` (schema version 2).
 
 ## Layout at a glance
 
 | Package | What it does |
 |---|---|
 | `internal/transport` | The seam between the protocol and the network: `Stream` (one request or attach session), `Listener`, the shared accept loop, the Unix socket transport, and the QUIC transport with pinned-key identities (`quic-go`). |
-| `internal/protocol` | The framed binary protocol and the small daemon management protocol. The same framing and encodings as `crates/agentd-shared/src/protocol.rs`; golden-frame tests on both sides pin identical bytes. |
-| `internal/session`, `internal/paths` | The session model and runtime-root resolution, shared in meaning with `crates/agentd-shared`. |
+| `internal/protocol` | The framed binary protocol and the small daemon management protocol, used by both binaries. Golden-frame tests pin the bytes. |
+| `internal/session`, `internal/paths`, `internal/config` | The session model (and name rules), runtime-root resolution, and `config.toml`, shared by both binaries. |
 | `internal/db` | `state.db`: schema, and the guarded session state transitions the daemon and workers use. Uses `modernc.org/sqlite` (pure Go). |
 | `internal/daemon` | `agentd serve`: lock/socket/pid file lifecycle, create/kill/rm/ls/get, attach and request proxies to workers, history, daemon management, worker supervision and startup reconciliation. Tests run the daemon in-process against real worker processes. |
 | `internal/worker` | One session: PTY via `creack/pty`, shadow terminal via `go.mitchellh.com/libghostty`, per-session Unix socket. Real-PTY tests run under `-race`. |
 | `cmd/agentd` | `serve [--daemonize]`, `upgrade`, `remote enable|disable|status` (set `[remote] listen` and restart the daemon), `remote id|list|authorize|revoke`, `session-worker`. The agent CLI runs `serve --daemonize`. |
+| `internal/cli`, `cmd/agent` | The `agent` CLI: commands, the session picker, attach and the Ctrl-Y overlay (plain ANSI), and `hosts.toml` for remote hosts. Pure Go: it never imports `worker`, `daemon` or `db`, and `cmd/agent`'s tests check that, then drive both real binaries through PTYs. |
 
 ## How the daemon and workers fit together
 
@@ -49,12 +50,12 @@ agent CLI ──unix socket──► agentd serve ──unix socket──► age
 
 ```sh
 make -C go build
-AGENTD_BIN=$PWD/go/bin/agentd agent new --cwd ~/src/project my-task
+go/bin/agent new --cwd ~/src/project my-task
 ```
 
 The agent CLI starts `agentd serve --daemonize` itself when no daemon is
-running. `AGENTD_BIN` points it at this build instead of the `agentd` next
-to the `agent` binary.
+running. It looks for `agentd` next to its own
+executable; `AGENTD_BIN` points it at another build.
 
 ## Building
 
@@ -64,7 +65,8 @@ commit (pinned in `scripts/build-libghostty.sh`, matching the bindings'
 its own checkout under `go/.build/`.
 
 ```sh
-make -C go build      # builds libghostty-vt if needed, then bin/agentd
+make -C go build      # builds libghostty-vt if needed, then bin/agentd and bin/agent
+make -C go agent      # just the CLI: pure Go, no Zig needed
 make -C go test
 ```
 

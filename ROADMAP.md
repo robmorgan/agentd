@@ -239,8 +239,8 @@ The purpose is not merely a language rewrite. The Go implementation should becom
 * [x] Implement daemon lifecycle in Go
 * [x] Implement local Unix socket listener
 * [x] Implement existing framed protocol in Go
-* [ ] Implement client library
-* [ ] Implement CLI transport using Go client (the Rust CLI speaks the protocol directly for now)
+* [x] Implement client library
+* [x] Implement CLI transport using Go client (the `agent` CLI is Go, in `go/internal/cli`)
 * [x] Spawn agent processes under PTYs
 * [x] Support detach without process termination
 * [x] Support interactive reattach

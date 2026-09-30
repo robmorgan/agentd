@@ -128,7 +128,7 @@ func TestUnknownKindsAndVersionsAreRejected(t *testing.T) {
 	e.str("demo")
 	payload := e.buf
 
-	for _, k := range []uint16{0, 16, 99, 100, 116, 999} {
+	for _, k := range []uint16{0, 19, 99, 100, 118, 999} {
 		var buf bytes.Buffer
 		if err := writeFrame(&buf, ProtocolVersion, k, payload); err != nil {
 			t.Fatal(err)
@@ -166,8 +166,8 @@ func TestCleanEOFReturnsNil(t *testing.T) {
 	}
 }
 
-// The Rust CLI serialises DaemonManagementRequest::Shutdown with serde_json
-// as {"force":true}; the frame must match byte for byte.
+// Shutdown is {"force":true} on the wire; CLIs of other builds send exactly
+// this frame.
 func TestManagementShutdownGoldenFrame(t *testing.T) {
 	var buf bytes.Buffer
 	if err := WriteManagementRequest(&buf, &ManagementRequest{Shutdown: &ManagementShutdown{Force: true}}); err != nil {
@@ -224,9 +224,9 @@ func TestReadIncomingVersionMismatch(t *testing.T) {
 	}
 }
 
-// The frames below are pinned byte for byte in
-// crates/agentd-shared/src/protocol.rs as well, so an encoding change on
-// either side fails both test suites.
+// The frames below pin the encoding byte for byte: a change here breaks
+// every CLI and daemon of another build, so it needs a protocol version
+// bump.
 func assertRequestGolden(t *testing.T, req *Request, golden []byte) {
 	t.Helper()
 	var buf bytes.Buffer

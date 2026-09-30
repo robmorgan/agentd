@@ -1,9 +1,7 @@
 // Package protocol implements the framed binary wire protocol shared by the
-// agent CLI, the daemon, and session workers.
-//
-// crates/agentd-shared/src/protocol.rs implements the same protocol for the
-// agent CLI; the two must agree byte for byte (golden-frame tests on both
-// sides pin this).
+// agent CLI, the daemon, and session workers. Golden-frame tests pin its
+// bytes, so a CLI and a daemon of different builds (or on different
+// machines) keep understanding each other.
 package protocol
 
 import (
@@ -31,7 +29,7 @@ const (
 	// MaxFramePayload bounds a frame's declared payload length, which comes
 	// straight off the wire, so one bad header cannot make a peer allocate
 	// gigabytes. It comfortably fits a snapshot or history of the maximum
-	// retained scrollback. crates/agentd-shared uses the same limit.
+	// retained scrollback.
 	MaxFramePayload = 64 << 20
 )
 
@@ -878,8 +876,8 @@ func (d *decoder) bytes() []byte {
 	return out
 }
 
-// str rejects invalid UTF-8, as the Rust decoder does, so that nothing the Go
-// side accepts (and may persist) can later fail to decode in the CLI.
+// str rejects invalid UTF-8, so that nothing the daemon accepts (and may
+// persist) is text the CLI would print as something else.
 func (d *decoder) str() string {
 	b := d.bytes()
 	if !utf8.Valid(b) {

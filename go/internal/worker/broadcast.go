@@ -8,8 +8,7 @@ const subscriberBuffer = 256
 //
 // Slow-consumer policy: publish never blocks. A subscriber that falls more
 // than subscriberBuffer chunks (up to ~2 MiB of 8 KiB reads) behind silently
-// loses the chunks that do not fit, matching the Rust worker's
-// broadcast::RecvError::Lagged => continue. The PTY and every other client
+// loses the chunks that do not fit. The PTY and every other client
 // keep flowing, but the lagging client's screen is wrong until the program
 // repaints or the user reattaches. The intended fix is to mark the
 // subscriber lagged here and have serveAttach send a fresh snapshot once it
