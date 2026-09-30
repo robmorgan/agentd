@@ -106,10 +106,46 @@ func TestQUICRejectsUnauthorizedClient(t *testing.T) {
 			s.SetDeadline(time.Now().Add(quicTestTimeout))
 			s.Write([]byte("hi"))
 			s.CloseWrite()
-			if reply, err := io.ReadAll(s); err == nil {
+			reply, err := io.ReadAll(s)
+			if err == nil {
 				t.Fatalf("unauthorized client got a reply: %q", reply)
 			}
+			if !IsKeyRefused(err) {
+				t.Fatalf("refusal on the stream is not recognised: %v", err)
+			}
 		}
+	} else if !IsKeyRefused(err) {
+		t.Fatalf("refusal at dial is not recognised: %v", err)
+	}
+}
+
+// host add learns the daemon's key before this client is authorized.
+func TestProbeLearnsTheKeyBeforeAuthorization(t *testing.T) {
+	server, stranger := mustIdentity(t), mustIdentity(t)
+	l := startEcho(t, server)
+	fp, err := ProbeFingerprint(context.Background(), l.Addr(), stranger)
+	if err != nil || fp != server.Fingerprint {
+		t.Fatalf("probe = %q, %v; want %s", fp, err, server.Fingerprint)
+	}
+}
+
+// localhost resolving to ::1 first, with only 127.0.0.1 listening, still
+// connects.
+func TestDialTriesEveryResolvedAddress(t *testing.T) {
+	ips, err := net.DefaultResolver.LookupHost(context.Background(), "localhost")
+	if err != nil || len(ips) < 2 {
+		t.Skipf("localhost resolves to %v (%v)", ips, err)
+	}
+	server, client := mustIdentity(t), mustIdentity(t)
+	l := startEcho(t, server, client.Fingerprint)
+	_, port, _ := net.SplitHostPort(l.Addr())
+	c, err := DialQUIC(context.Background(), net.JoinHostPort("localhost", port), client, server.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if got := roundTrip(t, c, "hi"); got != "HI" {
+		t.Fatalf("got %q", got)
 	}
 }
 
@@ -119,7 +155,8 @@ func TestQUICClientRefusesUnpinnedDaemon(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), quicTestTimeout)
 	defer cancel()
 	_, err := DialQUIC(ctx, l.Addr(), client, impostorPin.Fingerprint)
-	if err == nil || !strings.Contains(err.Error(), "does not match the pinned key") {
+	var changed *KeyChangedError
+	if !errors.As(err, &changed) || changed.Presented != server.Fingerprint || changed.Pinned != impostorPin.Fingerprint {
 		t.Fatalf("dial to an unpinned daemon: %v", err)
 	}
 }
@@ -260,7 +297,9 @@ MC4CAQAwBQYDK2VwBCIEIBjksdA/xBFa67gw4s1UxuZHtUs8lCcbF6PTgueUIoCc
 	parityFingerprint = "SHA256:AOUfC64ic5/SwRe6zJIVSbIBIuiehNsWrqsT/Af5gtY"
 )
 
-func TestFingerprintMatchesTheCLI(t *testing.T) {
+// The fingerprint of a fixed key never changes: existing hosts.toml pins
+// and authorized_clients entries depend on it.
+func TestFingerprintIsStable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "parity.key")
 	if err := os.WriteFile(path, []byte(parityKeyPEM), 0o600); err != nil {
 		t.Fatal(err)

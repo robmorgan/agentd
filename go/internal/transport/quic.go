@@ -259,33 +259,118 @@ type QUICClient struct {
 	conn *quic.Conn
 }
 
+// DialTimeout bounds DialQUIC and ProbeFingerprint across all the addresses
+// they try.
+const DialTimeout = 10 * time.Second
+
+// KeyChangedError means the daemon presented a key other than the pinned
+// one: it was reinstalled, or something is impersonating it.
+type KeyChangedError struct {
+	Pinned, Presented string
+}
+
+func (e *KeyChangedError) Error() string {
+	return fmt.Sprintf("daemon key %s does not match the pinned key %s", e.Presented, e.Pinned)
+}
+
 // DialQUIC connects to a daemon at addr, authenticating with id and
-// refusing any daemon whose key does not match serverFingerprint.
-func DialQUIC(ctx context.Context, addr string, id *Identity, serverFingerprint string) (*QUICClient, error) {
+// refusing any daemon whose key does not match pinned, with a
+// *KeyChangedError. A host name may resolve to several addresses
+// (localhost is often ::1 and 127.0.0.1, only one of them listening), so
+// each is tried in turn, each with an equal share of the time left.
+func DialQUIC(ctx context.Context, addr string, id *Identity, pinned string) (*QUICClient, error) {
+	conn, _, err := dialEach(ctx, addr, id, pinned)
+	if err != nil {
+		return nil, err
+	}
+	return &QUICClient{conn: conn}, nil
+}
+
+// ProbeFingerprint learns the key the daemon at addr presents, without
+// pinning one, for `agent host add`. It works before this client is
+// authorized: the daemon shows its certificate before judging the client's.
+func ProbeFingerprint(ctx context.Context, addr string, id *Identity) (string, error) {
+	conn, presented, err := dialEach(ctx, addr, id, "")
+	if conn != nil {
+		conn.CloseWithError(0, "")
+	}
+	if presented != "" {
+		return presented, nil
+	}
+	return "", err
+}
+
+// IsKeyRefused reports whether err is the daemon refusing this client's
+// key: a TLS alert, which QUIC carries as a crypto error. With TLS 1.3 the
+// refusal may only surface on the first stream, after the dial succeeded.
+func IsKeyRefused(err error) bool {
+	var te *quic.TransportError
+	return errors.As(err, &te) && te.Remote && te.ErrorCode.IsCryptoError()
+}
+
+// dialEach tries every address addr resolves to. With a pin it stops at the
+// first connection, or at a daemon presenting another key; without one
+// (pinned == "") it stops at the first daemon that presents a key, whether
+// or not the handshake then completes. presented is the key the daemon
+// showed on the last attempt.
+func dialEach(ctx context.Context, addr string, id *Identity, pinned string) (conn *quic.Conn, presented string, err error) {
+	ctx, cancel := context.WithTimeout(ctx, DialTimeout)
+	defer cancel()
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, "", err
+	}
+	ips, err := net.DefaultResolver.LookupHost(ctx, host)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to resolve %s: %w", host, err)
+	}
+	for i, ip := range ips {
+		attemptCtx := ctx
+		if deadline, ok := ctx.Deadline(); ok {
+			var attemptCancel context.CancelFunc
+			attemptCtx, attemptCancel = context.WithTimeout(ctx, time.Until(deadline)/time.Duration(len(ips)-i))
+			defer attemptCancel()
+		}
+		conn, presented, err = dialOne(attemptCtx, net.JoinHostPort(ip, port), id, pinned)
+		switch {
+		case err == nil:
+			return conn, presented, nil
+		case presented != "" && pinned == "":
+			return nil, presented, err
+		case presented != "" && presented != pinned:
+			return nil, presented, &KeyChangedError{Pinned: pinned, Presented: presented}
+		case ctx.Err() != nil:
+			return nil, presented, err
+		}
+	}
+	return nil, presented, err
+}
+
+func dialOne(ctx context.Context, addr string, id *Identity, pinned string) (*quic.Conn, string, error) {
+	var presented string
 	tlsConf := &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{id.cert},
 		NextProtos:   []string{ALPN},
 		ServerName:   "agentd",
 		// The daemon's certificate is self-signed; it is trusted only by
-		// its pinned key fingerprint, checked below.
+		// its pinned key fingerprint, checked below. TLS still checks the
+		// handshake signature, so the daemon proves it holds that key.
 		InsecureSkipVerify: true,
 		VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
 			fp, err := leafFingerprint(raw)
 			if err != nil {
 				return err
 			}
-			if fp != serverFingerprint {
-				return fmt.Errorf("daemon key %s does not match the pinned key %s", fp, serverFingerprint)
+			presented = fp
+			if pinned != "" && fp != pinned {
+				return &KeyChangedError{Pinned: pinned, Presented: fp}
 			}
 			return nil
 		},
 	}
 	conn, err := quic.DialAddr(ctx, addr, tlsConf, quicConfig())
-	if err != nil {
-		return nil, err
-	}
-	return &QUICClient{conn: conn}, nil
+	return conn, presented, err
 }
 
 // OpenStream opens a stream for one request or attach session.
