@@ -19,8 +19,8 @@ import (
 
 func (s *Server) addWorkspace(req *protocol.AddWorkspace) (*session.Workspace, error) {
 	name := strings.TrimSpace(req.Name)
-	if !validSessionName(name) {
-		return nil, fmt.Errorf("invalid workspace name `%s`: %s", name, sessionNameRules)
+	if !session.ValidName(name) {
+		return nil, fmt.Errorf("invalid workspace name `%s`: %s", name, session.NameRules)
 	}
 	path, err := expandHome(req.Path)
 	if err != nil {

@@ -25,32 +25,12 @@ const (
 	workerKillTimeout = 2 * time.Second
 	workerDialTimeout = 2 * time.Second
 	pollInterval      = 20 * time.Millisecond
-
-	sessionNameRules = "use 1-64 lowercase letters, numbers, and single hyphens"
 )
 
 var (
 	nameAdjectives = []string{"brisk", "calm", "clever", "curious", "gentle", "nimble", "quiet", "steady", "swift", "wrinkly"}
 	nameAnimals    = []string{"badgers", "bears", "foxes", "geckos", "otters", "pandas", "ravens", "tigers", "whales", "wolves"}
 )
-
-func validSessionName(name string) bool {
-	if name == "" || len(name) > 64 || name[0] == '-' || name[len(name)-1] == '-' {
-		return false
-	}
-	lastHyphen := false
-	for i := 0; i < len(name); i++ {
-		switch c := name[i]; {
-		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
-			lastHyphen = false
-		case c == '-' && !lastHyphen:
-			lastHyphen = true
-		default:
-			return false
-		}
-	}
-	return true
-}
 
 type liveness int
 
@@ -230,8 +210,8 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 	var name *string
 	if req.Name != nil {
 		if trimmed := strings.TrimSpace(*req.Name); trimmed != "" {
-			if !validSessionName(trimmed) {
-				return nil, fmt.Errorf("invalid session name `%s`: %s", trimmed, sessionNameRules)
+			if !session.ValidName(trimmed) {
+				return nil, fmt.Errorf("invalid session name `%s`: %s", trimmed, session.NameRules)
 			}
 			name = &trimmed
 		}

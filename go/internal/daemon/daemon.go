@@ -45,6 +45,7 @@ import (
 	"github.com/robmorgan/agentd/go/internal/db"
 	"github.com/robmorgan/agentd/go/internal/paths"
 	"github.com/robmorgan/agentd/go/internal/protocol"
+	"github.com/robmorgan/agentd/go/internal/session"
 	"github.com/robmorgan/agentd/go/internal/transport"
 )
 
@@ -455,7 +456,7 @@ func (s *Server) handleRequest(conn transport.Stream, reader *bufio.Reader, req 
 	// Session ids become socket and log paths, so anything that could not
 	// have been created as a session name (e.g. "../x") is refused here,
 	// before any path is built from it.
-	if id, ok := requestSessionID(req); ok && !validSessionName(id) {
+	if id, ok := requestSessionID(req); ok && !session.ValidName(id) {
 		return reply(protocol.ErrorResponsef("session `%s` not found", id))
 	}
 

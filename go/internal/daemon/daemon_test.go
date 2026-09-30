@@ -983,18 +983,6 @@ func TestRuntimeFilesArePrivate(t *testing.T) {
 	}
 }
 
-func TestValidSessionName(t *testing.T) {
-	for name, want := range map[string]bool{
-		"a": true, "a-b": true, "abc-123": true, strings.Repeat("a", 64): true,
-		"": false, "-a": false, "a-": false, "a--b": false, "A": false, "a_b": false,
-		"é": false, "a/b": false, "..": false, strings.Repeat("a", 65): false,
-	} {
-		if got := validSessionName(name); got != want {
-			t.Errorf("%q: got %v, want %v", name, got, want)
-		}
-	}
-}
-
 func TestLoadConfig(t *testing.T) {
 	dir := t.TempDir()
 	cfg, err := LoadConfig(filepath.Join(dir, "missing.toml"))
@@ -1061,7 +1049,7 @@ func TestGeneratedNamesDoNotRunOut(t *testing.T) {
 		}
 	}
 	id := h.mustCreate("")
-	if !validSessionName(id) || strings.Count(id, "-") != 2 {
+	if !session.ValidName(id) || strings.Count(id, "-") != 2 {
 		t.Fatalf("generated name %q", id)
 	}
 }
