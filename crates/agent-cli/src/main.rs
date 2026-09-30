@@ -32,7 +32,6 @@ use tokio::{
     signal::unix::{SignalKind, signal},
 };
 
-mod local;
 mod runtime;
 mod session_display;
 mod transport;
@@ -52,8 +51,6 @@ use agentd_shared::{
         SessionStatus, WorkspaceRecord, validate_session_name,
     },
 };
-
-use crate::local::{LocalStore, normalize_degraded_session, remove_session_artifacts};
 
 const AGENTD_ATTACH_ENTER_SEQUENCE: &[u8] = b"\x1b[>1u";
 const AGENTD_ATTACH_RESTORE_SEQUENCE: &[u8] =
@@ -353,22 +350,16 @@ async fn run(mut cli: Cli, paths: AppPaths) -> Result<()> {
         )?),
         _ => None,
     };
-    let execution = resolve_execution_mode(&paths, cli.command.as_ref()).await?;
+    prepare_daemon(&paths, cli.command.as_ref()).await?;
 
-    match (cli.command, execution) {
-        (None, ExecutionMode::Daemon) => {
+    match cli.command {
+        None => {
             run_runtime(&paths, None).await?;
         }
-        (None, ExecutionMode::Local(reason)) => {
-            bail!("{reason}. `agent` requires a compatible daemon");
-        }
-        (Some(Command::Runtime { session_id }), ExecutionMode::Daemon) => {
+        Some(Command::Runtime { session_id }) => {
             run_runtime(&paths, session_id.as_deref()).await?;
         }
-        (Some(Command::Runtime { .. }), ExecutionMode::Local(reason)) => {
-            bail!("{reason}. `agent runtime` requires a compatible daemon");
-        }
-        (Some(Command::New { .. }), ExecutionMode::Daemon) => {
+        Some(Command::New { .. }) => {
             let options = new_session.take().expect("new session options resolved above");
             let response = send_request(
                 &paths,
@@ -390,10 +381,7 @@ async fn run(mut cli: Cli, paths: AppPaths) -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Some(Command::New { .. }), ExecutionMode::Local(reason)) => {
-            bail_live_command(&reason)?;
-        }
-        (Some(Command::Kill { rm, session_id }), ExecutionMode::Daemon) => {
+        Some(Command::Kill { rm, session_id }) => {
             let response = send_request(
                 &paths,
                 &Request::KillSession { session_id: session_id.clone(), remove: rm },
@@ -408,13 +396,7 @@ async fn run(mut cli: Cli, paths: AppPaths) -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Some(Command::Kill { rm, session_id }), ExecutionMode::Local(reason)) => {
-            if should_print_degraded_notice(DegradedNoticeCommand::Kill, &reason) {
-                print_degraded_notice(&reason);
-            }
-            local_kill(&paths, &session_id, rm).await?;
-        }
-        (Some(Command::Rm { session_id }), ExecutionMode::Daemon) => {
+        Some(Command::Rm { session_id }) => {
             let response = send_request(
                 &paths,
                 &Request::KillSession { session_id: session_id.clone(), remove: true },
@@ -429,19 +411,10 @@ async fn run(mut cli: Cli, paths: AppPaths) -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Some(Command::Rm { session_id }), ExecutionMode::Local(reason)) => {
-            if should_print_degraded_notice(DegradedNoticeCommand::Kill, &reason) {
-                print_degraded_notice(&reason);
-            }
-            local_kill(&paths, &session_id, true).await?;
-        }
-        (Some(Command::Attach { session_id }), ExecutionMode::Daemon) => {
+        Some(Command::Attach { session_id }) => {
             attach_session(&paths, &session_id).await?;
         }
-        (Some(Command::Attach { .. }), ExecutionMode::Local(reason)) => {
-            bail_live_command(&reason)?;
-        }
-        (Some(Command::Detach { session_id, attach, all }), ExecutionMode::Daemon) => {
+        Some(Command::Detach { session_id, attach, all }) => {
             let session_id = resolve_detach_session_id(session_id)?;
             if all && attach.is_some() {
                 bail!("use either `--all` or `--attach <attach_id>`, not both");
@@ -466,13 +439,7 @@ async fn run(mut cli: Cli, paths: AppPaths) -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Some(Command::Detach { .. }), ExecutionMode::Local(reason)) => {
-            bail_live_command(&reason)?;
-        }
-        (
-            Some(Command::SendInput { session_id, source_session_id, data }),
-            ExecutionMode::Daemon,
-        ) => {
+        Some(Command::SendInput { session_id, source_session_id, data }) => {
             let response = send_request(
                 &paths,
                 &Request::SendInput {
@@ -489,39 +456,18 @@ async fn run(mut cli: Cli, paths: AppPaths) -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Some(Command::SendInput { .. }), ExecutionMode::Local(reason)) => {
-            bail_live_command(&reason)?;
-        }
-        (Some(Command::History { session_id, vt }), ExecutionMode::Daemon) => {
+        Some(Command::History { session_id, vt }) => {
             print_history(&paths, &session_id, vt).await?;
         }
-        (Some(Command::History { .. }), ExecutionMode::Local(reason)) => {
-            bail!("{reason}. `agent history` requires a compatible daemon");
-        }
-        (Some(Command::List), ExecutionMode::Daemon) => {
+        Some(Command::List) => {
             let sessions = daemon_list_sessions(&paths).await?;
             print_sessions(&sessions);
         }
-        (Some(Command::List), ExecutionMode::Local(reason)) => {
-            if should_print_degraded_notice(DegradedNoticeCommand::List, &reason) {
-                print_degraded_notice(&reason);
-            }
-            let store = LocalStore::open(&paths)?;
-            let sessions = store
-                .list_sessions()?
-                .into_iter()
-                .map(normalize_degraded_session)
-                .collect::<Vec<_>>();
-            print_sessions(&sessions);
-        }
-        (Some(Command::Attachments { session_id }), ExecutionMode::Daemon) => {
+        Some(Command::Attachments { session_id }) => {
             let attachments = daemon_list_attachments(&paths, &session_id).await?;
             print_attachments(&attachments);
         }
-        (Some(Command::Attachments { .. }), ExecutionMode::Local(reason)) => {
-            bail!("{reason}. `agent attachments` requires a compatible daemon");
-        }
-        (Some(Command::Status { session_id }), ExecutionMode::Daemon) => {
+        Some(Command::Status { session_id }) => {
             let response = send_request(&paths, &Request::GetSession { session_id }).await?;
             match response {
                 Response::Session { session } => print_session(&session),
@@ -529,18 +475,7 @@ async fn run(mut cli: Cli, paths: AppPaths) -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Some(Command::Status { session_id }), ExecutionMode::Local(reason)) => {
-            if should_print_degraded_notice(DegradedNoticeCommand::Status, &reason) {
-                print_degraded_notice(&reason);
-            }
-            let store = LocalStore::open(&paths)?;
-            let session = store
-                .get_session(&session_id)?
-                .map(normalize_degraded_session)
-                .ok_or_else(|| anyhow::anyhow!("session `{session_id}` not found"))?;
-            print_session(&session);
-        }
-        (Some(Command::Workspace { command }), ExecutionMode::Daemon) => {
+        Some(Command::Workspace { command }) => {
             let request = match command {
                 WorkspaceCommand::Add { name, path } => Request::AddWorkspace {
                     name,
@@ -566,10 +501,7 @@ async fn run(mut cli: Cli, paths: AppPaths) -> Result<()> {
                 other => bail!("unexpected response: {:?}", other),
             }
         }
-        (Some(Command::Workspace { .. }), ExecutionMode::Local(reason)) => {
-            bail!("{reason}. `agent workspace` requires a compatible daemon");
-        }
-        (Some(Command::Daemon { command }), ExecutionMode::Daemon) => match command {
+        Some(Command::Daemon { command }) => match command {
             DaemonCommand::Info => {
                 let status = daemon_management_status(&paths).await?;
                 print_daemon_management_status(&status);
@@ -583,10 +515,7 @@ async fn run(mut cli: Cli, paths: AppPaths) -> Result<()> {
                 upgrade_daemon(&paths).await?;
             }
         },
-        (Some(Command::Daemon { .. }), ExecutionMode::Local(reason)) => {
-            bail!("{reason}. daemon management requires a reachable daemon");
-        }
-        (Some(Command::Host { .. } | Command::Remote { .. }), _) => {
+        Some(Command::Host { .. } | Command::Remote { .. }) => {
             unreachable!("handled before choosing a daemon")
         }
     }
@@ -722,11 +651,6 @@ async fn run_runtime(paths: &AppPaths, initial_session_id: Option<&str>) -> Resu
     Ok(())
 }
 
-enum ExecutionMode {
-    Daemon,
-    Local(String),
-}
-
 #[derive(Debug)]
 struct NewSessionOptions {
     cwd: String,
@@ -735,12 +659,13 @@ struct NewSessionOptions {
     workspace: Option<String>,
 }
 
-async fn resolve_execution_mode(
-    paths: &AppPaths,
-    command: Option<&Command>,
-) -> Result<ExecutionMode> {
-    // A remote daemon is never started, restarted or replaced from here, and
-    // there is no local state to fall back on.
+/// Makes sure a daemon is there for `command`. Every command goes through the
+/// daemon, which alone owns session state; with no compatible daemon a
+/// command fails and names the fix instead of editing state.db behind its
+/// back. `daemon` subcommands only need something to talk to, since they exist
+/// to repair a missing or mismatched daemon.
+async fn prepare_daemon(paths: &AppPaths, command: Option<&Command>) -> Result<()> {
+    // A remote daemon is never started, restarted or replaced from here.
     if let Some(name) = transport::remote_name() {
         if let Some(Command::Daemon {
             command: command @ (DaemonCommand::Restart | DaemonCommand::Upgrade),
@@ -755,79 +680,18 @@ async fn resolve_execution_mode(
         if !matches!(command, Some(Command::Daemon { .. })) {
             ensure_compatible_daemon(paths).await?;
         }
-        return Ok(ExecutionMode::Daemon);
+        return Ok(());
     }
-
-    if matches!(command, Some(Command::Daemon { command: DaemonCommand::Upgrade })) {
-        return Ok(ExecutionMode::Daemon);
-    }
-
-    if matches!(command, Some(Command::Daemon { .. })) {
-        if try_connect(paths).await.is_err() {
-            spawn_daemon(paths).await?;
-        }
-        return Ok(ExecutionMode::Daemon);
-    }
-
-    if command_supports_local_mode(command) {
-        if let Some(reason) = degraded_mode_reason(paths).await? {
-            return Ok(ExecutionMode::Local(reason));
-        }
-        return Ok(ExecutionMode::Daemon);
-    }
-
-    ensure_daemon(paths).await?;
-    Ok(ExecutionMode::Daemon)
-}
-
-fn command_supports_local_mode(command: Option<&Command>) -> bool {
-    matches!(
-        command,
-        Some(Command::Kill { .. } | Command::Rm { .. } | Command::List | Command::Status { .. })
-    )
-}
-
-async fn degraded_mode_reason(paths: &AppPaths) -> Result<Option<String>> {
-    match try_connect(paths).await {
-        Ok(_) => match daemon_info(paths).await {
-            Ok(info) if info.protocol_version == PROTOCOL_VERSION => Ok(None),
-            Ok(info) => Ok(Some(format!(
-                "agentd protocol version {} is incompatible with agent protocol version {}",
-                info.protocol_version, PROTOCOL_VERSION
-            ))),
-            Err(err) => Ok(Some(format!("agentd could not be queried: {err}"))),
-        },
-        Err(_) => {
-            if spawn_daemon(paths).await.is_ok() && ensure_compatible_daemon(paths).await.is_ok() {
-                return Ok(None);
+    match command {
+        Some(Command::Daemon { command: DaemonCommand::Upgrade }) => Ok(()),
+        Some(Command::Daemon { .. }) => {
+            if try_connect(paths).await.is_err() {
+                spawn_daemon(paths).await?;
             }
-            Ok(Some("agentd is unavailable".to_string()))
+            Ok(())
         }
+        _ => ensure_daemon(paths).await,
     }
-}
-
-fn print_degraded_notice(reason: &str) {
-    eprintln!(
-        "agent: {reason}; using local degraded mode for metadata/log/session cleanup commands"
-    );
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DegradedNoticeCommand {
-    Kill,
-    List,
-    Status,
-}
-
-fn should_print_degraded_notice(command: DegradedNoticeCommand, reason: &str) -> bool {
-    !matches!(command, DegradedNoticeCommand::Kill)
-        || !reason.starts_with("agentd could not be queried:")
-}
-
-fn bail_live_command(reason: &str) -> Result<()> {
-    bail!(
-        "{reason}. this command needs a compatible daemon with a live PTY; use `agent sessions` and `agent kill` first"
-    )
 }
 
 fn resolve_new_session_options(
@@ -1229,35 +1093,6 @@ async fn print_history(paths: &AppPaths, session_id: &str, vt: bool) -> Result<(
         Response::Error { message } => bail!(message),
         other => bail!("unexpected response: {:?}", other),
     }
-}
-
-/// `agent kill`/`agent rm` without a daemon. A session counts as running only
-/// if its worker socket answers (see local::worker_is_live); pids recorded in
-/// state.db are never signalled on their own say-so.
-async fn local_kill(paths: &AppPaths, session_id: &str, remove: bool) -> Result<()> {
-    let store = LocalStore::open(paths)?;
-    let session = store
-        .get_session(session_id)?
-        .ok_or_else(|| anyhow::anyhow!("session `{session_id}` not found"))?;
-    let was_running = local::worker_is_live(paths, session_id).await;
-
-    if was_running {
-        local::stop_live_session(&store, paths, session_id).await?;
-    } else if local::session_is_active(&session) {
-        store.mark_unknown_recovered(session_id)?;
-    }
-
-    if !was_running && !remove {
-        bail!("session `{session_id}` is not running");
-    }
-
-    if remove {
-        remove_session_artifacts(paths, &session)?;
-        store.delete_session(session_id)?;
-    }
-
-    print_kill_result(session_id, was_running, remove);
-    Ok(())
 }
 
 async fn attach_session(paths: &AppPaths, session_id: &str) -> Result<()> {
@@ -2248,13 +2083,12 @@ mod tests {
     use super::{
         AGENTD_ATTACH_ENTER_SEQUENCE, AGENTD_ATTACH_EXIT_TITLE, AGENTD_ATTACH_RESTORE_SEQUENCE,
         ATTACH_DETACH_BYTE, ATTACH_NEXT_SESSION_BYTE, ATTACH_OVERLAY_BYTE, AttachInputAction,
-        AttachInputParser, AttachSessionDirection, Cli, Command, DaemonCommand,
-        DegradedNoticeCommand, SessionEndSummary, WorkspaceCommand, adjacent_live_session_id_in,
-        attach_startup_bytes, cli_command, cli_styles, daemon_executable_from,
-        ensure_compatible_daemon, format_attach_title, format_session_end_summary, remote_cwd,
-        remote_workspace_path, resolve_cwd, resolve_detach_session_id, resolve_new_session_options,
-        should_print_degraded_notice, start_daemon, take_session_host, terminal_title_bytes,
-        workspace_path,
+        AttachInputParser, AttachSessionDirection, Cli, Command, DaemonCommand, SessionEndSummary,
+        WorkspaceCommand, adjacent_live_session_id_in, attach_startup_bytes, cli_command,
+        cli_styles, daemon_executable_from, ensure_compatible_daemon, format_attach_title,
+        format_session_end_summary, remote_cwd, remote_workspace_path, resolve_cwd,
+        resolve_detach_session_id, resolve_new_session_options, start_daemon, take_session_host,
+        terminal_title_bytes, workspace_path,
     };
     use agentd_shared::session::{AttentionLevel, SessionMode, SessionRecord, SessionStatus};
     use agentd_shared::{
@@ -2329,43 +2163,6 @@ mod tests {
 
         assert!(!help.contains("agentd - agent multiplexer"));
         assert!(help.contains("agent daemon"));
-    }
-
-    #[test]
-    fn kill_suppresses_query_failure_degraded_notice() {
-        assert!(!should_print_degraded_notice(
-            DegradedNoticeCommand::Kill,
-            "agentd could not be queried: broken pipe"
-        ));
-    }
-
-    #[test]
-    fn kill_keeps_unavailable_degraded_notice() {
-        assert!(should_print_degraded_notice(DegradedNoticeCommand::Kill, "agentd is unavailable"));
-    }
-
-    #[test]
-    fn kill_keeps_protocol_mismatch_degraded_notice() {
-        assert!(should_print_degraded_notice(
-            DegradedNoticeCommand::Kill,
-            "agentd protocol version 1 is incompatible with agent protocol version 2"
-        ));
-    }
-
-    #[test]
-    fn list_keeps_query_failure_degraded_notice() {
-        assert!(should_print_degraded_notice(
-            DegradedNoticeCommand::List,
-            "agentd could not be queried: broken pipe"
-        ));
-    }
-
-    #[test]
-    fn status_keeps_query_failure_degraded_notice() {
-        assert!(should_print_degraded_notice(
-            DegradedNoticeCommand::Status,
-            "agentd could not be queried: broken pipe"
-        ));
     }
 
     #[test]
@@ -2802,6 +2599,39 @@ command = "claude"
         assert!(err.contains("agent daemon upgrade"), "{err}");
     }
 
+    /// Commands that used to fall back to reading and editing state.db now
+    /// fail when the daemon is not compatible, and never touch the database.
+    #[tokio::test]
+    async fn session_commands_refuse_incompatible_daemon_without_touching_state_db() {
+        use tokio::io::AsyncReadExt;
+        let paths = test_paths();
+        paths.ensure_layout().unwrap();
+        let listener = tokio::net::UnixListener::bind(paths.socket.as_std_path()).unwrap();
+        // Accepts every connection (the liveness probe, then each info
+        // request) and hangs up without answering.
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0_u8; 64];
+                let _ = stream.read(&mut buf).await;
+            }
+        });
+
+        let commands = [
+            Command::List,
+            Command::Status { session_id: "demo".to_string() },
+            Command::Kill { rm: false, session_id: "demo".to_string() },
+            Command::Rm { session_id: "demo".to_string() },
+        ];
+        for command in &commands {
+            let err =
+                format!("{:#}", super::prepare_daemon(&paths, Some(command)).await.unwrap_err());
+            assert!(err.contains("agent daemon upgrade"), "{command:?}: {err}");
+        }
+        server.abort();
+        assert!(!paths.database.exists(), "state.db was created by the CLI");
+    }
+
     #[tokio::test]
     async fn cli_refuses_daemon_speaking_another_protocol() {
         // A DaemonInfo response framed at another version: the frame version
@@ -2851,123 +2681,6 @@ command = "claude"
         assert!(err.contains(paths.root.join("agentd.log").as_str()), "{err}");
         assert!(paths.pid_file.exists());
         assert!(paths.socket.exists());
-    }
-
-    fn insert_running_row(paths: &AppPaths, worker_pid: u32, agent_pid: u32) {
-        crate::local::LocalStore::open(paths).unwrap();
-        let conn = rusqlite::Connection::open(paths.database.as_std_path()).unwrap();
-        conn.execute(
-            "INSERT INTO sessions (
-                session_id, agent, model, mode, cwd, status, worker_pid, agent_pid,
-                attention, attention_summary, created_at, updated_at
-            ) VALUES ('demo', 'sh', NULL, 'execute', '/tmp', 'running', ?1, ?2, 'info', 'running',
-                '2026-09-28T01:02:03+00:00', '2026-09-28T01:02:03+00:00')",
-            rusqlite::params![worker_pid, agent_pid],
-        )
-        .unwrap();
-    }
-
-    fn row_state(paths: &AppPaths) -> (String, Option<u32>, Option<u32>, Option<i32>) {
-        let conn = rusqlite::Connection::open(paths.database.as_std_path()).unwrap();
-        conn.query_row(
-            "SELECT status, worker_pid, agent_pid, exit_code FROM sessions WHERE session_id = 'demo'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap()
-    }
-
-    /// A running row whose worker socket does not answer is not live, even if
-    /// its recorded pids belong to running processes (a recycled pid): nothing
-    /// is signalled, and the row is marked recovered with its pids cleared.
-    #[tokio::test]
-    async fn local_kill_never_signals_pids_without_a_live_worker_socket() {
-        let paths = test_paths();
-        paths.ensure_layout().unwrap();
-        let mut bystander = std::process::Command::new("sleep").arg("30").spawn().unwrap();
-        insert_running_row(&paths, bystander.id(), bystander.id());
-        // A stale socket file with no listener behind it.
-        fs::write(paths.session_socket_path("demo").as_std_path(), "").unwrap();
-
-        let err = super::local_kill(&paths, "demo", false).await.unwrap_err().to_string();
-        assert!(err.contains("is not running"), "{err}");
-        assert!(bystander.try_wait().unwrap().is_none(), "unrelated process was signalled");
-        assert_eq!(row_state(&paths), ("unknown_recovered".to_string(), None, None, None));
-
-        super::local_kill(&paths, "demo", true).await.unwrap();
-        assert!(bystander.try_wait().unwrap().is_none(), "unrelated process was signalled");
-        assert!(!paths.session_socket_path("demo").exists());
-        let _ = bystander.kill();
-        let _ = bystander.wait();
-    }
-
-    /// A live worker is asked to stop over its socket; the final state it
-    /// records is kept rather than overwritten.
-    #[tokio::test]
-    async fn local_kill_asks_live_worker_to_stop() {
-        use agentd_shared::protocol::{Request, Response, read_request, write_response};
-        let paths = test_paths();
-        paths.ensure_layout().unwrap();
-        insert_running_row(&paths, 999_999, 999_998);
-        let listener =
-            tokio::net::UnixListener::bind(paths.session_socket_path("demo").as_std_path())
-                .unwrap();
-        let db = paths.database.clone();
-        let worker = tokio::spawn(async move {
-            loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                // The liveness probe connects and hangs up without a request.
-                let Some(request) = read_request(&mut stream).await.unwrap() else { continue };
-                assert!(
-                    matches!(request, Request::KillSession { ref session_id, .. } if session_id == "demo")
-                );
-                write_response(&mut stream, &Response::Ok).await.unwrap();
-                let conn = rusqlite::Connection::open(db.as_std_path()).unwrap();
-                conn.execute(
-                    "UPDATE sessions SET status = 'exited', exit_code = 143, worker_pid = NULL,
-                        agent_pid = NULL WHERE session_id = 'demo'",
-                    [],
-                )
-                .unwrap();
-                return;
-            }
-        });
-
-        super::local_kill(&paths, "demo", false).await.unwrap();
-        worker.await.unwrap();
-        assert_eq!(row_state(&paths), ("exited".to_string(), None, None, Some(143)));
-    }
-
-    /// A worker that answers but never records a stop is escalated to signals
-    /// (its socket still answering is what vouches for the recorded pid), and
-    /// the exit is recorded locally. Takes the full worker stop timeout.
-    #[tokio::test]
-    async fn local_kill_escalates_when_live_worker_does_not_stop() {
-        use agentd_shared::protocol::{Response, read_request, write_response};
-        let paths = test_paths();
-        paths.ensure_layout().unwrap();
-        let mut stuck_worker = std::process::Command::new("sleep").arg("30").spawn().unwrap();
-        insert_running_row(&paths, stuck_worker.id(), stuck_worker.id());
-        // Reap it as soon as it dies, as init would reap a real worker; an
-        // unreaped zombie still looks alive to kill(pid, 0) on Linux.
-        let reaper = std::thread::spawn(move || stuck_worker.wait().unwrap());
-        let listener =
-            tokio::net::UnixListener::bind(paths.session_socket_path("demo").as_std_path())
-                .unwrap();
-        let server = tokio::spawn(async move {
-            loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                if read_request(&mut stream).await.unwrap().is_some() {
-                    write_response(&mut stream, &Response::Ok).await.unwrap();
-                }
-            }
-        });
-
-        super::local_kill(&paths, "demo", false).await.unwrap();
-        server.abort();
-        let status = reaper.join().unwrap();
-        assert!(!status.success(), "worker should have been signalled");
-        assert_eq!(row_state(&paths), ("exited".to_string(), None, None, None));
     }
 
     #[test]
