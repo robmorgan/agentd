@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/robmorgan/agentd/go/internal/config"
 )
 
 func TestEditRemoteListen(t *testing.T) {
@@ -42,7 +44,7 @@ func TestSetRemoteListen(t *testing.T) {
 	if err := SetRemoteListen(path, "100.64.0.5:7433"); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := LoadConfig(path)
+	cfg, err := config.Load(path)
 	if err != nil || cfg.Remote.Listen != "100.64.0.5:7433" || cfg.DefaultAgent != "claude" || cfg.Agents["codex"].Command != "codex" {
 		t.Fatalf("config = %+v, %v", cfg, err)
 	}
@@ -52,7 +54,7 @@ func TestSetRemoteListen(t *testing.T) {
 	if err := SetRemoteListen(path, ""); err != nil {
 		t.Fatal(err)
 	}
-	if cfg, _ := LoadConfig(path); cfg.Remote.Listen != "" {
+	if cfg, _ := config.Load(path); cfg.Remote.Listen != "" {
 		t.Fatalf("listen after disable = %q", cfg.Remote.Listen)
 	}
 
@@ -213,7 +215,7 @@ func TestSetRemoteListenFollowsSymlinks(t *testing.T) {
 	if info, _ := os.Stat(real); info.Mode().Perm() != 0o640 {
 		t.Fatalf("mode = %v, want 0640", info.Mode().Perm())
 	}
-	if cfg, err := LoadConfig(link); err != nil || cfg.Remote.Listen != "100.64.0.5:7433" {
+	if cfg, err := config.Load(link); err != nil || cfg.Remote.Listen != "100.64.0.5:7433" {
 		t.Fatalf("config = %+v, %v", cfg, err)
 	}
 }

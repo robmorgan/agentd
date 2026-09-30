@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/robmorgan/agentd/go/internal/config"
 )
 
 // DefaultRemotePort is the UDP port `agentd remote enable` listens on when
@@ -220,20 +222,6 @@ func ListenAddress(s string) (string, error) {
 	return net.JoinHostPort(host, DefaultRemotePort), nil
 }
 
-// defaultConfigText is written when enabling remote access on a machine
-// that has no config.toml yet. It matches the built-in defaults (and what
-// the agent CLI writes), so creating the file changes nothing else.
-const defaultConfigText = `default_agent = "claude"
-
-[agents.claude]
-command = "claude"
-args = []
-
-[agents.codex]
-command = "codex"
-args = []
-`
-
 var (
 	tableHeader = regexp.MustCompile(`^\s*\[`)
 	remoteTable = regexp.MustCompile(`^\s*\[\s*remote\s*\]\s*(#[^\n]*)?\s*$`)
@@ -253,7 +241,7 @@ func SetRemoteListen(path, listen string) error {
 		if listen == "" {
 			return nil
 		}
-		data = []byte(defaultConfigText)
+		data = []byte(config.DefaultText)
 	} else if err != nil {
 		return fmt.Errorf("failed to read %s: %w", path, err)
 	}
@@ -263,7 +251,7 @@ func SetRemoteListen(path, listen string) error {
 	}
 	updated := editRemoteListen(string(data), listen)
 	after := map[string]any{}
-	var cfg Config
+	var cfg config.Config
 	_, errMap := toml.Decode(updated, &after)
 	_, errCfg := toml.Decode(updated, &cfg)
 	if errMap != nil || errCfg != nil || cfg.Remote.Listen != listen || !sameApartFromListen(before, after) {

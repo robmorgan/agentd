@@ -221,7 +221,7 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 	if req.Agent == "" {
 		req.Agent = s.config.DefaultAgent
 	}
-	agent, err := s.config.requireAgent(req.Agent, s.paths.Config)
+	agent, err := s.config.RequireAgent(req.Agent, s.paths.Config)
 	if err != nil {
 		return nil, err
 	}
@@ -260,8 +260,8 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 		args = append(args, "--model", *req.Model)
 	}
 	launchArgs := append([]string(nil), agent.Args...)
-	if req.Model != nil && agent.modelFlag() != "" {
-		launchArgs = append(launchArgs, agent.modelFlag(), *req.Model)
+	if req.Model != nil && agent.Flag() != "" {
+		launchArgs = append(launchArgs, agent.Flag(), *req.Model)
 	}
 	for _, a := range launchArgs {
 		args = append(args, "--arg", a)

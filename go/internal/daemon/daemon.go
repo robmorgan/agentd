@@ -42,6 +42,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/robmorgan/agentd/go/internal/config"
 	"github.com/robmorgan/agentd/go/internal/db"
 	"github.com/robmorgan/agentd/go/internal/paths"
 	"github.com/robmorgan/agentd/go/internal/protocol"
@@ -67,7 +68,7 @@ const (
 type Server struct {
 	paths  *paths.AppPaths
 	db     *db.Database
-	config *Config
+	config *config.Config
 	// workerBin is the executable started as `<workerBin> session-worker`.
 	workerBin string
 	lockWait  time.Duration
@@ -108,7 +109,7 @@ func New(p *paths.AppPaths, workerBin string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := LoadConfig(p.Config)
+	cfg, err := config.Load(p.Config)
 	if err != nil {
 		return nil, err
 	}

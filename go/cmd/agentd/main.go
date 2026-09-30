@@ -18,6 +18,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/robmorgan/agentd/go/internal/config"
 	"github.com/robmorgan/agentd/go/internal/daemon"
 	"github.com/robmorgan/agentd/go/internal/paths"
 	"github.com/robmorgan/agentd/go/internal/transport"
@@ -243,7 +244,7 @@ func runRemoteEnable(p *paths.AppPaths, argv []string) int {
 	if err := daemon.CheckListen(addr, current); err != nil {
 		return fail(err)
 	}
-	cfg, err := daemon.LoadConfig(p.Config)
+	cfg, err := config.Load(p.Config)
 	if err != nil {
 		return fail(err)
 	}
@@ -313,7 +314,7 @@ func runRemoteStatus(p *paths.AppPaths) int {
 		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
 		return 1
 	}
-	cfg, err := daemon.LoadConfig(p.Config)
+	cfg, err := config.Load(p.Config)
 	if err != nil {
 		return fail(err)
 	}

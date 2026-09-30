@@ -983,40 +983,6 @@ func TestRuntimeFilesArePrivate(t *testing.T) {
 	}
 }
 
-func TestLoadConfig(t *testing.T) {
-	dir := t.TempDir()
-	cfg, err := LoadConfig(filepath.Join(dir, "missing.toml"))
-	if err != nil || cfg.DefaultAgent != "claude" || cfg.Agents["codex"].Command != "codex" {
-		t.Fatalf("defaults = %+v, %v", cfg, err)
-	}
-	path := filepath.Join(dir, "config.toml")
-	os.WriteFile(path, []byte("default_agent = \"x\"\n[agents.y]\ncommand = \"y\"\n"), 0o600)
-	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "default_agent `x`") {
-		t.Fatalf("got %v", err)
-	}
-	os.WriteFile(path, []byte("[agents.y]\ncommand = \"y\"\nmodel_flag = \"\"\n[agents.z]\ncommand = \"z\"\n[agents.codex]\ncommand = \"codex\"\n"), 0o600)
-	cfg, err = LoadConfig(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := cfg.Agents["y"].modelFlag(); got != "" {
-		t.Fatalf("empty model_flag = %q", got)
-	}
-	if got := cfg.Agents["z"].modelFlag(); got != "--model" {
-		t.Fatalf("default model_flag = %q", got)
-	}
-
-	// Without default_agent: claude if configured, else the first agent.
-	os.WriteFile(path, []byte("[agents.codex]\ncommand = \"codex\"\n[agents.claude]\ncommand = \"claude\"\n"), 0o600)
-	if cfg, err := LoadConfig(path); err != nil || cfg.DefaultAgent != "claude" {
-		t.Fatalf("with claude configured: %+v, %v", cfg, err)
-	}
-	os.WriteFile(path, []byte("[agents.zed]\ncommand = \"zed\"\n[agents.codex]\ncommand = \"codex\"\n"), 0o600)
-	if cfg, err := LoadConfig(path); err != nil || cfg.DefaultAgent != "zed" {
-		t.Fatalf("without claude: %+v, %v", cfg, err)
-	}
-}
-
 // Removing a session and immediately creating one with the same name must
 // leave the new session reachable: the old worker's cleanup may not delete
 // the new worker's socket.
