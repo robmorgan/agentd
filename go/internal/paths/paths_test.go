@@ -36,6 +36,9 @@ func TestDerivedPaths(t *testing.T) {
 	if p.Socket != "/Users/t/.agentd/agentd.sock" || p.SessionSocketPath("x") != "/Users/t/.agentd/sessions/x.sock" {
 		t.Fatalf("unexpected paths: %+v", p)
 	}
+	if p.ClientKeyPath() != "/Users/t/.agentd/remote/client.key" || p.HostsPath() != "/Users/t/.agentd/hosts.toml" {
+		t.Fatalf("unexpected remote paths: %q %q", p.ClientKeyPath(), p.HostsPath())
+	}
 }
 
 func TestEnsureLayoutIsPrivate(t *testing.T) {
@@ -63,5 +66,50 @@ func TestEnsureLayoutRefusesForeignRoot(t *testing.T) {
 	err := FromRoot("/usr").EnsureLayout()
 	if err == nil || !strings.Contains(err.Error(), "owned by uid") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestEnsureLayoutRefusesSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	link := filepath.Join(dir, "link")
+	os.Mkdir(target, 0o700)
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	err := FromRoot(link).EnsureLayout()
+	if err == nil || !strings.Contains(err.Error(), "symlink") || !strings.Contains(err.Error(), link) {
+		t.Fatalf("root: got %v", err)
+	}
+
+	// A subdirectory swapped for a symlink or a file is refused too.
+	root := filepath.Join(dir, "root")
+	p := FromRoot(root)
+	if err := p.EnsureLayout(); err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(p.LogsDir)
+	os.Symlink(target, p.LogsDir)
+	if err := p.EnsureLayout(); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("logs symlink: got %v", err)
+	}
+	os.Remove(p.LogsDir)
+	os.WriteFile(p.LogsDir, nil, 0o600)
+	if err := p.EnsureLayout(); err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("logs file: got %v", err)
+	}
+}
+
+func TestEnsureLayoutTightensSubdirectories(t *testing.T) {
+	p := FromRoot(filepath.Join(t.TempDir(), "root"))
+	if err := p.EnsureLayout(); err != nil {
+		t.Fatal(err)
+	}
+	os.Chmod(p.SessionsDir, 0o755)
+	if err := p.EnsureLayout(); err != nil {
+		t.Fatal(err)
+	}
+	if info, _ := os.Stat(p.SessionsDir); info.Mode().Perm() != 0o700 {
+		t.Fatalf("mode = %v", info.Mode())
 	}
 }

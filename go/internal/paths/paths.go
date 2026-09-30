@@ -1,8 +1,8 @@
-// Package paths resolves the agentd runtime root, mirroring
-// crates/agentd-shared/src/paths.rs.
+// Package paths resolves the agentd runtime root and the files under it.
 package paths
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/user"
@@ -26,8 +26,7 @@ func Discover() (*AppPaths, error) {
 	home, _ := os.UserHomeDir()
 	if home == "" {
 		// Without $HOME (cron, some service managers), fall back to the
-		// passwd entry, as the Rust CLI's dirs::home_dir does, so both
-		// pick the same root.
+		// passwd entry.
 		if u, err := user.Current(); err == nil {
 			home = u.HomeDir
 		}
@@ -78,38 +77,44 @@ func discoverRoot(agentdDir, xdgRuntimeDir, homeDir, tmpDir string, uid int) (st
 	return fmt.Sprintf("/tmp/%s-%d", AppDirName, uid), nil
 }
 
-// EnsureLayout creates the runtime root and its subdirectories private to
-// the current user. The root holds the control socket, session sockets,
-// state.db and full agent transcripts, and may live in shared temp space, so
-// a root that is (or is reached through a symlink) owned by another user is
-// refused, and an existing root with group/other access is tightened to 0700.
+// EnsureLayout creates the runtime root, logs/ and sessions/ as private
+// (0700) directories, tightening them if they already exist. The root holds
+// the control socket, session sockets, state.db and full agent transcripts,
+// and may live in shared temp space, so a directory that is a symlink, is not
+// a directory, or belongs to another user is refused rather than used.
 func (p *AppPaths) EnsureLayout() error {
 	if err := os.MkdirAll(p.Root, 0o700); err != nil {
 		return fmt.Errorf("failed to create %s: %w", p.Root, err)
 	}
-	if err := checkOwned(p.Root); err != nil {
-		return err
-	}
 	for _, dir := range []string{p.Root, p.LogsDir, p.SessionsDir} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return fmt.Errorf("failed to create %s: %w", dir, err)
-		}
-		if err := os.Chmod(dir, 0o700); err != nil {
-			return fmt.Errorf("failed to restrict %s: %w", dir, err)
+		if err := ensurePrivateDir(dir); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func checkOwned(root string) error {
+func ensurePrivateDir(dir string) error {
+	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("failed to create %s: %w", dir, err)
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("failed to inspect %s: %w", dir, err)
+	}
+	switch {
+	case info.Mode()&os.ModeSymlink != 0:
+		return fmt.Errorf("refusing to use %s: it is a symlink; point AGENTD_DIR at a real directory", dir)
+	case !info.IsDir():
+		return fmt.Errorf("refusing to use %s: it is not a directory", dir)
+	}
 	uid := os.Getuid()
-	for _, stat := range []func(string) (os.FileInfo, error){os.Lstat, os.Stat} {
-		info, err := stat(root)
-		if err != nil {
-			return fmt.Errorf("failed to inspect %s: %w", root, err)
-		}
-		if st, ok := info.Sys().(*syscall.Stat_t); ok && int(st.Uid) != uid {
-			return fmt.Errorf("refusing to use runtime root %s: it is owned by uid %d, not %d", root, st.Uid, uid)
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && int(st.Uid) != uid {
+		return fmt.Errorf("refusing to use %s: it is owned by uid %d, not %d", dir, st.Uid, uid)
+	}
+	if info.Mode().Perm() != 0o700 {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return fmt.Errorf("failed to restrict %s: %w", dir, err)
 		}
 	}
 	return nil
@@ -134,6 +139,17 @@ func (p *AppPaths) RemoteKeyPath() string {
 // AuthorizedClientsPath lists the client keys allowed to connect remotely.
 func (p *AppPaths) AuthorizedClientsPath() string {
 	return filepath.Join(p.Root, "remote", "authorized_clients")
+}
+
+// ClientKeyPath is this machine's key for connecting to remote daemons.
+func (p *AppPaths) ClientKeyPath() string {
+	return filepath.Join(p.Root, "remote", "client.key")
+}
+
+// HostsPath lists the remote daemons this machine knows, with their pinned
+// keys.
+func (p *AppPaths) HostsPath() string {
+	return filepath.Join(p.Root, "hosts.toml")
 }
 
 // LockPath is held (flock) by the running daemon for its whole lifetime.
