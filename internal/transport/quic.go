@@ -322,6 +322,33 @@ func IsKeyRefused(err error) bool {
 	return errors.As(err, &te) && te.Remote && te.ErrorCode.IsCryptoError()
 }
 
+// IsConnectionLost reports whether err means a QUIC connection, or an
+// attempt to make one, failed in a way that a later attempt may not: the
+// daemon went silent or unreachable, or closed the connection itself (to
+// restart, say). A client may connect again after it. A refused or changed
+// key, a protocol error, or this client closing the connection is not lost.
+func IsConnectionLost(err error) bool {
+	if err == nil || IsKeyRefused(err) {
+		return false
+	}
+	var (
+		idle      *quic.IdleTimeoutError
+		handshake *quic.HandshakeTimeoutError
+		reset     *quic.StatelessResetError
+		app       *quic.ApplicationError
+		netErr    net.Error
+	)
+	switch {
+	case errors.As(err, &idle), errors.As(err, &handshake), errors.As(err, &reset):
+		return true
+	case errors.As(err, &app):
+		return app.Remote
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &netErr):
+		return true
+	}
+	return false
+}
+
 // dialEach tries every address addr resolves to. With a pin it stops at the
 // first connection, or at a daemon presenting another key; without one
 // (pinned == "") it stops at the first daemon that presents a key, whether

@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -12,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
 const quicTestTimeout = 10 * time.Second
@@ -594,4 +597,29 @@ func startRelay(t *testing.T, serverAddr string) *udpRelay {
 		}
 	}()
 	return r
+}
+
+// Only failures a new connection may get past count as a lost connection.
+func TestIsConnectionLost(t *testing.T) {
+	for _, c := range []struct {
+		err  error
+		lost bool
+	}{
+		{nil, false},
+		{errors.New("unexpected response"), false},
+		{&quic.IdleTimeoutError{}, true},
+		{&quic.HandshakeTimeoutError{}, true},
+		{&quic.StatelessResetError{}, true},
+		{fmt.Errorf("could not reach agentd: %w", &net.DNSError{Err: "no such host"}), true},
+		{fmt.Errorf("dial: %w", context.DeadlineExceeded), true},
+		{&quic.ApplicationError{Remote: true, ErrorMessage: "agentd is shutting down"}, true},
+		// This client closed it.
+		{&quic.ApplicationError{Remote: false}, false},
+		// The daemon refused this client's key.
+		{&quic.TransportError{Remote: true, ErrorCode: quic.TransportErrorCode(0x100 + 42)}, false},
+	} {
+		if got := IsConnectionLost(c.err); got != c.lost {
+			t.Errorf("IsConnectionLost(%v) = %v, want %v", c.err, got, c.lost)
+		}
+	}
 }

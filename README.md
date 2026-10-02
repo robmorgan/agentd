@@ -344,7 +344,11 @@ agent rm devbox/auth-refactor
 ```
 
 Closing the laptop or losing the network leaves the session running; `agent attach` again, from any
-authorized machine, restores the screen. Without `--agent`, `new` uses the devbox's `default_agent`.
+authorized machine, restores the screen. An attachment that loses its connection reconnects by
+itself: the bottom row says it is reconnecting, typing is ignored until it is back, and `Ctrl-\`
+gives up. It keeps trying (every 5 seconds at most) until the devbox answers, so a laptop that slept
+picks up where it was when it wakes. It stops if the devbox refuses this machine's key or the
+session is gone. Without `--agent`, `new` uses the devbox's `default_agent`.
 
 Managing keys and hosts:
 

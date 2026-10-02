@@ -127,9 +127,21 @@ its management status.
 A client that disappears without closing (a laptop lid, a lost network) is noticed once the daemon
 has heard nothing from it for 15 seconds (`transport.DeadPeerTimeout`); until then its attachment
 is still listed. Closing the connection ends its attachments; the session is unaffected. QUIC uses
-the smaller of the two peers' idle timeouts, so this holds for older clients too. A network outage
-longer than that ends the attachment even if the client comes back, which automatic reattach is
-meant to hide.
+the smaller of the two peers' idle timeouts, so this holds for older clients too. Both ends notice a
+silent peer this way, so an outage longer than that ends the attachment even if the network comes
+back.
+
+The CLI hides that: when an attach stream fails because its connection was lost
+(`transport.IsConnectionLost`: an idle or handshake timeout, an unreachable network, or the daemon
+closing the connection, say to restart), it stays in raw mode, dials a new connection and attaches
+to the same session again, then repaints from the new snapshot. Session identity never depended on
+the connection, so nothing on the daemon is resumed: the old attachment is simply dropped when the
+daemon notices it. Retries back off from 0.5 to 5 seconds and continue until they succeed or fail
+for a reason a retry cannot fix (a refused or changed key, a session that is gone, a protocol
+error). Meanwhile the bottom row shows the status, and typed input is dropped rather than delivered
+late; only the detach key acts. Output written while disconnected is not replayed; the snapshot
+shows the screen as it is now. Local attachments do not reconnect: the Unix socket only fails when
+the daemon itself goes away.
 
 The daemon's tests run full sessions over QUIC, and over a TCP stand-in, to keep the seam honest.
 
