@@ -75,8 +75,8 @@ Two transports exist:
 * **Unix socket** (`agentd.sock`): local clients, always on.
 * **QUIC** (off unless `[remote] listen` is set): remote clients. Each client holds one QUIC
   connection and opens one bidirectional QUIC stream per request or attachment, so long-lived
-  attachments and short requests are multiplexed without blocking each other. Keep-alives hold
-  idle connections open, and each connection may have at most 256 streams. The daemon's first
+  attachments and short requests are multiplexed without blocking each other. Both peers ping
+  every 5 seconds to hold idle connections open, and each connection may have at most 256 streams. The daemon's first
   datagrams are 1200 bytes, QUIC's minimum, rather than quic-go's default 1280: Tailscale's
   interface MTU is 1280 including IP and UDP headers, so larger ones never leave it and the
   handshake times out. Path MTU discovery raises the size afterwards where the path allows.
@@ -124,8 +124,12 @@ previous setting is restored. A daemon whose listen address cannot be bound, or 
 stops, keeps local service and binds again every 5 seconds until shutdown, reporting the reason in
 its management status.
 
-A client that disappears without closing (a laptop lid, a lost network) is noticed by the daemon's
-60-second idle timeout; until then its attachment is still listed. The session is unaffected.
+A client that disappears without closing (a laptop lid, a lost network) is noticed once the daemon
+has heard nothing from it for 15 seconds (`transport.DeadPeerTimeout`); until then its attachment
+is still listed. Closing the connection ends its attachments; the session is unaffected. QUIC uses
+the smaller of the two peers' idle timeouts, so this holds for older clients too. A network outage
+longer than that ends the attachment even if the client comes back, which automatic reattach is
+meant to hide.
 
 The daemon's tests run full sessions over QUIC, and over a TCP stand-in, to keep the seam honest.
 

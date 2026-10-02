@@ -511,7 +511,7 @@ Done:
 - The CLI's QUIC client: `agent --host NAME` and `NAME/session` addresses, `agent host add|ls|rm` (confirm-on-first-use key pinning in `hosts.toml`), and `agent remote id` (`remote/client.key`).
 
 Next:
-1. Automatic reattach after a network drop, and noticing dead clients faster than the 60s idle timeout.
+1. Automatic reattach after a network drop (the daemon already drops a silent client after 15s).
 2. Cross-host discovery (`agent ls` across hosts) and host health.
 3. Per-client permissions and audit, if remote peers need to be limited.
 

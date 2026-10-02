@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -317,7 +318,7 @@ func TestFingerprintIsStable(t *testing.T) {
 // the handshake then times out; see quicConfig.
 func TestFirstDatagramFitsTailscaleMTU(t *testing.T) {
 	const tailscaleMTU, ipv6UDPHeaders = 1280, 48
-	if size := int(quicConfig().InitialPacketSize); size == 0 || size+ipv6UDPHeaders > tailscaleMTU {
+	if size := int(quicConfig(DeadPeerTimeout).InitialPacketSize); size == 0 || size+ipv6UDPHeaders > tailscaleMTU {
 		t.Fatalf("InitialPacketSize %d does not fit a %d-byte MTU", size, tailscaleMTU)
 	}
 }
@@ -462,4 +463,135 @@ func TestConcurrentAuthorizedEdits(t *testing.T) {
 			}
 		}
 	}
+}
+
+// A client that goes silent without closing its connection (a laptop lid
+// shut, a network dropped) is noticed within the idle timeout, which ends
+// its attachment on the daemon; one that is merely idle is kept alive by
+// pings.
+func TestQUICNoticesSilentClient(t *testing.T) {
+	server, client := mustIdentity(t), mustIdentity(t)
+	const idle = time.Second
+	l, err := ListenQUIC("127.0.0.1:0", server, QUICOptions{
+		Authorized:  func(fp string) bool { return fp == client.Fingerprint },
+		IdleTimeout: idle,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	ended := make(chan error, 1)
+	go Serve(l, "test", nil, func(s Stream) {
+		defer s.Close()
+		_, err := io.Copy(s, s) // an attachment: open until either side ends it
+		ended <- err
+	})
+	relay := startRelay(t, l.Addr())
+
+	ctx, cancel := context.WithTimeout(context.Background(), quicTestTimeout)
+	defer cancel()
+	c, err := DialQUIC(ctx, relay.addr(), client, server.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	s, err := c.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.SetDeadline(time.Now().Add(quicTestTimeout))
+	echo := func() error {
+		if _, err := s.Write([]byte("x")); err != nil {
+			return err
+		}
+		_, err := io.ReadFull(s, make([]byte, 1))
+		return err
+	}
+	if err := echo(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Idle for longer than the timeout: pings keep the attachment open.
+	time.Sleep(3 * idle)
+	select {
+	case err := <-ended:
+		t.Fatalf("idle attachment was closed: %v", err)
+	default:
+	}
+	if err := echo(); err != nil {
+		t.Fatalf("idle attachment stopped working: %v", err)
+	}
+
+	// Silence the client without it closing anything.
+	relay.drop.Store(true)
+	select {
+	case err := <-ended:
+		if err == nil {
+			t.Fatal("attachment ended cleanly; want a connection error")
+		}
+	case <-time.After(5 * idle):
+		t.Fatal("daemon did not notice the silent client")
+	}
+}
+
+// udpRelay forwards datagrams between one client and a server until drop
+// is set, after which it silently discards them in both directions, as a
+// dead network would.
+type udpRelay struct {
+	front *net.UDPConn
+	drop  atomic.Bool
+}
+
+func (r *udpRelay) addr() string { return r.front.LocalAddr().String() }
+
+func startRelay(t *testing.T, serverAddr string) *udpRelay {
+	t.Helper()
+	front, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raddr, err := net.ResolveUDPAddr("udp", serverAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := net.DialUDP("udp", nil, raddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { front.Close(); back.Close() })
+	r := &udpRelay{front: front}
+	var mu sync.Mutex
+	var clientAddr *net.UDPAddr
+	go func() {
+		buf := make([]byte, 65536)
+		for {
+			n, from, err := front.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			clientAddr = from
+			mu.Unlock()
+			if !r.drop.Load() {
+				back.Write(buf[:n])
+			}
+		}
+	}()
+	go func() {
+		buf := make([]byte, 65536)
+		for {
+			n, err := back.Read(buf)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			to := clientAddr
+			mu.Unlock()
+			if to != nil && !r.drop.Load() {
+				front.WriteToUDP(buf[:n], to)
+			}
+		}
+	}()
+	return r
 }
