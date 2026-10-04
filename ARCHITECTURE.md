@@ -65,8 +65,9 @@ session. Sessions whose worker disappeared while no daemon was running are marke
 
 ## Transports
 
-The protocol runs over any bidirectional byte stream that supports half-close. Each stream carries
-one request/response exchange or one attach session. Everything above `internal/transport` sees
+The protocol runs over any bidirectional byte stream that supports half-close. Each stream has one
+role (a request, the control stream, an attachment, a transfer; see "Streams and their roles"
+below). Everything above `internal/transport` sees
 only that `Stream` and a `Listener` that yields streams, so the daemon does not know or care which
 transport a client used. The daemon-to-worker link is always a local Unix socket.
 
@@ -74,8 +75,9 @@ Two transports exist:
 
 * **Unix socket** (`agentd.sock`): local clients, always on.
 * **QUIC** (off unless `[remote] listen` is set): remote clients. Each client holds one QUIC
-  connection and opens one bidirectional QUIC stream per request or attachment, so long-lived
-  attachments and short requests are multiplexed without blocking each other. Both peers ping
+  connection and opens one bidirectional QUIC stream per role instance: a control stream for its
+  one-shot requests, one per attachment, one per transfer. Long-lived attachments, transfers and
+  short requests are multiplexed without blocking each other. Both peers ping
   every 5 seconds to hold idle connections open, and each connection may have at most 256 streams. The daemon's first
   datagrams are 1200 bytes, QUIC's minimum, rather than quic-go's default 1280: Tailscale's
   interface MTU is 1280 including IP and UDP headers, so larger ones never leave it and the
@@ -100,8 +102,8 @@ The `agent` CLI is the client (`internal/cli/client.go`, over the same `internal
 QUIC code as the daemon). Its key is
 `remote/client.key`, in the same format as the daemon's, and `hosts.toml` maps host names to an
 address and the daemon fingerprint pinned by `agent host add`. One CLI process opens at most one
-QUIC connection and one stream per request or attachment, so an attachment and the overlay's
-requests share a connection. A remote host is never started, restarted or upgraded from the CLI.
+QUIC connection, with one control stream for its requests and one stream per attachment or
+transfer, so an attachment and the overlay's requests share a connection. A remote host is never started, restarted or upgraded from the CLI.
 With TLS 1.3 a client can finish its half of the handshake
 before the daemon rejects its key, so a refusal may only surface on the first stream; the CLI
 recognises the TLS alert there and says how to authorize the machine. A name that resolves to
@@ -155,39 +157,104 @@ is 1.
 Each frame has a fixed 16-byte header followed by a payload:
 
 * `magic` (`u32`, little-endian) identifies an `agentd` protocol frame
-* `version` (`u16`, little-endian) must match the current protocol version
+* `version` (`u16`, little-endian) is the protocol version the frame is written in
 * `message_type` (`u16`, little-endian) identifies the request or response variant
-* `flags` (`u16`, currently unused and set to `0`)
+* `flags` (`u16`): bit 0 marks a frame whose payload starts with a `u32` request id (only on
+  control streams, below). A frame with a flag the reader does not know is refused, since flags
+  change the payload's layout
 * `reserved` (`u16`, currently unused and set to `0`)
-* `payload_len` (`u32`, little-endian) gives the number of payload bytes that follow
+* `payload_len` (`u32`, little-endian) gives the number of payload bytes that follow (at most
+  64 MiB; a longer declared length is refused before anything is allocated)
 
 Payloads are binary-encoded field-by-field rather than serialized as JSON:
 
-* strings => `u32 len` + UTF-8 bytes
+* strings => `u32 len` + UTF-8 bytes (invalid UTF-8 is refused)
 * byte blobs => `u32 len` + raw bytes
 * booleans => single `u8`
 * optional values => presence `u8` followed by the encoded value
-* lists => `u32 count` followed by elements
+* lists => `u32 count` followed by elements (the count never sizes an allocation by itself)
 
-PTY snapshots, PTY output, and interactive input are sent as raw bytes. The current protocol
-version is 1. A client on another version gets an `Error` frame in its own framing explaining the
-mismatch, so the `Error` message kind and its payload never change.
+PTY snapshots, PTY output, and interactive input are sent as raw bytes. A client on an unsupported
+version gets an `Error` frame in its own framing explaining the mismatch, so the `Error` message
+kind and its payload never change. Fuzz tests (`internal/protocol/fuzz_test.go`) check that no
+input makes a decoder panic or allocate without bound, and that whatever decodes re-encodes to the
+same value.
 
 A second, deliberately tiny daemon management protocol (framed at header version 0, JSON payloads)
 carries daemon status and shutdown for `agent daemon info`, `restart` and `upgrade`, so those keep
-working even when the CLI and daemon speak different versions of the main protocol.
+working even when the CLI and daemon speak different versions of the main protocol. Its status
+includes connection-level metrics: the streams the daemon is serving, and for each open QUIC
+connection the client key, remote address, stream counts, QUIC's smoothed RTT, bytes sent and
+received, and packets lost (`agent daemon info`, `agentd remote status`).
 
-Most commands use a simple request/response exchange:
+### Streams and their roles
 
-1. client connects to the daemon socket
-2. client writes one request frame
-3. daemon writes one response frame or a stream of response frames
-4. streaming commands terminate with an explicit `EndOfStream` or `SessionEnded` frame
+The unit of the protocol is a stream (a Unix connection, or one QUIC stream on a client's QUIC
+connection). The first frame a client sends on a stream decides its role for its whole life, so no
+separate negotiation round trip is needed (`protocol.Request.Role`):
+
+| Role | First frame | Then |
+|---|---|---|
+| request | any one-shot request | one response, then the stream ends |
+| control | `Hello` | `Welcome`, then any number of tagged one-shot requests and their tagged responses, in any order |
+| attach | `AttachSession` | `Attached` with a snapshot, then `PtyOutput` frames one way and `AttachInput`, `AttachResize`, `AttachSnapshot` the other, until either side ends it |
+| artifact | `GetHistory` | one large response, kept off the control stream so it never delays small requests |
+| management | a version-0 frame | one JSON response |
+
+Over QUIC each stream has its own flow control, so a stalled attachment or a large transfer never
+blocks another stream on the same connection, and a client never needs more than one connection.
+
+### Handshake, versions and capabilities
+
+`Hello` is the connection handshake. The client sends the range of protocol versions it speaks
+(framed at the lowest), its name, and the optional features ("capabilities") it supports. The
+daemon answers `Welcome` with the newest version in both ranges, its own capabilities, and a
+description of its machine (host name, OS, architecture, CPUs, memory, configured agents and the
+default one), or with an `Error` when the ranges do not overlap. Both sides then use only the
+features both listed. Today there is one protocol version (1) and one capability
+(`control-stream`).
+
+The protocol grows without breaking older peers this way: a new message kind, or a field appended
+to the end of an existing message, comes with a capability, and neither side sends it unless the
+other advertised that capability. Decoders reject unknown kinds, unknown flags and trailing bytes,
+so nothing is ever silently misread. Changing an existing encoding needs a new protocol version.
+
+The CLI opens one control stream per process, right after connecting, and sends all its one-shot
+requests on it (`internal/cli/control.go`). Each request carries a `u32` id that its response
+echoes; the daemon runs up to 16 requests of one control stream at once and stops reading the
+stream beyond that, so a client that pipelines requests is held back by flow control rather than
+queued in the daemon. A request that cannot be decoded is answered with an error under its id and
+the stream carries on. Requests that need their own stream (attach, history) are refused on a
+control stream. If the control stream has ended when the CLI next uses it (the daemon restarted,
+say), it opens a new one, but never resends a request it already wrote, since the daemon may have
+acted on it.
+
+### Messages
+
+| Request | Response | Role |
+|---|---|---|
+| `Hello` | `Welcome` | control |
+| `GetDaemonInfo` | `DaemonInfo` | request |
+| `ShutdownDaemon` | `Ok` | request |
+| `CreateSession` | `CreateSession` | request |
+| `KillSession` | `KillSession` | request |
+| `GetSession` | `Session` | request |
+| `ListSessions` | `Sessions` | request |
+| `ListAttachments` | `Attachments` | request |
+| `DetachSession`, `DetachAttachment` | `Ok` | request |
+| `SendInput` | `InputAccepted` | request |
+| `ListWorkspaces` | `Workspaces` | request |
+| `AddWorkspace` | `Workspace` | request |
+| `RemoveWorkspace` | `Ok` | request |
+| `GetHistory` | `History` | artifact |
+| `AttachSession` | `Attached` (or `SessionEnded` for a finished session), then `PtyOutput`, `AttachSnapshot`, and finally `SessionEnded` or `EndOfStream` | attach |
+
+Any request may instead be answered with `Error`.
 
 `attach` is the bidirectional case. After the initial `AttachSession` request and `Attached`
 response (which carries a snapshot of the current screen), the worker streams `PtyOutput` frames
 while the client sends `AttachInput`, `AttachResize`, and `AttachSnapshot` frames on the same
-socket until either side closes. The daemon forwards the attach stream as raw bytes and never
+stream until either side closes. The daemon forwards the attach stream as raw bytes and never
 buffers PTY output itself.
 
 ## Creating a Session

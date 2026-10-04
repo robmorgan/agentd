@@ -382,17 +382,17 @@ The protocol should operate over explicit message and stream abstractions rather
 * [x] Extract transport-neutral protocol package (`internal/protocol` over the stream/listener seam in `internal/transport`)
 * [x] Resolve session working directories on the daemon (`~/` paths and named workspaces managed
       with `agent workspace`), so a remote client does not need the host's paths
-* [ ] Define connection handshake
-* [ ] Define protocol capability negotiation
-* [ ] Define protocol version negotiation
-* [ ] Add request IDs
-* [ ] Define request/response messages
+* [x] Define connection handshake (`Hello`/`Welcome`, opening the control stream)
+* [x] Define protocol capability negotiation (capability lists in `Hello`/`Welcome`)
+* [x] Define protocol version negotiation (version ranges in `Hello`, the daemon picks)
+* [x] Add request IDs (frame flag + `u32` id on control streams)
+* [x] Define request/response messages (catalog in ARCHITECTURE.md)
 * [ ] Define long-lived event streams
 * [x] Define bidirectional attachment streams
 * [x] Define structured error frames
-* [ ] Add connection-level metrics
+* [x] Add connection-level metrics (per QUIC connection: streams, RTT, bytes, loss)
 * [x] Add explicit payload limits
-* [ ] Fuzz protocol decoding
+* [x] Fuzz protocol decoding (`internal/protocol/fuzz_test.go`)
 * [x] Reject malformed and oversized messages safely
 
 ## Protocol concepts
@@ -488,7 +488,7 @@ One slow session should not unnecessarily stall unrelated sessions.
 * [x] Establish TLS identity model (self-signed Ed25519 keys, pinned by fingerprint)
 * [x] Authenticate machines/clients (mutual TLS: authorized client keys, pinned daemon key)
 * [x] Define stream roles (one bidirectional stream per request or attachment)
-* [ ] Define stream negotiation
+* [x] Define stream negotiation (a stream's first frame sets its role)
 * [ ] Support remote:
 
   * [x] `ls`

@@ -54,6 +54,8 @@ type Request struct {
 	ListWorkspaces   *struct{}
 	AddWorkspace     *AddWorkspace
 	RemoveWorkspace  *WorkspaceRef
+	// Hello opens a control stream; see handshake.go.
+	Hello *Hello
 }
 
 type SessionRef struct{ SessionID string }
@@ -134,6 +136,7 @@ type Response struct {
 	Ok             *struct{}
 	Workspaces     *[]session.Workspace
 	Workspace      *session.Workspace
+	Welcome        *Welcome
 }
 
 type DaemonInfo struct {
@@ -189,6 +192,7 @@ const (
 	kListWorkspacesRequest   kind = 16
 	kAddWorkspaceRequest     kind = 17
 	kRemoveWorkspaceRequest  kind = 18
+	kHelloRequest            kind = 19
 
 	kDaemonInfoResponse     kind = 101
 	kCreateSessionResponse  kind = 102
@@ -207,29 +211,56 @@ const (
 	kOkResponse             kind = 115
 	kWorkspacesResponse     kind = 116
 	kWorkspaceResponse      kind = 117
+	kWelcomeResponse        kind = 118
 )
 
 // ---------------------------------------------------------------------------
 // Framing
 
+// Frame flags. A flag changes how the payload is laid out, so a frame with a
+// flag this build does not know is refused rather than misread.
+const (
+	// flagRequestID marks a frame whose payload starts with a u32 request
+	// id. Only control streams (handshake.go) carry them.
+	flagRequestID uint16 = 1 << 0
+
+	knownFlags = flagRequestID
+)
+
 type frameHeader struct {
 	version uint16
 	kind    uint16
+	// tagged reports that the frame carried a request id.
+	tagged bool
+	id     uint32
 }
 
 func writeFrame(w io.Writer, version uint16, k uint16, payload []byte) error {
-	if len(payload) > MaxFramePayload {
-		return fmt.Errorf("frame payload too large: %d bytes (limit %d)", len(payload), MaxFramePayload)
+	return writeFrameTagged(w, version, k, false, 0, payload)
+}
+
+func writeFrameTagged(w io.Writer, version uint16, k uint16, tagged bool, id uint32, payload []byte) error {
+	var flags uint16
+	prefix := 0
+	if tagged {
+		flags |= flagRequestID
+		prefix = 4
+	}
+	if prefix+len(payload) > MaxFramePayload {
+		return fmt.Errorf("frame payload too large: %d bytes (limit %d)", prefix+len(payload), MaxFramePayload)
 	}
 	var header [frameHeaderLen]byte
 	binary.LittleEndian.PutUint32(header[0:4], frameMagic)
 	binary.LittleEndian.PutUint16(header[4:6], version)
 	binary.LittleEndian.PutUint16(header[6:8], k)
-	binary.LittleEndian.PutUint16(header[8:10], 0)
+	binary.LittleEndian.PutUint16(header[8:10], flags)
 	binary.LittleEndian.PutUint16(header[10:12], 0)
-	binary.LittleEndian.PutUint32(header[12:16], uint32(len(payload)))
-	buf := make([]byte, 0, frameHeaderLen+len(payload))
+	binary.LittleEndian.PutUint32(header[12:16], uint32(prefix+len(payload)))
+	buf := make([]byte, 0, frameHeaderLen+prefix+len(payload))
 	buf = append(buf, header[:]...)
+	if tagged {
+		buf = binary.LittleEndian.AppendUint32(buf, id)
+	}
 	buf = append(buf, payload...)
 	_, err := w.Write(buf)
 	if err != nil {
@@ -264,6 +295,7 @@ func readRawFrame(r io.Reader) (*frameHeader, []byte, error) {
 		version: binary.LittleEndian.Uint16(header[4:6]),
 		kind:    binary.LittleEndian.Uint16(header[6:8]),
 	}
+	flags := binary.LittleEndian.Uint16(header[8:10])
 	payloadLen := binary.LittleEndian.Uint32(header[12:16])
 	if payloadLen > MaxFramePayload {
 		return nil, nil, fmt.Errorf("frame payload too large: %d bytes (limit %d)", payloadLen, MaxFramePayload)
@@ -272,20 +304,40 @@ func readRawFrame(r io.Reader) (*frameHeader, []byte, error) {
 	if _, err := io.ReadFull(r, payload); err != nil {
 		return nil, nil, err
 	}
+	// The payload is consumed before the flags are judged, so a refused
+	// frame leaves the stream at the next frame boundary.
+	if flags&^knownFlags != 0 {
+		return nil, nil, &DecodeError{Version: h.version, Err: fmt.Errorf("unsupported frame flags %#04x", flags)}
+	}
+	if flags&flagRequestID != 0 {
+		if len(payload) < 4 {
+			return nil, nil, &DecodeError{Version: h.version, Err: errors.New("truncated request id")}
+		}
+		h.tagged = true
+		h.id = binary.LittleEndian.Uint32(payload)
+		payload = payload[4:]
+	}
 	return h, payload, nil
 }
 
-// readStandardFrame returns ok=false on a clean EOF before any frame.
-func readStandardFrame(r io.Reader) (k kind, payload []byte, ok bool, err error) {
+// readStandardFrame returns a nil header on a clean EOF before any frame.
+func readStandardFrame(r io.Reader) (*frameHeader, []byte, error) {
 	h, payload, err := readRawFrame(r)
 	if err != nil || h == nil {
-		return 0, nil, false, err
+		return nil, nil, err
 	}
-	if h.version != ProtocolVersion {
-		return 0, nil, false, &VersionError{Version: h.version}
+	if !supportedVersion(h.version) {
+		return nil, nil, &VersionError{Version: h.version}
 	}
-	return kind(h.kind), payload, true, nil
+	return h, payload, nil
 }
+
+func supportedVersion(v uint16) bool {
+	return v >= MinProtocolVersion && v <= ProtocolVersion
+}
+
+// errUnexpectedTag reports a request id on a stream that does not use them.
+var errUnexpectedTag = errors.New("unexpected request id outside a control stream")
 
 // VersionError reports a frame whose protocol version this build does not
 // speak. The frame's payload has been consumed.
@@ -326,20 +378,26 @@ func WriteResponse(w io.Writer, resp *Response) error {
 
 // ReadRequest returns (nil, nil) when the peer closed the connection cleanly.
 func ReadRequest(r io.Reader) (*Request, error) {
-	k, payload, ok, err := readStandardFrame(r)
-	if err != nil || !ok {
+	h, payload, err := readStandardFrame(r)
+	if err != nil || h == nil {
 		return nil, err
 	}
-	return decodeRequest(k, payload)
+	if h.tagged {
+		return nil, errUnexpectedTag
+	}
+	return decodeRequest(kind(h.kind), payload)
 }
 
 // ReadResponse returns (nil, nil) when the peer closed the connection cleanly.
 func ReadResponse(r io.Reader) (*Response, error) {
-	k, payload, ok, err := readStandardFrame(r)
-	if err != nil || !ok {
+	h, payload, err := readStandardFrame(r)
+	if err != nil || h == nil {
 		return nil, err
 	}
-	return decodeResponse(k, payload)
+	if h.tagged {
+		return nil, errUnexpectedTag
+	}
+	return decodeResponse(kind(h.kind), payload)
 }
 
 // ---------------------------------------------------------------------------
@@ -412,6 +470,13 @@ func encodeRequest(req *Request) (kind, []byte, error) {
 	case req.RemoveWorkspace != nil:
 		e.str(req.RemoveWorkspace.Name)
 		return kRemoveWorkspaceRequest, e.buf, e.err
+	case req.Hello != nil:
+		h := req.Hello
+		e.u16(h.MinVersion)
+		e.u16(h.MaxVersion)
+		e.str(h.Client)
+		e.strs(h.Capabilities)
+		return kHelloRequest, e.buf, e.err
 	}
 	return 0, nil, errors.New("empty request")
 }
@@ -465,6 +530,8 @@ func decodeRequest(k kind, payload []byte) (*Request, error) {
 		req.AddWorkspace = &AddWorkspace{Name: d.str(), Path: d.str()}
 	case kRemoveWorkspaceRequest:
 		req.RemoveWorkspace = &WorkspaceRef{Name: d.str()}
+	case kHelloRequest:
+		req.Hello = &Hello{MinVersion: d.u16(), MaxVersion: d.u16(), Client: d.str(), Capabilities: d.strs()}
 	default:
 		return nil, fmt.Errorf("unexpected message kind `%d` while decoding request", k)
 	}
@@ -548,6 +615,19 @@ func encodeResponse(resp *Response) (kind, []byte, error) {
 	case resp.Workspace != nil:
 		e.workspace(resp.Workspace)
 		return kWorkspaceResponse, e.buf, e.err
+	case resp.Welcome != nil:
+		w := resp.Welcome
+		e.u16(w.Version)
+		e.str(w.DaemonVersion)
+		e.strs(w.Capabilities)
+		e.str(w.Host.Name)
+		e.str(w.Host.OS)
+		e.str(w.Host.Arch)
+		e.u32(w.Host.CPUs)
+		e.u64(w.Host.MemoryBytes)
+		e.strs(w.Host.Agents)
+		e.str(w.Host.DefaultAgent)
+		return kWelcomeResponse, e.buf, e.err
 	}
 	return 0, nil, errors.New("empty response")
 }
@@ -579,14 +659,14 @@ func decodeResponse(k kind, payload []byte) (*Response, error) {
 		resp.Session = &rec
 	case kSessionsResponse:
 		n := d.length()
-		sessions := make([]session.Record, 0, n)
+		sessions := make([]session.Record, 0, d.capacity(n))
 		for i := 0; i < n && d.err == nil; i++ {
 			sessions = append(sessions, d.sessionRecord())
 		}
 		resp.Sessions = &sessions
 	case kAttachmentsResponse:
 		n := d.length()
-		attachments := make([]session.AttachmentRecord, 0, n)
+		attachments := make([]session.AttachmentRecord, 0, d.capacity(n))
 		for i := 0; i < n && d.err == nil; i++ {
 			attachments = append(attachments, session.AttachmentRecord{
 				AttachID: d.str(), SessionID: d.str(), Kind: d.attachmentKind(), ConnectedAt: d.datetime(),
@@ -605,7 +685,7 @@ func decodeResponse(k kind, payload []byte) (*Response, error) {
 		resp.Ok = Empty
 	case kWorkspacesResponse:
 		n := d.length()
-		workspaces := make([]session.Workspace, 0, n)
+		workspaces := make([]session.Workspace, 0, d.capacity(n))
 		for i := 0; i < n && d.err == nil; i++ {
 			workspaces = append(workspaces, d.workspace())
 		}
@@ -613,6 +693,13 @@ func decodeResponse(k kind, payload []byte) (*Response, error) {
 	case kWorkspaceResponse:
 		w := d.workspace()
 		resp.Workspace = &w
+	case kWelcomeResponse:
+		w := &Welcome{Version: d.u16(), DaemonVersion: d.str(), Capabilities: d.strs()}
+		w.Host = HostInfo{
+			Name: d.str(), OS: d.str(), Arch: d.str(), CPUs: d.u32(), MemoryBytes: d.u64(),
+			Agents: d.strs(), DefaultAgent: d.str(),
+		}
+		resp.Welcome = w
 	default:
 		return nil, fmt.Errorf("unexpected message kind `%d` while decoding response", k)
 	}
@@ -636,6 +723,7 @@ func (e *encoder) u16(v uint16) { e.buf = binary.LittleEndian.AppendUint16(e.buf
 func (e *encoder) u32(v uint32) { e.buf = binary.LittleEndian.AppendUint32(e.buf, v) }
 func (e *encoder) i32(v int32)  { e.u32(uint32(v)) }
 func (e *encoder) i64(v int64)  { e.buf = binary.LittleEndian.AppendUint64(e.buf, uint64(v)) }
+func (e *encoder) u64(v uint64) { e.buf = binary.LittleEndian.AppendUint64(e.buf, v) }
 
 func (e *encoder) length(n int) {
 	if n < 0 || uint64(n) > uint64(^uint32(0)) {
@@ -651,6 +739,13 @@ func (e *encoder) bytes(v []byte) {
 }
 
 func (e *encoder) str(v string) { e.bytes([]byte(v)) }
+
+func (e *encoder) strs(v []string) {
+	e.length(len(v))
+	for _, s := range v {
+		e.str(s)
+	}
+}
 
 func (e *encoder) optStr(v *string) {
 	if v == nil {
@@ -805,6 +900,13 @@ func (d *decoder) take(n int) []byte {
 	return b
 }
 
+// capacity bounds a slice's initial capacity for a count read off the wire:
+// every element takes at least one byte, so no more than the bytes left can
+// be real, and a lying count cannot make the decoder allocate gigabytes.
+func (d *decoder) capacity(n int) int {
+	return max(0, min(n, len(d.buf)-d.pos))
+}
+
 func (d *decoder) finish() error {
 	if d.err != nil {
 		return d.err
@@ -840,6 +942,8 @@ func (d *decoder) u32() uint32 {
 }
 
 func (d *decoder) i32() int32 { return int32(d.u32()) }
+
+func (d *decoder) u64() uint64 { return uint64(d.i64()) }
 
 func (d *decoder) i64() int64 {
 	b := d.take(8)
@@ -885,6 +989,17 @@ func (d *decoder) str() string {
 		return ""
 	}
 	return string(b)
+}
+
+// strs decodes a list of strings. The count comes off the wire, so the slice
+// grows as elements decode rather than being sized from it up front.
+func (d *decoder) strs() []string {
+	n := d.length()
+	var out []string
+	for i := 0; i < n && d.err == nil; i++ {
+		out = append(out, d.str())
+	}
+	return out
 }
 
 func (d *decoder) optStr() *string {

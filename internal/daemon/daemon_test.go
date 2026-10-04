@@ -1161,8 +1161,17 @@ func TestServesSessionsOverQUIC(t *testing.T) {
 	if resp := h.request(&protocol.Request{ListSessions: protocol.Empty}); resp.Sessions == nil || len(*resp.Sessions) != 1 {
 		t.Fatalf("list over QUIC = %#v", resp)
 	}
-	if st := h.management(&protocol.ManagementRequest{Status: protocol.Empty}).Status; st == nil || st.ProtocolVersion != protocol.ProtocolVersion {
+	st := h.management(&protocol.ManagementRequest{Status: protocol.Empty}).Status
+	if st == nil || st.ProtocolVersion != protocol.ProtocolVersion {
 		t.Fatalf("management status over QUIC = %#v", st)
+	}
+	// The status describes this connection, including the stream asking.
+	if len(st.Connections) != 1 || st.OpenStreams < 1 {
+		t.Fatalf("connections = %#v, open streams %d", st.Connections, st.OpenStreams)
+	}
+	conn := st.Connections[0]
+	if conn.Fingerprint != client.Fingerprint || conn.Name != "test laptop" || conn.StreamsOpened < 5 || conn.StreamsOpen < 1 || conn.RTTMicros <= 0 {
+		t.Fatalf("connection = %#v", conn)
 	}
 }
 

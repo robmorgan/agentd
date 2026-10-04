@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -81,8 +83,55 @@ type QUICListener struct {
 	cancel  context.CancelFunc
 
 	mu sync.Mutex
-	// conns maps each open connection to its client key's fingerprint.
-	conns map[*quic.Conn]string
+	// conns maps each open connection to what is known about it.
+	conns map[*quic.Conn]*connEntry
+}
+
+// connEntry is the listener's record of one open client connection.
+type connEntry struct {
+	fingerprint string
+	connectedAt time.Time
+	// opened counts the streams the client has opened; open is how many
+	// are open now. Each stream decrements open once, when it is closed.
+	opened atomic.Uint64
+	open   atomic.Int64
+}
+
+// ConnectionInfo describes one open client connection, for status output.
+type ConnectionInfo struct {
+	Fingerprint   string
+	Remote        string
+	ConnectedAt   time.Time
+	StreamsOpened uint64
+	StreamsOpen   int64
+	// RTT is QUIC's smoothed round-trip time estimate.
+	RTT                      time.Duration
+	BytesSent, BytesReceived uint64
+	PacketsSent, PacketsLost uint64
+}
+
+// Connections describes the open client connections, oldest first.
+func (q *QUICListener) Connections() []ConnectionInfo {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	out := make([]ConnectionInfo, 0, len(q.conns))
+	for conn, e := range q.conns {
+		stats := conn.ConnectionStats()
+		out = append(out, ConnectionInfo{
+			Fingerprint:   e.fingerprint,
+			Remote:        conn.RemoteAddr().String(),
+			ConnectedAt:   e.connectedAt,
+			StreamsOpened: e.opened.Load(),
+			StreamsOpen:   e.open.Load(),
+			RTT:           stats.SmoothedRTT,
+			BytesSent:     stats.BytesSent,
+			BytesReceived: stats.BytesReceived,
+			PacketsSent:   stats.PacketsSent,
+			PacketsLost:   stats.PacketsLost,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ConnectedAt.Before(out[j].ConnectedAt) })
+	return out
 }
 
 // ListenQUIC listens for QUIC connections on addr (a UDP host:port) with the
@@ -132,7 +181,7 @@ func ListenQUIC(addr string, id *Identity, opts QUICOptions) (*QUICListener, err
 		streams: make(chan Stream),
 		ctx:     ctx,
 		cancel:  cancel,
-		conns:   make(map[*quic.Conn]string),
+		conns:   make(map[*quic.Conn]*connEntry),
 	}
 	go q.acceptConns()
 	go q.recheck()
@@ -154,14 +203,15 @@ func (q *QUICListener) acceptConns() {
 			conn.CloseWithError(0, "no client certificate")
 			continue
 		}
-		if !q.track(conn, fp) {
+		entry := &connEntry{fingerprint: fp, connectedAt: time.Now()}
+		if !q.track(conn, entry) {
 			conn.CloseWithError(0, "agentd is shutting down")
 			return
 		}
 		if q.opts.OnConnect != nil {
 			q.opts.OnConnect(fp, conn.RemoteAddr())
 		}
-		go q.acceptStreams(conn, fp)
+		go q.acceptStreams(conn, entry)
 	}
 }
 
@@ -170,22 +220,27 @@ func (q *QUICListener) acceptConns() {
 // client cannot get ahead of the daemon accepting its streams, and QUIC's
 // stream limit bounds what it can have open. It ends when the connection or
 // the listener closes.
-func (q *QUICListener) acceptStreams(conn *quic.Conn, fp string) {
+func (q *QUICListener) acceptStreams(conn *quic.Conn, entry *connEntry) {
 	defer q.untrack(conn)
 	for {
 		s, err := conn.AcceptStream(q.ctx)
 		if err != nil {
 			return
 		}
-		if !q.opts.Authorized(fp) {
+		if !q.opts.Authorized(entry.fingerprint) {
 			s.CancelRead(0)
 			s.CancelWrite(0)
 			conn.CloseWithError(0, "client key revoked")
 			return
 		}
+		entry.opened.Add(1)
+		entry.open.Add(1)
+		stream := &quicStream{Stream: s, onClose: func() { entry.open.Add(-1) }}
 		select {
-		case q.streams <- &quicStream{s}:
+		case q.streams <- stream:
 		case <-q.ctx.Done():
+			// Never handed out, so never closed by its handler.
+			entry.open.Add(-1)
 			s.CancelRead(0)
 			s.CancelWrite(0)
 			return
@@ -207,8 +262,8 @@ func (q *QUICListener) recheck() {
 		}
 		q.mu.Lock()
 		open := make(map[*quic.Conn]string, len(q.conns))
-		for conn, fp := range q.conns {
-			open[conn] = fp
+		for conn, e := range q.conns {
+			open[conn] = e.fingerprint
 		}
 		q.mu.Unlock()
 		// Authorized reads a file, so it is called outside the lock, once
@@ -227,13 +282,13 @@ func (q *QUICListener) recheck() {
 	}
 }
 
-func (q *QUICListener) track(conn *quic.Conn, fp string) bool {
+func (q *QUICListener) track(conn *quic.Conn, e *connEntry) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.ctx.Err() != nil {
 		return false
 	}
-	q.conns[conn] = fp
+	q.conns[conn] = e
 	return true
 }
 
@@ -258,7 +313,7 @@ func (q *QUICListener) Close() error {
 	q.mu.Lock()
 	q.cancel()
 	conns := q.conns
-	q.conns = map[*quic.Conn]string{}
+	q.conns = map[*quic.Conn]*connEntry{}
 	q.mu.Unlock()
 	for conn := range conns {
 		conn.CloseWithError(0, "agentd is shutting down")
@@ -420,18 +475,26 @@ func (c *QUICClient) OpenStream(ctx context.Context) (Stream, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &quicStream{s}, nil
+	return &quicStream{Stream: s}, nil
 }
 
 func (c *QUICClient) Close() error { return c.conn.CloseWithError(0, "") }
 
 // quicStream adapts a QUIC stream to Stream. Closing a QUIC stream only ends
 // its send side, which is exactly CloseWrite; Close also stops receiving.
-type quicStream struct{ *quic.Stream }
+// onClose, if set, runs once, at the first Close.
+type quicStream struct {
+	*quic.Stream
+	onClose   func()
+	closeOnce sync.Once
+}
 
 func (s *quicStream) CloseWrite() error { return s.Stream.Close() }
 
 func (s *quicStream) Close() error {
+	if s.onClose != nil {
+		s.closeOnce.Do(s.onClose)
+	}
 	s.Stream.CancelRead(0)
 	return s.Stream.Close()
 }

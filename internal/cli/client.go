@@ -19,9 +19,10 @@ import (
 // client reaches one daemon: the local one over its Unix socket, or a
 // remote one over QUIC (agent --host NAME).
 //
-// The protocol's unit is one stream per request or attach session, ended
-// by half-closing. Locally that is one Unix connection; remotely it is one
-// QUIC stream on a connection the process opens once, lazily, and reuses.
+// The protocol's unit is a stream: the control stream that carries every
+// one-shot request, one per attach session, one per transfer. Locally a
+// stream is one Unix connection; remotely it is one QUIC stream on a
+// connection the process opens once, lazily, and reuses.
 type client struct {
 	paths *paths.AppPaths
 	// host is the remote daemon, or nil for the local one.
@@ -29,6 +30,12 @@ type client struct {
 
 	mu   sync.Mutex
 	quic *transport.QUICClient
+
+	// controlMu guards control, the stream one-shot requests share; see
+	// controlStream. It is separate from mu because opening a control
+	// stream may dial the remote connection, which takes mu.
+	controlMu sync.Mutex
+	control   *controlStream
 }
 
 const (
@@ -109,9 +116,16 @@ func (c *client) remoteConnection(ctx context.Context) (*transport.QUICClient, e
 	return conn, nil
 }
 
-// close ends the remote connection, if any, so the daemon sees this client
-// go away at once rather than after an idle timeout.
+// close ends the control stream and the remote connection, if any, so the
+// daemon sees this client go away at once rather than after an idle
+// timeout.
 func (c *client) close() {
+	c.controlMu.Lock()
+	if c.control != nil {
+		c.control.close()
+		c.control = nil
+	}
+	c.controlMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.quic != nil {
@@ -163,9 +177,15 @@ func localHostname() string {
 
 // request sends one request and reads its response. With a non-zero
 // timeout the whole exchange, connecting included, must finish in time.
+//
+// One-shot requests share the control stream; an attach, or a transfer
+// such as history, gets a stream of its own (see protocol.StreamRole).
 func (c *client) request(req *protocol.Request, timeout time.Duration) (*protocol.Response, error) {
 	ctx, cancel := contextFor(timeout)
 	defer cancel()
+	if req.Role() == protocol.RoleRequest {
+		return c.controlRequest(ctx, req)
+	}
 	s, err := c.open(ctx)
 	if err != nil {
 		return nil, err
@@ -185,6 +205,51 @@ func (c *client) request(req *protocol.Request, timeout time.Duration) (*protoco
 		return nil, errors.New("agentd closed the connection")
 	}
 	return resp, nil
+}
+
+// controlRequest sends req on the control stream. A stream that turns out
+// to have ended before req was written (the daemon restarted since it was
+// opened, say) is replaced once; a request that was sent is never repeated,
+// since the daemon may have acted on it.
+func (c *client) controlRequest(ctx context.Context, req *protocol.Request) (*protocol.Response, error) {
+	for attempt := 0; ; attempt++ {
+		cs, err := c.controlStream(ctx)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := cs.roundTrip(ctx, req)
+		var sent *sentError
+		if err == nil || errors.As(err, &sent) || attempt > 0 {
+			if sent != nil {
+				err = sent.err
+			}
+			return resp, err
+		}
+	}
+}
+
+// controlStream returns the open control stream, opening one (and with it
+// the handshake) if there is none or it has ended.
+func (c *client) controlStream(ctx context.Context) (*controlStream, error) {
+	c.controlMu.Lock()
+	defer c.controlMu.Unlock()
+	if c.control != nil && !c.control.failed() {
+		return c.control, nil
+	}
+	if c.control != nil {
+		c.control.close()
+		c.control = nil
+	}
+	s, err := c.open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	cs, err := openControl(ctx, s)
+	if err != nil {
+		return nil, err
+	}
+	c.control = cs
+	return cs, nil
 }
 
 func contextFor(timeout time.Duration) (context.Context, context.CancelFunc) {
@@ -334,36 +399,31 @@ func daemonExecutableFrom(agentdBin, exe string, exeErr error) (string, error) {
 	return filepath.Join(filepath.Dir(exe), "agentd"), nil
 }
 
+// ensureCompatible performs the handshake, which agrees on a protocol
+// version, and keeps the control stream it opens for the requests that
+// follow.
 func (c *client) ensureCompatible() error {
-	info, err := c.daemonInfo()
-	if err != nil {
-		return err
-	}
-	if info.ProtocolVersion != protocol.ProtocolVersion {
-		return fmt.Errorf("agentd `%s` speaks protocol %d but agent `%s` needs protocol %d; %s",
-			info.DaemonVersion, info.ProtocolVersion, Version, protocol.ProtocolVersion, upgradeHint)
-	}
-	return nil
+	_, err := c.welcome()
+	return err
 }
 
 func incompatibleDaemonMessage() string {
 	return fmt.Sprintf("agentd does not speak agent protocol %d; %s", protocol.ProtocolVersion, upgradeHint)
 }
 
-func (c *client) daemonInfo() (*protocol.DaemonInfo, error) {
-	resp, err := c.request(&protocol.Request{GetDaemonInfo: protocol.Empty}, c.controlTimeout())
+// welcome is the daemon's answer to this client's Hello.
+func (c *client) welcome() (*protocol.Welcome, error) {
+	ctx, cancel := contextFor(c.controlTimeout())
+	defer cancel()
+	cs, err := c.controlStream(ctx)
 	switch {
 	case err != nil && c.host != nil:
 		// Remote connect errors already say what to do.
 		return nil, err
 	case err != nil:
 		return nil, fmt.Errorf("%s: %w", incompatibleDaemonMessage(), err)
-	case resp.Error != nil:
-		return nil, errors.New(resp.Error.Message)
-	case resp.DaemonInfo == nil:
-		return nil, fmt.Errorf("unexpected response: %s", describeResponse(resp))
 	}
-	return resp.DaemonInfo, nil
+	return cs.welcome, nil
 }
 
 func (c *client) managementStatus() (*protocol.ManagementStatus, error) {

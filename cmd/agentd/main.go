@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/robmorgan/agentd/internal/config"
 	"github.com/robmorgan/agentd/internal/daemon"
@@ -344,6 +345,17 @@ func runRemoteStatus(p *paths.AppPaths) int {
 	}
 	fmt.Printf("key: %s\n", id.Fingerprint)
 	fmt.Printf("authorized clients: %d\n", len(clients))
+	if status != nil {
+		fmt.Printf("connected clients: %d\n", len(status.Connections))
+		for _, c := range status.Connections {
+			name := c.Name
+			if name == "" {
+				name = "(unnamed)"
+			}
+			fmt.Printf("  %s %s from %s since %s: %d streams open, rtt %dus, %d/%d packets lost\n",
+				name, c.Fingerprint, c.Remote, c.ConnectedAt.Local().Format(time.DateTime), c.StreamsOpen, c.RTTMicros, c.PacketsLost, c.PacketsSent)
+		}
+	}
 	return 0
 }
 
