@@ -1,10 +1,12 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"os"
 	"path/filepath"
@@ -21,7 +23,7 @@ const quicTestTimeout = 10 * time.Second
 
 // startEcho runs a QUIC listener whose streams echo their input back,
 // upper-cased, once the client half-closes.
-func startEcho(t *testing.T, server *Identity, authorized ...string) *QUICListener {
+func startEcho(t testing.TB, server *Identity, authorized ...string) *QUICListener {
 	t.Helper()
 	allowed := map[string]bool{}
 	for _, fp := range authorized {
@@ -44,7 +46,7 @@ func startEcho(t *testing.T, server *Identity, authorized ...string) *QUICListen
 	return l
 }
 
-func mustIdentity(t *testing.T) *Identity {
+func mustIdentity(t testing.TB) *Identity {
 	t.Helper()
 	id, err := GenerateIdentity()
 	if err != nil {
@@ -489,7 +491,7 @@ func TestQUICNoticesSilentClient(t *testing.T) {
 		_, err := io.Copy(s, s) // an attachment: open until either side ends it
 		ended <- err
 	})
-	relay := startRelay(t, l.Addr())
+	relay := startRelay(t, l.Addr(), relayOptions{})
 
 	ctx, cancel := context.WithTimeout(context.Background(), quicTestTimeout)
 	defer cancel()
@@ -538,34 +540,78 @@ func TestQUICNoticesSilentClient(t *testing.T) {
 	}
 }
 
-// udpRelay forwards datagrams between one client and a server until drop
-// is set, after which it silently discards them in both directions, as a
-// dead network would.
+// udpRelay forwards datagrams between one client and a server, standing in
+// for the network between them. Setting drop silently discards everything in
+// both directions, as a dead network would; relayOptions add random loss and
+// delay; rebind moves the server side to a new socket, as a NAT rebinding or
+// a switch from Wi-Fi to cellular would.
 type udpRelay struct {
-	front *net.UDPConn
-	drop  atomic.Bool
+	t      testing.TB
+	front  *net.UDPConn
+	server *net.UDPAddr
+	opts   relayOptions
+	drop   atomic.Bool
+
+	// Packets forwarded and lost, in both directions.
+	forwarded, lost atomic.Int64
+
+	mu sync.Mutex
+	// back is the socket the relay sends to the server from; rebind
+	// replaces it.
+	back *net.UDPConn
+	// client is where the client's last packet came from.
+	client *net.UDPAddr
+	rng    *rand.Rand
+
+	// toServer and toClient hold delayed packets in order, so that delay
+	// does not also reorder them.
+	toServer, toClient chan delayedPacket
+	done               chan struct{}
+}
+
+type delayedPacket struct {
+	due  time.Time
+	p    []byte
+	send func([]byte)
+}
+
+type relayOptions struct {
+	// Loss is the probability that a packet in either direction is lost.
+	Loss float64
+	// Delay is added to every packet in each direction, so the round-trip
+	// time grows by twice this.
+	Delay time.Duration
 }
 
 func (r *udpRelay) addr() string { return r.front.LocalAddr().String() }
 
-func startRelay(t *testing.T, serverAddr string) *udpRelay {
+func startRelay(t testing.TB, serverAddr string, opts relayOptions) *udpRelay {
 	t.Helper()
 	front, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	raddr, err := net.ResolveUDPAddr("udp", serverAddr)
+	server, err := net.ResolveUDPAddr("udp", serverAddr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	back, err := net.DialUDP("udp", nil, raddr)
-	if err != nil {
-		t.Fatal(err)
+	// A fixed seed makes a lossy run repeatable, as far as the scheduler
+	// allows.
+	r := &udpRelay{t: t, front: front, server: server, opts: opts, rng: rand.New(rand.NewPCG(1, 2)), done: make(chan struct{})}
+	// Bursts of a full flow-control window must not overflow the relay's
+	// own socket buffers.
+	front.SetReadBuffer(8 << 20)
+	if opts.Delay > 0 {
+		r.toServer, r.toClient = r.delayLine(), r.delayLine()
 	}
-	t.Cleanup(func() { front.Close(); back.Close() })
-	r := &udpRelay{front: front}
-	var mu sync.Mutex
-	var clientAddr *net.UDPAddr
+	t.Cleanup(func() {
+		close(r.done)
+		front.Close()
+		r.mu.Lock()
+		r.back.Close()
+		r.mu.Unlock()
+	})
+	r.rebind()
 	go func() {
 		buf := make([]byte, 65536)
 		for {
@@ -573,14 +619,33 @@ func startRelay(t *testing.T, serverAddr string) *udpRelay {
 			if err != nil {
 				return
 			}
-			mu.Lock()
-			clientAddr = from
-			mu.Unlock()
-			if !r.drop.Load() {
-				back.Write(buf[:n])
-			}
+			r.mu.Lock()
+			r.client = from
+			back := r.back
+			r.mu.Unlock()
+			r.forward(r.toServer, buf[:n], func(p []byte) { back.Write(p) })
 		}
 	}()
+	return r
+}
+
+// rebind sends to the server from a new socket from now on, so the server
+// sees the client's packets arrive from a new address, and closes the old
+// one, so replies sent to the old address are lost. It returns the new
+// address.
+func (r *udpRelay) rebind() net.Addr {
+	back, err := net.DialUDP("udp", nil, r.server)
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	back.SetReadBuffer(8 << 20)
+	r.mu.Lock()
+	old := r.back
+	r.back = back
+	r.mu.Unlock()
+	if old != nil {
+		old.Close()
+	}
 	go func() {
 		buf := make([]byte, 65536)
 		for {
@@ -588,15 +653,61 @@ func startRelay(t *testing.T, serverAddr string) *udpRelay {
 			if err != nil {
 				return
 			}
-			mu.Lock()
-			to := clientAddr
-			mu.Unlock()
-			if to != nil && !r.drop.Load() {
-				front.WriteToUDP(buf[:n], to)
+			r.mu.Lock()
+			to := r.client
+			r.mu.Unlock()
+			if to != nil {
+				r.forward(r.toClient, buf[:n], func(p []byte) { r.front.WriteToUDP(p, to) })
 			}
 		}
 	}()
-	return r
+	return back.LocalAddr()
+}
+
+// forward sends p with send unless it is dropped or lost, after the delay
+// through line.
+func (r *udpRelay) forward(line chan delayedPacket, p []byte, send func([]byte)) {
+	if r.drop.Load() {
+		return
+	}
+	if r.opts.Loss > 0 {
+		r.mu.Lock()
+		lost := r.rng.Float64() < r.opts.Loss
+		r.mu.Unlock()
+		if lost {
+			r.lost.Add(1)
+			return
+		}
+	}
+	r.forwarded.Add(1)
+	if r.opts.Delay <= 0 {
+		send(p)
+		return
+	}
+	select {
+	case line <- delayedPacket{due: time.Now().Add(r.opts.Delay), p: bytes.Clone(p), send: send}:
+	default:
+		// A full queue drops, as a router's does.
+		r.lost.Add(1)
+	}
+}
+
+// delayLine starts a goroutine that sends each packet queued on the
+// returned channel once it is due, in order. It ends with the relay.
+func (r *udpRelay) delayLine() chan delayedPacket {
+	line := make(chan delayedPacket, 16384)
+	go func() {
+		for {
+			select {
+			case <-r.done:
+				return
+			case d := <-line:
+				time.Sleep(time.Until(d.due))
+				d.send(d.p)
+			}
+		}
+	}()
+	return line
 }
 
 // Only failures a new connection may get past count as a lost connection.
