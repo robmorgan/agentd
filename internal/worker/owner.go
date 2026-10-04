@@ -27,6 +27,10 @@ type ownerState struct {
 	attachments         map[string]*ownerAttachment
 	output              *broadcaster
 	input               *ptyInput
+	// outputBytes and outputChunks count the PTY output published
+	// (session stats).
+	outputBytes  uint64
+	outputChunks uint64
 }
 
 type ownerAttachment struct {
@@ -145,6 +149,8 @@ func (s *ownerState) resize(g protocol.Geometry) error {
 // publishOutput feeds PTY output through the shadow terminal, answers any
 // terminal queries on behalf of absent clients, then fans the raw bytes out.
 func (s *ownerState) publishOutput(data []byte) error {
+	s.outputBytes += uint64(len(data))
+	s.outputChunks++
 	writes := s.terminal.feed(data)
 	if !s.hasLiveAttachTerminal() {
 		for _, response := range writes {

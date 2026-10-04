@@ -285,7 +285,7 @@ rather than merely:
 # Package layout
 
 ```text
-cmd/agentd/          serve, upgrade, session-worker
+cmd/agentd/          serve, upgrade, remote, bench, session-worker
 cmd/agent/           the `agent` CLI (and its end-to-end PTY tests)
 internal/
   cli/               the CLI: commands, picker, attach, overlay
@@ -298,6 +298,8 @@ internal/
   session/           session model and name rules
   paths/             runtime root
   config/            config.toml
+  procstat/          process resource usage from the OS and the Go runtime
+  bench/             `agentd bench sessions`
 scripts/             libghostty-vt build helper
 ```
 
@@ -522,6 +524,7 @@ Done:
 - The connection handshake (`Hello`/`Welcome`): version and capability negotiation, host description, and a control stream of tagged requests; stream roles are set by a stream's first frame.
 
 - Host health (`agent hosts`), machine capabilities (`agent host info`), and placement hints (`agent --host auto new`).
+- Resource usage: workers and the daemon report their own (`GetSessionStats`/`GetDaemonStats`, `agent status --stats`, `agent daemon stats`), and `agentd bench sessions` measures sessions at scale (BENCHMARKS.md, "Sessions at scale").
 
 Next:
 1. Cross-host discovery (`agent ls` across hosts).

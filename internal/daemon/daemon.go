@@ -48,6 +48,7 @@ import (
 	"github.com/robmorgan/agentd/internal/config"
 	"github.com/robmorgan/agentd/internal/db"
 	"github.com/robmorgan/agentd/internal/paths"
+	"github.com/robmorgan/agentd/internal/procstat"
 	"github.com/robmorgan/agentd/internal/protocol"
 	"github.com/robmorgan/agentd/internal/session"
 	"github.com/robmorgan/agentd/internal/transport"
@@ -75,6 +76,8 @@ type Server struct {
 	// workerBin is the executable started as `<workerBin> session-worker`.
 	workerBin string
 	lockWait  time.Duration
+	// startedAt is when this daemon was created, for its uptime in stats.
+	startedAt time.Time
 
 	// remoteAddr is where the QUIC listener is bound, if remote access is
 	// enabled and it started.
@@ -124,6 +127,7 @@ func New(p *paths.AppPaths, workerBin string) (*Server, error) {
 		config:    cfg,
 		workerBin: workerBin,
 		lockWait:  defaultLockWait,
+		startedAt: time.Now(),
 		shutdown:  make(chan struct{}),
 		conns:     make(map[transport.Stream]struct{}),
 	}, nil
@@ -621,6 +625,13 @@ func (s *Server) respond(req *protocol.Request, f protocol.Features) (resp *prot
 			return fail(err)
 		}
 		return protocol.OkResponse(), nil
+	case req.GetSessionStats != nil:
+		return s.sessionStats(req), nil
+	case req.GetDaemonStats != nil:
+		return &protocol.Response{DaemonStats: &protocol.DaemonStats{
+			Daemon:      procstat.DescribeSelf(s.startedAt),
+			OpenStreams: uint32(s.openStreams()),
+		}}, nil
 	}
 	return protocol.ErrorResponsef("unsupported request"), nil
 }
@@ -650,6 +661,8 @@ func requestSessionID(req *protocol.Request) (string, bool) {
 		return req.ListArtifacts.SessionID, true
 	case req.GetArtifact != nil:
 		return req.GetArtifact.SessionID, true
+	case req.GetSessionStats != nil:
+		return req.GetSessionStats.SessionID, true
 	}
 	return "", false
 }

@@ -162,3 +162,153 @@ after each move took 0.5-5 ms, a 1 MiB burst afterwards arrived intact, and the 
 single connection throughout. A client whose address changes therefore keeps its attachments, as
 long as packets flow again before the 15-second idle timeout; after that the CLI reconnects and
 reattaches as before.
+
+## Sessions at scale
+
+What a session costs, measured end to end with `agentd bench sessions` (`internal/bench`): it
+starts a private daemon in a temporary root, creates the sessions through the protocol, asks each
+worker for its own numbers (`GetSessionStats`, see "Resource Usage" in ARCHITECTURE.md), reads CPU
+time from outside the processes, and stops everything it started.
+
+Measured on an Apple M1 Max (10 cores, 64 GiB), macOS (Darwin 27.0.0), Go 1.26.3, with the
+commits that added the bench (on top of `d048e1e`). The machine was shared with other jobs (load
+average 9-47 during the runs), so latency and throughput are pessimistic; memory, thread, file
+and goroutine counts are not affected. The sessions run `/bin/sh -c 'exec cat'` (idle), `yes ... & exec cat` (output-heavy)
+or print 200,000 lines and then `cat` (full scrollback), so the numbers are agentd's and not a
+real agent's.
+
+```sh
+make agentd
+bin/agentd bench sessions --count 1
+bin/agentd bench sessions --count 10
+bin/agentd bench sessions --count 100 --output-heavy 10 --attach 10
+bin/agentd bench sessions --count 500
+bin/agentd bench sessions --count 100 --duration 60s --fill-lines 0      # idle CPU
+bin/agentd bench sessions --count 0 --output-heavy 100 --attach 100 --duration 10s --fill-lines 0
+go test ./internal/worker -run '^$' -bench TerminalMemory -benchtime 1x
+go test ./internal/db -run '^$' -bench .
+```
+
+1,000 sessions could not be run here: macOS allows 511 pseudo-terminals for all programs together
+(`kern.tty.ptmx_max`; creating more fails with "device not configured", which agentd now explains).
+500 was the most this machine allowed. Every per-session cost below is flat from 1 to 500 sessions,
+so 1,000 idle sessions would cost about 8.7 GiB of worker memory, 1.2 GiB for the `cat` agents,
+1,000 more daemon threads and about 100 MiB in the daemon.
+
+### Per-session fixed costs
+
+One idle session (mean over 500; the same at 1, 10 and 100):
+
+| Cost | Per session | Notes |
+| --- | --- | --- |
+| Worker private memory | 8.9 MiB | Physical footprint. RSS is 19.7 MiB, but about 10.8 MiB of it is the `agentd` executable and system libraries, shared by every worker |
+| Worker Go heap | 2.5 MiB | About 2 MiB of it is `modernc.org/libc`'s `/etc/services` and `/etc/protocols` tables, built at start-up (see the candidates below) |
+| Worker Go runtime memory | 9.8 MiB mapped | Not all resident |
+| libghostty terminal | 25 KB | `BenchmarkTerminalMemory`: 10,000 empty terminals at 160x48. At the 10 MB scrollback limit (6,900 rows at 160 columns) a terminal holds 9.4 MiB |
+| Worker threads | 9 (8-10) | Includes the PTY reader blocked in `read(2)` and `cmd.Wait` blocked in `wait4` |
+| Worker goroutines | 27 | 10 are the GC's mark workers (one per CPU), about 10 are the runtime's, 7 are agentd's |
+| Worker open files | 9 | stdin, the log (stdout and stderr), the PTY, the session socket, the Go netpoller's kqueue, 2 pipes |
+| Agent (`cat`) | 1.2 MiB, 1 thread, 3 files | A real agent costs far more: this is agentd's share only |
+| Daemon | 1 goroutine, 1.0 thread, 85-112 KiB, 0 files | The supervisor goroutine blocked in `wait4`, which holds a thread |
+| state.db | about 220 bytes | 112 KiB with 501 rows |
+| Idle CPU | 0.4 µs/s per worker | 100 workers over 60 s: 0.004% of a core for all of them, daemon 0.0001%. Nothing wakes an idle worker |
+
+At 1, 10, 100 and 500 sessions:
+
+| Sessions | Create all (p50 / p99 each) | Daemon private / threads / goroutines | Worker private | Idle attach p50 / p99 | ListSessions through the daemon / state.db alone |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 0.02 s (24 / 24 ms) | 9.4 MiB / 9 / 24 | 8.8 MiB | 0.49 / 0.49 ms | 0.29 / 0.13 ms |
+| 10 | 0.06 s (32 / 58 ms) | 12.5 MiB / 24 / 33 | 9.0 MiB | 0.83 / 0.85 ms | 0.54 / 0.16 ms |
+| 100 | 0.67 s (36 / 216 ms) | 19.8 MiB / 113 / 123 | 8.9 MiB | 0.53 / 1.04 ms | 2.4 / 0.44 ms |
+| 500 | 2.6 s (34 / 111 ms) | 50.2 MiB / 514 / 523 | 8.9 MiB | 0.50 / 1.12 ms | 11 / 1.5 ms |
+
+Sessions are created 8 at a time. The daemon starts (to its first answer) in 11-14 ms and holds
+8.8 MiB private (19.4 MiB RSS), 8 threads, 23 goroutines and 9 files with no sessions.
+
+### Snapshots and restore
+
+The worker formats a snapshot on its owner goroutine and the bench replays it into a fresh
+libghostty terminal of the session's size ("restore", what a client's terminal does with it).
+Attach is the client's round trip through the daemon until the snapshot has arrived.
+
+| Session | Snapshot | Format | Restore | Attach p50 (p99) |
+| --- | --- | --- | --- | --- |
+| Idle (empty screen) | 5.4 KiB | 38 µs | 75 µs | 0.5 ms (1.1 ms) |
+| Full scrollback (6,903 rows) | 630 KiB | 2.0-2.7 ms | 1.3-1.6 ms | 3.1-4.7 ms (11 ms) |
+
+A worker with full scrollback holds 26-27 MiB private, against 8.9 MiB idle: 9.4 MiB of
+libghostty state, and the rest Go memory from formatting snapshots and history.
+
+### PTY throughput and fan-out
+
+With no client attached, output-heavy sessions are bound by the worker feeding libghostty:
+
+| Output-heavy sessions | Total | Per session | Worker CPU | CPU per MiB |
+| --- | --- | --- | --- | --- |
+| 10 | 99 MiB/s | 9.8 MiB/s | 554% | 56 ms |
+| 100 | 89-91 MiB/s | 0.9 MiB/s | 647-727% | 71-82 ms |
+
+The machine's CPUs, shared with other jobs, are the limit: two sessions alone reached 46-64 MiB/s
+each at 17-23 ms of worker CPU per MiB. macOS PTYs return about 1 KiB per read under a flood
+(1,012 bytes on average). An output-heavy worker holds 21-22 MiB private (its scrollback is
+full) and 15 threads.
+
+Fan-out, one output-heavy session with K clients attached through the daemon's Unix socket:
+
+| Clients | PTY output | Each client receives | Dropped chunks | Echo to every client p50 / p99 / max | Worker / daemon CPU |
+| --- | --- | --- | --- | --- | --- |
+| 10 | 17.4 MiB/s | 17.4 MiB/s (100%) | 59 | 0.37 / 2.9 / 5.5 ms | 184% / 234% |
+| 100 | 19.2 MiB/s | 6.7 MiB/s (35%) | 13.1 million | 35 / 71 / 110 ms, 34% lost | 303% / 290% |
+
+Echo is a marker typed every 100 ms into the session, timed until the PTY's echo of it reaches
+each client: input latency behind a stream of output. With 100 clients each PTY read becomes 100
+frames of about 1 KiB, nearly 2 million a second through the worker and the daemon's proxy; the
+clients fall behind, the worker drops what does not fit in their queues (the slow-consumer policy
+in `internal/worker/broadcast.go`), and echoes are lost with the dropped chunks.
+
+### Database
+
+`go test ./internal/db -bench .` (every call opens its own SQLite connection, about 120 µs of it):
+
+| Operation | Time | Allocations |
+| --- | --- | --- |
+| ListSessions, 10 / 100 / 1,000 rows | 0.16 / 0.39 / 3.0 ms | 464 / 3,527 / 34,131 |
+| GetSession, 1,000 rows | 0.13 ms | 158 |
+| InsertSession, 1,000 rows | 0.55 ms | 113 |
+| InsertSession + MarkRunning (a session start) | 1.0 ms | 220 |
+
+Through the daemon, ListSessions also probes every running worker's socket (about 19 µs each),
+which is most of its 11 ms at 500 sessions.
+
+### Candidates
+
+The largest per-session fixed costs, from the numbers above. None of them was changed here: the
+largest is in a dependency and belongs upstream, and the others are not simple or not permanent
+costs.
+
+1. **`modernc.org/libc` parses `/etc/services` at start-up: 3.9 MiB of every worker's 8.9 MiB.**
+   Its `netdb` package reads `/etc/services` (678 KB on macOS) and `/etc/protocols` in `init`:
+   3.6 MB and 44,000 allocations and about 3 ms in every `agentd` process (`GODEBUG=inittrace=1`),
+   keeping about 2 MB of tables alive that agentd never uses. With a local copy that loads the
+   tables on first use (a `sync.Once` in its four lookup functions; nothing outside the package
+   reads them), an idle worker held 5.0 MiB private instead of 8.9 MiB, a 150 KiB heap instead of
+   2.5 MiB, and 17 goroutines instead of 27 (no garbage collection had to run, so the GC's workers
+   never started). That change should go to `modernc.org/libc` upstream rather than into a fork
+   here.
+2. **Scrollback, up to 10 MB of libghostty state per session** (`maxScrollbackBytes`). A session
+   whose output fills it costs 12-18 MiB more than an idle one. It is a variable cost, but the
+   largest one: 500 such sessions would need about 13 GiB. A configurable or smaller limit is a
+   product decision.
+3. **One daemon thread per session.** Each worker's supervisor blocks in `cmd.Wait` (`wait4`),
+   which holds an OS thread: 514 daemon threads at 500 sessions, and 85-112 KiB per session. One
+   reaper driven by SIGCHLD would make it constant, but the daemon's share is about 1% of a
+   session's cost.
+4. **Worker threads.** 9 per idle worker: the PTY reader blocks in `read(2)` (the PTY is not in
+   Go's poller) and `cmd.Wait` in `wait4`, beside the runtime's own. `GOMAXPROCS=1` or `2` saved
+   1-2 threads and 0.2-0.4 MiB per worker, and would cap a busy one; not worth it.
+5. **One frame per PTY read per client.** Fan-out to 100 clients collapses because every 1 KiB
+   read becomes a frame for every client. Writing the chunks queued for a client as one frame
+   would cut frames and system calls by about an order of magnitude; it changes throughput, not
+   per-session cost, and fits with the planned resync of lagging clients.
+6. **ListSessions dials every running worker** to check it is alive: 11 ms at 500 sessions, against
+   1.5 ms for state.db.

@@ -74,6 +74,15 @@ func (s *terminalState) format(vt bool) ([]byte, error) {
 	return f.Format()
 }
 
+// scrollbackRows is the number of rows of history above the screen.
+func (s *terminalState) scrollbackRows() uint64 {
+	n, err := s.term.ScrollbackRows()
+	if err != nil {
+		return 0
+	}
+	return uint64(n)
+}
+
 func (s *terminalState) close() {
 	if s.term != nil {
 		s.term.Close()
