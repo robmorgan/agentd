@@ -18,7 +18,7 @@ func TestStatsRoundTrips(t *testing.T) {
 	roundTripResponse(t, &Response{SessionStats: &SessionStats{
 		SessionID: "demo", Worker: testProcessStats, Agent: ProcessStats{PID: 9, RSSBytes: 1 << 40},
 		Cols: 160, Rows: 48, ScrollbackRows: 1000, ScrollbackLimitBytes: 10_000_000, Attachments: 2,
-		OutputBytes: 1 << 33, DroppedOutputChunks: 7,
+		OutputBytes: 1 << 33, OutputChunks: 1 << 20, DroppedOutputChunks: 7,
 	}})
 	roundTripResponse(t, &Response{SessionStats: &SessionStats{
 		SessionID: "demo", Snapshot: &SnapshotStats{Bytes: 1, FormatNanos: 2, RestoreNanos: 3},
@@ -75,7 +75,7 @@ func TestStatsGoldenFrames(t *testing.T) {
 		0x50, 0x44, 0x47, 0x41, 0x01, 0x00,
 		0xaa, 0x00, // SessionStats (170)
 		0x00, 0x00, 0x00, 0x00,
-		0xd7, 0x00, 0x00, 0x00, // 6 + 72 + 72 + 4 + 16 + 4 + 16 + 1 + 24 = 215
+		0xdf, 0x00, 0x00, 0x00, // 6 + 72 + 72 + 4 + 16 + 4 + 24 + 1 + 24 = 223
 		0x02, 0x00, 0x00, 0x00, 0x61, 0x62, // session id
 	}
 	sess = append(sess, processStatsGolden...) // worker
@@ -86,6 +86,7 @@ func TestStatsGoldenFrames(t *testing.T) {
 		0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // scrollback limit
 		0x0f, 0x00, 0x00, 0x00, // attachments
 		0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // output bytes
+		0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // output chunks
 		0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // dropped chunks
 		0x01,                                           // snapshot present
 		0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // snapshot bytes
@@ -94,7 +95,7 @@ func TestStatsGoldenFrames(t *testing.T) {
 	)
 	assertResponseGolden(t, &Response{SessionStats: &SessionStats{
 		SessionID: "ab", Worker: testProcessStats, Cols: 80, Rows: 24, ScrollbackRows: 13, ScrollbackLimitBytes: 14,
-		Attachments: 15, OutputBytes: 16, DroppedOutputChunks: 17,
+		Attachments: 15, OutputBytes: 16, OutputChunks: 21, DroppedOutputChunks: 17,
 		Snapshot: &SnapshotStats{Bytes: 18, FormatNanos: 19, RestoreNanos: 20},
 	}}, sess)
 }

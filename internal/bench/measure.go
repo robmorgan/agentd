@@ -65,12 +65,13 @@ func (b *bench) measureOutput(ctx context.Context) error {
 	w1, a1 := cpuOf(p.workers), cpuOf(p.agents)
 	wall := time.Since(start)
 
-	var total uint64
+	var total, chunks uint64
 	rates := make([]float64, n)
 	workers := make([]processStats, n)
 	for i := range n {
 		d := after[i].OutputBytes - before[i].OutputBytes
 		total += d
+		chunks += after[i].OutputChunks - before[i].OutputChunks
 		rates[i] = float64(d) / wall.Seconds()
 		workers[i] = after[i].Worker
 	}
@@ -85,6 +86,7 @@ func (b *bench) measureOutput(ctx context.Context) error {
 	}
 	if total > 0 {
 		o.CPUMsPerMiB = millis(w1-w0) / (float64(total) / (1 << 20))
+		o.ChunkBytes = float64(total) / float64(chunks)
 	}
 	b.report.Output = o
 	// Fan-out is measured on the first of them alone, so stop the rest.
@@ -281,6 +283,7 @@ func (b *bench) measureFanOut(ctx context.Context) error {
 		ClientBytesPerSec: summarize(rates),
 		Delivered:         summarize(delivered),
 		DroppedChunks:     after.DroppedOutputChunks - before.DroppedOutputChunks,
+		ChunkBytes:        float64(produced) / float64(max(1, after.OutputChunks-before.OutputChunks)),
 		EchoMs:            summarize(echoes),
 		EchoesLost:        lost,
 		WorkerCPU:         percent(wc1-wc0, wall),

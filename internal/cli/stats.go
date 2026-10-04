@@ -37,8 +37,8 @@ func (c *client) sessionStats(id string) (*protocol.SessionStats, error) {
 func printSessionStats(w io.Writer, s *protocol.SessionStats) {
 	fmt.Fprintf(w, "worker: %s\n", describeProcess(s.Worker))
 	fmt.Fprintf(w, "agent: %s\n", describeProcess(s.Agent))
-	fmt.Fprintf(w, "terminal: %dx%d, scrollback %d rows (limit %s), output %s, attachments %d, dropped output chunks %d\n",
-		s.Cols, s.Rows, s.ScrollbackRows, formatBytes(s.ScrollbackLimitBytes), formatBytes(s.OutputBytes),
+	fmt.Fprintf(w, "terminal: %dx%d, scrollback %d rows (limit %s), output %s in %d chunks, attachments %d, dropped output chunks %d\n",
+		s.Cols, s.Rows, s.ScrollbackRows, formatBytes(s.ScrollbackLimitBytes), formatBytes(s.OutputBytes), s.OutputChunks,
 		s.Attachments, s.DroppedOutputChunks)
 }
 

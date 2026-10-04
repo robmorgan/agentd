@@ -144,12 +144,14 @@ type OutputReport struct {
 	Sessions    int     `json:"sessions"`
 	IntervalSec float64 `json:"interval_sec"`
 	// BytesPerSec is the PTY output all of them read, per second.
-	BytesPerSec           float64     `json:"bytes_per_sec"`
-	PerSessionBytesPerSec Dist        `json:"per_session_bytes_per_sec"`
-	WorkersCPUPercent     float64     `json:"workers_cpu_percent"`
-	AgentsCPUPercent      float64     `json:"agents_cpu_percent"`
-	CPUMsPerMiB           float64     `json:"worker_cpu_ms_per_mib"`
-	Workers               ProcessDist `json:"workers"`
+	BytesPerSec           float64 `json:"bytes_per_sec"`
+	PerSessionBytesPerSec Dist    `json:"per_session_bytes_per_sec"`
+	WorkersCPUPercent     float64 `json:"workers_cpu_percent"`
+	AgentsCPUPercent      float64 `json:"agents_cpu_percent"`
+	CPUMsPerMiB           float64 `json:"worker_cpu_ms_per_mib"`
+	// ChunkBytes is the mean size of a PTY read.
+	ChunkBytes float64     `json:"chunk_bytes"`
+	Workers    ProcessDist `json:"workers"`
 }
 
 // FanOutReport is one output-heavy session with Clients attached.
@@ -163,6 +165,8 @@ type FanOutReport struct {
 	// rest was dropped for falling behind.
 	Delivered     Dist   `json:"delivered"`
 	DroppedChunks uint64 `json:"dropped_chunks"`
+	// ChunkBytes is the mean size of a PTY read, each a frame per client.
+	ChunkBytes float64 `json:"chunk_bytes"`
 	// EchoMs is how long typed input took to come back, as echo, to every
 	// client: input latency behind a stream of output.
 	EchoMs     Dist    `json:"echo_ms"`
@@ -325,16 +329,16 @@ func (r *Report) Print(w io.Writer) {
 
 	if o := r.Output; o != nil {
 		fmt.Fprintf(w, "\nOutput: %d output-heavy sessions, no clients, over %.1f s\n", o.Sessions, o.IntervalSec)
-		fmt.Fprintf(w, "PTY throughput: %s/s total, %s/s per session (p50); workers %.0f%% CPU, agents %.0f%%; %.1f ms worker CPU per MiB\n",
-			mib(o.BytesPerSec), mib(o.PerSessionBytesPerSec.P50), o.WorkersCPUPercent, o.AgentsCPUPercent, o.CPUMsPerMiB)
+		fmt.Fprintf(w, "PTY throughput: %s/s total, %s/s per session (p50), %s per read; workers %.0f%% CPU, agents %.0f%%; %.1f ms worker CPU per MiB\n",
+			mib(o.BytesPerSec), mib(o.PerSessionBytesPerSec.P50), mib(o.ChunkBytes), o.WorkersCPUPercent, o.AgentsCPUPercent, o.CPUMsPerMiB)
 		section("Output-heavy worker")
 		procRows(o.Workers)
 		tw.Flush()
 	}
 	if f := r.FanOut; f != nil {
 		fmt.Fprintf(w, "\nFan-out: %d clients on one output-heavy session over %.1f s\n", f.Clients, f.IntervalSec)
-		fmt.Fprintf(w, "PTY output %s/s; per client %s/s (p50), delivered %.1f%% (min %.1f%%); %d chunks dropped; worker %.0f%% CPU, daemon %.0f%%\n",
-			mib(f.PTYBytesPerSec), mib(f.ClientBytesPerSec.P50), 100*f.Delivered.P50, 100*f.Delivered.Min, f.DroppedChunks, f.WorkerCPU, f.DaemonCPU)
+		fmt.Fprintf(w, "PTY output %s/s in %s reads; per client %s/s (p50), delivered %.1f%% (min %.1f%%); %d chunks dropped; worker %.0f%% CPU, daemon %.0f%%\n",
+			mib(f.PTYBytesPerSec), mib(f.ChunkBytes), mib(f.ClientBytesPerSec.P50), 100*f.Delivered.P50, 100*f.Delivered.Min, f.DroppedChunks, f.WorkerCPU, f.DaemonCPU)
 		fmt.Fprintf(w, "echo to every client: p50 %s, p99 %s, max %s, %d lost\n", ms(f.EchoMs.P50), ms(f.EchoMs.P99), ms(f.EchoMs.Max), f.EchoesLost)
 	}
 }

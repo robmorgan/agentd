@@ -67,8 +67,11 @@ type SessionStats struct {
 	ScrollbackRows       uint64
 	ScrollbackLimitBytes uint64
 	Attachments          uint32
-	// OutputBytes counts the PTY output read since the session started.
-	OutputBytes uint64
+	// OutputBytes counts the PTY output read since the session started,
+	// in OutputChunks reads. Each chunk is sent to each attached client as
+	// a frame of its own, so small chunks make fan-out costly.
+	OutputBytes  uint64
+	OutputChunks uint64
 	// DroppedOutputChunks counts output chunks dropped for attached
 	// clients that fell behind, summed over all of them.
 	DroppedOutputChunks uint64
@@ -123,6 +126,7 @@ func (e *encoder) sessionStats(s *SessionStats) {
 	e.u64(s.ScrollbackLimitBytes)
 	e.u32(s.Attachments)
 	e.u64(s.OutputBytes)
+	e.u64(s.OutputChunks)
 	e.u64(s.DroppedOutputChunks)
 	if s.Snapshot == nil {
 		e.u8(0)
@@ -145,6 +149,7 @@ func (d *decoder) sessionStats() *SessionStats {
 		ScrollbackLimitBytes: d.u64(),
 		Attachments:          d.u32(),
 		OutputBytes:          d.u64(),
+		OutputChunks:         d.u64(),
 		DroppedOutputChunks:  d.u64(),
 	}
 	if d.bool() {

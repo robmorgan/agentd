@@ -106,6 +106,16 @@ func (rt *runtime) terminateAgent() {
 	}()
 }
 
+// ptyHint explains running out of pseudo-terminals, which caps how many
+// sessions a machine can run: macOS allows kern.tty.ptmx_max of them (511
+// by default, for all programs together), Linux kernel.pty.max (4096).
+func ptyHint(err error) string {
+	if errors.Is(err, syscall.ENXIO) || errors.Is(err, syscall.ENOSPC) {
+		return " (the system may have run out of pseudo-terminals: see sysctl kern.tty.ptmx_max on macOS or kernel.pty.max on Linux)"
+	}
+	return ""
+}
+
 func signalGroup(pid int, sig syscall.Signal) {
 	if err := syscall.Kill(-pid, sig); err != nil {
 		_ = syscall.Kill(pid, sig)
@@ -150,7 +160,7 @@ func Run(args Args) error {
 	)
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: defaultPtyRows, Cols: defaultPtyCols})
 	if err != nil {
-		return fail(fmt.Errorf("failed to spawn agent process: %w", err))
+		return fail(fmt.Errorf("failed to spawn agent process: %w%s", err, ptyHint(err)))
 	}
 	defer ptmx.Close()
 

@@ -5,6 +5,7 @@ import (
 	"os"
 	goruntime "runtime"
 	"runtime/debug"
+	"syscall"
 	"testing"
 
 	"github.com/robmorgan/agentd/internal/procstat"
@@ -82,5 +83,14 @@ func BenchmarkTerminalMemory(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func TestPTYHint(t *testing.T) {
+	if ptyHint(&os.PathError{Op: "open", Path: "/dev/ptmx", Err: syscall.ENXIO}) == "" {
+		t.Error("no hint for ENXIO")
+	}
+	if ptyHint(os.ErrNotExist) != "" {
+		t.Error("hint for an unrelated error")
 	}
 }

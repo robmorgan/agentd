@@ -27,6 +27,7 @@ func (rt *runtime) stats(snapshot bool) (*protocol.SessionStats, error) {
 		out.ScrollbackRows = s.terminal.scrollbackRows()
 		out.Attachments = uint32(len(s.attachments))
 		out.OutputBytes = s.outputBytes
+		out.OutputChunks = s.outputChunks
 		out.DroppedOutputChunks = s.output.droppedChunks()
 		if snapshot {
 			start := time.Now()
