@@ -21,7 +21,7 @@ args = ["-c", '''stty -echo; i=0; while [ ! -e stop ]; do echo "n $i"; i=$((i+1)
 
 [agents.stall]
 command = "/bin/sh"
-args = ["-c", '''stty raw -echo; echo stalled; sleep 6; echo resumed; exec cat''']
+args = ["-c", '''stty raw -echo; echo stalled; sleep 6; echo resumed; head -c 1048589 | tail -c 13; exec cat''']
 `
 
 // writeScript writes an executable shell script standing in for a broken
@@ -79,11 +79,13 @@ func TestFailedHandoffRestoresTheSession(t *testing.T) {
 	}
 	c := h.attachRestartable("stall")
 	h.eventually("the agent to stall", func() bool { return strings.Contains(h.history("stall"), "stalled") })
-	// More input than the PTY's input buffer holds, so the input writer is
-	// stuck in a write until the agent reads.
-	line := strings.Repeat("x", 63)
-	for range 256 {
-		h.sendInput("stall", line+"\n")
+	// Far more input than the kernel buffers for a PTY (about 4 KiB on
+	// macOS; Linux keeps up to 64 KiB in the PTY's buffer besides the line
+	// discipline's 4 KiB), so the input writer is stuck in a write until
+	// the agent reads.
+	chunk := strings.Repeat("x", 16<<10)
+	for range 64 {
+		h.sendInput("stall", chunk)
 	}
 	h.sendInput("stall", "end-of-input\n")
 
@@ -94,13 +96,12 @@ func TestFailedHandoffRestoresTheSession(t *testing.T) {
 	c.expectRestarting()
 
 	// The old image serves again: a new attachment, output once the agent
-	// wakes up, and every byte of the input that was queued.
+	// wakes up, and every byte of the input that was queued: the agent
+	// reads exactly the 1 MiB and the marker after it, and prints the
+	// marker.
 	c2 := h.attachRestartable("stall")
 	c2.expectOutput("resumed")
 	c2.expectOutput("end-of-input")
-	if n := strings.Count(c2.output.String(), line); n != 256 {
-		t.Fatalf("delivered %d of 256 queued input lines", n)
-	}
 	if rec := h.session("stall"); rec.Status != session.StatusRunning {
 		t.Fatalf("status = %s", rec.Status)
 	}
