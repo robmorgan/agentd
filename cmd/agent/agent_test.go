@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -373,8 +374,11 @@ func TestRemoteAttachEndToEnd(t *testing.T) {
 		t.Fatalf("wrong fingerprint: %v\n%s", err, out)
 	}
 	e.mustRun("agent", "host", "add", "dev", addr, "--fingerprint", daemonKey)
-	if out := e.mustRun("agent", "host", "ls"); !strings.Contains(out, "dev\t"+addr+"\t"+daemonKey) {
-		t.Fatalf("host ls:\n%s", out)
+	if out := e.mustRun("agent", "host", "ls", "--no-probe"); !strings.Contains(out, "dev\t"+addr+"\t"+daemonKey) {
+		t.Fatalf("host ls --no-probe:\n%s", out)
+	}
+	if out := e.mustRun("agent", "host", "ls"); !regexp.MustCompile(`dev\s+` + regexp.QuoteMeta(addr) + `\s+unauthorized`).MatchString(out) {
+		t.Fatalf("host ls before authorizing:\n%s", out)
 	}
 
 	// Until this machine is authorized the daemon refuses it, and the CLI
@@ -387,8 +391,35 @@ func TestRemoteAttachEndToEnd(t *testing.T) {
 		t.Fatalf("remote ls:\n%s", out)
 	}
 
+	// Host health: this machine, the reachable host, and one that is not.
+	// `agent host add` refuses a host it cannot reach, so write this one.
+	if err := transport.AddHost(paths.FromRoot(e.root).HostsPath(), transport.Host{Name: "gone", Address: "127.0.0.1:9", Fingerprint: daemonKey}); err != nil {
+		t.Fatal(err)
+	}
+	out := e.mustRun("agent", "hosts")
+	for _, want := range []string{`local\s+\(this machine\)\s+online\s+\S+\s+1/1`, `dev\s+` + regexp.QuoteMeta(addr) + `\s+online\s+\S+\s+1/1\s+\d+\s+sh\s`, `gone\s+127\.0\.0\.1:9\s+offline`} {
+		if !regexp.MustCompile(want).MatchString(out) {
+			t.Fatalf("hosts: no %s in\n%s", want, out)
+		}
+	}
+	info = e.mustRun("agent", "host", "info", "dev")
+	for _, want := range []string{"fingerprint: " + daemonKey, "status: online", "agents: sh", "capabilities: control-stream"} {
+		if !strings.Contains(info, want) {
+			t.Fatalf("host info: no %q in\n%s", want, info)
+		}
+	}
+	e.mustRun("agent", "host", "rm", "gone")
+
+	// Placement picks the lighter host: both are this daemon here, so the
+	// tie goes to this machine.
+	tm := e.start("--host", "auto", "new", "--cwd", e.work, "placed")
+	tm.expect(0, "placing the session on local")
+	tm.expect(0, "attached to placed")
+	tm.write("\x1c")
+	tm.wait()
+
 	// Attach over QUIC with a host/session address.
-	tm := e.start("attach", "dev/demo")
+	tm = e.start("attach", "dev/demo")
 	m := tm.expect(0, "attached to demo")
 	tm.write("echo over-quic\r")
 	tm.expect(m, "over-quic")

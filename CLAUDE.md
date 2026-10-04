@@ -445,6 +445,10 @@ agent status
 agent kill
 agent rm
 agent daemon info | restart | upgrade
+agent host add | ls | info | rm
+agent hosts
+agent workspace add | ls | rm
+agent remote id
 ```
 
 Do not rename commands merely because implementation internals changed.
@@ -512,8 +516,10 @@ Done:
 - Dead remote clients are noticed within 15s, and a remote attachment that loses its connection reconnects and reattaches by itself.
 - The connection handshake (`Hello`/`Welcome`): version and capability negotiation, host description, and a control stream of tagged requests; stream roles are set by a stream's first frame.
 
+- Host health (`agent hosts`), machine capabilities (`agent host info`), and placement hints (`agent --host auto new`).
+
 Next:
-1. Cross-host discovery (`agent ls` across hosts) and host health.
+1. Cross-host discovery (`agent ls` across hosts).
 2. Per-client permissions and audit, if remote peers need to be limited.
 
 Known gaps:

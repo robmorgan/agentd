@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -31,8 +32,15 @@ func ValidHostName(name string) error {
 	if !session.ValidName(name) {
 		return fmt.Errorf("invalid host name `%s`: %s", name, session.NameRules)
 	}
+	if slices.Contains(ReservedHostNames, name) {
+		return fmt.Errorf("host name `%s` is reserved", name)
+	}
 	return nil
 }
+
+// ReservedHostNames cannot name a remote host: "local" is this machine's own
+// daemon wherever hosts are listed, and "auto" asks `agent new` to pick one.
+var ReservedHostNames = []string{"local", "auto"}
 
 // ReadHosts reads hosts.toml in file order. A missing file lists no hosts.
 func ReadHosts(path string) ([]Host, error) {

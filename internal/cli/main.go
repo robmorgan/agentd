@@ -116,6 +116,12 @@ func (a *app) connect(sessionArgs []*string, daemonCommand string, before func(*
 	case name == "":
 		name = prefixed
 	}
+	switch name {
+	case localHostName:
+		name = ""
+	case autoHostName:
+		return nil, errors.New("`--host auto` only chooses a host for `agent new`")
+	}
 	c := &client{paths: a.paths}
 	if name != "" {
 		host, err := transport.LookupHost(a.paths.HostsPath(), name)
