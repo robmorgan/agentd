@@ -398,7 +398,7 @@ _TIME. Following reconnects by itself and resumes after the last event shown.`}
 
 	cmds = append(cmds, group("daemon", "Inspect or control the local agent daemon",
 		"Inspect, restart, or upgrade the local daemon process.",
-		"Notes:\n  `restart` keeps running sessions; they live in their own worker processes\n  and reattach to the new daemon.\n  `upgrade` refuses to run while sessions are still live.",
+		"Notes:\n  `restart` keeps running sessions; they live in their own worker processes\n  and reattach to the new daemon.\n  `upgrade` replaces the daemon and hands running sessions over to the new\n  binary without stopping their agents; attached clients reattach.",
 		a.command("info", "Show daemon version, socket, pid, and compatibility", noArgs, func([]string) error {
 			c, err := a.connect(nil, "info", nil)
 			if err != nil {
@@ -426,7 +426,7 @@ _TIME. Following reconnects by itself and resumes after the last event shown.`}
 			}
 			return c.printDaemonStatus()
 		}),
-		a.command("upgrade", "Upgrade the daemon binary when no sessions are live", noArgs, func([]string) error {
+		a.command("upgrade", "Upgrade the daemon and running sessions to the agentd binary", noArgs, func([]string) error {
 			c, err := a.connect(nil, "upgrade", nil)
 			if err != nil {
 				return err

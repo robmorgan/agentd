@@ -183,14 +183,6 @@ func (s *Server) negotiateAttach(req *protocol.AttachSession) error {
 // features it supports. A worker from before attach features answers Hello
 // with an error, and supports none.
 func (s *Server) workerAttachCapabilities(id string) []string {
-	worker, err := transport.DialUnix(s.paths.SessionSocketPath(id), workerDialTimeout)
-	if err != nil {
-		return nil
-	}
-	defer worker.Close()
-	resp, err := exchange(worker, &protocol.Request{Hello: protocol.NewHello("agentd " + Version)})
-	if err != nil || resp.Welcome == nil {
-		return nil
-	}
-	return resp.Welcome.Capabilities
+	caps, _ := workerCapabilities(s.paths.SessionSocketPath(id))
+	return caps
 }

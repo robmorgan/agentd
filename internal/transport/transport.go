@@ -38,6 +38,14 @@ type Listener interface {
 	Addr() string
 }
 
+// Counter counts running handlers for Serve. *sync.WaitGroup is one.
+type Counter interface {
+	Add(delta int)
+	Done()
+}
+
+var _ Counter = (*sync.WaitGroup)(nil)
+
 const maxAcceptBackoff = time.Second
 
 // Serve accepts streams until the listener is closed and runs handle for
@@ -46,10 +54,11 @@ const maxAcceptBackoff = time.Second
 // ending the loop. Serve returns once Accept reports that the listener is
 // closed.
 //
-// If handlers is non-nil, Serve counts each handler in it before starting
-// it, so once Serve has returned, handlers.Wait covers every handler it
+// If handlers is non-nil, Serve counts each handler in it (Add(1), then
+// Done when it returns) before starting it, so once Serve has returned,
+// waiting on handlers (a *sync.WaitGroup, say) covers every handler it
 // started.
-func Serve(l Listener, logPrefix string, handlers *sync.WaitGroup, handle func(Stream)) {
+func Serve(l Listener, logPrefix string, handlers Counter, handle func(Stream)) {
 	backoff := time.Duration(0)
 	for {
 		stream, err := l.Accept()

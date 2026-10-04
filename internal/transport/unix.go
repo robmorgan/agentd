@@ -44,6 +44,30 @@ func ListenUnix(path string, opts UnixOptions) (*UnixListener, error) {
 	return &UnixListener{l: l, path: path}, nil
 }
 
+// File returns a duplicate of the listening socket's descriptor, which
+// keeps the socket listening (and connections queueing in its backlog) after
+// u is closed, for example across an exec (see the session worker's
+// handoff). It is close-on-exec like every descriptor Go opens.
+func (u *UnixListener) File() (*os.File, error) { return u.l.File() }
+
+// UnixListenerFromFile serves streams on an already listening Unix socket,
+// such as one inherited across an exec, bound at path. f is not closed and
+// may be closed once this returns. The socket file is left in place when the
+// listener closes.
+func UnixListenerFromFile(f *os.File, path string) (*UnixListener, error) {
+	l, err := net.FileListener(f)
+	if err != nil {
+		return nil, fmt.Errorf("failed to use the inherited socket for %s: %w", path, err)
+	}
+	ul, ok := l.(*net.UnixListener)
+	if !ok {
+		l.Close()
+		return nil, fmt.Errorf("the inherited socket for %s is not a Unix socket", path)
+	}
+	ul.SetUnlinkOnClose(false)
+	return &UnixListener{l: ul, path: path}, nil
+}
+
 func (u *UnixListener) Accept() (Stream, error) {
 	conn, err := u.l.AcceptUnix()
 	if err != nil {

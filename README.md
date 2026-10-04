@@ -475,8 +475,8 @@ agent rm devbox/auth-refactor
 ```
 
 Closing the laptop or losing the network leaves the session running; `agent attach` again, from any
-authorized machine, restores the screen. An attachment that loses its connection reconnects by
-itself: the bottom row says it is reconnecting, typing is ignored until it is back, and `Ctrl-\`
+authorized machine, restores the screen. An attachment that loses its connection (or whose daemon
+restarts or is upgraded, locally too) reconnects by itself: the bottom row says it is reconnecting, typing is ignored until it is back, and `Ctrl-\`
 gives up. It keeps trying (every 5 seconds at most) until the devbox answers, so a laptop that slept
 picks up where it was when it wakes. It stops if the devbox refuses this machine's key or the
 session is gone, or was removed and replaced by a new session of the same name while you were away.
@@ -558,8 +558,20 @@ agent daemon upgrade
 ```
 
 `agent daemon restart` is safe while sessions run: they keep running and reattach to the new
-daemon. `agent daemon upgrade` still refuses while live sessions are active, since their workers
-run the old binary; stop them first.
+daemon. `agent daemon upgrade` (or `agentd upgrade`, run as the new binary) is too: it replaces the
+daemon, then hands each running session's worker over to the new binary without stopping the agent
+(a live handoff), and lists what happened to each session:
+
+```text
+✓ Upgraded daemon
+✓ Session fix-tests now runs /usr/local/bin/agentd (live handoff, pid 4242)
+! Session old-work keeps running on its previous binary: ...
+```
+
+A session whose handoff cannot be done (its worker predates live handoff, or the new binary does not
+run) keeps running on the binary it has. Attached clients, local or remote, reattach by themselves
+after a daemon restart or a handoff and repaint the screen; output the agent writes meanwhile is
+kept. ARCHITECTURE.md lists exactly what survives each kind of restart and crash.
 
 `agent` starts the daemon on demand with `agentd serve --daemonize`, using the `agentd` binary
 installed next to `agent`. Set `AGENTD_BIN` to use a different daemon binary, for example a local
@@ -576,8 +588,9 @@ Current capabilities include:
 - local `agentd` daemon over a Unix socket
 - remote sessions over QUIC with `agent --host` and pinned keys (preview)
 - PTY-backed agent processes that outlive client connections
-- sessions that survive the daemon stopping, restarting, or being upgraded: each runs in its
-  own worker process, and a new daemon picks it up again
+- sessions that survive the daemon stopping, crashing, restarting, or being upgraded: each runs
+  in its own worker process, a new daemon picks it up again, and an upgrade hands the worker itself
+  over to the new binary with the agent still running
 - SQLite-backed session metadata
 - per-session PTY history held by the session while it runs and saved to `logs/` when it ends
 - git state and artifacts of a session's repository (`agent diff`, `agent artifacts`), locally and

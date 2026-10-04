@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -76,6 +77,16 @@ func (c *client) attachSessionUID(id, uid string) error {
 		}
 	}
 }
+
+var (
+	// errSessionRestarting: the session's worker is restarting (a live
+	// handoff to a new agentd binary) and ended the attach stream; the
+	// session is still there to attach to again.
+	errSessionRestarting = errors.New("the session is restarting")
+	// errAttachDropped: the attach stream ended without a final frame, so
+	// it was cut (the daemon stopped, say) rather than ended by the worker.
+	errAttachDropped = errors.New("the attach stream ended unexpectedly")
+)
 
 // attachIdentity is what a reattach carries over from the attachment it
 // replaces, so that it reaches the same session incarnation and the daemon
@@ -214,9 +225,11 @@ func (c *client) connectAttach(ctx context.Context, id string, prev attachIdenti
 // stream's frames, and SIGWINCH. Output is written to stdout as it
 // arrives; while stdout is slow, the loop, and with it input, waits.
 //
-// When the connection to a remote daemon is lost, the terminal stays in
-// raw mode while attachOnce reconnects and attaches to the same session
-// again, repainting the screen from the new snapshot; see reattach.
+// When the attachment is cut while the session lives on (the connection to
+// the daemon is lost, the daemon restarts, or the session's worker restarts
+// for an upgrade) the terminal stays in raw mode while attachOnce attaches
+// to the same session again, repainting the screen from the new snapshot;
+// see reattach.
 func (c *client) attachOnce(id, uid string, titled *bool) (attachResult, error) {
 	ident := attachIdentity{uid: uid}
 	stream, attached, ended, err := c.connectAttach(context.Background(), id, ident)
@@ -254,7 +267,7 @@ func (c *client) attachOnce(id, uid string, titled *bool) (attachResult, error) 
 	for {
 		writeOut(attachStartupBytes(snapshot))
 		res, err := c.runAttachment(id, stream, keys, &parser, winch)
-		if err == nil || c.host == nil || !transport.IsConnectionLost(err) {
+		if err == nil || !c.reconnectable(err) {
 			return res, err
 		}
 		stream.stop()
@@ -349,10 +362,31 @@ func (c *client) runAttachment(id string, stream *attachStream, keys <-chan []by
 const (
 	reconnectFirstRetry = 500 * time.Millisecond
 	reconnectMaxRetry   = 5 * time.Second
+	// reconnectStartDaemon is the attempt at which a local CLI starts the
+	// daemon itself, as any command would, if it has not come back (it
+	// crashed, say). A restart or upgrade brings it back well before.
+	reconnectStartDaemon = 4
 )
 
-// reattach reconnects to the remote daemon after the connection was lost
-// (cause) and attaches to session id again. It shows a status line on the
+// reconnectable reports whether an attachment that failed with err can be
+// resumed by attaching again: the session is fine, only the path to it
+// broke. Errors a retry cannot fix (a refused or changed key, a session that
+// is gone or replaced, a protocol error) are not.
+func (c *client) reconnectable(err error) bool {
+	switch {
+	case errors.Is(err, errSessionRestarting), errors.Is(err, errAttachDropped):
+		return true
+	case c.host != nil:
+		return transport.IsConnectionLost(err)
+	}
+	// The local daemon's socket is refused or missing while it restarts.
+	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOENT) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) || errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// reattach attaches to session id again after its attachment was cut
+// (cause): the connection was lost, the daemon restarted, or the session's
+// worker restarted for an upgrade. It shows a status line on the
 // bottom row, which the new snapshot paints over. Typed input is dropped
 // rather than sent late to an agent the user cannot see; only the detach
 // key acts, at any point. It gives up on errors a retry cannot fix: a
@@ -365,9 +399,15 @@ func (c *client) reattach(id string, prev attachIdentity, keys <-chan []byte, pa
 	detached := &attachResult{outcome: outcomeDetached}
 	delay := time.Duration(0)
 	for try := 1; ; try++ {
-		// The old connection is dead; the next stream dials a new one.
-		c.close()
-		writeOut(reconnectStatusBytes(c.host.Name, try, cause))
+		if !errors.Is(cause, errSessionRestarting) {
+			// The old connection is dead; the next stream dials a new
+			// one. A restarting worker leaves the connection alone.
+			c.close()
+		}
+		if c.host == nil && try == reconnectStartDaemon && !c.localDaemonAnswers() {
+			_ = c.spawnDaemon()
+		}
+		writeOut(reconnectStatusBytes(c.reconnectStatus(cause), try, cause))
 
 		retry := make(chan struct{})
 		timer := time.AfterFunc(delay, func() { close(retry) })
@@ -407,7 +447,7 @@ func (c *client) reattach(id string, prev attachIdentity, keys <-chan []byte, pa
 			return nil, nil, &attachResult{outcome: outcomeEnded, ended: a.ended}, nil
 		case a.err == nil:
 			return a.stream, a.attached, nil, nil
-		case !transport.IsConnectionLost(a.err):
+		case !c.reconnectable(a.err):
 			return nil, nil, nil, a.err
 		}
 		cause = a.err
@@ -435,11 +475,22 @@ func waitUnlessDetached(done <-chan struct{}, keys <-chan []byte, parser *attach
 	}
 }
 
+// reconnectStatus says what happened to the attachment.
+func (c *client) reconnectStatus(cause error) string {
+	switch {
+	case errors.Is(cause, errSessionRestarting):
+		return "session restarting, reattaching"
+	case c.host != nil:
+		return fmt.Sprintf("connection to %s lost, reconnecting", c.host.Name)
+	}
+	return "connection to agentd lost, reconnecting"
+}
+
 // reconnectStatusBytes draws the reconnect status on the bottom row,
 // leaving the cursor where it was.
-func reconnectStatusBytes(host string, try int, cause error) []byte {
+func reconnectStatusBytes(status string, try int, cause error) []byte {
 	cols, rows, _, _ := terminalGeometry()
-	msg := fmt.Sprintf("connection to %s lost, reconnecting", host)
+	msg := status
 	if try > 1 {
 		msg += fmt.Sprintf(" (attempt %d)", try)
 	}
@@ -465,8 +516,12 @@ func handleFrame(f frame, overlayOpen bool) (attachResult, bool, error) {
 	switch {
 	case f.err != nil:
 		return attachResult{}, true, f.err
-	case f.resp == nil || f.resp.EndOfStream != nil:
+	case f.resp == nil:
+		return attachResult{}, true, errAttachDropped
+	case f.resp.EndOfStream != nil:
 		return attachResult{outcome: outcomeDetached}, true, nil
+	case f.resp.SessionRestarting != nil:
+		return attachResult{}, true, errSessionRestarting
 	case f.resp.PtyOutput != nil:
 		if !overlayOpen {
 			writeOut(f.resp.PtyOutput.Data)
@@ -531,7 +586,9 @@ func restoreSnapshot(stream *attachStream) ([]byte, *protocol.SessionEnded, erro
 		case f.err != nil:
 			return nil, nil, f.err
 		case f.resp == nil:
-			return nil, nil, errors.New("agentd closed the attach connection")
+			return nil, nil, errAttachDropped
+		case f.resp.SessionRestarting != nil:
+			return nil, nil, errSessionRestarting
 		case f.resp.AttachSnapshot != nil:
 			return f.resp.AttachSnapshot.Data, nil, nil
 		case f.resp.PtyOutput != nil, f.resp.AttachResync != nil:

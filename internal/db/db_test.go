@@ -239,6 +239,30 @@ func TestStateTransitionGuards(t *testing.T) {
 	if err := store.MarkRunning("missing", created["a"], 1, 2); !errors.Is(err, ErrNotCreating) {
 		t.Fatalf("MarkRunning on missing row = %v", err)
 	}
+	// A session its worker claimed is not failed by a daemon that read it
+	// as still being created.
+	if err := store.MarkFailedIfCreating("a", "agentd stopped"); err != nil {
+		t.Fatal(err)
+	}
+	if rec := get("a"); rec.Status != session.StatusRunning {
+		t.Fatalf("MarkFailedIfCreating failed a running session: %+v", rec)
+	}
+	// A worker back from a handoff resumes only the session it ran, under
+	// the same pid; the pids stay as they were.
+	if err := store.MarkResumed("a", created["a"], 10); err != nil {
+		t.Fatal(err)
+	}
+	if rec := get("a"); rec.Status != session.StatusRunning || *rec.WorkerPID != 10 || *rec.AgentPID != 11 {
+		t.Fatalf("after MarkResumed: %+v", rec)
+	}
+	for _, bad := range []struct {
+		id, at string
+		pid    int
+	}{{"a", created["a"], 99}, {"a", "another incarnation", 10}, {"b", created["b"], 10}} {
+		if err := store.MarkResumed(bad.id, bad.at, bad.pid); !errors.Is(err, ErrNotResumable) {
+			t.Fatalf("MarkResumed(%v) = %v", bad, err)
+		}
+	}
 	zero := int32(0)
 	if err := store.MarkExited("a", &zero); err != nil {
 		t.Fatal(err)

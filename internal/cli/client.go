@@ -654,6 +654,10 @@ func describeResponse(r *protocol.Response) string {
 		return "Event"
 	case r.Events != nil:
 		return "Events"
+	case r.HandedOff != nil:
+		return "HandedOff"
+	case r.SessionRestarting != nil:
+		return "SessionRestarting"
 	}
 	return "unknown"
 }

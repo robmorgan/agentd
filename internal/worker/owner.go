@@ -3,7 +3,6 @@ package worker
 import (
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"sort"
 	"sync"
@@ -40,6 +39,10 @@ type ownerState struct {
 	// fallback timer only runs the ones it was started for. See atGround.
 	groundWaiters []func()
 	groundGen     uint64
+	// restart is closed when a handoff begins, telling every attachment to
+	// end (with SessionRestarting where the client asked for it); a
+	// handoff that fails replaces it.
+	restart chan struct{}
 }
 
 type ownerAttachment struct {
@@ -299,6 +302,7 @@ type attachResult struct {
 	attachID string
 	snapshot []byte
 	detach   chan struct{}
+	restart  chan struct{}
 	sub      *subscriber
 }
 
@@ -334,6 +338,7 @@ func (s *ownerState) attach(attachID string, kind session.AttachmentKind, g prot
 		attachID: attachID,
 		snapshot: snapshot,
 		detach:   a.detach,
+		restart:  s.restart,
 		sub:      a.sub,
 	}, nil
 }
@@ -365,35 +370,6 @@ func (s *ownerState) detachAttachment(attachID string) error {
 func (s *ownerState) detachAll() {
 	for _, a := range s.attachments {
 		a.signalDetach()
-	}
-}
-
-// maxOutputBatch caps how much PTY output the pump hands the owner at once,
-// and so the size of each chunk fanned out to clients.
-const maxOutputBatch = 8192
-
-// pumpPty reads the PTY and hands the output to the owner goroutine.
-//
-// PTY reads can be small: on macOS, a program writing in small pieces (a
-// pipeline such as yes | head) gives mostly 30 to 130 bytes per read. Handed
-// over one by one, each would cost a trip through the owner's
-// queue, a VTWrite into libghostty, and a frame to every attached client.
-// So reads accumulate in a batch while the owner is busy with the previous
-// one, up to maxOutputBatch, and the owner takes everything pending at
-// once. An idle owner gets each read straight away, so batching adds no
-// latency. When a batch is full and the owner has not taken it, the pump
-// stops reading, which leaves the agent blocked on a full PTY as before.
-func pumpPty(reader io.Reader, o *owner) {
-	b := &outputBatch{taken: make(chan struct{}, 1)}
-	buf := make([]byte, maxOutputBatch)
-	for {
-		n, err := reader.Read(buf)
-		if n > 0 && !b.add(buf[:n], o) {
-			return
-		}
-		if err != nil {
-			return
-		}
 	}
 }
 

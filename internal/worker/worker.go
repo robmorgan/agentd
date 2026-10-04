@@ -1,6 +1,22 @@
 // Package worker runs a single agent session: it owns the PTY, the shadow
 // terminal used for reattach snapshots, and the per-session Unix socket the
 // daemon proxies client requests through.
+//
+// A worker can hand its session over to a new agentd executable without
+// stopping the agent (see handoff.go): it re-executes itself in place,
+// keeping its pid, the PTY and its socket, and the new image restores the
+// terminal state and carries on.
+//
+// Goroutines, and what ends them:
+//   - The main goroutine (run): waits for the session to end or for a
+//     handoff request, which it carries out itself.
+//   - The owner goroutine: all session state (owner.go). Stopped last.
+//   - The pump: reads the PTY (pump.go). Ends at EOF, or when stopped by a
+//     handoff or shutdown.
+//   - The agent watcher: waits for the agent to exit and reaps it, unless
+//     a handoff holds reapMu.
+//   - The input writer (input.go), the accept loop, and one handler per
+//     connection.
 package worker
 
 import (
@@ -76,20 +92,54 @@ func (e *endedSignal) fire(info *sessionEnded) {
 }
 
 type runtime struct {
+	args      Args
 	sessionID string
 	uid       string
 	paths     *paths.AppPaths
 	db        *db.Database
 	owner     *owner
 	ended     *endedSignal
-	conns     sync.WaitGroup
+	// handlers counts connection handlers, so shutdown and handoffs can
+	// wait for them.
+	handlers tracker
 	// agentPID leads the agent's process group (pty.Start puts the agent in
-	// its own session).
+	// its own session). The agent is this process's child, across handoffs
+	// too: an exec keeps the pid.
 	agentPID int
 	// killed is set once a kill has been requested, so the exit is recorded
 	// as a deliberate stop rather than a failure.
 	killed atomic.Bool
-	// startedAt is when the worker started, for its uptime in stats.
+
+	ptmx       *os.File
+	socketPath string
+	ownSocket  os.FileInfo
+
+	// listener, acceptDone and pump belong to the main goroutine, which
+	// stops and restarts them around a handoff.
+	listener   *transport.UnixListener
+	acceptDone chan struct{}
+	pump       *pump
+	// ptyEOF is closed once the PTY reports end of file.
+	ptyEOF chan struct{}
+
+	// handoffs carries handoff requests from connection handlers to the
+	// main goroutine. One may wait; a second is refused.
+	handoffs chan *handoffRequest
+	// handoffCount counts the handoffs this session's worker has been
+	// through, across images.
+	handoffCount uint32
+	// reapMu keeps the agent from being reaped while a handoff is under
+	// way: the new image must find it unreaped to collect its exit status.
+	// The agent watcher holds it while reaping; a handoff holds it from its
+	// start until the exec, or until it gives up.
+	reapMu sync.Mutex
+	// agentExited is set by the watcher once the agent has exited (before
+	// it is reaped).
+	agentExited atomic.Bool
+	// noHandoff, when set, says why this worker cannot hand off.
+	noHandoff atomic.Pointer[string]
+	// startedAt is when the worker started (the first image, across
+	// handoffs), for its uptime in stats.
 	startedAt time.Time
 	// recorder writes events and activity to state.db (activity.go).
 	recorder *recorder
@@ -130,6 +180,8 @@ func signalGroup(pid int, sig syscall.Signal) {
 	}
 }
 
+// Run starts a session: it spawns the agent in a new PTY and serves the
+// session until the agent exits.
 func Run(args Args) error {
 	startedAt := time.Now()
 	p, err := paths.Discover()
@@ -174,37 +226,38 @@ func Run(args Args) error {
 		return fail(fmt.Errorf("failed to spawn agent process: %w%s", err, ptyHint(err)))
 	}
 	defer ptmx.Close()
+	agentPID := cmd.Process.Pid
+	// The agent watcher reaps the agent with wait4 rather than through
+	// cmd.Wait (see watchAgent).
+	_ = cmd.Process.Release()
 
 	terminal, err := newTerminalState(defaultPtyCols, defaultPtyRows, maxScrollbackBytes)
 	if err != nil {
-		_ = cmd.Process.Kill()
+		signalGroup(agentPID, syscall.SIGKILL)
 		return fail(err)
 	}
-	defer terminal.close()
+	defer func() { terminal.close() }()
 
 	// Unlink the socket ourselves, and only while the path is still ours:
 	// after the session is removed its name may be reused, and a new
 	// worker's socket may already sit at the same path.
 	listener, err := transport.ListenUnix(socketPath, transport.UnixOptions{KeepSocketOnClose: true})
 	if err != nil {
-		signalGroup(cmd.Process.Pid, syscall.SIGKILL)
+		signalGroup(agentPID, syscall.SIGKILL)
 		return fail(fmt.Errorf("failed to bind worker socket: %w", err))
 	}
 	ownSocket, err := os.Stat(socketPath)
 	if err != nil {
 		listener.Close()
-		signalGroup(cmd.Process.Pid, syscall.SIGKILL)
+		signalGroup(agentPID, syscall.SIGKILL)
 		return fail(fmt.Errorf("failed to stat worker socket: %w", err))
 	}
-	removeOwnSocket := func() {
-		if cur, err := os.Stat(socketPath); err == nil && os.SameFile(cur, ownSocket) {
-			_ = os.Remove(socketPath)
-		}
-	}
-	if err := store.MarkRunning(args.SessionID, args.CreatedAt, os.Getpid(), cmd.Process.Pid); err != nil {
+	rt := newRuntime(args, p, store, agentPID, ptmx, socketPath, ownSocket, listener)
+	rt.startedAt = startedAt
+	if err := store.MarkRunning(args.SessionID, args.CreatedAt, os.Getpid(), agentPID); err != nil {
 		listener.Close()
-		removeOwnSocket()
-		signalGroup(cmd.Process.Pid, syscall.SIGKILL)
+		rt.removeOwnSocket()
+		signalGroup(agentPID, syscall.SIGKILL)
 		if errors.Is(err, db.ErrNotCreating) {
 			// The daemon gave up on this worker or the session was
 			// removed while it started; the row is not ours to touch.
@@ -213,19 +266,58 @@ func Run(args Args) error {
 		return fail(err)
 	}
 
-	rt := &runtime{
-		sessionID: args.SessionID,
-		uid:       args.UID,
-		paths:     p,
-		db:        store,
-		owner:     newOwner(),
-		ended:     &endedSignal{ch: make(chan struct{})},
-		agentPID:  cmd.Process.Pid,
-		startedAt: startedAt,
-		recorder:  newRecorder(store, args.SessionID, os.Getpid()),
-	}
+	state := newOwnerState(args.SessionID, ptmx, terminal)
+	state.activity = newActivityTracker(rt.recorder, agentPID, time.Now())
+	state.owner = rt.owner
+	return rt.run(state, nil)
+}
 
-	// The daemon stops a session by sending the worker SIGTERM.
+func newRuntime(args Args, p *paths.AppPaths, store *db.Database, agentPID int, ptmx *os.File,
+	socketPath string, ownSocket os.FileInfo, listener *transport.UnixListener) *runtime {
+	return &runtime{
+		args:       args,
+		sessionID:  args.SessionID,
+		uid:        args.UID,
+		paths:      p,
+		db:         store,
+		owner:      newOwner(),
+		ended:      &endedSignal{ch: make(chan struct{})},
+		agentPID:   agentPID,
+		ptmx:       ptmx,
+		socketPath: socketPath,
+		ownSocket:  ownSocket,
+		listener:   listener,
+		ptyEOF:     make(chan struct{}),
+		handoffs:   make(chan *handoffRequest, 1),
+		recorder:   newRecorder(store, args.SessionID, os.Getpid()),
+	}
+}
+
+func newOwnerState(sessionID string, ptmx *os.File, terminal *terminalState) *ownerState {
+	return &ownerState{
+		sessionID:   sessionID,
+		ptmx:        ptmx,
+		terminal:    terminal,
+		geometry:    protocol.Geometry{Cols: defaultPtyCols, Rows: defaultPtyRows},
+		attachments: make(map[string]*ownerAttachment),
+		output:      newBroadcaster(),
+		input:       newPTYInput(ptmx),
+		restart:     make(chan struct{}),
+	}
+}
+
+func (rt *runtime) removeOwnSocket() {
+	if cur, err := os.Stat(rt.socketPath); err == nil && os.SameFile(cur, rt.ownSocket) {
+		_ = os.Remove(rt.socketPath)
+	}
+}
+
+// run serves the session until the agent exits, carrying out handoffs on
+// the way. ready, if set, runs once everything is serving. It returns only
+// when the session has ended (a successful handoff never returns: the
+// process is the new image by then).
+func (rt *runtime) run(state *ownerState, ready func()) error {
+	// SIGTERM and SIGINT stop the session like a kill request.
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
 	defer signal.Stop(sigs)
@@ -237,28 +329,18 @@ func Run(args Args) error {
 		}
 	}()
 
-	state := &ownerState{
-		sessionID:   args.SessionID,
-		ptmx:        ptmx,
-		terminal:    terminal,
-		geometry:    protocol.Geometry{Cols: defaultPtyCols, Rows: defaultPtyRows},
-		attachments: make(map[string]*ownerAttachment),
-		output:      newBroadcaster(),
-		input:       newPTYInput(ptmx),
-		activity:    newActivityTracker(rt.recorder, cmd.Process.Pid, time.Now()),
-		owner:       rt.owner,
-	}
-
 	ownerDone := make(chan struct{})
 	go func() {
 		rt.owner.run(state)
 		close(ownerDone)
 	}()
-	pumpDone := make(chan struct{})
-	go func() {
-		pumpPty(ptmx, rt.owner)
-		close(pumpDone)
-	}()
+	if err := rt.startPump(); err != nil {
+		// Without a pump the agent's output would never be read; stop
+		// the session rather than leave it hanging.
+		fmt.Fprintf(os.Stderr, "session worker: %v\n", err)
+		rt.terminateAgent()
+	}
+	go rt.watchAgent()
 	// Drives activity detection (idleness, stalls, the foreground
 	// process) until the session ends.
 	go func() {
@@ -273,59 +355,125 @@ func Run(args Args) error {
 			}
 		}
 	}()
-	go func() {
-		err := cmd.Wait()
-		// Let the pump queue the agent's last output before the exit is
-		// handled, so the saved history and SessionEnded include it. The
-		// pump ends once nothing holds the PTY open; a lingering
-		// descendant may keep it open, hence the bound.
+	rt.startAccepting()
+	if ready != nil {
+		ready()
+	}
+
+	for done := false; !done; {
 		select {
-		case <-pumpDone:
-		case <-time.After(pumpDrainTimeout):
+		case <-rt.ended.ch:
+			done = true
+		case req := <-rt.handoffs:
+			// Returns only if the handoff did not happen.
+			rt.handoff(req, state)
 		}
-		var code *int32
-		if err == nil {
-			zero := int32(0)
-			code = &zero
-		} else if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() >= 0 {
-			c := int32(exitErr.ExitCode())
-			code = &c
-		}
-		rt.owner.post(func(s *ownerState) { rt.onChildExited(s, code) })
-	}()
+	}
 
-	acceptDone := make(chan struct{})
-	go func() {
-		defer close(acceptDone)
-		transport.Serve(listener, "session worker", &rt.conns, func(conn transport.Stream) {
-			defer conn.Close()
-			if err := rt.handleConnection(conn); err != nil {
-				fmt.Fprintf(os.Stderr, "session worker connection error: %v\n", err)
-			}
-		})
-	}()
-
-	<-rt.ended.ch
-	listener.Close()
-	// Every handler Serve started is counted in rt.conns once it returns.
-	<-acceptDone
-	removeOwnSocket()
+	rt.listener.Close()
+	// Every handler Serve started is counted in rt.handlers once it
+	// returns.
+	<-rt.acceptDone
+	rt.removeOwnSocket()
+	// A handoff requested meanwhile will not happen.
+	select {
+	case req := <-rt.handoffs:
+		req.refuse(errors.New("the session has ended"))
+	default:
+	}
 
 	// Give attached clients a moment to receive their SessionEnded frame.
-	finished := make(chan struct{})
-	go func() {
-		rt.conns.Wait()
-		close(finished)
-	}()
-	select {
-	case <-finished:
-	case <-time.After(shutdownGrace):
-	}
+	rt.handlers.waitIdle(shutdownGrace)
 	rt.owner.stop()
 	<-ownerDone
+	if rt.pump != nil {
+		rt.pump.stop()
+	}
 	// Only the owner goroutine enqueues input, so the queue can close now.
 	state.input.close()
 	return nil
+}
+
+func (rt *runtime) startPump() error {
+	p, err := startPump(rt.ptmx, rt.owner, rt.ptyEOF)
+	if err != nil {
+		return err
+	}
+	rt.pump = p
+	return nil
+}
+
+func (rt *runtime) startAccepting() {
+	done := make(chan struct{})
+	rt.acceptDone = done
+	l := rt.listener
+	go func() {
+		defer close(done)
+		transport.Serve(l, "session worker", &rt.handlers, func(conn transport.Stream) {
+			keep, err := rt.handleConnection(conn)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "session worker connection error: %v\n", err)
+			}
+			if !keep {
+				conn.Close()
+			}
+		})
+	}()
+}
+
+// watchAgent waits for the agent to exit, reaps it, and ends the session.
+//
+// It waits without reaping first and then reaps under reapMu, so a handoff
+// in progress (which holds reapMu) either sees that the agent exited and
+// gives up, or execs with the agent still unreaped, for the new image to
+// reap. The exit status is never lost in between.
+func (rt *runtime) watchAgent() {
+	coordinated := true
+	if err := waitExited(rt.agentPID); err != nil {
+		reason := fmt.Sprintf("cannot watch the agent without reaping it: %v", err)
+		fmt.Fprintf(os.Stderr, "session worker: %s\n", reason)
+		rt.noHandoff.Store(&reason)
+		coordinated = false
+	}
+	rt.agentExited.Store(true)
+	if coordinated {
+		rt.reapMu.Lock()
+	}
+	code := reapAgent(rt.agentPID)
+	if coordinated {
+		rt.reapMu.Unlock()
+	}
+	// Let the pump queue the agent's last output before the exit is
+	// handled, so the saved history and SessionEnded include it. The pump
+	// ends once nothing holds the PTY open; a lingering descendant may
+	// keep it open, hence the bound.
+	select {
+	case <-rt.ptyEOF:
+	case <-time.After(pumpDrainTimeout):
+	}
+	rt.owner.post(func(s *ownerState) { rt.onChildExited(s, code) })
+}
+
+// reapAgent collects the agent's exit status: its exit code, or nil if it
+// was killed by a signal (or could not be reaped).
+func reapAgent(pid int) *int32 {
+	var ws syscall.WaitStatus
+	for {
+		_, err := syscall.Wait4(pid, &ws, 0, nil)
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "session worker: failed to reap the agent: %v\n", err)
+			return nil
+		}
+		break
+	}
+	if !ws.Exited() {
+		return nil
+	}
+	code := int32(ws.ExitStatus())
+	return &code
 }
 
 func (rt *runtime) onChildExited(s *ownerState, exitCode *int32) {
@@ -393,7 +541,10 @@ func (rt *runtime) endedResponse() *protocol.Response {
 	}}
 }
 
-func (rt *runtime) handleConnection(conn transport.Stream) error {
+// handleConnection serves one connection. keep reports that the connection
+// was handed to someone else (a handoff request, answered by the main
+// goroutine or the next image), so the caller must not close it.
+func (rt *runtime) handleConnection(conn transport.Stream) (keep bool, err error) {
 	reader := bufio.NewReader(conn)
 	// A peer that connects and never sends a request must not hold a
 	// handler forever.
@@ -401,7 +552,7 @@ func (rt *runtime) handleConnection(conn transport.Stream) error {
 	req, err := protocol.ReadRequest(reader)
 	conn.SetReadDeadline(time.Time{})
 	if err != nil || req == nil {
-		return err
+		return false, err
 	}
 
 	reply := func(resp *protocol.Response) error { return protocol.WriteResponse(conn, resp) }
@@ -415,18 +566,30 @@ func (rt *runtime) handleConnection(conn transport.Stream) error {
 
 	switch {
 	case req.Hello != nil:
-		// The daemon asks which attach-stream features this worker
-		// supports before it forwards an AttachSession that lists some: a
-		// worker started by an older daemon build may support fewer.
+		// The daemon asks which features this worker (which may run an
+		// older binary than the daemon) supports: the attach-stream
+		// features, before it forwards an AttachSession that lists some,
+		// and live handoff, before an upgrade.
 		version, err := protocol.NegotiateVersion(req.Hello.MinVersion, req.Hello.MaxVersion)
 		if err != nil {
-			return fail(err)
+			return false, fail(err)
 		}
-		return reply(&protocol.Response{Welcome: &protocol.Welcome{
-			Version: version, Capabilities: protocol.AttachCapabilities(),
+		return false, reply(&protocol.Response{Welcome: &protocol.Welcome{
+			Version: version, Capabilities: append(protocol.AttachCapabilities(), protocol.CapWorkerHandoff),
 		}})
+	case req.HandoffSession != nil:
+		h := req.HandoffSession
+		if h.SessionID != rt.sessionID {
+			return false, fail(fmt.Errorf("this worker runs session `%s`, not `%s`", rt.sessionID, h.SessionID))
+		}
+		select {
+		case rt.handoffs <- &handoffRequest{conn: conn, exe: h.Executable}:
+			return true, nil
+		default:
+			return false, fail(errors.New("a handoff is already in progress"))
+		}
 	case req.AttachSession != nil:
-		return rt.serveAttach(conn, reader, req.AttachSession)
+		return false, rt.serveAttach(conn, reader, req.AttachSession)
 	case req.SendInput != nil, req.AttachInput != nil:
 		data := []byte(nil)
 		if req.SendInput != nil {
@@ -435,25 +598,25 @@ func (rt *runtime) handleConnection(conn transport.Stream) error {
 			data = req.AttachInput.Data
 		}
 		if err := rt.owner.do(func(s *ownerState) error { return s.writeInput(data) }); err != nil {
-			return fail(err)
+			return false, fail(err)
 		}
-		return reply(&protocol.Response{InputAccepted: protocol.Empty})
+		return false, reply(&protocol.Response{InputAccepted: protocol.Empty})
 	case req.ListAttachments != nil:
 		var attachments []session.AttachmentRecord
 		_ = rt.owner.do(func(s *ownerState) error { attachments = s.listAttachments(); return nil })
-		return reply(&protocol.Response{Attachments: &attachments})
+		return false, reply(&protocol.Response{Attachments: &attachments})
 	case req.DetachAttachment != nil:
 		id := req.DetachAttachment.AttachID
 		if err := rt.owner.do(func(s *ownerState) error { return s.detachAttachment(id) }); err != nil {
-			return fail(err)
+			return false, fail(err)
 		}
-		return reply(protocol.OkResponse())
+		return false, reply(protocol.OkResponse())
 	case req.DetachSession != nil:
 		if !req.DetachSession.All {
-			return fail(errors.New("worker detach requires all=true"))
+			return false, fail(errors.New("worker detach requires all=true"))
 		}
 		_ = rt.owner.do(func(s *ownerState) error { s.detachAll(); return nil })
-		return reply(protocol.OkResponse())
+		return false, reply(protocol.OkResponse())
 	case req.GetHistory != nil:
 		vt := req.GetHistory.VT
 		var data string
@@ -462,34 +625,23 @@ func (rt *runtime) handleConnection(conn transport.Stream) error {
 			data, err = s.history(vt)
 			return err
 		}); err != nil {
-			return fail(err)
+			return false, fail(err)
 		}
-		return reply(&protocol.Response{History: &protocol.History{Data: data}})
+		return false, reply(&protocol.Response{History: &protocol.History{Data: data}})
 	case req.KillSession != nil:
 		rt.terminateAgent()
-		return reply(protocol.OkResponse())
+		return false, reply(protocol.OkResponse())
 	case req.GetSessionStats != nil:
 		stats, err := rt.stats(req.GetSessionStats.Snapshot)
 		if err != nil {
-			return fail(err)
+			return false, fail(err)
 		}
-		return reply(&protocol.Response{SessionStats: stats})
+		return false, reply(&protocol.Response{SessionStats: stats})
 	default:
-		return reply(protocol.ErrorResponsef("unsupported worker request"))
+		return false, reply(protocol.ErrorResponsef("unsupported worker request"))
 	}
 }
 
-// serveAttach serves one attach stream.
-//
-// The attachment's life: AttachSession numbers it (kind-N, N counted per
-// session incarnation in state.db, so an id is never reused within an
-// incarnation, not even by a later worker), takes its snapshot and
-// subscribes it to output in one step on the owner goroutine, and answers
-// Attached. It then lives until the client half-closes the stream (detach
-// or disconnect), a DetachAttachment or DetachSession names it, a later
-// attach replaces it, the session ends, or a write to the client fails.
-// Whatever ends it, it is unsubscribed and removed from the list on the
-// owner goroutine as this returns.
 func (rt *runtime) serveAttach(conn transport.Stream, reader *bufio.Reader, req *protocol.AttachSession) error {
 	refuse := func(err error) error {
 		_ = protocol.WriteResponse(conn, protocol.ErrorResponsef("%v", err))
@@ -510,6 +662,9 @@ func (rt *runtime) serveAttach(conn transport.Stream, reader *bufio.Reader, req 
 		replaces = req.Replaces
 	}
 	resync := slices.Contains(features, protocol.CapAttachResync)
+	// A client that asked for CapSessionRestart is told when the worker
+	// restarts, and attaches again; any other is simply detached.
+	canRestart := slices.Contains(features, protocol.CapSessionRestart)
 
 	seq, err := rt.db.NextAttachID(rt.sessionID, rt.uid)
 	if errors.Is(err, db.ErrNoSuchIncarnation) {
@@ -531,14 +686,15 @@ func (rt *runtime) serveAttach(conn transport.Stream, reader *bufio.Reader, req 
 	})
 
 	// A client that stops reading blocks this handler in a write, where it
-	// cannot notice a detach or the session ending. Once either happens,
-	// give the client shutdownGrace to take its final frames, then fail the
-	// blocked write so the attachment is released.
+	// cannot notice a detach, a restart or the session ending. Once one
+	// happens, give the client shutdownGrace to take its final frames, then
+	// fail the blocked write so the attachment is released.
 	handlerDone := make(chan struct{})
 	defer close(handlerDone)
 	go func() {
 		select {
 		case <-att.detach:
+		case <-att.restart:
 		case <-rt.ended.ch:
 		case <-handlerDone:
 			return
@@ -598,6 +754,18 @@ loop:
 				return err
 			}
 		case <-att.detach:
+			break loop
+		case <-att.restart:
+			// The client repaints from a fresh snapshot when it attaches
+			// again, but flush what it was sent so far anyway.
+			if err := drainOutput(conn, att.sub); err != nil {
+				return err
+			}
+			if canRestart {
+				final = &protocol.Response{SessionRestarting: &protocol.SessionRestarting{
+					SessionID: rt.sessionID, Reason: "the session worker is restarting",
+				}}
+			}
 			break loop
 		case <-rt.ended.ch:
 			// Flush output already queued for this client so the tail of
@@ -683,5 +851,48 @@ func drainOutput(conn transport.Stream, sub *subscriber) error {
 		if err := protocol.WriteResponse(conn, &protocol.Response{PtyOutput: &protocol.Bytes{Data: data}}); err != nil {
 			return err
 		}
+	}
+}
+
+// tracker counts running connection handlers (a transport.Counter) and lets
+// the main goroutine wait, with a bound, for there to be none. Unlike a
+// sync.WaitGroup it can be waited on again after a wait timed out, which a
+// handoff that gives up needs.
+type tracker struct {
+	mu sync.Mutex
+	n  int
+	// idle is closed while n is zero; nil means "not created yet".
+	idle chan struct{}
+}
+
+func (t *tracker) Add(delta int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.n == 0 && delta > 0 {
+		t.idle = make(chan struct{})
+	}
+	t.n += delta
+	if t.n == 0 && t.idle != nil {
+		close(t.idle)
+	}
+}
+
+func (t *tracker) Done() { t.Add(-1) }
+
+// waitIdle waits up to timeout for every handler to return and reports
+// whether they did.
+func (t *tracker) waitIdle(timeout time.Duration) bool {
+	t.mu.Lock()
+	if t.n == 0 {
+		t.mu.Unlock()
+		return true
+	}
+	idle := t.idle
+	t.mu.Unlock()
+	select {
+	case <-idle:
+		return true
+	case <-time.After(timeout):
+		return false
 	}
 }

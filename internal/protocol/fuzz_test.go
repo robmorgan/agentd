@@ -30,6 +30,7 @@ func seedFrames(f *testing.F) {
 		{GetSessionStats: &GetSessionStats{SessionID: "ab", Snapshot: true}},
 		{SubscribeEvents: &SubscribeEvents{AfterID: u64p(7), SessionID: strp("ab"), Tail: 3}},
 		{ListEvents: &ListEvents{Limit: 5}},
+		{HandoffSession: &HandoffSession{SessionID: "ab", Executable: "/bin/agentd"}},
 	}
 	resps := []*Response{
 		{Welcome: &Welcome{Version: 1, Capabilities: []string{CapControlStream}, Host: HostInfo{Agents: []string{"a"}}}},
@@ -46,6 +47,8 @@ func seedFrames(f *testing.F) {
 		{DaemonStats: &DaemonStats{Daemon: ProcessStats{PID: 1}, OpenStreams: 2}},
 		{Event: &session.Event{ID: 9, SessionID: "ab", At: now, Kind: session.EventBell, Attention: session.AttentionAction, Summary: "bell"}},
 		{Events: &[]session.Event{{ID: 1, SessionID: "ab", At: now, Kind: "future-kind", Attention: session.AttentionInfo}}},
+		{HandedOff: &HandedOff{SessionID: "ab", WorkerPID: 7, Executable: "/bin/agentd", Handoffs: 1}},
+		{SessionRestarting: &SessionRestarting{SessionID: "ab", Reason: "upgrade"}},
 	}
 	for _, r := range reqs {
 		var buf bytes.Buffer

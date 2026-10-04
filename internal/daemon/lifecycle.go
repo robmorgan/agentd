@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strings"
 	"syscall"
 	"time"
 
@@ -39,27 +38,138 @@ func Daemonize(p *paths.AppPaths, exe string) error {
 	return cmd.Process.Release()
 }
 
-// Upgrade replaces the running daemon with exe. It refuses while sessions are
-// running, since their workers run the old binary.
-func Upgrade(p *paths.AppPaths, exe string) error {
+// Upgrade replaces the running daemon with exe, then hands every running
+// session's worker over to exe as well (HandoffSessions), so sessions keep
+// running, on the new binary, through an upgrade. It returns each session's
+// outcome; one whose handoff failed keeps running on its old binary.
+func Upgrade(p *paths.AppPaths, exe string) ([]HandoffResult, error) {
 	if err := p.EnsureLayout(); err != nil {
-		return err
-	}
-	running, err := runningSessions(p)
-	if err != nil {
-		return err
-	}
-	if len(running) > 0 {
-		return fmt.Errorf("cannot upgrade agentd while sessions are running: %s", strings.Join(running, ", "))
+		return nil, err
 	}
 	if err := stopDaemon(p); err != nil {
-		return err
+		return nil, err
 	}
 	if err := Daemonize(p, exe); err != nil {
-		return err
+		return nil, err
 	}
-	_, err = waitForDaemon(p)
-	return err
+	if _, err := waitForDaemon(p); err != nil {
+		return nil, err
+	}
+	return HandoffSessions(p, exe)
+}
+
+// handoffTimeout bounds one worker's handoff: probing the new binary,
+// letting clients go, and the new image restoring the terminal.
+const handoffTimeout = 60 * time.Second
+
+// HandoffResult is the outcome of asking one session's worker to hand off.
+type HandoffResult struct {
+	SessionID string
+	// HandedOff is the new image's answer, or nil if the handoff did not
+	// happen (Err says why).
+	HandedOff *protocol.HandedOff
+	Err       error
+	// Lost reports that the worker went away during a failed handoff, so
+	// the session did not survive it (and is recorded as failed).
+	Lost bool
+}
+
+// HandoffSessions asks the worker of every running session, one at a time,
+// to hand its session over to exe without stopping the agent (see
+// internal/worker/handoff.go). A worker that cannot (it predates handoff, or
+// the new binary does not run) keeps its session running as it was.
+func HandoffSessions(p *paths.AppPaths, exe string) ([]HandoffResult, error) {
+	store, err := db.Open(p.Database)
+	if err != nil {
+		return nil, err
+	}
+	recs, err := store.ListSessions()
+	if err != nil {
+		return nil, err
+	}
+	var results []HandoffResult
+	for _, rec := range recs {
+		if rec.Status != session.StatusRunning || !answers(p.SessionSocketPath(rec.SessionID)) {
+			continue
+		}
+		results = append(results, handoffWorker(p, rec.SessionID, exe))
+	}
+	return results, nil
+}
+
+func handoffWorker(p *paths.AppPaths, id, exe string) HandoffResult {
+	res := HandoffResult{SessionID: id}
+	socket := p.SessionSocketPath(id)
+	caps, err := workerCapabilities(socket)
+	if err != nil {
+		res.Err = err
+		return res
+	}
+	if !protocol.HasCapability(caps, protocol.CapWorkerHandoff) {
+		res.Err = errors.New("its worker was started by an agentd without live handoff; it picks up the new binary when the session is restarted")
+		return res
+	}
+	conn, err := transport.DialUnix(socket, workerDialTimeout)
+	if err != nil {
+		res.Err = err
+		return res
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(handoffTimeout))
+	resp, err := exchangeOn(conn, &protocol.Request{HandoffSession: &protocol.HandoffSession{SessionID: id, Executable: exe}})
+	switch {
+	case err == nil && resp.HandedOff != nil:
+		res.HandedOff = resp.HandedOff
+		return res
+	case err == nil && resp.Error != nil:
+		res.Err = errors.New(resp.Error.Message)
+		return res
+	case err == nil:
+		res.Err = errors.New("unexpected response to the handoff request")
+		return res
+	}
+	// The connection ended without an answer: the new image failed after
+	// the exec, or the worker died. Tell which from whether the session
+	// still answers.
+	if answers(socket) {
+		res.Err = fmt.Errorf("the handoff's outcome is unknown (%v); the session is still running", err)
+	} else {
+		res.Err = fmt.Errorf("the session's worker exited during the handoff (%v); see %s", err, p.WorkerLogPath(id))
+		res.Lost = true
+	}
+	return res
+}
+
+// exchangeOn writes req on conn and reads the one response.
+func exchangeOn(conn transport.Stream, req *protocol.Request) (*protocol.Response, error) {
+	if err := protocol.WriteRequest(conn, req); err != nil {
+		return nil, err
+	}
+	resp, err := protocol.ReadResponse(bufio.NewReader(conn))
+	if err == nil && resp == nil {
+		err = errors.New("the worker closed the connection")
+	}
+	return resp, err
+}
+
+// workerCapabilities asks a session's worker which optional protocol
+// features it supports. A worker may run an older binary than the daemon
+// (one whose handoff failed, or that predates handoff); one too old to
+// answer Hello supports none.
+func workerCapabilities(socket string) ([]string, error) {
+	conn, err := transport.DialUnix(socket, workerDialTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(workerDialTimeout))
+	resp, err := exchangeOn(conn, &protocol.Request{Hello: protocol.NewHello("agentd " + Version)})
+	if err != nil || resp.Welcome == nil {
+		// A worker that predates Hello answers it with an error, or
+		// drops the connection if it cannot decode it.
+		return nil, nil
+	}
+	return resp.Welcome.Capabilities, nil
 }
 
 // Restart stops the running daemon, if any, and starts exe in its place, so
@@ -101,25 +211,6 @@ func waitForDaemon(p *paths.AppPaths) (*protocol.ManagementStatus, error) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-}
-
-// runningSessions lists sessions whose worker still answers.
-func runningSessions(p *paths.AppPaths) ([]string, error) {
-	store, err := db.Open(p.Database)
-	if err != nil {
-		return nil, err
-	}
-	recs, err := store.ListSessions()
-	if err != nil {
-		return nil, err
-	}
-	var running []string
-	for _, rec := range recs {
-		if rec.Status == session.StatusRunning && answers(p.SessionSocketPath(rec.SessionID)) {
-			running = append(running, fmt.Sprintf("%s (%s)", rec.SessionID, rec.Agent))
-		}
-	}
-	return running, nil
 }
 
 func managementStatus(p *paths.AppPaths) (*protocol.ManagementStatus, error) {

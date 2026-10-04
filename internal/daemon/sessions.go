@@ -80,6 +80,14 @@ func (s *Server) refresh(rec *session.Record) (*session.Record, error) {
 	if rec.Status != session.StatusRunning {
 		return rec, nil
 	}
+	if rec.WorkerPID != nil {
+		if _, ok := s.supervised.Load(int(*rec.WorkerPID)); ok {
+			// This daemon spawned the worker and has not reaped it: it is
+			// alive, or its supervisor is about to record how it died
+			// (failed, which says more than unknown_recovered).
+			return rec, nil
+		}
+	}
 	if state, _ := s.workerState(rec.SessionID); state != workerGone {
 		return rec, nil
 	}
@@ -154,8 +162,10 @@ func (s *Server) reconcileSessions() error {
 			}
 		case session.StatusCreating:
 			// The daemon that was creating it is gone. If its worker is
-			// still starting, MarkRunning will now refuse it and it exits.
-			if err := s.db.MarkFailedIfActive(rec.SessionID, "agentd stopped while the session was starting"); err != nil {
+			// still starting, MarkRunning will now refuse it and it exits;
+			// if it claimed the session since the list was read, it keeps
+			// it, and is adopted like any running session.
+			if err := s.db.MarkFailedIfCreating(rec.SessionID, "agentd stopped while the session was starting"); err != nil {
 				return err
 			}
 		}
@@ -378,8 +388,10 @@ func (s *Server) spawnWorker(id string, args []string) (*exec.Cmd, <-chan struct
 
 	workerPID := cmd.Process.Pid
 	exited := make(chan struct{})
+	s.supervised.Store(workerPID, struct{}{})
 	go func() {
 		defer close(exited)
+		defer s.supervised.Delete(workerPID)
 		_ = cmd.Wait()
 		select {
 		case <-s.shutdown:
