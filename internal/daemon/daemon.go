@@ -89,6 +89,8 @@ type Server struct {
 
 	// createMu serialises session name allocation and row insertion.
 	createMu sync.Mutex
+	// replays remembers the answers to tokened requests; see replay.go.
+	replays *replayCache
 
 	shutdownOnce sync.Once
 	shutdown     chan struct{}
@@ -128,6 +130,7 @@ func New(p *paths.AppPaths, workerBin string) (*Server, error) {
 		workerBin: workerBin,
 		lockWait:  defaultLockWait,
 		startedAt: time.Now(),
+		replays:   newReplayCache(),
 		shutdown:  make(chan struct{}),
 		conns:     make(map[transport.Stream]struct{}),
 	}, nil
@@ -212,6 +215,10 @@ func (s *Server) Serve(ctx context.Context) error {
 // retried. Tests shorten it.
 var remoteRetryInterval = 5 * time.Second
 
+// remoteIdleTimeout, when set, replaces transport.DeadPeerTimeout for the
+// QUIC listener. Tests shorten it to exercise long outages quickly.
+var remoteIdleTimeout time.Duration
+
 // startRemote starts the QUIC listener when remote access is configured. A
 // failure is logged and local service carries on: a bad remote setting must
 // not lock the user out of their local sessions.
@@ -238,6 +245,7 @@ func (s *Server) startRemote() {
 	retry := remoteRetryInterval
 	authorized := s.paths.AuthorizedClientsPath()
 	opts := transport.QUICOptions{
+		IdleTimeout: remoteIdleTimeout,
 		Authorized: func(fp string) bool {
 			ok, err := transport.IsAuthorized(authorized, fp)
 			if err != nil {
@@ -539,6 +547,21 @@ func (s *Server) respond(req *protocol.Request, f protocol.Features) (resp *prot
 	if id, ok := requestSessionID(req); ok && !session.ValidName(id) {
 		return protocol.ErrorResponsef("session `%s` not found", id), nil
 	}
+	token := ""
+	if slot := req.TokenSlot(); slot != nil {
+		token = *slot
+		if err := checkToken(token); err != nil {
+			return fail(err)
+		}
+	}
+	// once runs a tokened request at most once; see replay.go.
+	// CreateSession keeps its token in state.db instead.
+	once := func(run func() *protocol.Response) (*protocol.Response, func()) {
+		if token == "" {
+			return run(), nil
+		}
+		return s.replays.do(token, req, run), nil
+	}
 
 	switch {
 	case req.GetDaemonInfo != nil:
@@ -562,11 +585,13 @@ func (s *Server) respond(req *protocol.Request, f protocol.Features) (resp *prot
 		return &protocol.Response{CreateSession: result}, nil
 	case req.KillSession != nil:
 		k := req.KillSession
-		result, err := s.killSession(k.SessionID, k.Remove)
-		if err != nil {
-			return fail(err)
-		}
-		return &protocol.Response{KillSession: result}, nil
+		return once(func() *protocol.Response {
+			result, err := s.killSession(k.SessionID, k.Remove)
+			if err != nil {
+				return protocol.ErrorResponsef("%v", err)
+			}
+			return &protocol.Response{KillSession: result}
+		})
 	case req.Hello != nil:
 		return protocol.ErrorResponsef("hello is only valid as the first request on a stream"), nil
 	case req.AttachSession != nil:
@@ -615,16 +640,20 @@ func (s *Server) respond(req *protocol.Request, f protocol.Features) (resp *prot
 		}
 		return &protocol.Response{Workspaces: &ws}, nil
 	case req.AddWorkspace != nil:
-		w, err := s.addWorkspace(req.AddWorkspace)
-		if err != nil {
-			return fail(err)
-		}
-		return &protocol.Response{Workspace: w}, nil
+		return once(func() *protocol.Response {
+			w, err := s.addWorkspace(req.AddWorkspace)
+			if err != nil {
+				return protocol.ErrorResponsef("%v", err)
+			}
+			return &protocol.Response{Workspace: w}
+		})
 	case req.RemoveWorkspace != nil:
-		if err := s.removeWorkspace(req.RemoveWorkspace.Name); err != nil {
-			return fail(err)
-		}
-		return protocol.OkResponse(), nil
+		return once(func() *protocol.Response {
+			if err := s.removeWorkspace(req.RemoveWorkspace.Name); err != nil {
+				return protocol.ErrorResponsef("%v", err)
+			}
+			return protocol.OkResponse()
+		})
 	case req.GetSessionStats != nil:
 		return s.sessionStats(req), nil
 	case req.GetDaemonStats != nil:

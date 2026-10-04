@@ -20,7 +20,8 @@ import (
 //     tagged responses may arrive in any order. It lives as long as the
 //     client wants it.
 //   - attach: AttachSession. The interactive stream of one attachment:
-//     snapshot, PTY output, input, resize.
+//     snapshot, PTY output, input, resize. It has no Hello; AttachSession
+//     carries the stream's own feature list instead (CapAttachFeatures).
 //   - artifact: GetArtifact or GetHistory. One large transfer, kept off the
 //     control stream so it never delays small requests behind it, and off
 //     attachments so it never delays terminal traffic (artifact.go).
@@ -117,6 +118,31 @@ const (
 	CapArtifacts = "artifacts"
 	// CapRuntimeStats: GetSessionStats and GetDaemonStats (stats.go).
 	CapRuntimeStats = "runtime-stats"
+	// CapSessionUID: every session incarnation has an immutable random
+	// UID, appended to session records and CreateSession results. On an
+	// attach stream (see CapAttachFeatures) it adds AttachSession.ExpectUID
+	// and Attached.SessionUID.
+	CapSessionUID = "session-uid"
+	// CapRequestTokens: CreateSession, KillSession, AddWorkspace and
+	// RemoveWorkspace carry a client-chosen token (appended), and the
+	// daemon answers a request whose token it has seen with the original
+	// result instead of acting again. A client that lost its connection
+	// after sending one may therefore send it again.
+	CapRequestTokens = "request-tokens"
+	// CapAttachFeatures: AttachSession may end with the attach stream's
+	// own feature list, and Attached then echoes the features the session
+	// worker agreed to. Attach streams have no Hello, so this is their
+	// handshake. The features below are only meaningful in that list.
+	CapAttachFeatures = "attach-features"
+	// CapAttachReplace (attach stream): AttachSession.Replaces names an
+	// attachment of the same session incarnation that this one replaces,
+	// typically the client's own attachment on a connection it lost; the
+	// worker drops it at once instead of waiting to notice it is dead.
+	CapAttachReplace = "attach-replace"
+	// CapAttachResync (attach stream): the worker may send AttachResync, a
+	// fresh snapshot that replaces the screen, when it had to drop output
+	// for this client because it fell behind.
+	CapAttachResync = "attach-resync"
 )
 
 // MinProtocolVersion is the oldest protocol version this build speaks.
@@ -125,7 +151,41 @@ const MinProtocolVersion uint16 = 1
 
 // Capabilities is what this build supports.
 func Capabilities() []string {
-	return []string{CapControlStream, CapGitState, CapArtifacts, CapRuntimeStats}
+	return []string{CapControlStream, CapGitState, CapArtifacts, CapSessionUID, CapRequestTokens, CapAttachFeatures, CapAttachReplace, CapAttachResync, CapRuntimeStats}
+}
+
+// AttachCapabilities are the capabilities that apply to an attach stream,
+// listed in AttachSession.Features.
+func AttachCapabilities() []string {
+	return []string{CapSessionUID, CapAttachReplace, CapAttachResync}
+}
+
+// AttachFeatures is the attach-stream features a client may ask for given
+// the features it negotiated on its control stream: none unless the daemon
+// takes an attach feature list at all.
+func AttachFeatures(control Features) []string {
+	if !control.Has(CapAttachFeatures) {
+		return nil
+	}
+	var out []string
+	for _, c := range AttachCapabilities() {
+		if control.Has(c) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// IntersectCapabilities is the capabilities in a that b lists too, in a's
+// order.
+func IntersectCapabilities(a, b []string) []string {
+	var out []string
+	for _, c := range a {
+		if slices.Contains(b, c) && !slices.Contains(out, c) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // HasCapability reports whether caps lists c.
@@ -236,4 +296,44 @@ func ReadTaggedResponse(r io.Reader, f Features) (resp *Response, id uint32, tag
 		return nil, h.id, h.tagged, err
 	}
 	return resp, h.id, h.tagged, nil
+}
+
+// SessionReplacedMessage is the error for an attach whose ExpectUID no
+// longer matches: the session the client knew was removed and another one
+// started under its name.
+func SessionReplacedMessage(id string) string {
+	return fmt.Sprintf("session `%s` is not the session you were attached to: it was removed and a new session was started under the same name; attach to it again if you want it", id)
+}
+
+// MaxRequestTokenLen bounds a request token; a token is meant to be a
+// random id, not data.
+const MaxRequestTokenLen = 64
+
+// TokenSlot returns where req keeps its request token (CapRequestTokens),
+// or nil for a request that takes none. Only requests with side effects
+// that a retry must not repeat take one: creating, stopping and removing
+// sessions, and adding and removing workspaces.
+func (r *Request) TokenSlot() *string {
+	switch {
+	case r.CreateSession != nil:
+		return &r.CreateSession.Token
+	case r.KillSession != nil:
+		return &r.KillSession.Token
+	case r.AddWorkspace != nil:
+		return &r.AddWorkspace.Token
+	case r.RemoveWorkspace != nil:
+		return &r.RemoveWorkspace.Token
+	}
+	return nil
+}
+
+// Digest identifies what req asks for, without its token: two requests
+// with the same token must have the same digest, or the second is not a
+// retry of the first.
+func (r *Request) Digest() (string, error) {
+	k, payload, err := encodeRequest(r, Features{})
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%d:%x", k, payload), nil
 }

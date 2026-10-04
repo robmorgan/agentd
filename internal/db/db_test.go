@@ -99,7 +99,7 @@ PRAGMA user_version = 1;`); err != nil {
 		t.Fatalf("user_version = %d", got)
 	}
 	rec, err := store.GetSession("old")
-	if err != nil || rec == nil || rec.Cwd != "/w" || rec.Workspace != nil {
+	if err != nil || rec == nil || rec.Cwd != "/w" || rec.Workspace != nil || len(rec.UID) != 32 {
 		t.Fatalf("migrated record = %+v, %v", rec, err)
 	}
 	if err := store.MarkExited("old", nil); err != nil {
@@ -277,5 +277,63 @@ func TestStateTransitionGuards(t *testing.T) {
 	}
 	if err := store.MarkRunning("b", created["b"], 10, 11); !errors.Is(err, ErrNotCreating) {
 		t.Fatalf("stale worker claimed a recreated session: %v", err)
+	}
+}
+
+// Every incarnation of a session gets its own UID, a create token finds
+// the session it created, and attach ids keep counting per incarnation.
+func TestSessionIncarnations(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	insert := func(token string) *session.Record {
+		t.Helper()
+		if _, err := store.InsertSession(NewSession{SessionID: "s", Agent: "sh", Mode: session.ModeExecute, Cwd: "/w", CreateToken: token}); err != nil {
+			t.Fatal(err)
+		}
+		rec, err := store.GetSession("s")
+		if err != nil || rec == nil {
+			t.Fatalf("get: %v, %v", rec, err)
+		}
+		return rec
+	}
+	first := insert("tok-1")
+	if len(first.UID) != 32 {
+		t.Fatalf("uid = %q", first.UID)
+	}
+	if rec, err := store.SessionByCreateToken("tok-1"); err != nil || rec == nil || rec.UID != first.UID {
+		t.Fatalf("by token = %+v, %v", rec, err)
+	}
+	if rec, err := store.SessionByCreateToken("other"); err != nil || rec != nil {
+		t.Fatalf("unknown token = %+v, %v", rec, err)
+	}
+	for want := uint64(1); want <= 3; want++ {
+		if got, err := store.NextAttachID("s", first.UID); err != nil || got != want {
+			t.Fatalf("attach id = %d, %v; want %d", got, err, want)
+		}
+	}
+
+	if err := store.DeleteSession("s"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.NextAttachID("s", first.UID); !errors.Is(err, ErrNoSuchIncarnation) {
+		t.Fatalf("attach id of a removed incarnation: %v", err)
+	}
+	second := insert("")
+	if second.UID == first.UID {
+		t.Fatal("a recreated session reused the UID")
+	}
+	if _, err := store.NextAttachID("s", first.UID); !errors.Is(err, ErrNoSuchIncarnation) {
+		t.Fatalf("attach id of a replaced incarnation: %v", err)
+	}
+	if got, err := store.NextAttachID("s", second.UID); err != nil || got != 1 {
+		t.Fatalf("new incarnation attach id = %d, %v", got, err)
+	}
+	if _, err := store.InsertSession(NewSession{SessionID: "t", Agent: "sh", Mode: session.ModeExecute, Cwd: "/w", CreateToken: "tok-2"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertSession(NewSession{SessionID: "u", Agent: "sh", Mode: session.ModeExecute, Cwd: "/w", CreateToken: "tok-2"}); !errors.Is(err, ErrCreateTokenUsed) {
+		t.Fatalf("reused token: %v", err)
 	}
 }

@@ -52,13 +52,15 @@ func TestMain(m *testing.M) {
 }
 
 // echoAgent echoes each line back as got:<line>. "where" prints the working
-// directory, "done" exits 0, "quit" exits 3.
+// directory, "bigflood" writes about 67 MB of output, "done" exits 0, "quit"
+// exits 3.
 const echoAgent = `stty -echo; echo ready
 while IFS= read -r l; do
   case "$l" in
     quit) exit 3;;
     done) exit 0;;
     where) echo "pwd:$(pwd -P)";;
+    bigflood) seq -f "line %g padding padding padding padding" 1 1500000; echo flood-done;;
     *) echo "got:$l";;
   esac
 done`

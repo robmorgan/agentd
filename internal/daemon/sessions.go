@@ -156,24 +156,34 @@ func (s *Server) reconcileSessions() error {
 	return nil
 }
 
-func (s *Server) allocateSession(name *string, agent string, model *string, cwd string, workspace *string, base repo.Base) (id, createdAt string, err error) {
+// allocateSession picks the session's name and inserts its row. If a
+// session was already created with token, it inserts nothing and returns
+// that session as replay instead.
+func (s *Server) allocateSession(name *string, agent string, model *string, cwd string, workspace *string, base repo.Base, uid, token string) (id, createdAt string, replay *session.Record, err error) {
 	s.createMu.Lock()
 	defer s.createMu.Unlock()
+
+	if token != "" {
+		rec, err := s.db.SessionByCreateToken(token)
+		if err != nil || rec != nil {
+			return "", "", rec, err
+		}
+	}
 
 	if name != nil {
 		id = *name
 		existing, err := s.db.GetSession(id)
 		if err != nil {
-			return "", "", err
+			return "", "", nil, err
 		}
 		if existing != nil {
-			return "", "", fmt.Errorf("session `%s` already exists", id)
+			return "", "", nil, fmt.Errorf("session `%s` already exists", id)
 		}
 	} else {
 		for _, candidate := range generatedNames() {
 			existing, err := s.db.GetSession(candidate)
 			if err != nil {
-				return "", "", err
+				return "", "", nil, err
 			}
 			if existing == nil {
 				id = candidate
@@ -181,14 +191,15 @@ func (s *Server) allocateSession(name *string, agent string, model *string, cwd 
 			}
 		}
 		if id == "" {
-			return "", "", errors.New("failed to allocate a unique session name")
+			return "", "", nil, errors.New("failed to allocate a unique session name")
 		}
 	}
 	createdAt, err = s.db.InsertSession(db.NewSession{
-		SessionID: id, Agent: agent, Model: model, Mode: session.ModeExecute, Cwd: cwd, Workspace: workspace,
-		GitBase: base.Commit, GitBaseBranch: base.Branch,
+		SessionID: id, UID: uid, Agent: agent, Model: model, Mode: session.ModeExecute, Cwd: cwd, Workspace: workspace,
+		CreateToken: token,
+		GitBase:     base.Commit, GitBaseBranch: base.Branch,
 	})
-	return id, createdAt, err
+	return id, createdAt, nil, err
 }
 
 // generatedNames yields candidate names for an unnamed session: every
@@ -208,7 +219,24 @@ func generatedNames() []string {
 	return names
 }
 
+// createSession creates a session and waits for its worker. A request
+// whose token already created a session (a client retrying after it lost
+// its connection) is answered with that session instead; see replay.go.
 func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResult, error) {
+	if req.Token != "" {
+		// Checked before anything else, so a retry gets the original
+		// answer even if, say, the workspace it named is gone since.
+		rec, err := s.db.SessionByCreateToken(req.Token)
+		if err != nil {
+			return nil, err
+		}
+		if rec != nil {
+			if req.Name != nil && strings.TrimSpace(*req.Name) != "" && strings.TrimSpace(*req.Name) != rec.SessionID {
+				return nil, fmt.Errorf("request token %q was already used to create session `%s`", req.Token, rec.SessionID)
+			}
+			return s.awaitCreated(rec)
+		}
+	}
 	var name *string
 	if req.Name != nil {
 		if trimmed := strings.TrimSpace(*req.Name); trimmed != "" {
@@ -235,9 +263,13 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 	// What the agent produces is measured from the repository's HEAD now.
 	// The daemon only reads it; it never creates branches or worktrees.
 	base := probeBase(cwd)
-	id, createdAt, err := s.allocateSession(name, req.Agent, req.Model, cwd, workspace, base)
+	uid := db.NewUID()
+	id, createdAt, replay, err := s.allocateSession(name, req.Agent, req.Model, cwd, workspace, base, uid, req.Token)
 	if err != nil {
 		return nil, err
+	}
+	if replay != nil {
+		return s.awaitCreated(replay)
 	}
 	fail := func(err error) (*session.CreateResult, error) {
 		_ = s.db.MarkFailedIfActive(id, err.Error())
@@ -258,6 +290,7 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 		"--session-id", id,
 		"--cwd", cwd,
 		"--created-at", createdAt,
+		"--session-uid", uid,
 		"--agent-name", req.Agent,
 		"--command", agent.Command,
 	}
@@ -280,7 +313,38 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 		return nil, err
 	}
 	return &session.CreateResult{
-		SessionID: id, Cwd: cwd, Status: session.StatusRunning, Mode: session.ModeExecute,
+		SessionID: id, UID: uid, Cwd: cwd, Status: session.StatusRunning, Mode: session.ModeExecute,
+	}, nil
+}
+
+// awaitCreated answers a retried CreateSession with the session the first
+// attempt created, waiting for it to finish starting if it still is. The
+// answer is what the first attempt answered, or would have: the session if
+// it started (it may have finished since), the error if it failed.
+func (s *Server) awaitCreated(rec *session.Record) (*session.CreateResult, error) {
+	deadline := time.Now().Add(workerReadyTimeout + time.Second)
+	for rec.Status == session.StatusCreating && time.Now().Before(deadline) {
+		time.Sleep(pollInterval)
+		fresh, err := s.db.GetSession(rec.SessionID)
+		if err != nil {
+			return nil, err
+		}
+		if fresh == nil || fresh.UID != rec.UID {
+			return nil, fmt.Errorf("session `%s` was removed while it was starting", rec.SessionID)
+		}
+		rec = fresh
+	}
+	switch rec.Status {
+	case session.StatusCreating:
+		return nil, errors.New("timed out waiting for session worker to start")
+	case session.StatusFailed:
+		if rec.Error != nil {
+			return nil, errors.New(*rec.Error)
+		}
+		return nil, errors.New("session worker exited before becoming ready")
+	}
+	return &session.CreateResult{
+		SessionID: rec.SessionID, UID: rec.UID, Cwd: rec.Cwd, Status: rec.Status, Mode: rec.Mode,
 	}, nil
 }
 

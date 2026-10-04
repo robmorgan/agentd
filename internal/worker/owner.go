@@ -23,7 +23,6 @@ type ownerState struct {
 	terminal            *terminalState
 	hasClientDimensions bool
 	geometry            protocol.Geometry
-	nextAttachOrdinal   uint64
 	attachments         map[string]*ownerAttachment
 	output              *broadcaster
 	input               *ptyInput
@@ -36,6 +35,7 @@ type ownerState struct {
 type ownerAttachment struct {
 	kind        session.AttachmentKind
 	connectedAt time.Time
+	sub         *subscriber
 	detach      chan struct{}
 	detachOnce  sync.Once
 }
@@ -182,10 +182,20 @@ type attachResult struct {
 	sub      *subscriber
 }
 
-func (s *ownerState) attach(kind session.AttachmentKind, g protocol.Geometry) (*attachResult, error) {
-	attachID := fmt.Sprintf("%s-%d", kind, s.nextAttachOrdinal)
-	s.nextAttachOrdinal++
+// attach registers a new attachment under attachID, which the caller
+// numbered (see db.NextAttachID), and takes its snapshot. If replaces names
+// a live attachment, that one is dropped at once: the client says it was
+// its own, on a connection it has lost.
+func (s *ownerState) attach(attachID string, kind session.AttachmentKind, g protocol.Geometry, replaces string) (*attachResult, error) {
 	connectedAt := time.Now().UTC()
+	if old, ok := s.attachments[replaces]; ok && replaces != "" {
+		// Its handler may be blocked writing to the dead connection; it
+		// ends within shutdownGrace and cleans up after itself, but the
+		// attachment stops receiving output and leaves the list now.
+		old.signalDetach()
+		s.output.unsubscribe(old.sub)
+		delete(s.attachments, replaces)
+	}
 
 	var snapshot []byte
 	var err error
@@ -205,13 +215,13 @@ func (s *ownerState) attach(kind session.AttachmentKind, g protocol.Geometry) (*
 		}
 	}
 
-	a := &ownerAttachment{kind: kind, connectedAt: connectedAt, detach: make(chan struct{})}
+	a := &ownerAttachment{kind: kind, connectedAt: connectedAt, sub: s.output.subscribe(), detach: make(chan struct{})}
 	s.attachments[attachID] = a
 	return &attachResult{
 		attachID: attachID,
 		snapshot: snapshot,
 		detach:   a.detach,
-		sub:      s.output.subscribe(),
+		sub:      a.sub,
 	}, nil
 }
 

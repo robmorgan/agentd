@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -45,6 +46,10 @@ type Args struct {
 	// CreatedAt identifies the incarnation of the session this worker was
 	// started for (see db.InsertSession).
 	CreatedAt string
+	// UID is that incarnation's UID (session.Record.UID). Attach streams
+	// that expect another incarnation are refused, and attach ids are
+	// numbered per UID.
+	UID       string
 	AgentName string
 	Command   string
 	Model     string
@@ -72,6 +77,7 @@ func (e *endedSignal) fire(info *sessionEnded) {
 
 type runtime struct {
 	sessionID string
+	uid       string
 	paths     *paths.AppPaths
 	db        *db.Database
 	owner     *owner
@@ -130,6 +136,9 @@ func Run(args Args) error {
 	}
 	if err := p.EnsureLayout(); err != nil {
 		return err
+	}
+	if args.UID == "" {
+		return errors.New("session worker needs the session's UID")
 	}
 	store, err := db.Open(p.Database)
 	if err != nil {
@@ -204,6 +213,7 @@ func Run(args Args) error {
 
 	rt := &runtime{
 		sessionID: args.SessionID,
+		uid:       args.UID,
 		paths:     p,
 		db:        store,
 		owner:     newOwner(),
@@ -233,7 +243,6 @@ func Run(args Args) error {
 		output:      newBroadcaster(),
 		input:       newPTYInput(ptmx),
 	}
-	state.nextAttachOrdinal = 1
 
 	ownerDone := make(chan struct{})
 	go func() {
@@ -380,8 +389,19 @@ func (rt *runtime) handleConnection(conn transport.Stream) error {
 	}
 
 	switch {
+	case req.Hello != nil:
+		// The daemon asks which attach-stream features this worker
+		// supports before it forwards an AttachSession that lists some: a
+		// worker started by an older daemon build may support fewer.
+		version, err := protocol.NegotiateVersion(req.Hello.MinVersion, req.Hello.MaxVersion)
+		if err != nil {
+			return fail(err)
+		}
+		return reply(&protocol.Response{Welcome: &protocol.Welcome{
+			Version: version, Capabilities: protocol.AttachCapabilities(),
+		}})
 	case req.AttachSession != nil:
-		return rt.serveAttach(conn, reader, req.AttachSession.Kind, req.AttachSession.Geometry)
+		return rt.serveAttach(conn, reader, req.AttachSession)
 	case req.SendInput != nil, req.AttachInput != nil:
 		data := []byte(nil)
 		if req.SendInput != nil {
@@ -434,15 +454,51 @@ func (rt *runtime) handleConnection(conn transport.Stream) error {
 	}
 }
 
-func (rt *runtime) serveAttach(conn transport.Stream, reader *bufio.Reader, kind session.AttachmentKind, g protocol.Geometry) error {
+// serveAttach serves one attach stream.
+//
+// The attachment's life: AttachSession numbers it (kind-N, N counted per
+// session incarnation in state.db, so an id is never reused within an
+// incarnation, not even by a later worker), takes its snapshot and
+// subscribes it to output in one step on the owner goroutine, and answers
+// Attached. It then lives until the client half-closes the stream (detach
+// or disconnect), a DetachAttachment or DetachSession names it, a later
+// attach replaces it, the session ends, or a write to the client fails.
+// Whatever ends it, it is unsubscribed and removed from the list on the
+// owner goroutine as this returns.
+func (rt *runtime) serveAttach(conn transport.Stream, reader *bufio.Reader, req *protocol.AttachSession) error {
+	refuse := func(err error) error {
+		_ = protocol.WriteResponse(conn, protocol.ErrorResponsef("%v", err))
+		return err
+	}
+	features := protocol.IntersectCapabilities(req.Features, protocol.AttachCapabilities())
+	expect := ""
+	if slices.Contains(features, protocol.CapSessionUID) {
+		expect = req.ExpectUID
+	}
+	if expect != "" && expect != rt.uid {
+		return refuse(errors.New(protocol.SessionReplacedMessage(rt.sessionID)))
+	}
+	// A replaced id is only meaningful within the incarnation the client
+	// knew, which ExpectUID has just confirmed.
+	replaces := ""
+	if expect != "" && slices.Contains(features, protocol.CapAttachReplace) {
+		replaces = req.Replaces
+	}
+	resync := slices.Contains(features, protocol.CapAttachResync)
+
+	seq, err := rt.db.NextAttachID(rt.sessionID, rt.uid)
+	if errors.Is(err, db.ErrNoSuchIncarnation) {
+		return refuse(fmt.Errorf("session `%s` is being removed", rt.sessionID))
+	} else if err != nil {
+		return refuse(fmt.Errorf("failed to number the attachment: %w", err))
+	}
 	var att *attachResult
 	if err := rt.owner.do(func(s *ownerState) error {
 		var err error
-		att, err = s.attach(kind, g)
+		att, err = s.attach(fmt.Sprintf("%s-%d", req.Kind, seq), req.Kind, req.Geometry, replaces)
 		return err
 	}); err != nil {
-		_ = protocol.WriteResponse(conn, protocol.ErrorResponsef("%v", err))
-		return err
+		return refuse(err)
 	}
 	defer rt.owner.post(func(s *ownerState) {
 		s.output.unsubscribe(att.sub)
@@ -465,9 +521,11 @@ func (rt *runtime) serveAttach(conn transport.Stream, reader *bufio.Reader, kind
 		conn.SetWriteDeadline(time.Now().Add(shutdownGrace))
 	}()
 
-	if err := protocol.WriteResponse(conn, &protocol.Response{Attached: &protocol.Attached{
-		AttachID: att.attachID, Snapshot: att.snapshot,
-	}}); err != nil {
+	attached := &protocol.Attached{AttachID: att.attachID, Snapshot: att.snapshot, Features: features}
+	if slices.Contains(features, protocol.CapSessionUID) {
+		attached.SessionUID = rt.uid
+	}
+	if err := protocol.WriteResponse(conn, &protocol.Response{Attached: attached}); err != nil {
 		return err
 	}
 
@@ -500,6 +558,17 @@ loop:
 	for {
 		select {
 		case data := <-att.sub.ch:
+			att.sub.took(data)
+			// Output was dropped while this client lagged, so what is
+			// queued no longer continues its screen. Getting here means
+			// the previous write went through: the client is draining,
+			// and a snapshot taken now is as fresh as it can use.
+			if resync && att.sub.lagged.Load() {
+				if err := rt.sendSnapshot(conn, att.sub, true); err != nil {
+					return err
+				}
+				continue
+			}
 			if err := protocol.WriteResponse(conn, &protocol.Response{PtyOutput: &protocol.Bytes{Data: data}}); err != nil {
 				return err
 			}
@@ -507,8 +576,13 @@ loop:
 			break loop
 		case <-rt.ended.ch:
 			// Flush output already queued for this client so the tail of
-			// the session is not lost behind SessionEnded.
-			if err := drainOutput(conn, att.sub); err != nil {
+			// the session is not lost behind SessionEnded; a client that
+			// lagged gets the final screen instead.
+			if resync && att.sub.lagged.Load() {
+				if err := rt.sendSnapshot(conn, att.sub, true); err != nil {
+					return err
+				}
+			} else if err := drainOutput(conn, att.sub); err != nil {
 				return err
 			}
 			final = rt.endedResponse()
@@ -529,23 +603,17 @@ loop:
 			case in.req.AttachInput != nil:
 				data := in.req.AttachInput.Data
 				if err := rt.owner.do(func(s *ownerState) error { return s.writeInput(data) }); err != nil {
-					return err
+					if errors.Is(err, errOwnerStopped) {
+						return err
+					}
+					// The agent has stopped reading its input. Dropping
+					// keystrokes silently would be worse than ending the
+					// attachment with the reason.
+					final = protocol.ErrorResponsef("%v", err)
+					break loop
 				}
 			case in.req.AttachSnapshot != nil:
-				// Output is published on the owner goroutine, so discarding
-				// what is queued for this client and taking the snapshot
-				// there makes the snapshot an exact boundary: everything
-				// before it is in the snapshot, everything after follows it.
-				var snapshot []byte
-				if err := rt.owner.do(func(s *ownerState) error {
-					discardQueued(att.sub)
-					var err error
-					snapshot, err = s.snapshot()
-					return err
-				}); err != nil {
-					return err
-				}
-				if err := protocol.WriteResponse(conn, &protocol.Response{AttachSnapshot: &protocol.Bytes{Data: snapshot}}); err != nil {
+				if err := rt.sendSnapshot(conn, att.sub, false); err != nil {
 					return err
 				}
 			default:
@@ -558,25 +626,36 @@ loop:
 	return protocol.WriteResponse(conn, final)
 }
 
-func drainOutput(conn transport.Stream, sub *subscriber) error {
-	for {
-		select {
-		case data := <-sub.ch:
-			if err := protocol.WriteResponse(conn, &protocol.Response{PtyOutput: &protocol.Bytes{Data: data}}); err != nil {
-				return err
-			}
-		default:
-			return nil
-		}
+// sendSnapshot sends the client a snapshot of the screen: AttachSnapshot
+// when it asked for one, AttachResync when it lagged. Output is published
+// on the owner goroutine, so discarding what is queued for this client and
+// taking the snapshot there makes the snapshot an exact boundary: everything
+// before it is in the snapshot, everything after follows it.
+func (rt *runtime) sendSnapshot(conn transport.Stream, sub *subscriber, resync bool) error {
+	var snapshot []byte
+	if err := rt.owner.do(func(s *ownerState) error {
+		sub.discard()
+		var err error
+		snapshot, err = s.snapshot()
+		return err
+	}); err != nil {
+		return err
 	}
+	resp := &protocol.Response{AttachSnapshot: &protocol.Bytes{Data: snapshot}}
+	if resync {
+		resp = &protocol.Response{AttachResync: &protocol.Bytes{Data: snapshot}}
+	}
+	return protocol.WriteResponse(conn, resp)
 }
 
-func discardQueued(sub *subscriber) {
+func drainOutput(conn transport.Stream, sub *subscriber) error {
 	for {
-		select {
-		case <-sub.ch:
-		default:
-			return
+		data, ok := sub.next()
+		if !ok {
+			return nil
+		}
+		if err := protocol.WriteResponse(conn, &protocol.Response{PtyOutput: &protocol.Bytes{Data: data}}); err != nil {
+			return err
 		}
 	}
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/robmorgan/agentd/internal/paths"
 	"github.com/robmorgan/agentd/internal/protocol"
 	"github.com/robmorgan/agentd/internal/transport"
+	"github.com/robmorgan/agentd/internal/transport/transporttest"
 )
 
 // These tests drive the real agent and agentd binaries through real PTYs.
@@ -203,7 +204,12 @@ func (tm *term) write(s string) {
 // seen at mark.
 func (tm *term) expect(mark int, want string) int {
 	tm.t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	return tm.expectWithin(mark, want, 10*time.Second)
+}
+
+func (tm *term) expectWithin(mark int, want string, timeout time.Duration) int {
+	tm.t.Helper()
+	deadline := time.Now().Add(timeout)
 	for {
 		out := tm.output()
 		if i := strings.Index(out[mark:], want); i >= 0 {
@@ -217,6 +223,20 @@ func (tm *term) expect(mark int, want string) int {
 }
 
 func (tm *term) mark() int { return len(tm.output()) }
+
+// waitErr waits for agent to exit and returns how it exited.
+func (tm *term) waitErr() error {
+	tm.t.Helper()
+	exited := make(chan error, 1)
+	go func() { exited <- tm.cmd.Wait() }()
+	select {
+	case err := <-exited:
+		return err
+	case <-time.After(10 * time.Second):
+		tm.t.Fatalf("agent did not exit:\n%q", tm.output())
+		return nil
+	}
+}
 
 // wait waits for agent to exit and checks it exited cleanly, leaving the
 // terminal as it found it.
@@ -561,4 +581,49 @@ func TestRemoteAttachReconnects(t *testing.T) {
 	tm.wait()
 	// Start the daemon again so cleanup can stop the session.
 	e.mustRun("agent", "ls")
+}
+
+// A remote attachment that loses its connection reattaches only to the
+// same incarnation of its session: if the session was removed and another
+// started under its name while the client was away, the client says so
+// and stops rather than silently attaching to the new one.
+func TestRemoteReattachRefusesARecreatedSession(t *testing.T) {
+	probe, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := probe.LocalAddr().String()
+	probe.Close()
+	e := newEnv(t, "\n[remote]\nlisten = \""+addr+"\"\n")
+	e.startAndDetach("demo")
+	// The client reaches the daemon through a relay that stands in for
+	// the network.
+	relay := transporttest.NewRelay(t, addr)
+	e.mustRun("agent", "host", "add", "dev", relay.Addr(), "--fingerprint", strings.TrimSpace(e.mustRun("agentd", "remote", "id")))
+	e.mustRun("agentd", "remote", "authorize", strings.TrimSpace(e.mustRun("agent", "remote", "id")), "test")
+	if out := e.mustRun("agent", "status", "demo"); !strings.Contains(out, "uid: ") {
+		t.Fatalf("status shows no uid:\n%s", out)
+	}
+
+	tm := e.start("attach", "dev/demo")
+	m := tm.expect(0, "attached to demo")
+	tm.write("echo first-$((1+1))\r")
+	m = tm.expect(m, "first-2")
+
+	// The connection is lost, and while the client cannot get back in the
+	// session is replaced by another of the same name.
+	relay.BlockNew(true)
+	e.mustRun("agent", "daemon", "restart")
+	m = tm.expect(m, "connection to dev lost, reconnecting")
+	e.mustRun("agent", "kill", "--rm", "demo")
+	e.startAndDetach("demo")
+	relay.BlockNew(false)
+
+	tm.expectWithin(m, "is not the session you were attached to", 30*time.Second)
+	if err := tm.waitErr(); err == nil {
+		t.Fatal("agent exited cleanly after refusing to reattach")
+	}
+	if out := e.mustRun("agent", "attachments", "demo"); strings.Contains(out, "attach-") {
+		t.Fatalf("the new session got an attachment:\n%s", out)
+	}
 }

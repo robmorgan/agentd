@@ -63,7 +63,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       agentd remote enable [ADDRESS] [--yes] | disable | status")
 	fmt.Fprintln(os.Stderr, "       agentd remote id | list | authorize FINGERPRINT [NAME] | revoke FINGERPRINT")
 	fmt.Fprintln(os.Stderr, "       agentd bench sessions [--count N] [--output-heavy N] [--attach K] [--duration D] [--fill-lines L] [--json] [--json-file F]")
-	fmt.Fprintln(os.Stderr, "       agentd session-worker --session-id ID --cwd DIR --created-at TS --agent-name NAME --command CMD [--model M] [--arg A]...")
+	fmt.Fprintln(os.Stderr, "       agentd session-worker --session-id ID --cwd DIR --created-at TS --session-uid UID --agent-name NAME --command CMD [--model M] [--arg A]...")
 }
 
 func runServe(argv []string) int {
@@ -486,6 +486,7 @@ func runSessionWorker(argv []string) int {
 	fs.StringVar(&args.SessionID, "session-id", "", "session id")
 	fs.StringVar(&args.Cwd, "cwd", "", "working directory for the agent process")
 	fs.StringVar(&args.CreatedAt, "created-at", "", "creation timestamp of the session row this worker is for")
+	fs.StringVar(&args.UID, "session-uid", "", "UID of the session incarnation this worker is for")
 	fs.StringVar(&args.AgentName, "agent-name", "", "agent name")
 	fs.StringVar(&args.Command, "command", "", "agent command")
 	fs.StringVar(&args.Model, "model", "", "model")
@@ -495,7 +496,7 @@ func runSessionWorker(argv []string) int {
 	}
 	args.Args = extra
 	for name, v := range map[string]string{
-		"--session-id": args.SessionID, "--cwd": args.Cwd, "--created-at": args.CreatedAt,
+		"--session-id": args.SessionID, "--cwd": args.Cwd, "--created-at": args.CreatedAt, "--session-uid": args.UID,
 		"--agent-name": args.AgentName, "--command": args.Command,
 	} {
 		if v == "" {

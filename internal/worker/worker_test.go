@@ -29,7 +29,7 @@ const testTimeout = 10 * time.Second
 
 // echoAgent echoes each line back as got:<line>. "size" prints the PTY size,
 // "where" prints the working directory and cwd environment, "flood" writes a
-// burst of output, "stall" stops reading input for a few seconds, "done"
+// burst of output ("bigflood" about 9 MB of it), "stall" stops reading input for a few seconds, "done"
 // exits 0, "quit" exits 3.
 const echoAgent = `stty -echo; echo ready
 while IFS= read -r l; do
@@ -41,6 +41,7 @@ while IFS= read -r l; do
     bye) i=0; while [ $i -lt 2000 ]; do echo "tail $i"; i=$((i+1)); done; echo final-line; exit 0;;
     where) echo "pwd:$(pwd -P)"; echo "cwd:$AGENTD_CWD";;
     flood) i=0; while [ $i -lt 20000 ]; do echo "line $i padding padding padding padding"; i=$((i+1)); done; echo flood-done;;
+    bigflood) seq -f "line %g padding padding padding padding" 1 200000; echo flood-done;;
     *) echo "got:$l";;
   esac
 done`
@@ -50,6 +51,7 @@ var defaultGeometry = protocol.Geometry{Cols: 80, Rows: 24}
 type harness struct {
 	t         *testing.T
 	createdAt string
+	uid       string
 	paths     *paths.AppPaths
 	store     *db.Database
 	sessionID string
@@ -83,8 +85,9 @@ func newRoot(t *testing.T) (string, *harness) {
 		t.Fatal(err)
 	}
 	h := &harness{t: t, paths: p, store: store, sessionID: "test-session", done: make(chan error, 1)}
+	h.uid = db.NewUID()
 	h.createdAt, err = store.InsertSession(db.NewSession{
-		SessionID: h.sessionID, Agent: "sh", Mode: session.ModeExecute, Cwd: dir,
+		SessionID: h.sessionID, UID: h.uid, Agent: "sh", Mode: session.ModeExecute, Cwd: dir,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -98,7 +101,7 @@ func startWorkerWith(t *testing.T, script string) *harness {
 	p := h.paths
 	go func() {
 		h.done <- Run(Args{
-			SessionID: h.sessionID, Cwd: dir, CreatedAt: h.createdAt,
+			SessionID: h.sessionID, Cwd: dir, CreatedAt: h.createdAt, UID: h.uid,
 			AgentName: "sh", Command: "/bin/sh", Args: []string{"-c", script},
 		})
 	}()
@@ -482,7 +485,7 @@ func TestKillEscalatesToSIGKILL(t *testing.T) {
 func TestMissingCwdMarksSessionFailed(t *testing.T) {
 	dir, h := newRoot(t)
 	err := Run(Args{
-		SessionID: h.sessionID, Cwd: filepath.Join(dir, "nope"),
+		SessionID: h.sessionID, Cwd: filepath.Join(dir, "nope"), UID: h.uid,
 		AgentName: "sh", Command: "/bin/sh", Args: []string{"-c", echoAgent},
 	})
 	h.exited = true
@@ -645,7 +648,7 @@ func TestMissingCwdFailsBeforeSpawn(t *testing.T) {
 	t.Setenv("AGENTD_DIR", dir)
 
 	err = Run(Args{
-		SessionID: "missing", Cwd: filepath.Join(dir, "does-not-exist"),
+		SessionID: "missing", Cwd: filepath.Join(dir, "does-not-exist"), UID: "u",
 		AgentName: "sh", Command: "/bin/sh", Args: []string{"-c", "exit 0"},
 	})
 	if err == nil || !strings.Contains(err.Error(), "working directory") {

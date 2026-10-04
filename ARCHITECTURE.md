@@ -28,7 +28,7 @@ Both binaries are one Go module at the repository root.
 | `internal/daemon` | `agentd serve`: lock/socket/pid file lifecycle, create/kill/rm/ls/get, attach and request proxies to workers, history, daemon management, worker supervision and startup reconciliation. Tests run the daemon in-process against real worker processes. |
 | `internal/worker` | One session: PTY via `creack/pty`, shadow terminal via `go.mitchellh.com/libghostty`, per-session Unix socket. Real-PTY tests run under `-race`. |
 | `internal/repo` | Read-only views of the git repository a session works in, for the daemon: git state, the diff and patch artifacts. Runs the system `git`; tests use real temporary repositories. |
-| `internal/transport` | The seam between the protocol and the network: `Stream` (one request or attach session), `Listener`, the shared accept loop, the Unix socket transport, and the QUIC transport with pinned-key identities (`quic-go`). |
+| `internal/transport` | The seam between the protocol and the network: `Stream` (one request or attach session), `Listener`, the shared accept loop, the Unix socket transport, and the QUIC transport with pinned-key identities (`quic-go`). `transporttest` has a UDP relay that tests use as the network. |
 | `internal/protocol` | The framed binary protocol and the small daemon management protocol, used by both binaries. Golden-frame tests pin the bytes. |
 | `internal/session`, `internal/paths`, `internal/config` | The session model (and name rules), runtime-root resolution, and `config.toml`, shared by both binaries. |
 | `internal/db` | `state.db`: schema, and the guarded session state transitions the daemon and workers use. Uses `modernc.org/sqlite` (pure Go). Only the daemon and its workers open it. |
@@ -42,8 +42,9 @@ A few details of the daemon and workers that the sections below do not cover:
   `SessionEnded` to attached clients.
 * PTY input goes through a bounded per-session queue and writer goroutine, so an agent that stops
   reading input never stalls output.
-* Attach is a byte pipe through the daemon, so the daemon never buffers PTY output. Slow-consumer
-  policy lives in the worker (`internal/worker/broadcast.go`).
+* Attach is a byte pipe through the daemon, so the daemon buffers no PTY output beyond one copy
+  buffer per attachment. Slow-consumer policy lives in the worker (`internal/worker/broadcast.go`;
+  see "Slow Clients, Buffering And Backpressure").
 * Worker stderr goes to `logs/<id>.worker.log`; a daemonized `serve` logs to `agentd.log` in the
   root (not `logs/`, where it could collide with a session named `agentd`).
 
@@ -150,15 +151,34 @@ The CLI hides that: when an attach stream fails because its connection was lost
 (`transport.IsConnectionLost`: an idle or handshake timeout, an unreachable network, or the daemon
 closing the connection, say to restart), it stays in raw mode, dials a new connection and attaches
 to the same session again, then repaints from the new snapshot. Session identity never depended on
-the connection, so nothing on the daemon is resumed: the old attachment is simply dropped when the
-daemon notices it. Retries back off from 0.5 to 5 seconds and continue until they succeed or fail
-for a reason a retry cannot fix (a refused or changed key, a session that is gone, a protocol
-error). Meanwhile the bottom row shows the status, and typed input is dropped rather than delivered
-late; only the detach key acts. Output written while disconnected is not replayed; the snapshot
-shows the screen as it is now. Local attachments do not reconnect: the Unix socket only fails when
-the daemon itself goes away.
+the connection, so nothing on the daemon is resumed. The reattach names the session incarnation it
+expects (its UID, so it can never land on a new session that reused the name) and the attachment it
+replaces, which the worker drops at once rather than when the daemon notices the old connection is
+dead (see "Sessions, Incarnations And Attachments"). Retries back off from 0.5 to 5 seconds and
+continue until they succeed or fail for a reason a retry cannot fix (a refused or changed key, a
+session that is gone or was replaced, a protocol error). Meanwhile the bottom row shows the status,
+and typed input is dropped rather than delivered late; only the detach key acts. Output written
+while disconnected is not replayed; the snapshot shows the screen as it is now. Local attachments do
+not reconnect: the Unix socket only fails when the daemon itself goes away.
+
+A path change that QUIC can follow needs no reconnect at all: when a client's address changes
+mid-connection (NAT rebinding, or Wi-Fi to cellular behind the same NAT), quic-go validates the new
+path and moves the connection to it, and every stream on it carries on. A reconnect is only needed
+when the old path dies outright, and the attach above copes with that.
+
+One-shot requests recover the same way. A remote request whose connection is lost after it was
+sent is sent again on a new connection, with the same backoff, if that is safe: a read always, and a
+request with side effects (`new`, `kill`, `rm`, `workspace add|rm`) only because it carries a
+request token the daemon recognises (see "Duplicate And Replayed Requests"). Other requests
+(`send-input`, `detach`) are never sent twice. A daemon that was never reached fails at once.
 
 The daemon's tests run full sessions over QUIC, and over a TCP stand-in, to keep the seam honest.
+The QUIC ones also run through a UDP relay standing in for the network
+(`internal/transport/transporttest`), which can black-hole traffic, block new connections, or move
+a client to a new address: they cover an address change mid-attachment, a hard network switch, an
+outage longer than the dead-peer timeout, a client that stops reading while its session writes
+about 67 MB (checking the daemon's heap and the worker's RSS stay flat), and fifty abrupt reconnects in a row, counting goroutines, file descriptors, streams and attachments
+before and after.
 
 ## Wire Protocol
 
@@ -210,7 +230,7 @@ separate negotiation round trip is needed (`protocol.Request.Role`):
 |---|---|---|
 | request | any one-shot request | one response, then the stream ends |
 | control | `Hello` | `Welcome`, then any number of tagged one-shot requests and their tagged responses, in any order |
-| attach | `AttachSession` | `Attached` with a snapshot, then `PtyOutput` frames one way and `AttachInput`, `AttachResize`, `AttachSnapshot` the other, until either side ends it |
+| attach | `AttachSession` | `Attached` with a snapshot, then `PtyOutput` (and `AttachResync`, if negotiated) frames one way and `AttachInput`, `AttachResize`, `AttachSnapshot` the other, until either side ends it |
 | artifact | `GetArtifact` | `ArtifactChunk` frames, then `EndOfStream` (or an `Error`: the artifact is incomplete). On a stream of its own, a large transfer never delays the control stream or an attachment |
 | artifact | `GetHistory` | one `History` response holding the whole history (the `history` artifacts stream the same content) |
 | management | a version-0 frame | one JSON response |
@@ -225,9 +245,19 @@ blocks another stream on the same connection, and a client never needs more than
 daemon answers `Welcome` with the newest version in both ranges, its own capabilities, and a
 description of its machine (host name, OS, architecture, CPUs, memory, configured agents and the
 default one), or with an `Error` when the ranges do not overlap. Both sides then use only the
-features both listed. Today there is one protocol version (1) and four capabilities:
-`control-stream`, `git-state` (`GetGitState`), `artifacts` (`ListArtifacts`, `GetArtifact`,
-`ArtifactChunk`) and `runtime-stats` (`GetSessionStats`, `GetDaemonStats`).
+features both listed. Today there is one protocol version (1), and these capabilities:
+
+| Capability | Adds |
+|---|---|
+| `control-stream` | tagged requests on the stream that started with `Hello` |
+| `git-state` | `GetGitState` |
+| `artifacts` | `ListArtifacts`, `GetArtifact`, `ArtifactChunk` |
+| `session-uid` | the session UID appended to session records and to `CreateSession`'s answer; on an attach stream, `AttachSession.ExpectUID` and `Attached.SessionUID` |
+| `request-tokens` | a request token appended to `CreateSession`, `KillSession`, `AddWorkspace`, `RemoveWorkspace` |
+| `attach-features` | `AttachSession` may end with the attach stream's own feature list (below) |
+| `attach-replace` | attach stream: `AttachSession.Replaces`, the attachment this one replaces |
+| `attach-resync` | attach stream: the worker may send `AttachResync` |
+| `runtime-stats` | `GetSessionStats`, `GetDaemonStats` |
 
 The protocol grows without breaking older peers this way: a new message kind, or a field appended
 to the end of an existing message or struct (a session record, even inside a list), comes with a
@@ -237,6 +267,16 @@ optional fields to write and the decoder which to expect. Streams without a hand
 encoding. Decoders reject unknown kinds, unknown flags and trailing bytes, so nothing is ever
 silently misread. Changing an existing encoding needs a new protocol version.
 
+Attach streams have no `Hello`, so `AttachSession` carries their handshake: when the daemon's
+`Welcome` listed `attach-features`, the CLI appends the attach-stream capabilities it wants that the
+daemon also listed (`session-uid`, `attach-replace`, `attach-resync`), followed by the fields of the
+ones listed. The daemon cuts the list down to what the session's worker supports (it asks the worker
+with a `Hello` on the worker socket; a worker started by an older daemon build may support fewer,
+and one from before attach features supports none), and the worker's `Attached` echoes the list in
+effect, followed by its fields. Each side uses only what that list names. An older CLI sends no list
+and gets the base `Attached`; an older daemon never advertises the capability, so a newer CLI sends
+none.
+
 The CLI opens one control stream per process, right after connecting, and sends all its one-shot
 requests on it (`internal/cli/control.go`). Each request carries a `u32` id that its response
 echoes; the daemon runs up to 16 requests of one control stream at once and stops reading the
@@ -245,8 +285,8 @@ queued in the daemon. A request that cannot be decoded is answered with an error
 the stream carries on. Requests that need their own stream (attach, artifacts, history) are refused on a
 control stream. An artifact stream has no handshake of its own: the CLI opens one only after its
 control stream's `Welcome` listed `artifacts`. If the control stream has ended when the CLI next uses it (the daemon restarted,
-say), it opens a new one, but never resends a request it already wrote, since the daemon may have
-acted on it.
+say), it opens a new one. A request it already wrote is resent only if that is safe: a read, or a
+tokened request after a lost remote connection (see "Duplicate And Replayed Requests").
 
 ### Messages
 
@@ -271,9 +311,11 @@ acted on it.
 | `GetArtifact` | `ArtifactChunk` frames, then `EndOfStream` (or `Error`) | artifact |
 | `GetSessionStats` | `SessionStats` (`runtime-stats`) | request |
 | `GetDaemonStats` | `DaemonStats` (`runtime-stats`) | request |
-| `AttachSession` | `Attached` (or `SessionEnded` for a finished session), then `PtyOutput`, `AttachSnapshot`, and finally `SessionEnded` or `EndOfStream` | attach |
+| `AttachSession` | `Attached` (or `SessionEnded` for a finished session), then `PtyOutput`, `AttachSnapshot`, `AttachResync`, and finally `SessionEnded`, `EndOfStream` or `Error` | attach |
 
-Any request may instead be answered with `Error`.
+Any request may instead be answered with `Error`. Kinds are numbered by area so that parallel work
+does not collide: 1-19 and 101-118 are the base protocol, 30-39 and 130-139 git state and
+artifacts, 150-159 session resumption (`AttachResync` is 150).
 
 `attach` is the bidirectional case. After the initial `AttachSession` request and `Attached`
 response (which carries a snapshot of the current screen), the worker streams `PtyOutput` frames
@@ -291,7 +333,8 @@ When you create a session (`agent new [--cwd DIR] [NAME]`), the daemon:
    need to be a git repository.
 2. If `cwd` is in a git repository with a commit, reads HEAD's commit and branch: the session's
    base (see "Git State And Artifacts"). Nothing else about git is touched.
-3. Allocates a session id and stores the record, base included, in `<runtime-root>/state.db`.
+3. Allocates a session id (the name) and a new UID, and stores the record, base included, in
+   `<runtime-root>/state.db`.
 4. Spawns `agentd session-worker` in a new process session.
 5. Waits for the worker to report the session running and bind its socket.
 
@@ -407,16 +450,127 @@ RSS over many sessions overstates their cost. libghostty's memory is outside the
 measured in-process (`BenchmarkTerminalMemory`): about 25 KB for a new terminal, and the
 scrollback limit (10 MB) once full.
 
-## Slow Clients
+## Sessions, Incarnations And Attachments
 
-The PTY is never blocked by a client. Each attachment has a bounded queue in the worker; a client
-that falls too far behind loses output until it catches up, and its screen is wrong until the
-program repaints or the client reattaches. Resyncing a lagging client from a fresh snapshot is
-planned. See `internal/worker/broadcast.go`.
+A session's id is its name. Names are unique among the sessions that exist, but a name is free
+again once its session is removed, so a name alone cannot tell a client whether the session it
+knew is the one there now. Every session therefore also has a UID: 128 random bits, generated when
+the session is created, stored in `state.db` and never changed or reused. One UID is one
+incarnation of a name. `agent status` shows it. When several hosts are known to one client, a
+global id is the host's identity (its key fingerprint) plus the UID; neither part depends on the
+name.
 
-Input goes the other way through one bounded queue per session, drained by a dedicated writer.
-An agent that stops reading its input therefore never stalls PTY output or other requests; once
-the queue is full, further input is refused with an error until the agent catches up.
+An attachment is one client's live view of one incarnation, from `AttachSession` until it ends. Its
+lifecycle, all in the worker (`internal/worker/worker.go`, `serveAttach`):
+
+1. **Attach.** The worker numbers it `<kind>-<n>` (`attach-3`, `tui-1`), where `n` counts in the
+   session's row in `state.db`: ids are never reused within an incarnation, not even by a later
+   worker for the same session. (Reuse would let a client that names an old id, to replace it or
+   `agent detach --attach` it, hit someone else's attachment.) On the owner goroutine it then takes
+   the snapshot, applies the client's size, subscribes the attachment to output and lists it, in one
+   step, so the snapshot is an exact boundary: the output that follows continues it. `Attached`
+   carries the id and the snapshot (and with `session-uid`, the UID).
+2. **Live.** Output flows to the client through its bounded queue (below); its input, resizes and
+   snapshot requests flow back. Several attachments may be live at once; input is shared and resize
+   is last-writer-wins.
+3. **End.** Any of: the client half-closes the stream (detach) or its stream fails (disconnect, a
+   dead peer noticed after the 15-second timeout, a write that fails); `DetachAttachment` or
+   `DetachSession` names it; a later attach replaces it; the session ends (`SessionEnded` follows
+   the last output); the agent stops reading input and the input queue overflows (`Error`). The
+   attachment is unsubscribed and unlisted on the owner goroutine as its handler returns. A handler
+   blocked writing to a client that stopped reading is given 2 seconds to finish once it is told to
+   end, then its write is failed.
+
+The session never depends on any of this: it runs with no attachments at all.
+
+A reattach after a lost connection is a new attachment with a new id; nothing of the old one is
+resumed, and the screen is restored from the new snapshot. It carries two things from the old one.
+`ExpectUID` makes the daemon (checking `state.db`) and the worker (checking its own UID) refuse the
+attach if the name now belongs to another incarnation: the CLI reports that the session was
+replaced and stops, rather than attaching the user's terminal and keystrokes to a session they never
+saw. `Replaces` names the old attachment, which the worker drops at once (it is unlisted and stops
+receiving output immediately; its handler ends within the 2-second grace) instead of keeping it
+until its connection is noticed dead. A replace is honoured only together with a matching
+`ExpectUID`, since ids are only unique within an incarnation.
+
+### Output positions
+
+Attach streams carry no output offsets or sequence numbers, deliberately. What a terminal client
+needs after any gap (a reconnect, or output dropped because it lagged) is the current screen, and
+the worker supplies exactly that: a snapshot taken on the owner goroutine, where output is
+published, is an exact boundary in that client's stream, with everything before it inside the
+snapshot and everything after it following as output. Offsets would only help a client that wants
+the missed bytes themselves, which would mean the worker retaining a replay buffer per session, and
+a terminal does not need them: replaying them would only redraw what the snapshot already shows. A
+consumer that wants the full transcript reads history instead.
+
+## Duplicate And Replayed Requests
+
+A client whose connection dies after it sent a request cannot know whether the daemon acted on it.
+Reads are simply asked again. Requests with side effects carry a client-chosen token
+(`request-tokens`): `CreateSession`, `KillSession` (stop and `rm`), `AddWorkspace` and
+`RemoveWorkspace`. The CLI generates one random token per command and, if the connection to a
+remote daemon is lost after sending, sends the same request with the same token on a new
+connection. The daemon answers a token it has seen with the original answer: a retried `new`
+returns the session it created (waiting for it to finish starting if need be), not "already
+exists"; a retried `kill` or `rm` returns what the first one did, not "not running" or "not found".
+A duplicate that arrives while the first is still running waits for it. A token reused for a
+different request is refused.
+
+`CreateSession`'s token is stored on the session's row (`sessions.create_token`, unique), so a
+retry finds the session even across a daemon restart. The others are remembered in memory for 10
+minutes, at most 4096 of them (`internal/daemon/replay.go`); after a daemon restart a retried
+`kill` or `rm` reports what it finds, which is the state the client asked for. `send-input` and
+`detach` carry no token and are never resent.
+
+## Slow Clients, Buffering And Backpressure
+
+The PTY is never blocked by a client, and nothing buffers without bound. Every stage on the path
+between the PTY and a client either blocks its producer (backpressure) or, at exactly one place,
+drops with a defined recovery.
+
+Output, per attachment, from the PTY to the screen:
+
+| Stage | Bound | When full |
+|---|---|---|
+| PTY read (worker) | 8 KiB per read, published on the owner goroutine | never full: publish never blocks |
+| Subscriber queue (worker, `broadcast.go`) | 1024 reads and 1 MiB, whichever first | the chunk is dropped and the attachment marked lagged |
+| Attach handler (worker) | one frame being written: 8 KiB of output, or one snapshot | blocks: the queue above fills |
+| Worker to daemon Unix socket | kernel socket buffers (8 KiB each way on macOS, about 200 KiB on Linux) | blocks the handler |
+| Daemon proxy (`proxy.go`) | one 32 KiB copy buffer | blocks: stops reading the worker |
+| QUIC stream (remote only) | the client's stream receive window (`quicConfig`): 512 KiB, grown towards 4 MiB only for a reader that keeps up; 16 MiB per connection | blocks the daemon's copy for this stream only |
+| CLI frame queue (`attach.go`) | 16 decoded frames plus a 4 KiB read buffer | stops reading: the window above fills |
+| Terminal | the CLI writes to stdout synchronously | stops the CLI's loop: the queue above fills |
+
+So a remote client that stops reading holds at most about 1 MiB plus one snapshot in the worker,
+32 KiB plus QUIC's unacknowledged data (at most its window) in the daemon, and the window plus 16
+frames in the CLI. The rest of its output is dropped in the worker. Over QUIC each attachment is its
+own stream with its own flow control, so the stall stops at that stream: other attachments and
+requests on the same connection, and other clients, keep flowing. Over the Unix socket the same
+holds per connection.
+
+Recovery from the drop is a resync. The client asks for it in its attach feature list
+(`attach-resync`). Once its queue overflows, the worker sends the next thing it can, at the moment
+the client has drained what was in flight (the blocked write went through), as an `AttachResync`:
+a fresh snapshot taken on the owner goroutine, discarding what was queued, which is an exact
+boundary like any other snapshot. The CLI clears the screen and paints it, so the screen is correct
+again however much was dropped; with the overlay open it ignores it, since closing the overlay
+repaints from a snapshot anyway. If output keeps arriving faster than the client takes it, it gets
+a resync each time it drains, which keeps it as current as its link allows. A client that stalls
+outright may do so with a resync already in its blocked write; when it reads again it gets that
+stale one first and, since it lagged meanwhile, a fresh one right after. A client that did not
+ask for resyncs (an older CLI) keeps the old behaviour: its screen is wrong until the program
+repaints or it reattaches. A snapshot is the screen plus retained scrollback (scrollback memory is
+capped at 10 MB), typically some hundreds of KiB.
+
+Input goes the other way: the CLI's stdin reader queues up to 32 reads of 4 KiB; the CLI writes
+input frames to the stream as the user types, blocking when the stream's window is full; the
+daemon's proxy copies through one 32 KiB buffer; the worker's attach handler reads one request at
+a time and hands input to one bounded queue per session (256 writes and 4 MiB), drained by a
+dedicated writer. An agent that stops reading its input therefore never stalls PTY output or other
+requests. Once the queue is full, further input is refused with an error until the agent catches
+up: `send-input` gets the error, and an attachment ends with it rather than silently dropping
+keystrokes.
 
 ## Runtime Root
 
@@ -441,7 +595,7 @@ The selected root contains:
 * `agentd.sock`
 * `agentd.lock` (held by the running daemon)
 * `agentd.pid` (informational)
-* `state.db` (schema v3; older versions are migrated forward, newer ones refused. Migrations
+* `state.db` (schema v4; older versions are migrated forward, newer ones refused. Migrations
   must be additive, because session workers keep writing to the file across daemon upgrades)
 * `sessions/` (one socket per live session)
 * `agentd.log` (output of a daemonized daemon)
