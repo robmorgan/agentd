@@ -118,28 +118,62 @@ func listLayout(width int, summaries bool) sessionListLayout {
 }
 
 func renderSessionListLines(sessions []session.Record, width int, now time.Time) []string {
+	return renderSessionList(sessions, nil, width, now)
+}
+
+// renderSessionList renders `agent list`. hosts, when not nil, names the
+// host of each session (hosts[i] for sessions[i]) and adds a HOST column,
+// for `agent list --all`.
+func renderSessionList(sessions []session.Record, hosts []string, width int, now time.Time) []string {
+	index := make(map[*session.Record]int, len(sessions))
+	for i := range sessions {
+		index[&sessions[i]] = i
+	}
 	rows := make([]displayRow, 0, len(sessions))
+	rowHosts := make([]string, 0, len(sessions))
 	summaries := false
+	hostWidth := 0
+	if hosts != nil {
+		hostWidth = len("HOST")
+		for _, h := range hosts {
+			hostWidth = max(hostWidth, runeLen(h))
+		}
+	}
 	for _, s := range orderedSessions(sessions) {
 		row := buildDisplayRow(s, now)
 		summaries = summaries || row.summary != ""
 		rows = append(rows, row)
+		if hosts != nil {
+			rowHosts = append(rowHosts, hosts[index[s]])
+		}
 	}
-	l := listLayout(width, summaries)
-	headerRow := fmt.Sprintf("  %s  %s  %s  %s  %s", formatCell("RUN", l.run), formatCell("AGE", l.age), formatCell("NAME", l.name),
+	l := listLayout(width-hostWidth-min(hostWidth, 2), summaries)
+	hostCell := func(text string) string {
+		if hostWidth == 0 {
+			return ""
+		}
+		return formatCell(text, hostWidth) + "  "
+	}
+	headerRow := fmt.Sprintf("  %s  %s  %s%s  %s  %s", formatCell("RUN", l.run), formatCell("AGE", l.age), hostCell("HOST"), formatCell("NAME", l.name),
 		formatCell("ACTIVITY", l.activity), formatCell("CWD", l.cwd))
 	if l.summary > 0 {
 		headerRow += "  " + formatCell("ATTENTION", l.summary)
 	}
-	lines := []string{pickerQueryBG + pickerTextFG + takeRunes(headerRow, l.visible) + ansiReset}
+	visible := l.visible + hostWidth + min(hostWidth, 2)
+	lines := []string{pickerQueryBG + pickerTextFG + takeRunes(headerRow, visible) + ansiReset}
 	if len(sessions) == 0 {
-		return append(lines, truncateCell("  No sessions.", l.visible))
+		return append(lines, truncateCell("  No sessions.", visible))
 	}
-	for _, row := range rows {
+	for i, row := range rows {
 		icon, iconStyle := rowIcon(row)
-		line := fmt.Sprintf("  %s  %s  %s  %s  %s",
+		host := ""
+		if hosts != nil {
+			host = styleAge(hostCell(rowHosts[i]))
+		}
+		line := fmt.Sprintf("  %s  %s  %s%s  %s  %s",
 			iconStyle+formatCell(icon, l.run)+ansiReset,
 			styleAge(formatCell(row.age, l.age)),
+			host,
 			styleName(formatCell(row.name, l.name)),
 			formatCell(row.activity, l.activity),
 			styleCwd(formatPathCell(row.cwd, l.cwd)))

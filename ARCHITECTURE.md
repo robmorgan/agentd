@@ -264,6 +264,7 @@ features both listed. Today there is one protocol version (1), and these capabil
 | `attach-replace` | attach stream: `AttachSession.Replaces`, the attachment this one replaces |
 | `attach-resync` | attach stream: the worker may send `AttachResync` |
 | `runtime-stats` | `GetSessionStats`, `GetDaemonStats` |
+| `daemon-id` | the daemon's id appended to `Welcome` |
 | `events` | events streams (`SubscribeEvents`), `ListEvents` |
 | `session-activity` | the activity fields appended to session records (after the UID): activity, foreground command, title, last output and attention times |
 
@@ -668,6 +669,25 @@ dedicated writer. An agent that stops reading its input therefore never stalls P
 requests. Once the queue is full, further input is refused with an error until the agent catches
 up: `send-input` gets the error, and an attachment ends with it rather than silently dropping
 keystrokes.
+
+## Multiple Hosts
+
+Each host's daemon owns its own sessions; there is no directory of sessions anywhere else. The CLI
+makes several hosts feel like one workspace by asking each in turn (`internal/cli/hosts.go`,
+`allhosts.go`): `agent hosts` probes this machine's daemon and every host in `hosts.toml` in
+parallel within four seconds; `agent ls --all` merges their session lists into one, ordered by
+what needs attention first, with a HOST column; `agent events --all` follows every host's event
+stream on its own connection, each resuming after its own last event. An unreachable host is
+reported and skipped, never waited on.
+
+A session's global identifier is its daemon's id and its UID (`protocol.GlobalSessionID`). The
+daemon's id is the fingerprint of its key (`remote/daemon.key`, created at startup if missing),
+which is also what remote clients pin, so a host has one id however clients name it. The UID
+changes with every incarnation of a name. `host/name` stays the address people type; the global id
+is what scripts can keep (`agent ls --json`, `agent status`).
+
+`agent --host auto new` is a placement hint, not a scheduler: among hosts that are online, have the
+agent and (with `--workspace`) the workspace, it picks the fewest running sessions per CPU.
 
 ## Runtime Root
 

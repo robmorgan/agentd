@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/robmorgan/agentd/internal/protocol"
@@ -29,12 +30,12 @@ import (
 // runs a command for each event.
 
 type eventsOptions struct {
-	follow, json, notify bool
-	exec                 string
-	lines                int
-	after                uint64
-	afterSet             bool
-	level                string
+	follow, json, notify, all bool
+	exec                      string
+	lines                     int
+	after                     uint64
+	afterSet                  bool
+	level                     string
 }
 
 // eventsFollowRetry bounds the backoff between reconnects while following.
@@ -51,11 +52,34 @@ func (a *app) events(sessionArg string, opts eventsOptions) error {
 	if opts.lines < 0 || opts.lines > 1000 {
 		return usageError{errors.New("--lines must be between 0 and 1000")}
 	}
+	h := &eventHandler{json: opts.json, exec: opts.exec, minLevel: minLevel, out: os.Stdout, mu: &sync.Mutex{}}
+	if opts.notify {
+		h.alerts = openAlertTerminal()
+		if h.alerts == nil {
+			fmt.Fprintln(os.Stderr, "agent events: no terminal to notify on; --notify does nothing")
+		} else {
+			defer h.alerts.Close()
+		}
+	}
+	if opts.all {
+		if sessionArg != "" || a.host != "" {
+			return usageError{errors.New("--all lists every host's events; it takes no session or --host")}
+		}
+		return a.eventsAllHosts(opts, h)
+	}
 	id := sessionArg
 	c, err := a.connect([]*string{&id}, "", nil)
 	if err != nil {
 		return err
 	}
+	hh := *h
+	hh.host = c.remoteName()
+	return c.runEvents(id, opts, &hh)
+}
+
+// runEvents prints this client's daemon's events for session id (all
+// sessions when ""), then follows them if asked.
+func (c *client) runEvents(id string, opts eventsOptions, h *eventHandler) error {
 	w, err := c.welcome()
 	if err != nil {
 		return err
@@ -66,16 +90,6 @@ func (a *app) events(sessionArg string, opts eventsOptions) error {
 	var sessionID *string
 	if id != "" {
 		sessionID = &id
-	}
-
-	h := &eventHandler{host: c.remoteName(), json: opts.json, exec: opts.exec, minLevel: minLevel, out: os.Stdout}
-	if opts.notify {
-		h.alerts = openAlertTerminal()
-		if h.alerts == nil {
-			fmt.Fprintln(os.Stderr, "agent events: no terminal to notify on; --notify does nothing")
-		} else {
-			defer h.alerts.Close()
-		}
 	}
 
 	var cursor uint64
@@ -111,6 +125,57 @@ func (a *app) events(sessionArg string, opts eventsOptions) error {
 		return nil
 	}
 	return c.followEvents(cursor, sessionID, h)
+}
+
+// eventsAllHosts runs `agent events --all`: one reader per host (this
+// machine's daemon and every host in hosts.toml), each on its own
+// goroutine with its own connection, sharing one handler whose lock keeps
+// their lines whole. Event ids are per host, so --after is refused. Without
+// --follow it waits for every host; with it, a host that cannot be reached
+// yet is retried with backoff, like a lost stream, until interrupted.
+func (a *app) eventsAllHosts(opts eventsOptions, h *eventHandler) error {
+	if opts.afterSet {
+		return usageError{errors.New("--after names an event of one host; it cannot be used with --all")}
+	}
+	local := &client{paths: a.paths}
+	if err := local.ensureDaemon(); err != nil {
+		return err
+	}
+	local.close()
+	hosts, err := transport.ReadHosts(a.paths.HostsPath())
+	if err != nil {
+		return err
+	}
+	clients := []*client{{paths: a.paths}}
+	for i := range hosts {
+		clients = append(clients, &client{paths: a.paths, host: &hosts[i]})
+	}
+	var wg sync.WaitGroup
+	for _, c := range clients {
+		hh := *h
+		hh.host = c.remoteName()
+		if hh.host == "" {
+			hh.host = localHostName
+		}
+		wg.Go(func() {
+			defer c.close()
+			delay := time.Duration(0)
+			for {
+				err := c.runEvents("", opts, &hh)
+				if err == nil || !opts.follow || errors.Is(err, errHandler) || !(transport.IsConnectionLost(err) || errors.Is(err, context.DeadlineExceeded)) {
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "agent events: %s: %v\n", hh.host, err)
+					}
+					return
+				}
+				delay = min(max(2*delay, eventsFirstRetry), eventsMaxRetry)
+				c.close()
+				time.Sleep(delay)
+			}
+		})
+	}
+	wg.Wait()
+	return nil
 }
 
 // listEventsAfter prints events after cursor, page by page, up to limit
@@ -225,9 +290,16 @@ type eventHandler struct {
 	out      io.Writer
 	// alerts is the terminal --notify writes to, or nil.
 	alerts *os.File
+	// mu, shared by the handlers of every host with --all, keeps one
+	// event's output and command from interleaving with another's.
+	mu *sync.Mutex
 }
 
 func (h *eventHandler) handle(ev session.Event) error {
+	if h.mu != nil {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+	}
 	if ev.Attention.Rank() < h.minLevel.Rank() {
 		return nil
 	}

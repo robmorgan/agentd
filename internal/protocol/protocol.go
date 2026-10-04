@@ -848,6 +848,11 @@ func encodeResponse(resp *Response, f Features) (kind, []byte, error) {
 		e.u64(w.Host.MemoryBytes)
 		e.strs(w.Host.Agents)
 		e.str(w.Host.DefaultAgent)
+		// Appended (CapDaemonID); set only for a client whose Hello
+		// listed the capability, so older clients never see it.
+		if w.DaemonID != "" {
+			e.str(w.DaemonID)
+		}
 		return kWelcomeResponse, e.buf, e.err
 	case resp.GitState != nil:
 		e.gitState(resp.GitState)
@@ -963,6 +968,9 @@ func decodeResponse(k kind, payload []byte, f Features) (*Response, error) {
 		w.Host = HostInfo{
 			Name: d.str(), OS: d.str(), Arch: d.str(), CPUs: d.u32(), MemoryBytes: d.u64(),
 			Agents: d.strs(), DefaultAgent: d.str(),
+		}
+		if d.more() {
+			w.DaemonID = d.str()
 		}
 		resp.Welcome = w
 	case kGitStateResponse:

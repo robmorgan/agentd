@@ -81,6 +81,9 @@ type Server struct {
 	lockWait  time.Duration
 	// startedAt is when this daemon was created, for its uptime in stats.
 	startedAt time.Time
+	// daemonID identifies this runtime root's daemon across hosts (see
+	// protocol.CapDaemonID).
+	daemonID string
 
 	// remoteAddr is where the QUIC listener is bound, if remote access is
 	// enabled and it started.
@@ -129,7 +132,14 @@ func New(p *paths.AppPaths, workerBin string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The daemon's id is its key's fingerprint, the identity remote clients
+	// pin, so local and remote clients see one id per runtime root.
+	id, err := transport.LoadOrCreateIdentity(p.RemoteKeyPath())
+	if err != nil {
+		return nil, fmt.Errorf("failed to load the daemon's key: %w", err)
+	}
 	return &Server{
+		daemonID:  id.Fingerprint,
 		paths:     p,
 		db:        store,
 		config:    cfg,

@@ -174,3 +174,18 @@ func TestNegotiateFeatures(t *testing.T) {
 		t.Fatal("the zero Features has a capability")
 	}
 }
+
+// The daemon id is appended to Welcome only for clients that asked for
+// it; a Welcome without it still decodes.
+func TestWelcomeDaemonID(t *testing.T) {
+	w := &Welcome{Version: 1, DaemonVersion: "v", Capabilities: []string{CapDaemonID}, Host: HostInfo{Agents: []string{"a"}}, DaemonID: "SHA256:abc"}
+	roundTripResponse(t, &Response{Welcome: w})
+	w.DaemonID = ""
+	roundTripResponse(t, &Response{Welcome: w})
+	if got := GlobalSessionID("SHA256:abc", "00ff"); got != "SHA256:abc/00ff" {
+		t.Fatalf("global id = %q", got)
+	}
+	if GlobalSessionID("", "00ff") != "" || GlobalSessionID("SHA256:abc", "") != "" {
+		t.Fatal("a global id needs both parts")
+	}
+}

@@ -75,6 +75,23 @@ func TestControlStreamHandshake(t *testing.T) {
 		t.Fatalf("agents = %v default %q", w.Host.Agents, w.Host.DefaultAgent)
 	}
 
+	// The daemon's id is its key's fingerprint, sent only to a client that
+	// lists the capability.
+	key, err := transport.LoadOrCreateIdentity(h.paths.RemoteKeyPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.DaemonID != key.Fingerprint {
+		t.Fatalf("daemon id = %q, want %q", w.DaemonID, key.Fingerprint)
+	}
+	old := h.dial()
+	defer old.Close()
+	old.SetDeadline(time.Now().Add(testTimeout))
+	protocol.WriteRequest(old, &protocol.Request{Hello: &protocol.Hello{MinVersion: 1, MaxVersion: 1, Capabilities: []string{protocol.CapControlStream}}})
+	if resp := mustRead(t, old); resp.Welcome == nil || resp.Welcome.DaemonID != "" {
+		t.Fatalf("welcome for a client without daemon-id = %#v", resp.Welcome)
+	}
+
 	// A client whose versions do not overlap is refused in its own framing.
 	conn := h.dial()
 	defer conn.Close()
