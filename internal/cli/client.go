@@ -559,6 +559,14 @@ func describeResponse(r *protocol.Response) string {
 		return "Workspaces"
 	case r.Workspace != nil:
 		return "Workspace"
+	case r.Welcome != nil:
+		return "Welcome"
+	case r.GitState != nil:
+		return "GitState"
+	case r.Artifacts != nil:
+		return "Artifacts"
+	case r.ArtifactChunk != nil:
+		return "ArtifactChunk"
 	}
 	return "unknown"
 }

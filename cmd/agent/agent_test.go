@@ -427,6 +427,96 @@ func TestRemoteAttachEndToEnd(t *testing.T) {
 	tm.wait()
 }
 
+// gitIn runs git in dir for test setup, standing in for an agent at work.
+func gitIn(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1",
+		"GIT_AUTHOR_NAME=Agent", "GIT_AUTHOR_EMAIL=agent@example.com",
+		"GIT_COMMITTER_NAME=Agent", "GIT_COMMITTER_EMAIL=agent@example.com")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+// What a session produced, locally and over QUIC: its diff, a diffstat,
+// the git section of status, and downloadable artifacts.
+func TestDiffAndArtifactsEndToEnd(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+	e := newEnv(t, "\n[remote]\nlisten = \"127.0.0.1:0\"\n")
+	gitIn(t, e.work, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(e.work, "README"), []byte("hello\n"), 0o644)
+	gitIn(t, e.work, "add", ".")
+	gitIn(t, e.work, "commit", "-q", "-m", "initial")
+	e.startAndDetach("demo")
+
+	// The agent commits something, then leaves an edit and a new file.
+	os.WriteFile(filepath.Join(e.work, "feature.go"), []byte("package feature\n"), 0o644)
+	gitIn(t, e.work, "add", ".")
+	gitIn(t, e.work, "commit", "-q", "-m", "add the feature")
+	os.WriteFile(filepath.Join(e.work, "README"), []byte("hello\nworld\n"), 0o644)
+	os.WriteFile(filepath.Join(e.work, "notes.txt"), []byte("todo\n"), 0o644)
+
+	diff := e.mustRun("agent", "diff", "demo")
+	for _, want := range []string{"+++ b/feature.go", "+world", "+++ b/notes.txt"} {
+		if !strings.Contains(diff, want) {
+			t.Fatalf("diff lacks %q:\n%s", want, diff)
+		}
+	}
+	if strings.Contains(diff, "\x1b[") {
+		t.Fatalf("diff to a pipe is coloured:\n%q", diff)
+	}
+	if out := e.mustRun("agent", "diff", "--name-only", "demo"); out != "README\nfeature.go\nnotes.txt\n" {
+		t.Fatalf("--name-only:\n%s", out)
+	}
+	if out := e.mustRun("agent", "diff", "--stat", "demo"); !strings.Contains(out, " feature.go | 1 +") || !strings.Contains(out, "3 files changed, 3 insertions(+)") {
+		t.Fatalf("--stat:\n%s", out)
+	}
+	status := e.mustRun("agent", "status", "demo")
+	for _, want := range []string{"git_branch: main", "git_commits: 1 since base", "add the feature (Agent,", "git_changed_files: 3 (1 added, 1 modified, 1 untracked), +3 -0"} {
+		if !strings.Contains(status, want) {
+			t.Fatalf("status lacks %q:\n%s", want, status)
+		}
+	}
+	if out := e.mustRun("agent", "artifacts", "demo"); !strings.Contains(out, "diff\tdiff\t-\t") || !strings.Contains(out, "patch\tpatch\t-\t1 commit since") || !strings.Contains(out, "history.vt\t") {
+		t.Fatalf("artifacts:\n%s", out)
+	}
+	mbox := filepath.Join(e.root, "out.mbox")
+	e.mustRun("agent", "artifact", "demo", "patch", "-o", mbox)
+	if data, _ := os.ReadFile(mbox); !bytes.Contains(data, []byte("Subject: [PATCH] add the feature")) {
+		t.Fatalf("patch artifact:\n%s", data)
+	}
+	if out, err := e.run("agent", "artifact", "demo", "nope", "-o", filepath.Join(e.root, "nope")); err == nil || !strings.Contains(out, "no artifact `nope`") {
+		t.Fatalf("unknown artifact: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(e.root, "nope")); err == nil {
+		t.Fatal("a failed download left a file behind")
+	}
+
+	// The same over QUIC, with --host and with a host/session address.
+	info := e.mustRun("agent", "daemon", "info")
+	addr := ""
+	for _, line := range strings.Split(info, "\n") {
+		if v, ok := strings.CutPrefix(line, "remote: "); ok {
+			addr = v
+		}
+	}
+	e.mustRun("agent", "host", "add", "dev", addr, "--fingerprint", strings.TrimSpace(e.mustRun("agentd", "remote", "id")))
+	e.mustRun("agentd", "remote", "authorize", strings.TrimSpace(e.mustRun("agent", "remote", "id")), "test")
+	if remote := e.mustRun("agent", "--host", "dev", "diff", "demo"); remote != diff {
+		t.Fatalf("remote diff differs:\n%s", remote)
+	}
+	if out := e.mustRun("agent", "diff", "--name-only", "dev/demo"); out != "README\nfeature.go\nnotes.txt\n" {
+		t.Fatalf("remote --name-only:\n%s", out)
+	}
+	if out := e.mustRun("agent", "artifact", "dev/demo", "patch"); !strings.Contains(out, "Subject: [PATCH] add the feature") {
+		t.Fatalf("remote patch:\n%s", out)
+	}
+}
+
 // A remote attachment survives the daemon going away: the CLI shows that it
 // is reconnecting, attaches to the same session again when the daemon is
 // back, and the detach key still works while it waits.

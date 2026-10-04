@@ -489,14 +489,14 @@ One slow session should not unnecessarily stall unrelated sessions.
 * [x] Authenticate machines/clients (mutual TLS: authorized client keys, pinned daemon key)
 * [x] Define stream roles (one bidirectional stream per request or attachment)
 * [x] Define stream negotiation (a stream's first frame sets its role)
-* [ ] Support remote:
+* [x] Support remote:
 
   * [x] `ls`
   * [x] `new` (`agent --host H new --cwd DIR`)
   * [x] `attach`
   * [x] `send`
   * [x] `history`
-  * [ ] `diff`
+  * [x] `diff` (`agent diff HOST/SESSION`, and `agent artifact` for the other artifacts)
   * [x] `kill`
 * [ ] Preserve sessions across network loss
 * [ ] Reconnect cleanly
@@ -586,10 +586,13 @@ Use independent streams.
 
 * [ ] Define stream taxonomy
 * [ ] Make attachment streams independent
-* [ ] Separate large transfers from latency-sensitive terminal traffic
+* [x] Separate large transfers from latency-sensitive terminal traffic (artifacts stream on their
+      own stream as bounded `ArtifactChunk` frames, held back by flow control)
 * [x] Measure flow-control behavior
 * [x] Test slow attachment while another remains interactive
-* [x] Test simultaneous large artifact transfer and interactive PTY
+* [x] Test simultaneous large artifact transfer and interactive PTY (end to end through the daemon
+      too: `TestInteractiveDuringLargeArtifactOverQUIC`, a 48 MiB diff, stalled and at full speed,
+      over one QUIC connection with a live attachment)
 * [x] Benchmark stream creation cost
 * [x] Benchmark many concurrent streams
 * [x] Investigate priority requirements if real workloads demonstrate a need
@@ -841,10 +844,10 @@ agent appears stalled
 * [ ] Surface attention in TUI
 * [ ] Track task elapsed time
 * [ ] Track agent/process status
-* [ ] Expose Git state
-* [ ] Expose produced commits
-* [ ] Expose changed files
-* [ ] Expose artifacts
+* [x] Expose Git state (`GetGitState`, `agent status`; the base is recorded at session creation)
+* [x] Expose produced commits (commits since the base; the `patch` artifact)
+* [x] Expose changed files (staged, unstaged and untracked since the base; `agent diff --stat`)
+* [x] Expose artifacts (`agent artifacts`, `agent artifact`: diff, patch, history)
 * [ ] Support task-level notifications
 
 ## Principle

@@ -96,6 +96,17 @@ agent history fix-tests
 agent history fix-tests --vt
 ```
 
+Review what the agent produced in its git repository: commits, staged and unstaged edits, and
+new files, all since the session started:
+
+```sh
+agent diff fix-tests                   # the whole diff, coloured in a terminal
+agent diff fix-tests --stat            # or a diffstat, or --name-only
+agent status fix-tests                 # includes branch, base, commits and changed files
+agent artifacts fix-tests              # what can be downloaded: diff, patch, history, history.vt
+agent artifact fix-tests patch -o fix-tests.mbox    # the commits, for `git am`
+```
+
 Stop a task:
 
 ```sh
@@ -149,6 +160,8 @@ Clients surface tasks based on attention instead of raw output.
 - PTY scrollback held by each session's worker process and saved to `logs/` when the session ends
 - interactive reattach with `agent attach`
 - background PTY input with `agent send-input`
+- git state and artifacts (`agent diff`, `agent artifacts`), read from the session's directory and
+  streamed apart from terminal traffic
 
 ## Build
 
@@ -204,6 +217,30 @@ agent new --cwd ../wt/auth-refactor auth-refactor
 
 A skill or a wrapper script can package this recipe. Two agents started in the same checkout
 will step on each other; that is your call, not the daemon's.
+
+### What A Session Produced
+
+When a session starts in a git repository, `agentd` records HEAD's commit and branch as the
+session's base. Everything is then measured from there:
+
+- `agent diff NAME` prints one unified diff of everything that differs from the base: commits made
+  since, staged and unstaged changes, and untracked files (respecting `.gitignore`). `--stat` and
+  `--name-only` summarise it. The diff applies to a checkout of the base with `git apply` (binary files are
+  only named in it; the `patch` artifact carries them).
+- `agent status NAME` adds a git section: branch, HEAD, base, upstream with ahead/behind, the
+  commits since the base, and the changed files counted by kind with line totals.
+- `agent artifacts NAME` lists what can be downloaded, and `agent artifact NAME ARTIFACT [-o FILE]`
+  downloads it: `diff`, `patch` (the commits since the base as an mbox, for `git am`), `history` and
+  `history.vt` (the terminal history, plain or with escape sequences). With `-o` the file only
+  appears once the artifact has arrived whole.
+
+These work for ended sessions too, as long as their directory is still there. A session started
+outside a repository, or before `agentd` recorded bases, is compared with HEAD instead.
+
+`agentd` only reads: it runs `git` in the session's directory without taking locks, and never
+writes to the repository, its index or its refs. Untracked files are included by marking them in a
+private copy of the index. Lists are capped (200 commits, 1000 files) and say when they are. A
+download that you stop reading (say, in a pager) simply waits; nothing piles up in the daemon.
 
 ### Workspaces
 
@@ -340,6 +377,7 @@ agent --host devbox ls
 agent attach devbox/auth-refactor
 agent send-input devbox/auth-refactor -- "run the tests"
 agent history devbox/auth-refactor
+agent diff devbox/auth-refactor --stat
 agent rm devbox/auth-refactor
 ```
 
@@ -432,5 +470,7 @@ Current capabilities include:
   own worker process, and a new daemon picks it up again
 - SQLite-backed session metadata
 - per-session PTY history held by the session while it runs and saved to `logs/` when it ends
+- git state and artifacts of a session's repository (`agent diff`, `agent artifacts`), locally and
+  remotely, with large transfers on their own streams so they never stall an attachment
 
 Sessions whose worker dies while no daemon is running are shown as `unknown_recovered`.

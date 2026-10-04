@@ -56,6 +56,10 @@ type Request struct {
 	RemoveWorkspace  *WorkspaceRef
 	// Hello opens a control stream; see handshake.go.
 	Hello *Hello
+	// Git state and artifacts (CapGitState, CapArtifacts); see artifact.go.
+	GetGitState   *SessionRef
+	ListArtifacts *SessionRef
+	GetArtifact   *GetArtifact
 }
 
 type SessionRef struct{ SessionID string }
@@ -137,6 +141,9 @@ type Response struct {
 	Workspaces     *[]session.Workspace
 	Workspace      *session.Workspace
 	Welcome        *Welcome
+	GitState       *session.GitState
+	Artifacts      *[]session.Artifact
+	ArtifactChunk  *Bytes
 }
 
 type DaemonInfo struct {
@@ -193,6 +200,9 @@ const (
 	kAddWorkspaceRequest     kind = 17
 	kRemoveWorkspaceRequest  kind = 18
 	kHelloRequest            kind = 19
+	kGetGitStateRequest      kind = 30
+	kListArtifactsRequest    kind = 31
+	kGetArtifactRequest      kind = 32
 
 	kDaemonInfoResponse     kind = 101
 	kCreateSessionResponse  kind = 102
@@ -212,6 +222,9 @@ const (
 	kWorkspacesResponse     kind = 116
 	kWorkspaceResponse      kind = 117
 	kWelcomeResponse        kind = 118
+	kGitStateResponse       kind = 130
+	kArtifactsResponse      kind = 131
+	kArtifactChunkResponse  kind = 132
 )
 
 // ---------------------------------------------------------------------------
@@ -250,12 +263,7 @@ func writeFrameTagged(w io.Writer, version uint16, k uint16, tagged bool, id uin
 		return fmt.Errorf("frame payload too large: %d bytes (limit %d)", prefix+len(payload), MaxFramePayload)
 	}
 	var header [frameHeaderLen]byte
-	binary.LittleEndian.PutUint32(header[0:4], frameMagic)
-	binary.LittleEndian.PutUint16(header[4:6], version)
-	binary.LittleEndian.PutUint16(header[6:8], k)
-	binary.LittleEndian.PutUint16(header[8:10], flags)
-	binary.LittleEndian.PutUint16(header[10:12], 0)
-	binary.LittleEndian.PutUint32(header[12:16], uint32(prefix+len(payload)))
+	putFrameHeader(header[:], version, k, flags, prefix+len(payload))
 	buf := make([]byte, 0, frameHeaderLen+prefix+len(payload))
 	buf = append(buf, header[:]...)
 	if tagged {
@@ -270,6 +278,17 @@ func writeFrameTagged(w io.Writer, version uint16, k uint16, tagged bool, id uin
 		return f.Flush()
 	}
 	return nil
+}
+
+// putFrameHeader writes a frame header into h, which is frameHeaderLen
+// bytes long.
+func putFrameHeader(h []byte, version, k, flags uint16, payloadLen int) {
+	binary.LittleEndian.PutUint32(h[0:4], frameMagic)
+	binary.LittleEndian.PutUint16(h[4:6], version)
+	binary.LittleEndian.PutUint16(h[6:8], k)
+	binary.LittleEndian.PutUint16(h[8:10], flags)
+	binary.LittleEndian.PutUint16(h[10:12], 0)
+	binary.LittleEndian.PutUint32(h[12:16], uint32(payloadLen))
 }
 
 // readRawFrame returns (nil, nil) on a clean EOF before any header byte.
@@ -501,6 +520,16 @@ func encodeRequest(req *Request, f Features) (kind, []byte, error) {
 		e.str(h.Client)
 		e.strs(h.Capabilities)
 		return kHelloRequest, e.buf, e.err
+	case req.GetGitState != nil:
+		e.str(req.GetGitState.SessionID)
+		return kGetGitStateRequest, e.buf, e.err
+	case req.ListArtifacts != nil:
+		e.str(req.ListArtifacts.SessionID)
+		return kListArtifactsRequest, e.buf, e.err
+	case req.GetArtifact != nil:
+		e.str(req.GetArtifact.SessionID)
+		e.str(req.GetArtifact.Name)
+		return kGetArtifactRequest, e.buf, e.err
 	}
 	return 0, nil, errors.New("empty request")
 }
@@ -556,6 +585,12 @@ func decodeRequest(k kind, payload []byte, f Features) (*Request, error) {
 		req.RemoveWorkspace = &WorkspaceRef{Name: d.str()}
 	case kHelloRequest:
 		req.Hello = &Hello{MinVersion: d.u16(), MaxVersion: d.u16(), Client: d.str(), Capabilities: d.strs()}
+	case kGetGitStateRequest:
+		req.GetGitState = &SessionRef{d.str()}
+	case kListArtifactsRequest:
+		req.ListArtifacts = &SessionRef{d.str()}
+	case kGetArtifactRequest:
+		req.GetArtifact = &GetArtifact{SessionID: d.str(), Name: d.str()}
 	default:
 		return nil, fmt.Errorf("unexpected message kind `%d` while decoding request", k)
 	}
@@ -652,6 +687,21 @@ func encodeResponse(resp *Response, f Features) (kind, []byte, error) {
 		e.strs(w.Host.Agents)
 		e.str(w.Host.DefaultAgent)
 		return kWelcomeResponse, e.buf, e.err
+	case resp.GitState != nil:
+		e.gitState(resp.GitState)
+		return kGitStateResponse, e.buf, e.err
+	case resp.Artifacts != nil:
+		e.length(len(*resp.Artifacts))
+		for _, a := range *resp.Artifacts {
+			e.str(a.Name)
+			e.str(a.Kind)
+			e.str(a.Description)
+			e.optU64(a.Size)
+		}
+		return kArtifactsResponse, e.buf, e.err
+	case resp.ArtifactChunk != nil:
+		e.bytes(resp.ArtifactChunk.Data)
+		return kArtifactChunkResponse, e.buf, e.err
 	}
 	return 0, nil, errors.New("empty response")
 }
@@ -724,6 +774,18 @@ func decodeResponse(k kind, payload []byte, f Features) (*Response, error) {
 			Agents: d.strs(), DefaultAgent: d.str(),
 		}
 		resp.Welcome = w
+	case kGitStateResponse:
+		g := d.gitState()
+		resp.GitState = &g
+	case kArtifactsResponse:
+		n := d.length()
+		artifacts := make([]session.Artifact, 0, d.capacity(n))
+		for i := 0; i < n && d.err == nil; i++ {
+			artifacts = append(artifacts, session.Artifact{Name: d.str(), Kind: d.str(), Description: d.str(), Size: d.optU64()})
+		}
+		resp.Artifacts = &artifacts
+	case kArtifactChunkResponse:
+		resp.ArtifactChunk = &Bytes{d.bytes()}
 	default:
 		return nil, fmt.Errorf("unexpected message kind `%d` while decoding response", k)
 	}
@@ -789,6 +851,15 @@ func (e *encoder) optU32(v *uint32) {
 	}
 	e.u8(1)
 	e.u32(*v)
+}
+
+func (e *encoder) optU64(v *uint64) {
+	if v == nil {
+		e.u8(0)
+		return
+	}
+	e.u8(1)
+	e.u64(*v)
 }
 
 func (e *encoder) optI32(v *int32) {
@@ -1051,6 +1122,14 @@ func (d *decoder) optU32() *uint32 {
 		return nil
 	}
 	v := d.u32()
+	return &v
+}
+
+func (d *decoder) optU64() *uint64 {
+	if !d.bool() {
+		return nil
+	}
+	v := d.u64()
 	return &v
 }
 

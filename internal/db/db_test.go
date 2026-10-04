@@ -108,6 +108,33 @@ PRAGMA user_version = 1;`); err != nil {
 	if _, err := store.AddWorkspace("mono", "/src/mono"); err != nil {
 		t.Fatal(err)
 	}
+	// Sessions from before version 3 recorded no git base.
+	if commit, branch, ok, err := store.GitBase("old"); err != nil || !ok || commit != "" || branch != "" {
+		t.Fatalf("GitBase of a migrated session = %q %q %v %v", commit, branch, ok, err)
+	}
+}
+
+func TestGitBase(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := strings.Repeat("a", 40)
+	if _, err := store.InsertSession(NewSession{SessionID: "repo", Agent: "sh", Mode: session.ModeExecute, Cwd: "/w", GitBase: base, GitBaseBranch: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertSession(NewSession{SessionID: "plain", Agent: "sh", Mode: session.ModeExecute, Cwd: "/tmp"}); err != nil {
+		t.Fatal(err)
+	}
+	if commit, branch, ok, err := store.GitBase("repo"); err != nil || !ok || commit != base || branch != "main" {
+		t.Fatalf("GitBase(repo) = %q %q %v %v", commit, branch, ok, err)
+	}
+	if commit, _, ok, err := store.GitBase("plain"); err != nil || !ok || commit != "" {
+		t.Fatalf("GitBase(plain) = %q %v %v", commit, ok, err)
+	}
+	if _, _, ok, err := store.GitBase("missing"); err != nil || ok {
+		t.Fatalf("GitBase(missing) = %v %v", ok, err)
+	}
 }
 
 func TestWorkspaces(t *testing.T) {

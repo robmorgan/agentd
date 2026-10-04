@@ -225,8 +225,58 @@ func (a *app) commands() []*cobra.Command {
 			return err
 		}
 		printSession(resp.Session)
+		// The git section is extra: a daemon without it, or git failing,
+		// never fails the status.
+		if w, err := c.welcome(); err == nil && protocol.HasCapability(w.Capabilities, protocol.CapGitState) {
+			st, err := c.gitState(id)
+			if err != nil {
+				st = &session.GitState{Error: err.Error()}
+			}
+			printGitState(os.Stdout, st, time.Now())
+		}
 		return nil
 	}), "<SESSION_ID>", "<SESSION_ID>"))
+
+	var diffStat, diffNameOnly bool
+	diff := a.command("diff SESSION", "Show what a session changed in its git repository", oneArg, func(args []string) error {
+		id := args[0]
+		c, err := a.connect([]*string{&id}, "", nil)
+		if err != nil {
+			return err
+		}
+		return c.diff(id, diffStat, diffNameOnly)
+	})
+	diff.Flags().BoolVar(&diffStat, "stat", false, "Show a diffstat instead of the diff")
+	diff.Flags().BoolVar(&diffNameOnly, "name-only", false, "Show only the changed files' names")
+	diff.Annotations = map[string]string{"after": "Notes:\n  The diff covers everything since the session started: commits, staged and\n  unstaged changes, and untracked files. A session started outside a repository\n  (or before agentd recorded where it started) is compared with HEAD instead.\n  Git runs on the daemon's machine and agentd never changes the repository."}
+	cmds = append(cmds, annotate(diff, "[OPTIONS] <SESSION_ID>", "<SESSION_ID>"))
+
+	cmds = append(cmds, annotate(a.command("artifacts SESSION", "List what a session produced that can be downloaded", oneArg, func(args []string) error {
+		id := args[0]
+		c, err := a.connect([]*string{&id}, "", nil)
+		if err != nil {
+			return err
+		}
+		artifacts, err := c.listArtifacts(id)
+		if err != nil {
+			return err
+		}
+		printArtifacts(os.Stdout, artifacts)
+		return nil
+	}), "<SESSION_ID>", "<SESSION_ID>"))
+
+	var artifactOutput string
+	artifact := a.command("artifact SESSION NAME", "Download one of a session's artifacts", twoArgs, func(args []string) error {
+		id := args[0]
+		c, err := a.connect([]*string{&id}, "", nil)
+		if err != nil {
+			return err
+		}
+		return c.downloadArtifact(id, args[1], artifactOutput)
+	})
+	artifact.Flags().StringVarP(&artifactOutput, "output", "o", "", "Write to FILE instead of stdout (only once complete)")
+	withValue(artifact, "output", "FILE")
+	cmds = append(cmds, annotate(artifact, "[OPTIONS] <SESSION_ID> <NAME>", "<SESSION_ID>\n<NAME>        diff, patch, history or history.vt (see `agent artifacts`)"))
 
 	cmds = append(cmds, group("workspace", "Manage named working directories on the daemon's machine",
 		"Name directories on the daemon's machine, then start sessions in them\nwith `agent new --workspace NAME`.",

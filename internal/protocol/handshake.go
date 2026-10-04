@@ -21,8 +21,9 @@ import (
 //     client wants it.
 //   - attach: AttachSession. The interactive stream of one attachment:
 //     snapshot, PTY output, input, resize.
-//   - artifact: GetHistory. One large transfer, kept off the control stream
-//     so it never delays small requests behind it.
+//   - artifact: GetArtifact or GetHistory. One large transfer, kept off the
+//     control stream so it never delays small requests behind it, and off
+//     attachments so it never delays terminal traffic (artifact.go).
 //
 // Over QUIC every stream has its own flow control, so a stalled attachment
 // or a large transfer never blocks another stream on the same connection.
@@ -54,7 +55,7 @@ func (r *Request) Role() StreamRole {
 		return RoleControl
 	case r.AttachSession != nil:
 		return RoleAttach
-	case r.GetHistory != nil:
+	case r.GetHistory != nil, r.GetArtifact != nil:
 		return RoleArtifact
 	}
 	return RoleRequest
@@ -109,6 +110,11 @@ const (
 	// CapControlStream: the daemon serves tagged requests on the stream
 	// that started with Hello.
 	CapControlStream = "control-stream"
+	// CapGitState: GetGitState and its GitState response.
+	CapGitState = "git-state"
+	// CapArtifacts: ListArtifacts, its Artifacts response, and artifact
+	// streams (GetArtifact, answered with ArtifactChunk frames).
+	CapArtifacts = "artifacts"
 )
 
 // MinProtocolVersion is the oldest protocol version this build speaks.
@@ -117,7 +123,7 @@ const MinProtocolVersion uint16 = 1
 
 // Capabilities is what this build supports.
 func Capabilities() []string {
-	return []string{CapControlStream}
+	return []string{CapControlStream, CapGitState, CapArtifacts}
 }
 
 // HasCapability reports whether caps lists c.
