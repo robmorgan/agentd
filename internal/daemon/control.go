@@ -34,6 +34,7 @@ func (s *Server) serveControl(conn transport.Stream, reader *bufio.Reader, hello
 	if err := protocol.WriteResponse(conn, &protocol.Response{Welcome: s.welcome(version)}); err != nil {
 		return err
 	}
+	features := protocol.NegotiateFeatures(protocol.Capabilities(), hello.Capabilities)
 
 	var (
 		writeMu  sync.Mutex
@@ -47,7 +48,7 @@ func (s *Server) serveControl(conn transport.Stream, reader *bufio.Reader, hello
 		if writeErr != nil {
 			return
 		}
-		if writeErr = protocol.WriteTaggedResponse(conn, id, resp); writeErr != nil {
+		if writeErr = protocol.WriteTaggedResponse(conn, features, id, resp); writeErr != nil {
 			// The client is gone or not reading; closing the stream ends
 			// the read loop too.
 			conn.Close()
@@ -56,7 +57,7 @@ func (s *Server) serveControl(conn transport.Stream, reader *bufio.Reader, hello
 	defer inFlight.Wait()
 
 	for {
-		req, id, tagged, err := protocol.ReadTaggedRequest(reader)
+		req, id, tagged, err := protocol.ReadTaggedRequest(reader, features)
 		var decodeErr *protocol.DecodeError
 		switch {
 		case errors.As(err, &decodeErr) && tagged:
@@ -81,7 +82,7 @@ func (s *Server) serveControl(conn transport.Stream, reader *bufio.Reader, hello
 		go func() {
 			defer inFlight.Done()
 			defer func() { <-slots }()
-			resp, after := s.respond(req)
+			resp, after := s.respond(req, features)
 			reply(id, resp)
 			if after != nil {
 				after()

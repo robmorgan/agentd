@@ -110,7 +110,7 @@ func ReadIncoming(r io.Reader) (*Request, *ManagementRequest, error) {
 	if h.tagged {
 		return nil, nil, &DecodeError{Version: h.version, Err: errUnexpectedTag}
 	}
-	req, err := decodeRequest(kind(h.kind), payload)
+	req, err := decodeRequest(kind(h.kind), payload, Features{})
 	if err != nil {
 		return nil, nil, &DecodeError{Version: h.version, Err: err}
 	}

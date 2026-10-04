@@ -37,7 +37,7 @@ func seedFrames(f *testing.F) {
 		WriteRequest(&buf, r)
 		f.Add(buf.Bytes())
 		buf.Reset()
-		WriteTaggedRequest(&buf, 3, r)
+		WriteTaggedRequest(&buf, Features{}, 3, r)
 		f.Add(buf.Bytes())
 	}
 	for _, r := range resps {
@@ -45,7 +45,7 @@ func seedFrames(f *testing.F) {
 		WriteResponse(&buf, r)
 		f.Add(buf.Bytes())
 		buf.Reset()
-		WriteTaggedResponse(&buf, 3, r)
+		WriteTaggedResponse(&buf, Features{}, 3, r)
 		f.Add(buf.Bytes())
 	}
 	var buf bytes.Buffer
@@ -56,20 +56,20 @@ func seedFrames(f *testing.F) {
 func FuzzReadRequest(f *testing.F) {
 	seedFrames(f)
 	f.Fuzz(func(t *testing.T, data []byte) {
-		req, id, tagged, err := ReadTaggedRequest(bytes.NewReader(data))
+		req, id, tagged, err := ReadTaggedRequest(bytes.NewReader(data), Features{})
 		if err != nil || req == nil {
 			return
 		}
 		var buf bytes.Buffer
 		if tagged {
-			err = WriteTaggedRequest(&buf, id, req)
+			err = WriteTaggedRequest(&buf, Features{}, id, req)
 		} else {
 			err = WriteRequest(&buf, req)
 		}
 		if err != nil {
 			t.Fatalf("decoded request does not encode: %v (%#v)", err, req)
 		}
-		again, id2, tagged2, err := ReadTaggedRequest(&buf)
+		again, id2, tagged2, err := ReadTaggedRequest(&buf, Features{})
 		if err != nil || id2 != id || tagged2 != tagged || !reflect.DeepEqual(again, req) {
 			t.Fatalf("request round trip changed it:\n%#v\n%#v (%v)", req, again, err)
 		}
@@ -79,20 +79,20 @@ func FuzzReadRequest(f *testing.F) {
 func FuzzReadResponse(f *testing.F) {
 	seedFrames(f)
 	f.Fuzz(func(t *testing.T, data []byte) {
-		resp, id, tagged, err := ReadTaggedResponse(bytes.NewReader(data))
+		resp, id, tagged, err := ReadTaggedResponse(bytes.NewReader(data), Features{})
 		if err != nil || resp == nil {
 			return
 		}
 		var buf bytes.Buffer
 		if tagged {
-			err = WriteTaggedResponse(&buf, id, resp)
+			err = WriteTaggedResponse(&buf, Features{}, id, resp)
 		} else {
 			err = WriteResponse(&buf, resp)
 		}
 		if err != nil {
 			t.Fatalf("decoded response does not encode: %v (%#v)", err, resp)
 		}
-		again, id2, tagged2, err := ReadTaggedResponse(&buf)
+		again, id2, tagged2, err := ReadTaggedResponse(&buf, Features{})
 		if err != nil || id2 != id || tagged2 != tagged || !reflect.DeepEqual(again, resp) {
 			t.Fatalf("response round trip changed it:\n%#v\n%#v (%v)", resp, again, err)
 		}

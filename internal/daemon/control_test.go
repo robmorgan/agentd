@@ -17,7 +17,8 @@ type controlClient struct {
 	conn   transport.Stream
 	reader *bufio.Reader
 	// welcome is the daemon's answer to Hello.
-	welcome *protocol.Welcome
+	welcome  *protocol.Welcome
+	features protocol.Features
 }
 
 func (h *harness) control() *controlClient {
@@ -34,12 +35,13 @@ func (h *harness) control() *controlClient {
 		h.t.Fatalf("hello: %#v, %v", resp, err)
 	}
 	c.welcome = resp.Welcome
+	c.features = protocol.NegotiateFeatures(protocol.Capabilities(), resp.Welcome.Capabilities)
 	return c
 }
 
 func (c *controlClient) send(id uint32, req *protocol.Request) {
 	c.t.Helper()
-	if err := protocol.WriteTaggedRequest(c.conn, id, req); err != nil {
+	if err := protocol.WriteTaggedRequest(c.conn, c.features, id, req); err != nil {
 		c.t.Fatal(err)
 	}
 }
@@ -47,7 +49,7 @@ func (c *controlClient) send(id uint32, req *protocol.Request) {
 // read returns the next tagged response.
 func (c *controlClient) read() (uint32, *protocol.Response) {
 	c.t.Helper()
-	resp, id, tagged, err := protocol.ReadTaggedResponse(c.reader)
+	resp, id, tagged, err := protocol.ReadTaggedResponse(c.reader, c.features)
 	if err != nil || resp == nil || !tagged {
 		c.t.Fatalf("control response: %#v tagged=%v err=%v", resp, tagged, err)
 	}
@@ -169,7 +171,7 @@ func TestShutdownEndsControlStreams(t *testing.T) {
 	c := h.control()
 	h.stop()
 	c.conn.SetReadDeadline(time.Now().Add(testTimeout))
-	if resp, _, _, err := protocol.ReadTaggedResponse(c.reader); resp != nil {
+	if resp, _, _, err := protocol.ReadTaggedResponse(c.reader, c.features); resp != nil {
 		t.Fatalf("response after shutdown: %#v %v", resp, err)
 	}
 }
