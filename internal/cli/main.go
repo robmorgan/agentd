@@ -30,6 +30,7 @@ Core flows:
   Start a session      agent new fix-flaky-tests
   Inspect sessions     agent list
   Reconnect live PTY   agent attach <name>
+  Review its work      agent diff <name>
   Run somewhere else   agent new --cwd ../wt/fix fix`
 
 const rootExamples = `Examples:

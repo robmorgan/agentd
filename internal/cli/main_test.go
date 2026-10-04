@@ -53,6 +53,11 @@ func TestCommandsParse(t *testing.T) {
 		{[]string{"host", "add", "dev", "10.0.0.1:7433", "--fingerprint", "SHA256:x"}, "agent host add", []string{"dev", "10.0.0.1:7433"}, map[string]string{"fingerprint": "SHA256:x"}},
 		{[]string{"--host", "dev", "ls"}, "agent list", nil, map[string]string{"host": "dev"}},
 		{[]string{"runtime", "demo"}, "agent runtime", []string{"demo"}, nil},
+		{[]string{"diff", "demo"}, "agent diff", []string{"demo"}, nil},
+		{[]string{"diff", "--stat", "dev/demo"}, "agent diff", []string{"dev/demo"}, map[string]string{"stat": "true"}},
+		{[]string{"--host", "dev", "diff", "--name-only", "demo"}, "agent diff", []string{"demo"}, map[string]string{"name-only": "true", "host": "dev"}},
+		{[]string{"artifacts", "demo"}, "agent artifacts", []string{"demo"}, nil},
+		{[]string{"artifact", "demo", "patch", "-o", "out.mbox"}, "agent artifact", []string{"demo", "patch"}, map[string]string{"output": "out.mbox"}},
 	} {
 		cmd, pos := parse(t, tc.args...)
 		if cmd.CommandPath() != tc.path || strings.Join(pos, " ") != strings.Join(tc.pos, " ") {
