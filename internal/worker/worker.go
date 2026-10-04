@@ -83,6 +83,8 @@ type runtime struct {
 	// killed is set once a kill has been requested, so the exit is recorded
 	// as a deliberate stop rather than a failure.
 	killed atomic.Bool
+	// startedAt is when the worker started, for its uptime in stats.
+	startedAt time.Time
 }
 
 // terminateAgent asks the agent's whole process group to exit and escalates
@@ -111,6 +113,7 @@ func signalGroup(pid int, sig syscall.Signal) {
 }
 
 func Run(args Args) error {
+	startedAt := time.Now()
 	p, err := paths.Discover()
 	if err != nil {
 		return err
@@ -196,6 +199,7 @@ func Run(args Args) error {
 		owner:     newOwner(),
 		ended:     &endedSignal{ch: make(chan struct{})},
 		agentPID:  cmd.Process.Pid,
+		startedAt: startedAt,
 	}
 
 	// The daemon stops a session by sending the worker SIGTERM.
@@ -409,6 +413,12 @@ func (rt *runtime) handleConnection(conn transport.Stream) error {
 	case req.KillSession != nil:
 		rt.terminateAgent()
 		return reply(protocol.OkResponse())
+	case req.GetSessionStats != nil:
+		stats, err := rt.stats(req.GetSessionStats.Snapshot)
+		if err != nil {
+			return fail(err)
+		}
+		return reply(&protocol.Response{SessionStats: stats})
 	default:
 		return reply(protocol.ErrorResponsef("unsupported worker request"))
 	}

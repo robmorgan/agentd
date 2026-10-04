@@ -1,0 +1,100 @@
+package protocol
+
+import (
+	"slices"
+	"testing"
+)
+
+var testProcessStats = ProcessStats{
+	PID: 1, RSSBytes: 2, PrivateBytes: 3, CPUUserNanos: 4, CPUSystemNanos: 5, Threads: 6, OpenFDs: 7,
+	UptimeNanos: 8, Goroutines: 9, GoHeapBytes: 10, GoRuntimeBytes: 11,
+}
+
+func TestStatsRoundTrips(t *testing.T) {
+	roundTripRequest(t, &Request{GetSessionStats: &GetSessionStats{SessionID: "demo", Snapshot: true}})
+	roundTripRequest(t, &Request{GetSessionStats: &GetSessionStats{SessionID: "demo"}})
+	roundTripRequest(t, &Request{GetDaemonStats: Empty})
+	roundTripResponse(t, &Response{DaemonStats: &DaemonStats{Daemon: testProcessStats, OpenStreams: 3}})
+	roundTripResponse(t, &Response{SessionStats: &SessionStats{
+		SessionID: "demo", Worker: testProcessStats, Agent: ProcessStats{PID: 9, RSSBytes: 1 << 40},
+		Cols: 160, Rows: 48, ScrollbackRows: 1000, ScrollbackLimitBytes: 10_000_000, Attachments: 2,
+		OutputBytes: 1 << 33, DroppedOutputChunks: 7,
+	}})
+	roundTripResponse(t, &Response{SessionStats: &SessionStats{
+		SessionID: "demo", Snapshot: &SnapshotStats{Bytes: 1, FormatNanos: 2, RestoreNanos: 3},
+	}})
+	if (&Request{GetSessionStats: &GetSessionStats{}}).Role() != RoleRequest || (&Request{GetDaemonStats: Empty}).Role() != RoleRequest {
+		t.Error("stats requests must be one-shot requests, so they can share the control stream")
+	}
+	if !slices.Contains(Capabilities(), CapRuntimeStats) {
+		t.Error("runtime-stats is not advertised")
+	}
+}
+
+// processStatsGolden is testProcessStats's encoding.
+var processStatsGolden = []byte{
+	0x01, 0x00, 0x00, 0x00, // pid
+	0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // rss
+	0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // private
+	0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // cpu user
+	0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // cpu system
+	0x06, 0x00, 0x00, 0x00, // threads
+	0x07, 0x00, 0x00, 0x00, // open fds
+	0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // uptime
+	0x09, 0x00, 0x00, 0x00, // goroutines
+	0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // go heap
+	0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // go runtime
+}
+
+func TestStatsGoldenFrames(t *testing.T) {
+	assertRequestGolden(t, &Request{GetSessionStats: &GetSessionStats{SessionID: "ab", Snapshot: true}}, []byte{
+		0x50, 0x44, 0x47, 0x41, 0x01, 0x00,
+		0x46, 0x00, // GetSessionStats (70)
+		0x00, 0x00, 0x00, 0x00,
+		0x07, 0x00, 0x00, 0x00,
+		0x02, 0x00, 0x00, 0x00, 0x61, 0x62, // session id
+		0x01, // snapshot
+	})
+	assertRequestGolden(t, &Request{GetDaemonStats: Empty}, []byte{
+		0x50, 0x44, 0x47, 0x41, 0x01, 0x00,
+		0x47, 0x00, // GetDaemonStats (71)
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	})
+
+	daemon := []byte{
+		0x50, 0x44, 0x47, 0x41, 0x01, 0x00,
+		0xab, 0x00, // DaemonStats (171)
+		0x00, 0x00, 0x00, 0x00,
+		0x4c, 0x00, 0x00, 0x00,
+	}
+	daemon = append(daemon, processStatsGolden...)
+	daemon = append(daemon, 0x0c, 0x00, 0x00, 0x00) // open streams
+	assertResponseGolden(t, &Response{DaemonStats: &DaemonStats{Daemon: testProcessStats, OpenStreams: 12}}, daemon)
+
+	sess := []byte{
+		0x50, 0x44, 0x47, 0x41, 0x01, 0x00,
+		0xaa, 0x00, // SessionStats (170)
+		0x00, 0x00, 0x00, 0x00,
+		0xd7, 0x00, 0x00, 0x00, // 6 + 72 + 72 + 4 + 16 + 4 + 16 + 1 + 24 = 215
+		0x02, 0x00, 0x00, 0x00, 0x61, 0x62, // session id
+	}
+	sess = append(sess, processStatsGolden...) // worker
+	sess = append(sess, make([]byte, 72)...)   // agent: all zero
+	sess = append(sess,
+		0x50, 0x00, 0x18, 0x00, // cols 80, rows 24
+		0x0d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // scrollback rows
+		0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // scrollback limit
+		0x0f, 0x00, 0x00, 0x00, // attachments
+		0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // output bytes
+		0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // dropped chunks
+		0x01,                                           // snapshot present
+		0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // snapshot bytes
+		0x13, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // format
+		0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // restore
+	)
+	assertResponseGolden(t, &Response{SessionStats: &SessionStats{
+		SessionID: "ab", Worker: testProcessStats, Cols: 80, Rows: 24, ScrollbackRows: 13, ScrollbackLimitBytes: 14,
+		Attachments: 15, OutputBytes: 16, DroppedOutputChunks: 17,
+		Snapshot: &SnapshotStats{Bytes: 18, FormatNanos: 19, RestoreNanos: 20},
+	}}, sess)
+}

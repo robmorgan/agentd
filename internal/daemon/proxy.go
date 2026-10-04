@@ -50,6 +50,18 @@ func (s *Server) forward(id string, req *protocol.Request) *protocol.Response {
 	return resp
 }
 
+// sessionStats asks the session's worker for its resource usage. A worker
+// started by an older agentd (workers outlive daemon upgrades) does not
+// know the request.
+func (s *Server) sessionStats(req *protocol.Request) *protocol.Response {
+	id := req.GetSessionStats.SessionID
+	resp := s.forward(id, req)
+	if resp.Error != nil && resp.Error.Message == "unsupported worker request" {
+		return protocol.ErrorResponsef("session `%s` was started by an older agentd that cannot report resource usage; it will once restarted", id)
+	}
+	return resp
+}
+
 // history serves a session's whole history in one response (GetHistory):
 // live from the worker, or from the logs a worker writes when its session
 // ends. The `history` artifacts stream the same content in chunks.

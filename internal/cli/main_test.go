@@ -49,6 +49,8 @@ func TestCommandsParse(t *testing.T) {
 		{[]string{"workspace", "add", "mono", "~/src"}, "agent workspace add", []string{"mono", "~/src"}, nil},
 		{[]string{"workspace", "ls"}, "agent workspace list", nil, nil},
 		{[]string{"daemon", "restart"}, "agent daemon restart", nil, nil},
+		{[]string{"daemon", "stats"}, "agent daemon stats", nil, nil},
+		{[]string{"status", "--stats", "demo"}, "agent status", []string{"demo"}, map[string]string{"stats": "true"}},
 		{[]string{"daemon", "upgrade"}, "agent daemon upgrade", nil, nil},
 		{[]string{"host", "add", "dev", "10.0.0.1:7433", "--fingerprint", "SHA256:x"}, "agent host add", []string{"dev", "10.0.0.1:7433"}, map[string]string{"fingerprint": "SHA256:x"}},
 		{[]string{"--host", "dev", "ls"}, "agent list", nil, map[string]string{"host": "dev"}},

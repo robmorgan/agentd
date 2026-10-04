@@ -115,6 +115,8 @@ const (
 	// CapArtifacts: ListArtifacts, its Artifacts response, and artifact
 	// streams (GetArtifact, answered with ArtifactChunk frames).
 	CapArtifacts = "artifacts"
+	// CapRuntimeStats: GetSessionStats and GetDaemonStats (stats.go).
+	CapRuntimeStats = "runtime-stats"
 )
 
 // MinProtocolVersion is the oldest protocol version this build speaks.
@@ -123,7 +125,7 @@ const MinProtocolVersion uint16 = 1
 
 // Capabilities is what this build supports.
 func Capabilities() []string {
-	return []string{CapControlStream, CapGitState, CapArtifacts}
+	return []string{CapControlStream, CapGitState, CapArtifacts, CapRuntimeStats}
 }
 
 // HasCapability reports whether caps lists c.

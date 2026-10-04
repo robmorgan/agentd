@@ -214,11 +214,17 @@ func (a *app) commands() []*cobra.Command {
 		return nil
 	}), "<SESSION_ID>", "<SESSION_ID>"))
 
-	cmds = append(cmds, annotate(a.command("status SESSION", "Show detailed session status", oneArg, func(args []string) error {
+	var withStats bool
+	status := a.command("status SESSION", "Show detailed session status", oneArg, func(args []string) error {
 		id := args[0]
 		c, err := a.connect([]*string{&id}, "", nil)
 		if err != nil {
 			return err
+		}
+		if withStats {
+			if err := c.requireStats(); err != nil {
+				return err
+			}
 		}
 		resp, err := c.call(&protocol.Request{GetSession: &protocol.SessionRef{SessionID: id}}, 0, func(r *protocol.Response) bool { return r.Session != nil })
 		if err != nil {
@@ -234,8 +240,17 @@ func (a *app) commands() []*cobra.Command {
 			}
 			printGitState(os.Stdout, st, time.Now())
 		}
+		if withStats && resp.Session.Status == session.StatusRunning {
+			stats, err := c.sessionStats(id)
+			if err != nil {
+				return err
+			}
+			printSessionStats(os.Stdout, stats)
+		}
 		return nil
-	}), "<SESSION_ID>", "<SESSION_ID>"))
+	})
+	status.Flags().BoolVar(&withStats, "stats", false, "Also show the session's resource usage (memory, CPU, threads, files)")
+	cmds = append(cmds, annotate(status, "[OPTIONS] <SESSION_ID>", "<SESSION_ID>"))
 
 	var diffStat, diffNameOnly bool
 	diff := a.command("diff SESSION", "Show what a session changed in its git repository", oneArg, func(args []string) error {
@@ -335,6 +350,16 @@ func (a *app) commands() []*cobra.Command {
 				return err
 			}
 			return c.printDaemonStatus()
+		}),
+		a.command("stats", "Show the resource usage of the daemon and each running session", noArgs, func([]string) error {
+			c, err := a.connect(nil, "", nil)
+			if err != nil {
+				return err
+			}
+			if err := c.requireStats(); err != nil {
+				return err
+			}
+			return c.printDaemonStats(os.Stdout)
 		}),
 		a.command("restart", "Restart the daemon", noArgs, func([]string) error {
 			c, err := a.connect(nil, "restart", nil)

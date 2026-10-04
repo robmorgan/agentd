@@ -60,6 +60,9 @@ type Request struct {
 	GetGitState   *SessionRef
 	ListArtifacts *SessionRef
 	GetArtifact   *GetArtifact
+	// Resource usage; see stats.go.
+	GetSessionStats *GetSessionStats
+	GetDaemonStats  *struct{}
 }
 
 type SessionRef struct{ SessionID string }
@@ -144,6 +147,8 @@ type Response struct {
 	GitState       *session.GitState
 	Artifacts      *[]session.Artifact
 	ArtifactChunk  *Bytes
+	SessionStats   *SessionStats
+	DaemonStats    *DaemonStats
 }
 
 type DaemonInfo struct {
@@ -203,6 +208,9 @@ const (
 	kGetGitStateRequest      kind = 30
 	kListArtifactsRequest    kind = 31
 	kGetArtifactRequest      kind = 32
+	// 70-79: resource usage (stats.go).
+	kGetSessionStatsRequest kind = 70
+	kGetDaemonStatsRequest  kind = 71
 
 	kDaemonInfoResponse     kind = 101
 	kCreateSessionResponse  kind = 102
@@ -225,6 +233,9 @@ const (
 	kGitStateResponse       kind = 130
 	kArtifactsResponse      kind = 131
 	kArtifactChunkResponse  kind = 132
+	// 170-179: resource usage (stats.go).
+	kSessionStatsResponse kind = 170
+	kDaemonStatsResponse  kind = 171
 )
 
 // ---------------------------------------------------------------------------
@@ -530,6 +541,12 @@ func encodeRequest(req *Request, f Features) (kind, []byte, error) {
 		e.str(req.GetArtifact.SessionID)
 		e.str(req.GetArtifact.Name)
 		return kGetArtifactRequest, e.buf, e.err
+	case req.GetSessionStats != nil:
+		e.str(req.GetSessionStats.SessionID)
+		e.bool(req.GetSessionStats.Snapshot)
+		return kGetSessionStatsRequest, e.buf, e.err
+	case req.GetDaemonStats != nil:
+		return kGetDaemonStatsRequest, nil, nil
 	}
 	return 0, nil, errors.New("empty request")
 }
@@ -591,6 +608,10 @@ func decodeRequest(k kind, payload []byte, f Features) (*Request, error) {
 		req.ListArtifacts = &SessionRef{d.str()}
 	case kGetArtifactRequest:
 		req.GetArtifact = &GetArtifact{SessionID: d.str(), Name: d.str()}
+	case kGetSessionStatsRequest:
+		req.GetSessionStats = &GetSessionStats{SessionID: d.str(), Snapshot: d.bool()}
+	case kGetDaemonStatsRequest:
+		req.GetDaemonStats = Empty
 	default:
 		return nil, fmt.Errorf("unexpected message kind `%d` while decoding request", k)
 	}
@@ -702,6 +723,13 @@ func encodeResponse(resp *Response, f Features) (kind, []byte, error) {
 	case resp.ArtifactChunk != nil:
 		e.bytes(resp.ArtifactChunk.Data)
 		return kArtifactChunkResponse, e.buf, e.err
+	case resp.SessionStats != nil:
+		e.sessionStats(resp.SessionStats)
+		return kSessionStatsResponse, e.buf, e.err
+	case resp.DaemonStats != nil:
+		e.processStats(&resp.DaemonStats.Daemon)
+		e.u32(resp.DaemonStats.OpenStreams)
+		return kDaemonStatsResponse, e.buf, e.err
 	}
 	return 0, nil, errors.New("empty response")
 }
@@ -786,6 +814,10 @@ func decodeResponse(k kind, payload []byte, f Features) (*Response, error) {
 		resp.Artifacts = &artifacts
 	case kArtifactChunkResponse:
 		resp.ArtifactChunk = &Bytes{d.bytes()}
+	case kSessionStatsResponse:
+		resp.SessionStats = d.sessionStats()
+	case kDaemonStatsResponse:
+		resp.DaemonStats = &DaemonStats{Daemon: d.processStats(), OpenStreams: d.u32()}
 	default:
 		return nil, fmt.Errorf("unexpected message kind `%d` while decoding response", k)
 	}

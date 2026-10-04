@@ -26,6 +26,7 @@ func seedFrames(f *testing.F) {
 		{ListSessions: Empty},
 		{GetGitState: &SessionRef{"ab"}},
 		{GetArtifact: &GetArtifact{SessionID: "ab", Name: "diff"}},
+		{GetSessionStats: &GetSessionStats{SessionID: "ab", Snapshot: true}},
 	}
 	resps := []*Response{
 		{Welcome: &Welcome{Version: 1, Capabilities: []string{CapControlStream}, Host: HostInfo{Agents: []string{"a"}}}},
@@ -36,6 +37,8 @@ func seedFrames(f *testing.F) {
 		{GitState: sampleGitState()},
 		{Artifacts: &[]session.Artifact{{Name: "diff", Kind: "diff", Size: u64p(9)}}},
 		{ArtifactChunk: &Bytes{Data: []byte("@@ -1 +1 @@")}},
+		{SessionStats: &SessionStats{SessionID: "ab", Worker: ProcessStats{PID: 1, RSSBytes: 2}, Snapshot: &SnapshotStats{Bytes: 3}}},
+		{DaemonStats: &DaemonStats{Daemon: ProcessStats{PID: 1}, OpenStreams: 2}},
 	}
 	for _, r := range reqs {
 		var buf bytes.Buffer

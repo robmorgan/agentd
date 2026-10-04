@@ -17,6 +17,9 @@ const subscriberBuffer = 256
 type broadcaster struct {
 	mu   sync.Mutex
 	subs map[*subscriber]struct{}
+	// dropped counts the chunks dropped for lagging subscribers, summed
+	// over all of them (reported in session stats).
+	dropped uint64
 }
 
 type subscriber struct {
@@ -48,6 +51,15 @@ func (b *broadcaster) publish(data []byte) {
 		select {
 		case s.ch <- data:
 		default:
+			b.dropped++
 		}
 	}
+}
+
+// droppedChunks is the number of chunks dropped so far for lagging
+// subscribers.
+func (b *broadcaster) droppedChunks() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.dropped
 }
