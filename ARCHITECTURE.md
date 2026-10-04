@@ -27,6 +27,7 @@ Both binaries are one Go module at the repository root.
 | `cmd/agent`, `internal/cli` | The `agent` CLI: commands, the session picker, attach and the Ctrl-Y overlay (plain ANSI), and `hosts.toml` for remote hosts. Pure Go: it never imports `worker`, `daemon` or `db`, and `cmd/agent`'s tests check that, then drive both real binaries through PTYs. |
 | `internal/daemon` | `agentd serve`: lock/socket/pid file lifecycle, create/kill/rm/ls/get, attach and request proxies to workers, history, daemon management, worker supervision and startup reconciliation. Tests run the daemon in-process against real worker processes. |
 | `internal/worker` | One session: PTY via `creack/pty`, shadow terminal via `go.mitchellh.com/libghostty`, per-session Unix socket. Real-PTY tests run under `-race`. |
+| `internal/repo` | Read-only views of the git repository a session works in, for the daemon: git state, the diff and patch artifacts. Runs the system `git`; tests use real temporary repositories. |
 | `internal/transport` | The seam between the protocol and the network: `Stream` (one request or attach session), `Listener`, the shared accept loop, the Unix socket transport, and the QUIC transport with pinned-key identities (`quic-go`). |
 | `internal/protocol` | The framed binary protocol and the small daemon management protocol, used by both binaries. Golden-frame tests pin the bytes. |
 | `internal/session`, `internal/paths`, `internal/config` | The session model (and name rules), runtime-root resolution, and `config.toml`, shared by both binaries. |
@@ -209,7 +210,8 @@ separate negotiation round trip is needed (`protocol.Request.Role`):
 | request | any one-shot request | one response, then the stream ends |
 | control | `Hello` | `Welcome`, then any number of tagged one-shot requests and their tagged responses, in any order |
 | attach | `AttachSession` | `Attached` with a snapshot, then `PtyOutput` frames one way and `AttachInput`, `AttachResize`, `AttachSnapshot` the other, until either side ends it |
-| artifact | `GetHistory` | one large response, kept off the control stream so it never delays small requests |
+| artifact | `GetArtifact` | `ArtifactChunk` frames, then `EndOfStream` (or an `Error`: the artifact is incomplete). On a stream of its own, a large transfer never delays the control stream or an attachment |
+| artifact | `GetHistory` | one `History` response holding the whole history (the `history` artifacts stream the same content) |
 | management | a version-0 frame | one JSON response |
 
 Over QUIC each stream has its own flow control, so a stalled attachment or a large transfer never
@@ -222,8 +224,9 @@ blocks another stream on the same connection, and a client never needs more than
 daemon answers `Welcome` with the newest version in both ranges, its own capabilities, and a
 description of its machine (host name, OS, architecture, CPUs, memory, configured agents and the
 default one), or with an `Error` when the ranges do not overlap. Both sides then use only the
-features both listed. Today there is one protocol version (1) and one capability
-(`control-stream`).
+features both listed. Today there is one protocol version (1) and three capabilities:
+`control-stream`, `git-state` (`GetGitState`) and `artifacts` (`ListArtifacts`, `GetArtifact`,
+`ArtifactChunk`).
 
 The protocol grows without breaking older peers this way: a new message kind, or a field appended
 to the end of an existing message or struct (a session record, even inside a list), comes with a
@@ -238,8 +241,9 @@ requests on it (`internal/cli/control.go`). Each request carries a `u32` id that
 echoes; the daemon runs up to 16 requests of one control stream at once and stops reading the
 stream beyond that, so a client that pipelines requests is held back by flow control rather than
 queued in the daemon. A request that cannot be decoded is answered with an error under its id and
-the stream carries on. Requests that need their own stream (attach, history) are refused on a
-control stream. If the control stream has ended when the CLI next uses it (the daemon restarted,
+the stream carries on. Requests that need their own stream (attach, artifacts, history) are refused on a
+control stream. An artifact stream has no handshake of its own: the CLI opens one only after its
+control stream's `Welcome` listed `artifacts`. If the control stream has ended when the CLI next uses it (the daemon restarted,
 say), it opens a new one, but never resends a request it already wrote, since the daemon may have
 acted on it.
 
@@ -261,6 +265,9 @@ acted on it.
 | `AddWorkspace` | `Workspace` | request |
 | `RemoveWorkspace` | `Ok` | request |
 | `GetHistory` | `History` | artifact |
+| `GetGitState` | `GitState` | request |
+| `ListArtifacts` | `Artifacts` | request |
+| `GetArtifact` | `ArtifactChunk` frames, then `EndOfStream` (or `Error`) | artifact |
 | `AttachSession` | `Attached` (or `SessionEnded` for a finished session), then `PtyOutput`, `AttachSnapshot`, and finally `SessionEnded` or `EndOfStream` | attach |
 
 Any request may instead be answered with `Error`.
@@ -279,9 +286,11 @@ When you create a session (`agent new [--cwd DIR] [NAME]`), the daemon:
    `~/` path expanded against the daemon user's home, or a path relative to a named workspace
    (stored in `state.db`, managed with `agent workspace`). The directory must exist; it does not
    need to be a git repository.
-2. Allocates a session id and stores the record in `<runtime-root>/state.db`.
-3. Spawns `agentd session-worker` in a new process session.
-4. Waits for the worker to report the session running and bind its socket.
+2. If `cwd` is in a git repository with a commit, reads HEAD's commit and branch: the session's
+   base (see "Git State And Artifacts"). Nothing else about git is touched.
+3. Allocates a session id and stores the record, base included, in `<runtime-root>/state.db`.
+4. Spawns `agentd session-worker` in a new process session.
+5. Waits for the worker to report the session running and bind its socket.
 
 The worker spawns the configured agent inside a PTY in `cwd`, with `AGENTD_SESSION_ID`,
 `AGENTD_SESSION_NAME` and `AGENTD_CWD` injected. The daemon socket is deliberately not passed in.
@@ -317,6 +326,67 @@ way). The worker stops the agent's whole process group (SIGKILL after five secon
 history logs, records the session as exited, and sends `SessionEnded` to attached clients. The
 daemon signals a worker directly only if it is wedged, and only while its socket still answers.
 
+## Git State And Artifacts
+
+`agentd` does not manage git, but it reports what an agent produced in git, read from the
+session's directory on the daemon's machine (`internal/repo`, `internal/daemon/artifacts.go`). It
+only ever reads: the repository, its index and its refs are never written.
+
+**Base.** When a session is created in a repository whose HEAD has a commit, the daemon records
+that commit and the branch (`sessions.git_base`, `git_base_branch`, schema v3). What the session
+produced is measured from there: its commits are those reachable from HEAD but not from the base,
+and its changed files are everything that differs from the base: committed since, staged,
+unstaged, and untracked. A session without a base (created before v3, outside a repository, or on
+a branch with no commits yet) is measured from HEAD instead (or from the empty tree on an unborn
+branch); one whose base has since vanished from the repository is reported as such and measured
+from HEAD. The base is never moved: a rebase, a branch switch or a reset by the agent is reported
+against where the session started.
+
+**`GetGitState`** (a one-shot request) answers with the repository root, branch (or detached HEAD),
+HEAD, base, upstream with ahead/behind counts, the commits since the base (hash, subject, author,
+time) and the changed files (path, old path for renames, status, added and deleted lines, binary).
+Lists are capped (200 commits, with the total count; 1000 files) and say when they were cut; git is
+stopped as soon as enough has been read, so a huge repository costs a bounded read. Failures (git
+not installed, the directory gone, a timeout after 30s) are reported inside the answer rather than
+failing the request, so `agent status` always works. It works for ended sessions too, while their
+directory exists.
+
+**Artifacts.** `ListArtifacts` names what can be downloaded: `diff` (a unified diff of everything
+since the base, untracked files included), `patch` (`git format-patch --stdout` of the commits since
+the base: an mbox for `git am`), and `history` and `history.vt` (the terminal history, with its size
+once saved). `GetArtifact` streams one on an artifact stream.
+
+**How git runs.** The system `git`, in the session's directory, with `GIT_OPTIONAL_LOCKS=0`,
+`core.fsmonitor=false`, no pager or colour, no external diff or textconv, and explicit flags for
+everything a user's config could change (rename detection, `a/` and `b/` prefixes, no relative
+paths). The daemon's own `GIT_*` variables are removed. Each git runs in its own process group,
+killed as a group when its request ends or its client goes away.
+
+`git diff` leaves out untracked files. To include them without touching the repository, the daemon
+copies the index to a private temporary directory, marks the untracked files intent-to-add in the
+copy (`GIT_INDEX_FILE`), and gives those commands a private object directory with the repository's
+as an alternate, since intent-to-add stores the empty blob. Git then handles untracked files like
+any other: binary detection and attributes apply, and a file moved without `git mv` is a rename. At
+most 20,000 untracked files are included (`GitState` says when there were more).
+
+**Streaming and backpressure.** An artifact is sent as `ArtifactChunk` frames of at most 256 KiB,
+built in place around one reused buffer as git (or the history file) produces them, then
+`EndOfStream`. The daemon never holds an artifact: a client that stops reading blocks the daemon's
+write, which stops it reading git's stdout, which blocks git on its pipe. In memory per transfer:
+one chunk, plus the pipe and the transport's buffers (over QUIC, the stream's flow-control window).
+The transfer resumes when the client reads again and ends when it closes the stream, its connection
+dies, or the daemon shuts down, killing git. There is no stall timeout, since a pager may pause as
+long as its reader does. Live history is the exception: the worker answers with the whole history
+in one frame (at most 64 MiB), which the daemon then sends in chunks.
+
+Large transfers are separated from terminal traffic by giving each its own stream: over QUIC each
+stream has its own flow control, so a transfer, stalled or at full speed, does not delay an
+attachment on the same connection. `TestInteractiveDuringLargeArtifactOverQUIC` measures it on
+loopback with a 48 MiB diff. Over six runs on a machine shared with other test suites, input
+echoed through a live session over one QUIC connection took a p50 of 0.3-0.7 ms idle, 0.3-1.2 ms
+with a stalled transfer open, and 0.35-0.9 ms while the transfer ran at 40-57 MiB/s (git diff
+included), with a p99 of 1-12 ms and never more than 15 ms.
+
 ## Slow Clients
 
 The PTY is never blocked by a client. Each attachment has a bounded queue in the worker; a client
@@ -351,7 +421,7 @@ The selected root contains:
 * `agentd.sock`
 * `agentd.lock` (held by the running daemon)
 * `agentd.pid` (informational)
-* `state.db` (schema v2; older versions are migrated forward, newer ones refused. Migrations
+* `state.db` (schema v3; older versions are migrated forward, newer ones refused. Migrations
   must be additive, because session workers keep writing to the file across daemon upgrades)
 * `sessions/` (one socket per live session)
 * `agentd.log` (output of a daemonized daemon)

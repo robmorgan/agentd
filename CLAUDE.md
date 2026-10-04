@@ -292,6 +292,7 @@ internal/
   daemon/            session registry, proxies, lifecycle, supervision
   worker/            one session: PTY, terminal state, fan-out, input queue
   protocol/          framed protocol + daemon management protocol
+  repo/              read-only git state and artifacts of a session's directory
   transport/         Stream/Listener seam, accept loop, Unix sockets, QUIC + identities
   db/                state.db
   session/           session model and name rules
@@ -440,6 +441,9 @@ agent attach
 agent attachments
 agent detach
 agent history
+agent diff
+agent artifacts
+agent artifact
 agent send-input
 agent status
 agent kill
@@ -514,6 +518,7 @@ Done:
 - `agentd remote enable [ADDRESS] | disable | status`: detects a Tailscale address (or asks about the default-route one), edits `[remote] listen`, restarts the daemon; an unbindable listen address is retried in the background.
 - The CLI's QUIC client: `agent --host NAME` and `NAME/session` addresses, `agent host add|ls|rm` (confirm-on-first-use key pinning in `hosts.toml`), and `agent remote id` (`remote/client.key`).
 - Dead remote clients are noticed within 15s, and a remote attachment that loses its connection reconnects and reattaches by itself.
+- Git state and artifacts, read-only (`internal/repo`): a session records its base commit at creation; `GetGitState` (commits and changed files since the base, untracked included) and artifact streams (`diff`, `patch`, `history`, `history.vt`) in bounded chunks under flow control; `agent diff`, `agent artifacts`, `agent artifact`, and a git section in `agent status`, locally and over QUIC.
 - The connection handshake (`Hello`/`Welcome`): version and capability negotiation, host description, and a control stream of tagged requests; stream roles are set by a stream's first frame.
 
 - Host health (`agent hosts`), machine capabilities (`agent host info`), and placement hints (`agent --host auto new`).
