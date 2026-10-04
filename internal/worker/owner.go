@@ -368,21 +368,85 @@ func (s *ownerState) detachAll() {
 	}
 }
 
+// maxOutputBatch caps how much PTY output the pump hands the owner at once,
+// and so the size of each chunk fanned out to clients.
+const maxOutputBatch = 8192
+
+// pumpPty reads the PTY and hands the output to the owner goroutine.
+//
+// PTY reads can be small: on macOS, a program writing in small pieces (a
+// pipeline such as yes | head) gives mostly 30 to 130 bytes per read. Handed
+// over one by one, each would cost a trip through the owner's
+// queue, a VTWrite into libghostty, and a frame to every attached client.
+// So reads accumulate in a batch while the owner is busy with the previous
+// one, up to maxOutputBatch, and the owner takes everything pending at
+// once. An idle owner gets each read straight away, so batching adds no
+// latency. When a batch is full and the owner has not taken it, the pump
+// stops reading, which leaves the agent blocked on a full PTY as before.
 func pumpPty(reader io.Reader, o *owner) {
-	buf := make([]byte, 8192)
+	b := &outputBatch{taken: make(chan struct{}, 1)}
+	buf := make([]byte, maxOutputBatch)
 	for {
 		n, err := reader.Read(buf)
-		if n > 0 {
-			chunk := make([]byte, n)
-			copy(chunk, buf[:n])
-			o.post(func(s *ownerState) {
-				if err := s.publishOutput(chunk); err != nil {
-					fmt.Fprintf(os.Stderr, "session worker: failed to publish output: %v\n", err)
-				}
-			})
+		if n > 0 && !b.add(buf[:n], o) {
+			return
 		}
 		if err != nil {
 			return
 		}
 	}
+}
+
+// outputBatch is PTY output read by the pump and not yet taken by the
+// owner goroutine.
+type outputBatch struct {
+	mu   sync.Mutex
+	data []byte
+	// posted is set while a take is queued on the owner goroutine and has
+	// not run; data added meanwhile goes out with it.
+	posted bool
+	// taken is signalled (without blocking) whenever the owner takes the
+	// batch, to wake a pump waiting for room.
+	taken chan struct{}
+}
+
+// add appends data to the batch, queueing a take on the owner unless one is
+// already queued. It returns false if the owner has stopped.
+func (b *outputBatch) add(data []byte, o *owner) bool {
+	b.mu.Lock()
+	for b.posted && len(b.data)+len(data) > maxOutputBatch {
+		b.mu.Unlock()
+		select {
+		case <-b.taken:
+		case <-o.done:
+			return false
+		}
+		b.mu.Lock()
+	}
+	// A fresh slice per batch: subscribers keep the one they were given.
+	b.data = append(b.data, data...)
+	post := !b.posted
+	b.posted = true
+	b.mu.Unlock()
+	if post {
+		o.post(func(s *ownerState) {
+			if err := s.publishOutput(b.take()); err != nil {
+				fmt.Fprintf(os.Stderr, "session worker: failed to publish output: %v\n", err)
+			}
+		})
+	}
+	return true
+}
+
+func (b *outputBatch) take() []byte {
+	b.mu.Lock()
+	data := b.data
+	b.data = nil
+	b.posted = false
+	b.mu.Unlock()
+	select {
+	case b.taken <- struct{}{}:
+	default:
+	}
+	return data
 }

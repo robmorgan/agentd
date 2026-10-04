@@ -49,7 +49,7 @@ done`
 var defaultGeometry = protocol.Geometry{Cols: 80, Rows: 24}
 
 type harness struct {
-	t         *testing.T
+	t         testing.TB
 	createdAt string
 	uid       string
 	paths     *paths.AppPaths
@@ -59,14 +59,14 @@ type harness struct {
 	exited    bool
 }
 
-func startWorker(t *testing.T) *harness {
+func startWorker(t testing.TB) *harness {
 	t.Helper()
 	return startWorkerWith(t, echoAgent)
 }
 
 // newRoot creates a runtime root with one session row and points
 // AGENTD_DIR at it.
-func newRoot(t *testing.T) (string, *harness) {
+func newRoot(t testing.TB) (string, *harness) {
 	t.Helper()
 	// Unix socket paths are limited to ~104 bytes, so avoid t.TempDir().
 	dir, err := os.MkdirTemp("/tmp", "agdw-")
@@ -95,7 +95,7 @@ func newRoot(t *testing.T) (string, *harness) {
 	return dir, h
 }
 
-func startWorkerWith(t *testing.T, script string) *harness {
+func startWorkerWith(t testing.TB, script string) *harness {
 	t.Helper()
 	dir, h := newRoot(t)
 	p := h.paths
@@ -221,7 +221,7 @@ func (h *harness) eventually(what string, cond func() bool) {
 }
 
 type client struct {
-	t        *testing.T
+	t        testing.TB
 	conn     net.Conn
 	r        *bufio.Reader
 	attachID string
