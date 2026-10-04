@@ -23,7 +23,7 @@ Both binaries are one Go module at the repository root.
 
 | Package | What it does |
 |---|---|
-| `cmd/agentd` | `serve [--daemonize]`, `upgrade`, `remote enable\|disable\|status` (set `[remote] listen` and restart the daemon), `remote id\|list\|authorize\|revoke`, `session-worker`. The agent CLI runs `serve --daemonize`. |
+| `cmd/agentd` | `serve [--daemonize]`, `upgrade`, `remote enable\|disable\|status` (set `[remote] listen` and restart the daemon), `remote id\|list\|authorize\|revoke`, `bench sessions` (`internal/bench`: measures sessions on a private daemon), `session-worker`. The agent CLI runs `serve --daemonize`. |
 | `cmd/agent`, `internal/cli` | The `agent` CLI: commands, the session picker, attach and the Ctrl-Y overlay (plain ANSI), and `hosts.toml` for remote hosts. Pure Go: it never imports `worker`, `daemon` or `db`, and `cmd/agent`'s tests check that, then drive both real binaries through PTYs. |
 | `internal/daemon` | `agentd serve`: lock/socket/pid file lifecycle, create/kill/rm/ls/get, attach and request proxies to workers, history, daemon management, worker supervision and startup reconciliation. Tests run the daemon in-process against real worker processes. |
 | `internal/worker` | One session: PTY via `creack/pty`, shadow terminal via `go.mitchellh.com/libghostty`, per-session Unix socket. Real-PTY tests run under `-race`. |
@@ -32,6 +32,7 @@ Both binaries are one Go module at the repository root.
 | `internal/protocol` | The framed binary protocol and the small daemon management protocol, used by both binaries. Golden-frame tests pin the bytes. |
 | `internal/session`, `internal/paths`, `internal/config` | The session model (and name rules), runtime-root resolution, and `config.toml`, shared by both binaries. |
 | `internal/db` | `state.db`: schema, and the guarded session state transitions the daemon and workers use. Uses `modernc.org/sqlite` (pure Go). Only the daemon and its workers open it. |
+| `internal/procstat` | A process's resource usage from the OS (libproc on macOS, `/proc` on Linux) and the Go runtime's own numbers, for session stats and the bench. |
 | `scripts/` | The libghostty-vt build helper. |
 
 A few details of the daemon and workers that the sections below do not cover:
@@ -224,9 +225,9 @@ blocks another stream on the same connection, and a client never needs more than
 daemon answers `Welcome` with the newest version in both ranges, its own capabilities, and a
 description of its machine (host name, OS, architecture, CPUs, memory, configured agents and the
 default one), or with an `Error` when the ranges do not overlap. Both sides then use only the
-features both listed. Today there is one protocol version (1) and three capabilities:
-`control-stream`, `git-state` (`GetGitState`) and `artifacts` (`ListArtifacts`, `GetArtifact`,
-`ArtifactChunk`).
+features both listed. Today there is one protocol version (1) and four capabilities:
+`control-stream`, `git-state` (`GetGitState`), `artifacts` (`ListArtifacts`, `GetArtifact`,
+`ArtifactChunk`) and `runtime-stats` (`GetSessionStats`, `GetDaemonStats`).
 
 The protocol grows without breaking older peers this way: a new message kind, or a field appended
 to the end of an existing message or struct (a session record, even inside a list), comes with a
@@ -268,6 +269,8 @@ acted on it.
 | `GetGitState` | `GitState` | request |
 | `ListArtifacts` | `Artifacts` | request |
 | `GetArtifact` | `ArtifactChunk` frames, then `EndOfStream` (or `Error`) | artifact |
+| `GetSessionStats` | `SessionStats` (`runtime-stats`) | request |
+| `GetDaemonStats` | `DaemonStats` (`runtime-stats`) | request |
 | `AttachSession` | `Attached` (or `SessionEnded` for a finished session), then `PtyOutput`, `AttachSnapshot`, and finally `SessionEnded` or `EndOfStream` | attach |
 
 Any request may instead be answered with `Error`.
@@ -386,6 +389,23 @@ loopback with a 48 MiB diff. Over six runs on a machine shared with other test s
 echoed through a live session over one QUIC connection took a p50 of 0.3-0.7 ms idle, 0.3-1.2 ms
 with a stalled transfer open, and 0.35-0.9 ms while the transfer ran at 40-57 MiB/s (git diff
 included), with a p99 of 1-12 ms and never more than 15 ms.
+
+## Resource Usage
+
+Each session's worker measures itself on request (`GetSessionStats`, which the daemon forwards):
+its process from the OS (resident and private memory, CPU time, threads, open files) and its Go
+runtime (goroutines, heap, memory held from the OS), the agent's top process, and its terminal and
+fan-out (size, scrollback rows, PTY bytes and reads, chunks dropped for lagging clients). Asked
+to, it also formats a reattach snapshot and replays it into a fresh terminal, timing both. The
+daemon answers `GetDaemonStats` for its own process. `agent status --stats` and `agent daemon
+stats` show them, and `agentd bench sessions` uses them to measure sessions at scale
+(BENCHMARKS.md, "Sessions at scale").
+
+Private memory is reported beside RSS because RSS counts the pages every worker shares (the
+`agentd` executable and system libraries, about 11 MiB of each idle worker's 20 MiB), so summing
+RSS over many sessions overstates their cost. libghostty's memory is outside the Go runtime and is
+measured in-process (`BenchmarkTerminalMemory`): about 25 KB for a new terminal, and the
+scrollback limit (10 MB) once full.
 
 ## Slow Clients
 

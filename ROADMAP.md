@@ -182,7 +182,7 @@ Before changing implementation language or transport architecture, document the 
 * [ ] Create resize integration tests
 * [ ] Test multiple simultaneous attachers
 * [ ] Document daemon restart behavior
-* [ ] Establish baseline benchmarks
+* [x] Establish baseline benchmarks (`agentd bench sessions`; BENCHMARKS.md, "Sessions at scale")
 
 Baseline metrics should include:
 
@@ -749,20 +749,20 @@ agentd bench sessions --count N
 
 ## Measure
 
-* [ ] RSS per idle session
-* [ ] Go heap per session
-* [ ] libghostty memory per session
-* [ ] goroutines per session
-* [ ] file descriptors per session
-* [ ] idle CPU
-* [ ] snapshot size
-* [ ] snapshot latency
-* [ ] restore latency
-* [ ] fan-out cost
+* [x] RSS per idle session (worker and agent, RSS and private memory)
+* [x] Go heap per session (worker stats)
+* [x] libghostty memory per session (`BenchmarkTerminalMemory`)
+* [x] goroutines per session (worker and daemon)
+* [x] file descriptors per session (worker, agent and daemon)
+* [x] idle CPU (read from outside the processes)
+* [x] snapshot size (idle and full scrollback)
+* [x] snapshot latency (worker format time and attach round trip)
+* [x] restore latency (replayed into a fresh terminal)
+* [x] fan-out cost (up to 100 clients, with echo latency)
 * [x] QUIC memory per connection
 * [x] QUIC memory per stream
 * [x] QUIC CPU overhead
-* [ ] database overhead
+* [x] database overhead (through the daemon and `internal/db` benchmarks)
 
 ## Target workloads
 
@@ -784,6 +784,8 @@ interactive PTY traffic
 ```
 
 Large counts do not necessarily represent expected deployments. They help expose fixed costs and architectural bottlenecks.
+
+Measured so far (BENCHMARKS.md): 1 to 500 idle sessions (macOS allows 511 PTYs, so 1,000 needs Linux or a raised `kern.tty.ptmx_max`), 10,000 terminal-state objects, 100 output-heavy sessions, and 100 attachments to one session. The candidates for reducing per-session cost are listed there.
 
 ## Optimization principles
 

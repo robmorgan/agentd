@@ -274,12 +274,17 @@ func (b *bench) create(name, agent string) (time.Duration, error) {
 // returns the first error. It stops starting new calls once ctx ends or a
 // call fails, and returns only after every call it started has returned.
 func (b *bench) parallel(ctx context.Context, n int, fn func(i int) error) error {
+	return parallelN(ctx, n, b.opts.Parallel, fn)
+}
+
+// parallelN is parallel with at most limit calls at a time.
+func parallelN(ctx context.Context, n, limit int, fn func(i int) error) error {
 	var (
 		wg       sync.WaitGroup
 		mu       sync.Mutex
 		firstErr error
 	)
-	slots := make(chan struct{}, b.opts.Parallel)
+	slots := make(chan struct{}, max(1, limit))
 	for i := range n {
 		mu.Lock()
 		failed := firstErr != nil
@@ -453,14 +458,16 @@ const snapshotSamples = 100
 // snapshotRepeats is how often the full-scrollback session is measured.
 const snapshotRepeats = 5
 
-// measureSnapshot attaches to a session and asks its worker to time a
-// snapshot, repeats times.
+// measureSnapshot attaches to each session and asks its worker to time a
+// snapshot, repeats times. Sessions are measured in parallel, but each
+// one's measurements one at a time, so they do not queue behind each other
+// on its worker.
 func (b *bench) measureSnapshot(ctx context.Context, ids []string, repeats int) (SnapshotReport, error) {
 	var mu sync.Mutex
 	var attach, format, restore, size []float64
 	var rows uint64
 	n := len(ids) * repeats
-	err := b.parallel(ctx, n, func(i int) error {
+	err := parallelN(ctx, n, min(b.opts.Parallel, len(ids)), func(i int) error {
 		id := ids[i%len(ids)]
 		a, elapsed, err := b.attach(id)
 		if err != nil {
@@ -521,12 +528,7 @@ func (b *bench) measureSnapshots(ctx context.Context) error {
 		}
 		last = s.OutputBytes
 	}
-	// One at a time, so the measurements do not queue behind each other on
-	// the worker.
-	parallel := b.opts.Parallel
-	b.opts.Parallel = 1
 	r, err := b.measureSnapshot(ctx, []string{fillName}, snapshotRepeats)
-	b.opts.Parallel = parallel
 	if err != nil {
 		return err
 	}

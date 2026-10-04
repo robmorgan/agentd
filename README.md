@@ -107,6 +107,14 @@ agent artifacts fix-tests              # what can be downloaded: diff, patch, hi
 agent artifact fix-tests patch -o fix-tests.mbox    # the commits, for `git am`
 ```
 
+See what sessions cost: memory, CPU, threads and open files of a session's worker and agent, and
+its scrollback; or the daemon and every running session at once:
+
+```sh
+agent status --stats fix-tests
+agent daemon stats
+```
+
 Stop a task:
 
 ```sh
@@ -186,6 +194,21 @@ Debug build parses PTY output at roughly 50 KB/s, which is slow enough to thrott
 
 Only libghostty needs cgo; `modernc.org/sqlite` is pure Go, so cross compiling `agentd` is `zig cc`
 plus `CGO_ENABLED=1` as described in the go-libghostty README.
+
+To measure what sessions cost on this machine, `agentd bench sessions` starts a private daemon in a
+temporary root (never `~/.agentd`), creates the sessions, prints a report, and stops everything it
+started, also on Ctrl-C. [BENCHMARKS.md](BENCHMARKS.md) has the numbers and what they mean:
+
+```sh
+bin/agentd bench sessions --count 100                       # idle sessions
+bin/agentd bench sessions --count 0 --output-heavy 100 --attach 100
+bin/agentd bench sessions --count 500 --json-file report.json
+```
+
+`--output-heavy N` adds sessions that write output as fast as they can, `--attach K` attaches K
+clients to one of them, `--duration` sets how long CPU, throughput and fan-out are measured, and
+`--fill-lines` sizes the session used for the full-scrollback snapshot. macOS allows 511
+pseudo-terminals for all programs together (`kern.tty.ptmx_max`), so about 500 sessions at most.
 
 For local development, run the freshly built CLI against the freshly built daemon without reinstalling:
 
