@@ -454,6 +454,7 @@ features both listed. Today there is one protocol version (1), and these capabil
 | `session-activity` | the activity fields appended to session records (after the UID): activity, foreground command, title, last output and attention times |
 | `session-restart` | attach stream: the worker may end it with `SessionRestarting` when it restarts for a live handoff |
 | `worker-handoff` | `HandoffSession` and `HandedOff`, between agentd and a session worker only (a worker lists it in its answer to `Hello`) |
+| `terminal-memory` | the shadow terminal's memory appended to `SessionStats` |
 
 The protocol grows without breaking older peers this way: a new message kind, or a field appended
 to the end of an existing message or struct (a session record, even inside a list), comes with a
@@ -732,9 +733,20 @@ stats` show them, and `agentd bench sessions` uses them to measure sessions at s
 
 Private memory is reported beside RSS because RSS counts the pages every worker shares (the
 `agentd` executable and system libraries, about 11 MiB of each idle worker's 20 MiB), so summing
-RSS over many sessions overstates their cost. libghostty's memory is outside the Go runtime and is
-measured in-process (`BenchmarkTerminalMemory`): about 25 KB for a new terminal, and the
-scrollback limit (10 MB) once full.
+RSS over many sessions overstates their cost. libghostty's memory is outside the Go runtime; the
+worker reports what its terminal holds as libghostty counts it (`Terminal.MemoryUsage`: pages,
+resident bytes, and how many pages are compressed) to clients that negotiated `terminal-memory`,
+shown by `agent status --stats` and in `agent daemon stats`' TERMINAL column. A new terminal holds
+about 25 KB (`BenchmarkTerminalMemory`), a full scrollback about 9.4 MiB.
+
+Quiet scrollback is compressed. On the worker's one-second tick, once no output has arrived for
+three seconds, the worker runs libghostty's incremental compression in steps of at most 5 ms on
+the owner goroutine, until it reports nothing more to do; it starts again only when the
+scrollback changes or a snapshot has read it (formatting decompresses the pages it reads, without
+changing libghostty's activity token). A full scrollback drops from 9.4 MiB to about 0.6 MiB
+resident. A busy session is never compressed, since new output would decompress it again, and a
+terminal restored after a live handoff is decoded with its history compressed
+(`SnapshotDecoder.SetCompressHistory`) rather than held uncompressed.
 
 ## Sessions, Incarnations And Attachments
 

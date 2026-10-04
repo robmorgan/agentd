@@ -60,6 +60,17 @@ func TestSessionStats(t *testing.T) {
 		t.Errorf("terminal stats = %+v", s)
 	}
 
+	// A one-shot stream gets the base encoding; a control stream that
+	// negotiated it also gets the terminal's memory.
+	if s.Terminal != nil {
+		t.Errorf("terminal memory sent to a client that did not ask: %+v", s.Terminal)
+	}
+	cc := h.control()
+	cc.send(1, &protocol.Request{GetSessionStats: &protocol.GetSessionStats{SessionID: id}})
+	if _, r := cc.read(); r.SessionStats == nil || r.SessionStats.Terminal == nil || r.SessionStats.Terminal.Pages == 0 || r.SessionStats.Terminal.ResidentBytes == 0 {
+		t.Errorf("stats on a control stream = %#v", r)
+	}
+
 	resp = h.request(&protocol.Request{GetSessionStats: &protocol.GetSessionStats{SessionID: id, Snapshot: true}})
 	if resp.SessionStats == nil || resp.SessionStats.Snapshot == nil {
 		t.Fatalf("stats with snapshot: %#v", resp)

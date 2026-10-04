@@ -239,6 +239,14 @@ Attach is the client's round trip through the daemon until the snapshot has arri
 A worker with full scrollback holds 26-27 MiB private, against 8.9 MiB idle: 9.4 MiB of
 libghostty state, and the rest Go memory from formatting snapshots and history.
 
+Since the worker compresses quiet scrollback (libghostty `Terminal.Compress`; see ARCHITECTURE.md,
+"Resource Usage"), the libghostty part shrinks once the session has been quiet for three seconds:
+a full 10 MB scrollback goes from 9.4 MiB to 0.6 MiB resident (23 of 24 pages compressed,
+`TestIdleScrollbackIsCompressed`), and `agentd bench sessions` measured the full-scrollback worker
+at 28.2 MiB private just after its snapshots and 19.4 MiB once idle. Formatting a snapshot from
+compressed scrollback took 5.0 ms instead of 4.5-4.9 ms, and leaves the pages decompressed until
+the next quiet tick.
+
 ### PTY throughput and fan-out
 
 With no client attached, output-heavy sessions are bound by the worker feeding libghostty:
@@ -296,7 +304,8 @@ costs.
    never started). That change should go to `modernc.org/libc` upstream rather than into a fork
    here.
 2. **Scrollback, up to 10 MB of libghostty state per session** (`maxScrollbackBytes`). A session
-   whose output fills it costs 12-18 MiB more than an idle one. It is a variable cost, but the
+   whose output fills it costs 12-18 MiB more than an idle one (about 9 MiB less once it is quiet,
+   now that quiet scrollback is compressed). It is a variable cost, but the
    largest one: 500 such sessions would need about 13 GiB. A configurable or smaller limit is a
    product decision.
 3. **One daemon thread per session.** Each worker's supervisor blocks in `cmd.Wait` (`wait4`),

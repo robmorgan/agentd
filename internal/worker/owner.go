@@ -169,11 +169,14 @@ func (s *ownerState) writeInput(data []byte) error {
 // watched reports whether an interactive client is attached.
 func (s *ownerState) watched() bool { return len(s.attachments) > 0 }
 
-// tickActivity checks idleness and samples the PTY's foreground process.
+// tickActivity checks idleness and samples the PTY's foreground process,
+// and compresses the scrollback of a terminal that has gone quiet.
 func (s *ownerState) tickActivity() {
+	now := time.Now()
 	if s.activity != nil {
-		s.activity.tick(time.Now(), foregroundPGID(s.ptmx), s.watched())
+		s.activity.tick(now, foregroundPGID(s.ptmx), s.watched())
 	}
+	s.terminal.compressIdle(now)
 }
 
 // resize applies a client's geometry. A zero row or column count (a client

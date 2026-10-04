@@ -77,6 +77,20 @@ type SessionStats struct {
 	DroppedOutputChunks uint64
 	// Snapshot is set when the request asked for it.
 	Snapshot *SnapshotStats
+	// Terminal is what the shadow terminal holds (CapTerminalMemory),
+	// measured by libghostty, which allocates outside the Go heap.
+	Terminal *TerminalMemory
+}
+
+// TerminalMemory is a session's shadow terminal's memory, both screens.
+type TerminalMemory struct {
+	// Pages hold the screens and scrollback; CompressedPages of them are
+	// compressed, into CompressedBytes.
+	Pages, CompressedPages uint64
+	// ResidentBytes is the memory the pages occupy now, compressed ones
+	// included.
+	ResidentBytes   uint64
+	CompressedBytes uint64
 }
 
 // DaemonStats answers GetDaemonStats.
@@ -130,12 +144,20 @@ func (e *encoder) sessionStats(s *SessionStats) {
 	e.u64(s.DroppedOutputChunks)
 	if s.Snapshot == nil {
 		e.u8(0)
-		return
+	} else {
+		e.u8(1)
+		e.u64(s.Snapshot.Bytes)
+		e.u64(s.Snapshot.FormatNanos)
+		e.u64(s.Snapshot.RestoreNanos)
 	}
-	e.u8(1)
-	e.u64(s.Snapshot.Bytes)
-	e.u64(s.Snapshot.FormatNanos)
-	e.u64(s.Snapshot.RestoreNanos)
+	// Appended (CapTerminalMemory). SessionStats is a whole response, so
+	// the field is last and a decoder reads it when present.
+	if s.Terminal != nil && e.f.Has(CapTerminalMemory) {
+		e.u64(s.Terminal.Pages)
+		e.u64(s.Terminal.CompressedPages)
+		e.u64(s.Terminal.ResidentBytes)
+		e.u64(s.Terminal.CompressedBytes)
+	}
 }
 
 func (d *decoder) sessionStats() *SessionStats {
@@ -154,6 +176,9 @@ func (d *decoder) sessionStats() *SessionStats {
 	}
 	if d.bool() {
 		s.Snapshot = &SnapshotStats{Bytes: d.u64(), FormatNanos: d.u64(), RestoreNanos: d.u64()}
+	}
+	if d.more() {
+		s.Terminal = &TerminalMemory{Pages: d.u64(), CompressedPages: d.u64(), ResidentBytes: d.u64(), CompressedBytes: d.u64()}
 	}
 	return s
 }

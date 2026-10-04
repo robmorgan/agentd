@@ -1,6 +1,8 @@
 package protocol
 
 import (
+	"bytes"
+	"reflect"
 	"slices"
 	"testing"
 )
@@ -23,6 +25,26 @@ func TestStatsRoundTrips(t *testing.T) {
 	roundTripResponse(t, &Response{SessionStats: &SessionStats{
 		SessionID: "demo", Snapshot: &SnapshotStats{Bytes: 1, FormatNanos: 2, RestoreNanos: 3},
 	}})
+	// Terminal memory is appended only for peers that negotiated it, and
+	// read whenever it is there.
+	withMemory := &Response{SessionStats: &SessionStats{
+		SessionID: "demo", Snapshot: &SnapshotStats{Bytes: 1},
+		Terminal: &TerminalMemory{Pages: 24, CompressedPages: 23, ResidentBytes: 600 << 10, CompressedBytes: 200 << 10},
+	}}
+	var buf bytes.Buffer
+	if err := WriteResponseWith(&buf, NegotiateFeatures(Capabilities(), []string{CapTerminalMemory}), withMemory); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ReadResponse(&buf); err != nil || !reflect.DeepEqual(got, withMemory) {
+		t.Fatalf("with terminal-memory: %#v, %v", got, err)
+	}
+	buf.Reset()
+	if err := WriteResponse(&buf, withMemory); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ReadResponse(&buf); err != nil || got.SessionStats.Terminal != nil || got.SessionStats.Snapshot == nil {
+		t.Fatalf("base encoding: %#v, %v", got, err)
+	}
 	if (&Request{GetSessionStats: &GetSessionStats{}}).Role() != RoleRequest || (&Request{GetDaemonStats: Empty}).Role() != RoleRequest {
 		t.Error("stats requests must be one-shot requests, so they can share the control stream")
 	}
