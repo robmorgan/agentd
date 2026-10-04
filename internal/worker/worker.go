@@ -246,6 +246,7 @@ func Run(args Args) error {
 		output:      newBroadcaster(),
 		input:       newPTYInput(ptmx),
 		activity:    newActivityTracker(rt.recorder, cmd.Process.Pid, time.Now()),
+		owner:       rt.owner,
 	}
 
 	ownerDone := make(chan struct{})
@@ -517,7 +518,7 @@ func (rt *runtime) serveAttach(conn transport.Stream, reader *bufio.Reader, req 
 		return refuse(fmt.Errorf("failed to number the attachment: %w", err))
 	}
 	var att *attachResult
-	if err := rt.owner.do(func(s *ownerState) error {
+	if err := rt.owner.doAtGround(func(s *ownerState) error {
 		var err error
 		att, err = s.attach(fmt.Sprintf("%s-%d", req.Kind, seq), req.Kind, req.Geometry, replaces)
 		return err
@@ -654,10 +655,11 @@ loop:
 // when it asked for one, AttachResync when it lagged. Output is published
 // on the owner goroutine, so discarding what is queued for this client and
 // taking the snapshot there makes the snapshot an exact boundary: everything
-// before it is in the snapshot, everything after follows it.
+// before it is in the snapshot, everything after follows it. doAtGround
+// keeps that boundary outside escape sequences.
 func (rt *runtime) sendSnapshot(conn transport.Stream, sub *subscriber, resync bool) error {
 	var snapshot []byte
-	if err := rt.owner.do(func(s *ownerState) error {
+	if err := rt.owner.doAtGround(func(s *ownerState) error {
 		sub.discard()
 		var err error
 		snapshot, err = s.snapshot()
