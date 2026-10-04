@@ -180,7 +180,11 @@ func (a *app) commands() []*cobra.Command {
 	history.Flags().BoolVar(&vt, "vt", false, "")
 	cmds = append(cmds, annotate(history, "[OPTIONS] <SESSION_ID>", "<SESSION_ID>"))
 
-	cmds = append(cmds, visibleAlias(a.command("list", "List known sessions", noArgs, func([]string) error {
+	var listAll, listJSON bool
+	list := visibleAlias(a.command("list", "List known sessions", noArgs, func([]string) error {
+		if listAll {
+			return a.listAllSessions(listJSON)
+		}
 		c, err := a.connect(nil, "", nil)
 		if err != nil {
 			return err
@@ -188,6 +192,14 @@ func (a *app) commands() []*cobra.Command {
 		sessions, err := c.listSessions(0)
 		if err != nil {
 			return err
+		}
+		if listJSON {
+			w, _ := c.welcome()
+			listed := make([]hostSession, len(sessions))
+			for i := range sessions {
+				listed[i] = hostSession{host: c.remoteName(), welcome: w, rec: sessions[i]}
+			}
+			return writeSessionsJSON(os.Stdout, listed)
 		}
 		width := stdoutWidth()
 		if width == 0 {
@@ -197,7 +209,10 @@ func (a *app) commands() []*cobra.Command {
 			fmt.Println(line)
 		}
 		return nil
-	}), "ls", "sessions"))
+	}), "ls", "sessions")
+	list.Flags().BoolVarP(&listAll, "all", "a", false, "List the sessions of this machine and every host (see `agent hosts`)")
+	list.Flags().BoolVar(&listJSON, "json", false, "Print one JSON object per session, with its host and global id")
+	cmds = append(cmds, list)
 
 	cmds = append(cmds, annotate(a.command("attachments SESSION", "Show currently attached clients for a session", oneArg, func(args []string) error {
 		id := args[0]
@@ -230,6 +245,14 @@ func (a *app) commands() []*cobra.Command {
 		resp, err := c.call(&protocol.Request{GetSession: &protocol.SessionRef{SessionID: id}}, 0, func(r *protocol.Response) bool { return r.Session != nil })
 		if err != nil {
 			return err
+		}
+		if w, err := c.welcome(); err == nil {
+			if host := c.remoteName(); host != "" {
+				fmt.Printf("host: %s\n", host)
+			}
+			if gid := protocol.GlobalSessionID(w.DaemonID, resp.Session.UID); gid != "" {
+				fmt.Printf("global_id: %s\n", gid)
+			}
 		}
 		printSession(os.Stdout, resp.Session, time.Now())
 		// The git section is extra: a daemon without it, or git failing,
@@ -302,6 +325,7 @@ func (a *app) commands() []*cobra.Command {
 	events.Flags().IntVarP(&ev.lines, "lines", "n", 20, "How many past events to show first")
 	events.Flags().StringVar(&ev.level, "level", "", "Only events at or above this attention: info, notice or action")
 	events.Flags().BoolVar(&ev.json, "json", false, "Print one JSON object per event")
+	events.Flags().BoolVarP(&ev.all, "all", "a", false, "Show the events of this machine and every host (see `agent hosts`)")
 	events.Flags().BoolVar(&ev.notify, "notify", false, "Ring the bell and post a desktop notification for action-level events")
 	events.Flags().StringVar(&ev.exec, "exec", "", "Run CMD with sh for each event, described in AGENTD_EVENT_* variables")
 	events.Flags().Func("after", "Start after event ID (from an earlier run) instead of with the newest events", func(v string) error {

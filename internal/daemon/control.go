@@ -31,7 +31,11 @@ func (s *Server) serveControl(conn transport.Stream, reader *bufio.Reader, hello
 	if err != nil {
 		return protocol.WriteResponse(conn, protocol.ErrorResponsef("%v", err))
 	}
-	if err := protocol.WriteResponse(conn, &protocol.Response{Welcome: s.welcome(version)}); err != nil {
+	welcome := s.welcome(version)
+	if protocol.HasCapability(hello.Capabilities, protocol.CapDaemonID) {
+		welcome.DaemonID = s.daemonID
+	}
+	if err := protocol.WriteResponse(conn, &protocol.Response{Welcome: welcome}); err != nil {
 		return err
 	}
 	features := protocol.NegotiateFeatures(protocol.Capabilities(), hello.Capabilities)

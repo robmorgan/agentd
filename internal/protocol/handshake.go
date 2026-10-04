@@ -98,6 +98,8 @@ type Welcome struct {
 	// client uses a feature only if it is listed here.
 	Capabilities []string
 	Host         HostInfo
+	// DaemonID is the daemon's stable id (CapDaemonID), or "".
+	DaemonID string
 }
 
 // HostInfo describes the daemon's machine, so a client can tell machines
@@ -160,7 +162,24 @@ const (
 	// CapSessionActivity: session records carry the activity fields
 	// appended to them (session.Record.Activity onwards).
 	CapSessionActivity = "session-activity"
+	// CapDaemonID: Welcome ends with the daemon's id, the fingerprint of
+	// its key (remote/daemon.key), which is stable for the life of its
+	// runtime root. With a session's UID it forms the session's global
+	// identifier (GlobalSessionID). Sent only to a client whose Hello
+	// listed it.
+	CapDaemonID = "daemon-id"
 )
+
+// GlobalSessionID identifies one incarnation of a session across every
+// host: the daemon's id and the session's UID. Unlike `host/name` it
+// survives renaming the host in hosts.toml and never refers to a newer
+// session that reused the name.
+func GlobalSessionID(daemonID, uid string) string {
+	if daemonID == "" || uid == "" {
+		return ""
+	}
+	return daemonID + "/" + uid
+}
 
 // MinProtocolVersion is the oldest protocol version this build speaks.
 // Versions in [MinProtocolVersion, ProtocolVersion] can be negotiated.
@@ -169,7 +188,7 @@ const MinProtocolVersion uint16 = 1
 // Capabilities is what this build supports.
 func Capabilities() []string {
 	return []string{CapControlStream, CapGitState, CapArtifacts, CapSessionUID, CapRequestTokens, CapAttachFeatures, CapAttachReplace, CapAttachResync, CapRuntimeStats,
-		CapEvents, CapSessionActivity}
+		CapEvents, CapSessionActivity, CapDaemonID}
 }
 
 // AttachCapabilities are the capabilities that apply to an attach stream,

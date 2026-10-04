@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -427,6 +428,37 @@ func TestRemoteAttachEndToEnd(t *testing.T) {
 		if !strings.Contains(info, want) {
 			t.Fatalf("host info: no %q in\n%s", want, info)
 		}
+	}
+	// Sessions across hosts: here "local" and "dev" are the same daemon,
+	// so the same session shows twice, under one global id.
+	if out := regexp.MustCompile("\x1b\\[[0-9;]*m").ReplaceAllString(e.mustRun("agent", "ls", "--all"), ""); !regexp.MustCompile(`local\s+demo`).MatchString(out) || !regexp.MustCompile(`dev\s+demo`).MatchString(out) {
+		t.Fatalf("ls --all:\n%s", out)
+	}
+	var ids []string
+	for _, line := range strings.Split(strings.TrimSpace(e.mustRun("agent", "ls", "--all", "--json")), "\n") {
+		if !strings.HasPrefix(line, "{") {
+			continue // stderr: the unreachable host
+		}
+		var v struct {
+			Address  string `json:"address"`
+			GlobalID string `json:"global_id"`
+		}
+		if err := json.Unmarshal([]byte(line), &v); err != nil {
+			t.Fatalf("ls --all --json line %q: %v", line, err)
+		}
+		if !strings.HasPrefix(v.GlobalID, daemonKey+"/") {
+			t.Fatalf("global id %q does not start with the daemon key", v.GlobalID)
+		}
+		ids = append(ids, v.GlobalID)
+	}
+	if len(ids) != 2 || ids[0] != ids[1] {
+		t.Fatalf("global ids = %v", ids)
+	}
+	if out := e.mustRun("agent", "status", "dev/demo"); !strings.Contains(out, "host: dev") || !strings.Contains(out, "global_id: "+ids[0]) {
+		t.Fatalf("status dev/demo:\n%s", out)
+	}
+	if out := e.mustRun("agent", "events", "--all"); !strings.Contains(out, "local/demo") || !strings.Contains(out, "dev/demo") {
+		t.Fatalf("events --all:\n%s", out)
 	}
 	e.mustRun("agent", "host", "rm", "gone")
 

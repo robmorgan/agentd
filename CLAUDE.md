@@ -529,9 +529,10 @@ Done:
 - Host health (`agent hosts`), machine capabilities (`agent host info`), and placement hints (`agent --host auto new`).
 - Resource usage: workers and the daemon report their own (`GetSessionStats`/`GetDaemonStats`, `agent status --stats`, `agent daemon stats`), and `agentd bench sessions` measures sessions at scale (BENCHMARKS.md, "Sessions at scale").
 
+- Cross-host discovery (`agent ls --all`, `agent events --all`) and global session ids (daemon id + session UID).
+
 Next:
-1. Cross-host discovery (`agent ls` across hosts).
-2. Per-client permissions and audit, if remote peers need to be limited.
+1. Per-client permissions and audit, if remote peers need to be limited.
 
 Known gaps:
 - History is only saved when a session exits.

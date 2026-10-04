@@ -585,7 +585,7 @@ Use independent streams.
 ## Deliverables
 
 * [x] Define stream taxonomy (request, control, attach, events, artifact; ARCHITECTURE.md "Streams and their roles")
-* [ ] Make attachment streams independent
+* [x] Make attachment streams independent (one QUIC stream per attachment with its own flow control; `TestQUICStreamsAreIndependent`, the slow-attachment tests in `quic_measure_test.go`)
 * [x] Separate large transfers from latency-sensitive terminal traffic (artifacts stream on their
       own stream as bounded `ArtifactChunk` frames, held back by flow control)
 * [x] Measure flow-control behavior
@@ -893,9 +893,9 @@ agent attach devbox-1/auth-tests
 * [x] Host configuration (`agent host add|ls|rm`, `hosts.toml`)
 * [x] Host aliases (`--host NAME`, `NAME/session`)
 * [x] Host health (`agent hosts` / `agent host ls`: online, offline, unauthorized, latency, load)
-* [ ] Cross-host session discovery
-* [ ] Stable global session identifiers
-* [ ] Host-aware CLI UX
+* [x] Cross-host session discovery (`agent ls --all`, `agent events --all`)
+* [x] Stable global session identifiers (daemon id + session UID, shown by `agent status` and `agent ls --json`)
+* [x] Host-aware CLI UX (HOST column, `local/` and `host/` addresses everywhere, `--host local|auto`)
 * [x] Machine capabilities (`Welcome` host description; `agent host info`)
 * [x] Simple placement hints (`agent --host auto new`: least running sessions per CPU among hosts with the agent and workspace)
 

@@ -499,6 +499,18 @@ gpu-01  10.0.0.9:7433    offline  -        -         -     -             -
 `key changed`. `agent host info devbox` shows its machine (OS, CPUs, memory), its agents, daemon
 version, capabilities and pinned key. `--host local` (or `local/session`) is this machine.
 
+Across every host at once:
+
+```sh
+agent ls --all             # one list, with a HOST column, what needs attention first
+agent ls --all --json      # one object per session, with its address and global id
+agent events --all -f      # follow every host's events (add --notify for alerts)
+```
+
+A session's global id (`agent status` shows it) is its host's daemon key plus the session's UID.
+Unlike `host/name`, it never changes when a host is renamed and never refers to a newer session
+that reused the name.
+
 `agent --host auto new` lets the CLI choose: among the hosts that are online, have the agent, and
 (with `--workspace`) have that workspace, it picks the one with the fewest running sessions per
 CPU, and says which and why. It is a hint for spreading work, not a scheduler. It needs
