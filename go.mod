@@ -8,7 +8,7 @@ require (
 	github.com/quic-go/quic-go v0.63.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.9
-	go.mitchellh.com/libghostty v0.0.0-20260920220152-31b65cdc24cf
+	go.mitchellh.com/libghostty v0.0.0-20261001181910-76867c77a212
 	golang.org/x/sys v0.47.0
 	golang.org/x/term v0.45.0
 	modernc.org/sqlite v1.59.0

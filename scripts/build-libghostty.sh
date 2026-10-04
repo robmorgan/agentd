@@ -8,7 +8,7 @@
 #        eval "$(scripts/build-libghostty.sh --env)"   # only print exports
 set -euo pipefail
 
-GHOSTTY_COMMIT="27e8b3fa85d9cf8c7cd5ae2ced348bcb0a4fba9c"
+GHOSTTY_COMMIT="33da6848d63b3bba2b4f31ab1531d618f2795192"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD="${HERE}/../.build"
 SRC="${BUILD}/ghostty"

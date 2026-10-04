@@ -40,6 +40,10 @@ func printSessionStats(w io.Writer, s *protocol.SessionStats) {
 	fmt.Fprintf(w, "terminal: %dx%d, scrollback %d rows (limit %s), output %s in %d chunks, attachments %d, dropped output chunks %d\n",
 		s.Cols, s.Rows, s.ScrollbackRows, formatBytes(s.ScrollbackLimitBytes), formatBytes(s.OutputBytes), s.OutputChunks,
 		s.Attachments, s.DroppedOutputChunks)
+	if t := s.Terminal; t != nil {
+		fmt.Fprintf(w, "terminal memory: %s in %d pages, %d of them compressed (into %s)\n",
+			formatBytes(t.ResidentBytes), t.Pages, t.CompressedPages, formatBytes(t.CompressedBytes))
+	}
 }
 
 // describeProcess is one line of a process's usage. The Go runtime fields
@@ -107,7 +111,7 @@ func (c *client) printDaemonStats(w io.Writer) error {
 	wg.Wait()
 
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "SESSION\tPRIVATE\tRSS\tCPU\tTHREADS\tFDS\tGOROUTINES\tGO HEAP\tSCROLLBACK\tAGENT PRIVATE")
+	fmt.Fprintln(tw, "SESSION\tPRIVATE\tRSS\tCPU\tTHREADS\tFDS\tGOROUTINES\tGO HEAP\tSCROLLBACK\tTERMINAL\tAGENT PRIVATE")
 	var workers, agents uint64
 	for i, id := range running {
 		s := stats[i]
@@ -117,10 +121,14 @@ func (c *client) printDaemonStats(w io.Writer) error {
 		}
 		workers += s.Worker.PrivateBytes
 		agents += s.Agent.PrivateBytes
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%d\t%d\t%s\t%d\t%s\n", id,
+		terminal := "-"
+		if s.Terminal != nil {
+			terminal = formatBytes(s.Terminal.ResidentBytes)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%d\t%d\t%s\t%d\t%s\t%s\n", id,
 			formatBytes(s.Worker.PrivateBytes), formatBytes(s.Worker.RSSBytes), formatCPU(s.Worker),
 			s.Worker.Threads, s.Worker.OpenFDs, s.Worker.Goroutines, formatBytes(s.Worker.GoHeapBytes),
-			s.ScrollbackRows, formatBytes(s.Agent.PrivateBytes))
+			s.ScrollbackRows, terminal, formatBytes(s.Agent.PrivateBytes))
 	}
 	if err := tw.Flush(); err != nil {
 		return err

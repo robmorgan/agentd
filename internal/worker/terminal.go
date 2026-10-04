@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"time"
 
 	"go.mitchellh.com/libghostty"
+
+	"github.com/robmorgan/agentd/internal/protocol"
 )
 
 // continuationMaxBytes bounds the unfinished escape sequence (or UTF-8
@@ -25,7 +28,33 @@ type terminalState struct {
 	pending [][]byte
 	size    libghostty.SizeReportSize
 	effects terminalEffects
+
+	// lastFeed is when PTY output last reached the terminal, which
+	// decides when its scrollback is idle enough to compress.
+	lastFeed time.Time
+	// compressed reports that a compression pass finished while the
+	// terminal's compression activity token was compressedToken; until
+	// the token changes there is nothing more to compress.
+	compressed      bool
+	compressedToken uint64
 }
+
+// Scrollback compression. libghostty can compress the pages of scrollback
+// it holds, which a session that has scrolled far keeps for as long as it
+// runs: a full 10 MB scrollback goes from about 9.4 MiB resident to under
+// 1 MiB. Formatting a snapshot (an attach, a resync, history) still works on
+// compressed pages, takes about 10% longer, and leaves them decompressed
+// until the next quiet tick compresses them again.
+//
+// Compression runs on the owner goroutine (the terminal is not safe to share)
+// from the worker's one-second activity tick, once output has been quiet for
+// compressIdleAfter, in incremental steps that stop after compressStepBudget
+// so PTY output and requests queued behind it wait at most that long. A busy
+// session is never compressed: its pages would be decompressed again at once.
+const (
+	compressIdleAfter  = 3 * time.Second
+	compressStepBudget = 5 * time.Millisecond
+)
 
 // maxNotificationsPerFeed bounds the notifications kept from one PTY read; a
 // program flooding them gains nothing past the first few.
@@ -146,6 +175,11 @@ func decodeSnapshot(data []byte) (*libghostty.Terminal, error) {
 	if err := d.SetRetainContinuation(true); err != nil {
 		return nil, err
 	}
+	// A restored terminal would otherwise hold all its scrollback
+	// uncompressed, however compressed it was in the previous image.
+	if err := d.SetCompressHistory(true); err != nil {
+		return nil, err
+	}
 	term, err := d.Decode()
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode the terminal snapshot: %w", err)
@@ -157,6 +191,7 @@ func decodeSnapshot(data []byte) (*libghostty.Terminal, error) {
 // write back to the PTY (mode reports, size reports, and so on), and the
 // attention effects the output had.
 func (s *terminalState) feed(data []byte) ([][]byte, terminalEffects) {
+	s.lastFeed = time.Now()
 	s.term.VTWrite(data)
 	return s.take()
 }
@@ -175,6 +210,7 @@ func (s *terminalState) title() string {
 // it never gets there) along with any responses and effects. See
 // ownerState.atGround.
 func (s *terminalState) feedUntilGround(data []byte) (int, [][]byte, terminalEffects) {
+	s.lastFeed = time.Now()
 	n, _ := s.term.VTWriteUntilGround(data)
 	writes, effects := s.take()
 	return n, writes, effects
@@ -202,6 +238,10 @@ func (s *terminalState) resize(cols, rows uint16, cellWidthPx, cellHeightPx uint
 // format renders the active screen and its scrollback for history: plain
 // text, or VT sequences that reproduce the styles.
 func (s *terminalState) format(vt bool) ([]byte, error) {
+	// Formatting reads, and so decompresses, every page of scrollback
+	// without changing the compression activity token: compress again
+	// at the next quiet tick.
+	s.compressed = false
 	if !vt {
 		return formatScreen(s.term, libghostty.FormatterFormatPlain, true)
 	}
@@ -422,6 +462,47 @@ func runFormatter(term *libghostty.Terminal, format libghostty.FormatterFormat, 
 	}
 	defer f.Close()
 	return f.Format()
+}
+
+// compressIdle compresses scrollback if output has been quiet long enough
+// and the scrollback changed (or was read by format) since the last complete
+// pass; see compressIdleAfter.
+func (s *terminalState) compressIdle(now time.Time) {
+	if now.Sub(s.lastFeed) < compressIdleAfter {
+		return
+	}
+	token, err := s.term.CompressionActivity()
+	if err != nil || (s.compressed && token == s.compressedToken) {
+		return
+	}
+	deadline := now.Add(compressStepBudget)
+	for {
+		result, err := s.term.Compress(libghostty.TerminalCompressionIncremental)
+		if err != nil || result != libghostty.TerminalCompressionPending {
+			// Done, or not possible on this platform (or failing):
+			// nothing more to do until the scrollback changes.
+			s.compressed = true
+			s.compressedToken, _ = s.term.CompressionActivity()
+			return
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+	}
+}
+
+// memory is what the terminal's screens hold, from libghostty.
+func (s *terminalState) memory() (*protocol.TerminalMemory, error) {
+	m, err := s.term.MemoryUsage()
+	if err != nil {
+		return nil, err
+	}
+	return &protocol.TerminalMemory{
+		Pages:           m.Primary.Pages + m.Alternate.Pages,
+		ResidentBytes:   m.Primary.ResidentBytes + m.Alternate.ResidentBytes,
+		CompressedPages: m.Primary.CompressedPages + m.Alternate.CompressedPages,
+		CompressedBytes: m.Primary.CompressedBytes + m.Alternate.CompressedBytes,
+	}, nil
 }
 
 // scrollbackRows is the number of rows of history above the screen.

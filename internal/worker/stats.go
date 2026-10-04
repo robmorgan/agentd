@@ -29,6 +29,8 @@ func (rt *runtime) stats(snapshot bool) (*protocol.SessionStats, error) {
 		out.OutputBytes = s.outputBytes
 		out.OutputChunks = s.outputChunks
 		out.DroppedOutputChunks = s.output.droppedChunks()
+		// Best effort: a terminal that cannot say leaves it unset.
+		out.Terminal, _ = s.terminal.memory()
 		if snapshot {
 			start := time.Now()
 			var err error

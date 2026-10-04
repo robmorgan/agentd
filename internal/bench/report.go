@@ -137,6 +137,9 @@ type SnapshotReport struct {
 	RestoreMs      Dist    `json:"restore_ms"`
 	AttachMs       Dist    `json:"attach_ms"`
 	WorkerPrivate  float64 `json:"worker_private,omitempty"`
+	// WorkerPrivateIdle is WorkerPrivate once the session has been quiet
+	// long enough for its scrollback to be compressed.
+	WorkerPrivateIdle float64 `json:"worker_private_idle,omitempty"`
 }
 
 // OutputReport is PTY throughput with no client attached.
@@ -324,7 +327,8 @@ func (r *Report) Print(w io.Writer) {
 	fmt.Fprintf(w, "\nidle CPU over %.1f s: daemon %.2f%%, workers %.2f%% (%.0f µs/s each), agents %.2f%%\n",
 		c.IntervalSec, c.DaemonPercent, c.WorkersPercent, c.PerWorkerMicros, c.AgentsPercent)
 	if r.FullSnapshot != nil && r.FullSnapshot.WorkerPrivate > 0 {
-		fmt.Fprintf(w, "worker with full scrollback: %s private\n", mib(r.FullSnapshot.WorkerPrivate))
+		fmt.Fprintf(w, "worker with full scrollback: %s private just after snapshots, %s once idle (scrollback compressed)\n",
+			mib(r.FullSnapshot.WorkerPrivate), mib(r.FullSnapshot.WorkerPrivateIdle))
 	}
 
 	if o := r.Output; o != nil {

@@ -537,9 +537,23 @@ func (b *bench) measureSnapshots(ctx context.Context) error {
 		return err
 	}
 	r.WorkerPrivate = float64(s.Worker.PrivateBytes)
+	// Taking snapshots decompressed the scrollback; once the session has
+	// been quiet for a few of the worker's ticks it is compressed again.
+	if err := sleep(ctx, fullIdleWait); err != nil {
+		return err
+	}
+	if s, err = b.sessionStats(fillName, false); err != nil {
+		return err
+	}
+	r.WorkerPrivateIdle = float64(s.Worker.PrivateBytes)
 	b.report.FullSnapshot = &r
 	return nil
 }
+
+// fullIdleWait is how long the full-scrollback session is left quiet before
+// its memory is sampled again: past the worker's compression delay (3s) and
+// a couple of its one-second ticks.
+const fullIdleWait = 6 * time.Second
 
 func sleep(ctx context.Context, d time.Duration) error {
 	select {

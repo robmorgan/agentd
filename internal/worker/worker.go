@@ -636,7 +636,7 @@ func (rt *runtime) handleConnection(conn transport.Stream) (keep bool, err error
 		if err != nil {
 			return false, fail(err)
 		}
-		return false, reply(&protocol.Response{SessionStats: stats})
+		return false, protocol.WriteResponseWith(conn, protocol.OwnFeatures(), &protocol.Response{SessionStats: stats})
 	default:
 		return false, reply(protocol.ErrorResponsef("unsupported worker request"))
 	}

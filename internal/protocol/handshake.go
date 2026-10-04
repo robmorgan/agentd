@@ -176,6 +176,9 @@ const (
 	// list it in their answer to Hello, so agentd can tell a worker that
 	// supports handoff from one started by an older binary.
 	CapWorkerHandoff = "worker-handoff"
+	// CapTerminalMemory: SessionStats ends with the shadow terminal's
+	// memory (TerminalMemory).
+	CapTerminalMemory = "terminal-memory"
 )
 
 // GlobalSessionID identifies one incarnation of a session across every
@@ -196,7 +199,7 @@ const MinProtocolVersion uint16 = 1
 // Capabilities is what this build supports.
 func Capabilities() []string {
 	return []string{CapControlStream, CapGitState, CapArtifacts, CapSessionUID, CapRequestTokens, CapAttachFeatures, CapAttachReplace, CapAttachResync, CapRuntimeStats,
-		CapEvents, CapSessionActivity, CapDaemonID, CapSessionRestart, CapWorkerHandoff}
+		CapEvents, CapSessionActivity, CapDaemonID, CapSessionRestart, CapWorkerHandoff, CapTerminalMemory}
 }
 
 // AttachCapabilities are the capabilities that apply to an attach stream,
@@ -278,6 +281,12 @@ func NegotiateFeatures(ours, theirs []string) Features {
 	}
 	return f
 }
+
+// OwnFeatures is every feature this build supports. A session worker
+// answers its daemon with them: the daemon is never older than its
+// workers (an upgrade replaces the daemon first), and decodes appended
+// fields only when they are present.
+func OwnFeatures() Features { return NegotiateFeatures(Capabilities(), Capabilities()) }
 
 // Has reports whether both peers support capability c.
 func (f Features) Has(c string) bool { return f.set[c] }
