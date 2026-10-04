@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-func shortSocketPath(t *testing.T) string {
+func shortSocketPath(t testing.TB) string {
 	t.Helper()
 	// Unix socket paths are limited to ~104 bytes, so avoid t.TempDir().
 	dir, err := os.MkdirTemp("/tmp", "agdt-")

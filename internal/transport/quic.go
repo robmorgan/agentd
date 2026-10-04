@@ -50,6 +50,27 @@ func quicConfig(idleTimeout time.Duration) *quic.Config {
 		// many a single client can have open at once.
 		MaxIncomingStreams:    256,
 		MaxIncomingUniStreams: -1,
+		// Flow-control windows bound what a peer can make this end buffer
+		// for data the application has not read yet: one stream at most
+		// its stream window, the whole connection, however many of its
+		// 256 streams are open, at most the connection window. A stream
+		// starts at the initial window and grows towards the maximum only
+		// while it is being read quickly; a stalled one stops growing.
+		//
+		// Measurements (BENCHMARKS.md): a 4 MiB stream window moves a
+		// large transfer as fast as 16 MiB does at 20 ms round-trip time
+		// and at about 23 MB/s at 100 ms, plenty for snapshots, history
+		// and PTY output. A stalled stream takes only its own window of
+		// the connection's, so the connection window starts at 8 fresh
+		// stream windows (quic-go's 1.5 would let 2 stalled attachments
+		// block every other stream) and is capped at 16 MiB, which is
+		// therefore the most one client can make the daemon buffer.
+		InitialStreamReceiveWindow:     512 << 10,
+		MaxStreamReceiveWindow:         4 << 20,
+		InitialConnectionReceiveWindow: 4 << 20,
+		MaxConnectionReceiveWindow:     16 << 20,
+		// Datagrams stay off (the default): nothing in the protocol is
+		// replaceable enough to send unreliably; see BENCHMARKS.md.
 	}
 }
 
