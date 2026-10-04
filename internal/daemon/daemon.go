@@ -504,7 +504,7 @@ func (s *Server) handleRequest(conn transport.Stream, reader *bufio.Reader, req 
 		}
 		return s.proxyAttach(conn, reader, req.AttachSession)
 	}
-	resp, after := s.respond(req)
+	resp, after := s.respond(req, protocol.Features{})
 	err := protocol.WriteResponse(conn, resp)
 	if after != nil {
 		after()
@@ -513,9 +513,10 @@ func (s *Server) handleRequest(conn transport.Stream, reader *bufio.Reader, req 
 }
 
 // respond answers a request that has a single response: every request but
-// Hello and AttachSession. after, if set, runs once the response is
-// written. It is safe to call concurrently, as a control stream does.
-func (s *Server) respond(req *protocol.Request) (resp *protocol.Response, after func()) {
+// Hello and AttachSession. f is the features the client's stream agreed
+// on. after, if set, runs once the response is written. It is safe to call
+// concurrently, as a control stream does.
+func (s *Server) respond(req *protocol.Request, f protocol.Features) (resp *protocol.Response, after func()) {
 	fail := func(err error) (*protocol.Response, func()) { return protocol.ErrorResponsef("%v", err), nil }
 
 	// Session ids become socket and log paths, so anything that could not

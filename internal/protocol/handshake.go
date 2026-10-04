@@ -144,9 +144,45 @@ func NewHello(client string) *Hello {
 	return &Hello{MinVersion: MinProtocolVersion, MaxVersion: ProtocolVersion, Client: client, Capabilities: Capabilities()}
 }
 
-// WriteTaggedRequest writes req on a control stream, tagged with id.
-func WriteTaggedRequest(w io.Writer, id uint32, req *Request) error {
-	k, payload, err := encodeRequest(req)
+// Features is the set of optional features both peers of a stream
+// support: the capabilities both listed in the handshake. It decides which
+// optional fields encoders write and decoders expect; the zero value is the
+// base encoding.
+//
+// A capability that adds a field to an existing message (or to a struct
+// such as a session record, even one inside a list) appends it to the end
+// of that message or struct, and encoders and decoders handle it only when
+// Features has the capability.
+type Features struct{ set map[string]bool }
+
+// NegotiateFeatures is the features in both ours and theirs.
+func NegotiateFeatures(ours, theirs []string) Features {
+	f := Features{set: map[string]bool{}}
+	for _, c := range theirs {
+		if slices.Contains(ours, c) {
+			f.set[c] = true
+		}
+	}
+	return f
+}
+
+// Has reports whether both peers support capability c.
+func (f Features) Has(c string) bool { return f.set[c] }
+
+// List returns the features, sorted.
+func (f Features) List() []string {
+	out := make([]string, 0, len(f.set))
+	for c := range f.set {
+		out = append(out, c)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// WriteTaggedRequest writes req on a control stream, tagged with id, with
+// the stream's negotiated features.
+func WriteTaggedRequest(w io.Writer, f Features, id uint32, req *Request) error {
+	k, payload, err := encodeRequest(req, f)
 	if err != nil {
 		return err
 	}
@@ -155,8 +191,8 @@ func WriteTaggedRequest(w io.Writer, id uint32, req *Request) error {
 
 // WriteTaggedResponse writes resp on a control stream, tagged with the id of
 // the request it answers.
-func WriteTaggedResponse(w io.Writer, id uint32, resp *Response) error {
-	k, payload, err := encodeResponse(resp)
+func WriteTaggedResponse(w io.Writer, f Features, id uint32, resp *Response) error {
+	k, payload, err := encodeResponse(resp, f)
 	if err != nil {
 		return err
 	}
@@ -168,12 +204,12 @@ func WriteTaggedResponse(w io.Writer, id uint32, resp *Response) error {
 // correctly but cannot be decoded returns a *DecodeError together with its
 // id, and leaves the stream at the next frame, so the daemon can answer it
 // and carry on.
-func ReadTaggedRequest(r io.Reader) (req *Request, id uint32, tagged bool, err error) {
+func ReadTaggedRequest(r io.Reader, f Features) (req *Request, id uint32, tagged bool, err error) {
 	h, payload, err := readStandardFrame(r)
 	if err != nil || h == nil {
 		return nil, 0, false, err
 	}
-	req, err = decodeRequest(kind(h.kind), payload)
+	req, err = decodeRequest(kind(h.kind), payload, f)
 	if err != nil {
 		return nil, h.id, h.tagged, &DecodeError{Version: h.version, Err: err}
 	}
@@ -182,12 +218,12 @@ func ReadTaggedRequest(r io.Reader) (req *Request, id uint32, tagged bool, err e
 
 // ReadTaggedResponse reads the next response on a control stream. It returns
 // a nil response and nil error on a clean EOF.
-func ReadTaggedResponse(r io.Reader) (resp *Response, id uint32, tagged bool, err error) {
+func ReadTaggedResponse(r io.Reader, f Features) (resp *Response, id uint32, tagged bool, err error) {
 	h, payload, err := readStandardFrame(r)
 	if err != nil || h == nil {
 		return nil, 0, false, err
 	}
-	resp, err = decodeResponse(kind(h.kind), payload)
+	resp, err = decodeResponse(kind(h.kind), payload, f)
 	if err != nil {
 		return nil, h.id, h.tagged, err
 	}

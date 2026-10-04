@@ -215,9 +215,12 @@ features both listed. Today there is one protocol version (1) and one capability
 (`control-stream`).
 
 The protocol grows without breaking older peers this way: a new message kind, or a field appended
-to the end of an existing message, comes with a capability, and neither side sends it unless the
-other advertised that capability. Decoders reject unknown kinds, unknown flags and trailing bytes,
-so nothing is ever silently misread. Changing an existing encoding needs a new protocol version.
+to the end of an existing message or struct (a session record, even inside a list), comes with a
+capability, and neither side sends it unless the other advertised that capability. The
+capabilities both sides listed are the stream's `protocol.Features`, which tell the encoder which
+optional fields to write and the decoder which to expect. Streams without a handshake use the base
+encoding. Decoders reject unknown kinds, unknown flags and trailing bytes, so nothing is ever
+silently misread. Changing an existing encoding needs a new protocol version.
 
 The CLI opens one control stream per process, right after connecting, and sends all its one-shot
 requests on it (`internal/cli/control.go`). Each request carries a `u32` id that its response

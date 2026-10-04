@@ -360,16 +360,30 @@ func WriteErrorAtVersion(w io.Writer, version uint16, message string) error {
 	return writeFrame(w, version, uint16(kErrorResponse), e.buf)
 }
 
+// WriteRequest writes req in the base encoding, which every peer of this
+// protocol version decodes. Streams whose peers agreed on optional
+// features use WriteRequestWith.
 func WriteRequest(w io.Writer, req *Request) error {
-	k, payload, err := encodeRequest(req)
+	return WriteRequestWith(w, Features{}, req)
+}
+
+// WriteRequestWith writes req, including the optional fields of features f.
+func WriteRequestWith(w io.Writer, f Features, req *Request) error {
+	k, payload, err := encodeRequest(req, f)
 	if err != nil {
 		return err
 	}
 	return writeFrame(w, ProtocolVersion, uint16(k), payload)
 }
 
+// WriteResponse writes resp in the base encoding.
 func WriteResponse(w io.Writer, resp *Response) error {
-	k, payload, err := encodeResponse(resp)
+	return WriteResponseWith(w, Features{}, resp)
+}
+
+// WriteResponseWith writes resp, including the optional fields of features f.
+func WriteResponseWith(w io.Writer, f Features, resp *Response) error {
+	k, payload, err := encodeResponse(resp, f)
 	if err != nil {
 		return err
 	}
@@ -378,6 +392,11 @@ func WriteResponse(w io.Writer, resp *Response) error {
 
 // ReadRequest returns (nil, nil) when the peer closed the connection cleanly.
 func ReadRequest(r io.Reader) (*Request, error) {
+	return ReadRequestWith(r, Features{})
+}
+
+// ReadRequestWith reads a request written with features f.
+func ReadRequestWith(r io.Reader, f Features) (*Request, error) {
 	h, payload, err := readStandardFrame(r)
 	if err != nil || h == nil {
 		return nil, err
@@ -385,11 +404,16 @@ func ReadRequest(r io.Reader) (*Request, error) {
 	if h.tagged {
 		return nil, errUnexpectedTag
 	}
-	return decodeRequest(kind(h.kind), payload)
+	return decodeRequest(kind(h.kind), payload, f)
 }
 
 // ReadResponse returns (nil, nil) when the peer closed the connection cleanly.
 func ReadResponse(r io.Reader) (*Response, error) {
+	return ReadResponseWith(r, Features{})
+}
+
+// ReadResponseWith reads a response written with features f.
+func ReadResponseWith(r io.Reader, f Features) (*Response, error) {
 	h, payload, err := readStandardFrame(r)
 	if err != nil || h == nil {
 		return nil, err
@@ -397,14 +421,14 @@ func ReadResponse(r io.Reader) (*Response, error) {
 	if h.tagged {
 		return nil, errUnexpectedTag
 	}
-	return decodeResponse(kind(h.kind), payload)
+	return decodeResponse(kind(h.kind), payload, f)
 }
 
 // ---------------------------------------------------------------------------
 // Encoding
 
-func encodeRequest(req *Request) (kind, []byte, error) {
-	e := &encoder{}
+func encodeRequest(req *Request, f Features) (kind, []byte, error) {
+	e := &encoder{f: f}
 	switch {
 	case req.GetDaemonInfo != nil:
 		return kGetDaemonInfoRequest, nil, nil
@@ -481,8 +505,8 @@ func encodeRequest(req *Request) (kind, []byte, error) {
 	return 0, nil, errors.New("empty request")
 }
 
-func decodeRequest(k kind, payload []byte) (*Request, error) {
-	d := &decoder{buf: payload}
+func decodeRequest(k kind, payload []byte, f Features) (*Request, error) {
+	d := &decoder{buf: payload, f: f}
 	req := &Request{}
 	switch k {
 	case kGetDaemonInfoRequest:
@@ -541,8 +565,8 @@ func decodeRequest(k kind, payload []byte) (*Request, error) {
 	return req, nil
 }
 
-func encodeResponse(resp *Response) (kind, []byte, error) {
-	e := &encoder{}
+func encodeResponse(resp *Response, f Features) (kind, []byte, error) {
+	e := &encoder{f: f}
 	switch {
 	case resp.DaemonInfo != nil:
 		e.str(resp.DaemonInfo.DaemonVersion)
@@ -632,8 +656,8 @@ func encodeResponse(resp *Response) (kind, []byte, error) {
 	return 0, nil, errors.New("empty response")
 }
 
-func decodeResponse(k kind, payload []byte) (*Response, error) {
-	d := &decoder{buf: payload}
+func decodeResponse(k kind, payload []byte, f Features) (*Response, error) {
+	d := &decoder{buf: payload, f: f}
 	resp := &Response{}
 	switch k {
 	case kDaemonInfoResponse:
@@ -715,6 +739,8 @@ func decodeResponse(k kind, payload []byte) (*Response, error) {
 type encoder struct {
 	buf []byte
 	err error
+	// f decides which optional fields are written.
+	f Features
 }
 
 func (e *encoder) u8(v uint8)   { e.buf = append(e.buf, v) }
@@ -879,6 +905,8 @@ type decoder struct {
 	buf []byte
 	pos int
 	err error
+	// f decides which optional fields are expected.
+	f Features
 }
 
 func (d *decoder) fail(format string, args ...any) {
@@ -905,6 +933,14 @@ func (d *decoder) take(n int) []byte {
 // be real, and a lying count cannot make the decoder allocate gigabytes.
 func (d *decoder) capacity(n int) int {
 	return max(0, min(n, len(d.buf)-d.pos))
+}
+
+// more reports whether bytes remain. A field appended to the end of a
+// message (never to a struct inside a list) may be decoded only if present,
+// for peers that send it unconditionally once the other side has said, in
+// some earlier frame, that it understands it.
+func (d *decoder) more() bool {
+	return d.err == nil && d.pos < len(d.buf)
 }
 
 func (d *decoder) finish() error {

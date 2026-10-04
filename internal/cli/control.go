@@ -26,6 +26,8 @@ import (
 type controlStream struct {
 	s       transport.Stream
 	welcome *protocol.Welcome
+	// features are the optional features both sides support.
+	features protocol.Features
 
 	writeMu sync.Mutex
 
@@ -73,10 +75,11 @@ func openControl(ctx context.Context, s transport.Stream) (*controlStream, error
 	}
 	s.SetDeadline(time.Time{})
 	cs := &controlStream{
-		s:       s,
-		welcome: resp.Welcome,
-		pending: make(map[uint32]chan *protocol.Response),
-		done:    make(chan struct{}),
+		s:        s,
+		welcome:  resp.Welcome,
+		features: protocol.NegotiateFeatures(protocol.Capabilities(), resp.Welcome.Capabilities),
+		pending:  make(map[uint32]chan *protocol.Response),
+		done:     make(chan struct{}),
 	}
 	go cs.read(reader)
 	return cs, nil
@@ -85,7 +88,7 @@ func openControl(ctx context.Context, s transport.Stream) (*controlStream, error
 func (cs *controlStream) read(r *bufio.Reader) {
 	defer close(cs.done)
 	for {
-		resp, id, tagged, err := protocol.ReadTaggedResponse(r)
+		resp, id, tagged, err := protocol.ReadTaggedResponse(r, cs.features)
 		switch {
 		case err == nil && resp == nil:
 			err = errControlClosed
@@ -161,7 +164,7 @@ func (cs *controlStream) roundTrip(ctx context.Context, req *protocol.Request) (
 	if deadline, ok := ctx.Deadline(); ok {
 		cs.s.SetWriteDeadline(deadline)
 	}
-	err := protocol.WriteTaggedRequest(cs.s, id, req)
+	err := protocol.WriteTaggedRequest(cs.s, cs.features, id, req)
 	cs.s.SetWriteDeadline(time.Time{})
 	cs.writeMu.Unlock()
 	if err != nil {

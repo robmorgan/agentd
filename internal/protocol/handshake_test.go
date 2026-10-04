@@ -48,7 +48,7 @@ func TestHelloGoldenFrame(t *testing.T) {
 // payload, counted in its length.
 func TestTaggedGoldenFrame(t *testing.T) {
 	var buf bytes.Buffer
-	if err := WriteTaggedRequest(&buf, 0x01020304, &Request{ListSessions: Empty}); err != nil {
+	if err := WriteTaggedRequest(&buf, Features{}, 0x01020304, &Request{ListSessions: Empty}); err != nil {
 		t.Fatal(err)
 	}
 	want := []byte{
@@ -60,16 +60,16 @@ func TestTaggedGoldenFrame(t *testing.T) {
 	if !bytes.Equal(buf.Bytes(), want) {
 		t.Fatalf("got  % x\nwant % x", buf.Bytes(), want)
 	}
-	req, id, tagged, err := ReadTaggedRequest(&buf)
+	req, id, tagged, err := ReadTaggedRequest(&buf, Features{})
 	if err != nil || !tagged || id != 0x01020304 || req.ListSessions == nil {
 		t.Fatalf("ReadTaggedRequest = %#v, %x, %v, %v", req, id, tagged, err)
 	}
 
 	buf.Reset()
-	if err := WriteTaggedResponse(&buf, 7, ErrorResponsef("no")); err != nil {
+	if err := WriteTaggedResponse(&buf, Features{}, 7, ErrorResponsef("no")); err != nil {
 		t.Fatal(err)
 	}
-	resp, id, tagged, err := ReadTaggedResponse(&buf)
+	resp, id, tagged, err := ReadTaggedResponse(&buf, Features{})
 	if err != nil || !tagged || id != 7 || resp.Error == nil || resp.Error.Message != "no" {
 		t.Fatalf("ReadTaggedResponse = %#v, %d, %v, %v", resp, id, tagged, err)
 	}
@@ -80,7 +80,7 @@ func TestTaggedGoldenFrame(t *testing.T) {
 // layout.
 func TestTagsAndUnknownFlagsAreRefused(t *testing.T) {
 	var buf bytes.Buffer
-	WriteTaggedRequest(&buf, 1, &Request{ListSessions: Empty})
+	WriteTaggedRequest(&buf, Features{}, 1, &Request{ListSessions: Empty})
 	if _, err := ReadRequest(bytes.NewReader(buf.Bytes())); err == nil {
 		t.Fatal("ReadRequest accepted a tagged frame")
 	}
@@ -90,7 +90,7 @@ func TestTagsAndUnknownFlagsAreRefused(t *testing.T) {
 
 	frame := buf.Bytes()
 	frame[8] = 0x02 // an unknown flag
-	_, _, _, err := ReadTaggedRequest(bytes.NewReader(frame))
+	_, _, _, err := ReadTaggedRequest(bytes.NewReader(frame), Features{})
 	var de *DecodeError
 	if !errors.As(err, &de) {
 		t.Fatalf("unknown flag: got %v", err)
@@ -100,11 +100,11 @@ func TestTagsAndUnknownFlagsAreRefused(t *testing.T) {
 	// leaves the stream at the next frame.
 	buf.Reset()
 	writeFrameTagged(&buf, ProtocolVersion, 9999, true, 42, nil)
-	WriteTaggedRequest(&buf, 43, &Request{ListSessions: Empty})
-	if _, id, tagged, err := ReadTaggedRequest(&buf); !errors.As(err, &de) || id != 42 || !tagged {
+	WriteTaggedRequest(&buf, Features{}, 43, &Request{ListSessions: Empty})
+	if _, id, tagged, err := ReadTaggedRequest(&buf, Features{}); !errors.As(err, &de) || id != 42 || !tagged {
 		t.Fatalf("bad kind: id %d tagged %v err %v", id, tagged, err)
 	}
-	if req, id, _, err := ReadTaggedRequest(&buf); err != nil || id != 43 || req.ListSessions == nil {
+	if req, id, _, err := ReadTaggedRequest(&buf, Features{}); err != nil || id != 43 || req.ListSessions == nil {
 		t.Fatalf("next frame: %#v %d %v", req, id, err)
 	}
 }
@@ -162,5 +162,15 @@ func TestLyingListCountsDoNotAllocate(t *testing.T) {
 		if allocs > 20 {
 			t.Fatalf("kind %d: %v allocations", k, allocs)
 		}
+	}
+}
+
+func TestNegotiateFeatures(t *testing.T) {
+	f := NegotiateFeatures([]string{"a", "b", "c"}, []string{"c", "a", "z"})
+	if !f.Has("a") || !f.Has("c") || f.Has("b") || f.Has("z") || !reflect.DeepEqual(f.List(), []string{"a", "c"}) {
+		t.Fatalf("features = %v", f.List())
+	}
+	if (Features{}).Has(CapControlStream) {
+		t.Fatal("the zero Features has a capability")
 	}
 }
