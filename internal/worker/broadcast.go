@@ -6,9 +6,10 @@ import (
 )
 
 const (
-	// subscriberBuffer bounds the PTY reads (up to 8 KiB each) queued for
-	// one attachment. Line-at-a-time output can come in reads of a few
-	// dozen bytes, so it is generous: the byte bound below is the real one.
+	// subscriberBuffer bounds the chunks of PTY output queued for one
+	// attachment (pumpPty batches reads into chunks of up to
+	// maxOutputBatch, 8 KiB). A chunk can be a single read of a few dozen
+	// bytes, so it is generous: the byte bound below is the real one.
 	subscriberBuffer = 1024
 	// ...and subscriberMaxBytes the bytes they hold, whichever is reached
 	// first.

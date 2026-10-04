@@ -18,14 +18,13 @@ import (
 // ownerState is only ever touched by the owner goroutine. All other
 // goroutines reach it through owner.do, which serialises access.
 type ownerState struct {
-	sessionID           string
-	ptmx                *os.File
-	terminal            *terminalState
-	hasClientDimensions bool
-	geometry            protocol.Geometry
-	attachments         map[string]*ownerAttachment
-	output              *broadcaster
-	input               *ptyInput
+	sessionID   string
+	ptmx        *os.File
+	terminal    *terminalState
+	geometry    protocol.Geometry
+	attachments map[string]*ownerAttachment
+	output      *broadcaster
+	input       *ptyInput
 	// outputBytes and outputChunks count the PTY output published
 	// (session stats).
 	outputBytes  uint64
@@ -33,6 +32,14 @@ type ownerState struct {
 	// activity tracks what the agent is doing; nil in tests that build
 	// an ownerState without a session.
 	activity *activityTracker
+	// owner is the goroutine this state belongs to, for timers that need
+	// to get back onto it.
+	owner *owner
+	// groundWaiters run once the shadow terminal's parser is between
+	// sequences; groundGen counts the times they have been run, so a
+	// fallback timer only runs the ones it was started for. See atGround.
+	groundWaiters []func()
+	groundGen     uint64
 }
 
 type ownerAttachment struct {
@@ -70,6 +77,25 @@ func (o *owner) do(fn func(*ownerState) error) error {
 	case o.cmds <- func(s *ownerState) { result <- fn(s) }:
 	case <-o.done:
 		return errOwnerStopped
+	}
+	select {
+	case err := <-result:
+		return err
+	case <-o.done:
+		return errOwnerStopped
+	}
+}
+
+// doAtGround is do for work that takes a snapshot: fn runs at the next
+// point in the PTY output where the snapshot is an exact boundary (see
+// ownerState.atGround), which may be after later output arrives.
+func (o *owner) doAtGround(fn func(*ownerState) error) error {
+	result := make(chan error, 1)
+	if err := o.do(func(s *ownerState) error {
+		s.atGround(func() { result <- fn(s) })
+		return nil
+	}); err != nil {
+		return err
 	}
 	select {
 	case err := <-result:
@@ -160,17 +186,44 @@ func (s *ownerState) resize(g protocol.Geometry) error {
 	if err := s.terminal.resize(g.Cols, g.Rows, cellWidthPx(g), cellHeightPx(g)); err != nil {
 		return err
 	}
-	s.hasClientDimensions = true
 	s.geometry = g
 	return nil
 }
 
 // publishOutput feeds PTY output through the shadow terminal, answers any
 // terminal queries on behalf of absent clients, then fans the raw bytes out.
+//
+// While snapshots are waiting for the parser to be between sequences (see
+// atGround), it feeds only up to that point first, runs them, and then
+// handles the rest: subscribers get the chunk in two pieces, and a client
+// attaching there gets only the second, after its snapshot.
 func (s *ownerState) publishOutput(data []byte) error {
 	s.outputBytes += uint64(len(data))
 	s.outputChunks++
-	writes, effects := s.terminal.feed(data)
+	if len(s.groundWaiters) > 0 {
+		n, writes, effects := s.terminal.feedUntilGround(data)
+		s.afterFeed(writes, effects)
+		if n > 0 {
+			s.output.publish(data[:n])
+		}
+		if s.terminal.atGround() {
+			s.runGroundWaiters()
+		}
+		data = data[n:]
+		if len(data) == 0 {
+			return nil
+		}
+	}
+	s.afterFeed(s.terminal.feed(data))
+	s.output.publish(data)
+	return nil
+}
+
+// afterFeed passes the attention effects of output to activity tracking,
+// and writes the shadow terminal's replies to terminal queries (cursor
+// position, device attributes and so on) to the PTY when no client terminal
+// is attached to answer them itself.
+func (s *ownerState) afterFeed(writes [][]byte, effects terminalEffects) {
 	if s.activity != nil {
 		title := ""
 		if effects.titleChanged {
@@ -178,15 +231,56 @@ func (s *ownerState) publishOutput(data []byte) error {
 		}
 		s.activity.output(time.Now(), effects, title, s.watched())
 	}
-	if !s.hasLiveAttachTerminal() {
-		for _, response := range writes {
-			if err := s.input.enqueue(response); err != nil {
-				fmt.Fprintf(os.Stderr, "session worker: dropped terminal reply: %v\n", err)
-			}
+	if s.hasLiveAttachTerminal() {
+		return
+	}
+	for _, response := range writes {
+		if err := s.input.enqueue(response); err != nil {
+			fmt.Fprintf(os.Stderr, "session worker: dropped terminal reply: %v\n", err)
 		}
 	}
-	s.output.publish(data)
-	return nil
+}
+
+// groundTimeout bounds how long a snapshot waits for a sequence that output
+// left unfinished. Programs write whole sequences, so the rest of one split
+// across PTY reads follows at once; a program that stops mid-sequence gets
+// a snapshot taken there instead (and its client may print the sequence's
+// tail as text). A variable so tests can lengthen it.
+var groundTimeout = 100 * time.Millisecond
+
+// atGround runs fn on the owner goroutine at the next point in the PTY
+// output where the shadow terminal's parser is between escape sequences and
+// UTF-8 characters: now, if it already is. A snapshot is a boundary in the
+// stream (the client gets the snapshot, then the output after it), and a
+// boundary inside a sequence would hand the client the sequence's tail
+// without its start, which it would print as text. PTY reads split
+// sequences routinely under heavy output, so snapshots wait for the next
+// boundary, at most groundTimeout.
+func (s *ownerState) atGround(fn func()) {
+	if len(s.groundWaiters) == 0 && s.terminal.atGround() {
+		fn()
+		return
+	}
+	s.groundWaiters = append(s.groundWaiters, fn)
+	if len(s.groundWaiters) == 1 {
+		gen := s.groundGen
+		time.AfterFunc(groundTimeout, func() {
+			s.owner.post(func(s *ownerState) {
+				if s.groundGen == gen {
+					s.runGroundWaiters()
+				}
+			})
+		})
+	}
+}
+
+func (s *ownerState) runGroundWaiters() {
+	waiters := s.groundWaiters
+	s.groundWaiters = nil
+	s.groundGen++
+	for _, fn := range waiters {
+		fn()
+	}
 }
 
 func (s *ownerState) history(vt bool) (string, error) {
@@ -198,7 +292,7 @@ func (s *ownerState) history(vt bool) (string, error) {
 }
 
 func (s *ownerState) snapshot() ([]byte, error) {
-	return s.terminal.format(true)
+	return s.terminal.snapshot()
 }
 
 type attachResult struct {
@@ -223,22 +317,15 @@ func (s *ownerState) attach(attachID string, kind session.AttachmentKind, g prot
 		delete(s.attachments, replaces)
 	}
 
-	var snapshot []byte
-	var err error
-	if s.hasClientDimensions {
-		if snapshot, err = s.snapshot(); err != nil {
-			return nil, err
-		}
-		if err = s.resize(g); err != nil {
-			return nil, err
-		}
-	} else {
-		if err = s.resize(g); err != nil {
-			return nil, err
-		}
-		if snapshot, err = s.snapshot(); err != nil {
-			return nil, err
-		}
+	// Resize first, so the snapshot is laid out for the client's terminal:
+	// one formatted at the previous size lands wrapped and with the cursor
+	// on the wrong row in a terminal of another size.
+	if err := s.resize(g); err != nil {
+		return nil, err
+	}
+	snapshot, err := s.snapshot()
+	if err != nil {
+		return nil, err
 	}
 
 	a := &ownerAttachment{kind: kind, connectedAt: connectedAt, sub: s.output.subscribe(), detach: make(chan struct{})}
@@ -281,21 +368,85 @@ func (s *ownerState) detachAll() {
 	}
 }
 
+// maxOutputBatch caps how much PTY output the pump hands the owner at once,
+// and so the size of each chunk fanned out to clients.
+const maxOutputBatch = 8192
+
+// pumpPty reads the PTY and hands the output to the owner goroutine.
+//
+// PTY reads can be small: on macOS, a program writing in small pieces (a
+// pipeline such as yes | head) gives mostly 30 to 130 bytes per read. Handed
+// over one by one, each would cost a trip through the owner's
+// queue, a VTWrite into libghostty, and a frame to every attached client.
+// So reads accumulate in a batch while the owner is busy with the previous
+// one, up to maxOutputBatch, and the owner takes everything pending at
+// once. An idle owner gets each read straight away, so batching adds no
+// latency. When a batch is full and the owner has not taken it, the pump
+// stops reading, which leaves the agent blocked on a full PTY as before.
 func pumpPty(reader io.Reader, o *owner) {
-	buf := make([]byte, 8192)
+	b := &outputBatch{taken: make(chan struct{}, 1)}
+	buf := make([]byte, maxOutputBatch)
 	for {
 		n, err := reader.Read(buf)
-		if n > 0 {
-			chunk := make([]byte, n)
-			copy(chunk, buf[:n])
-			o.post(func(s *ownerState) {
-				if err := s.publishOutput(chunk); err != nil {
-					fmt.Fprintf(os.Stderr, "session worker: failed to publish output: %v\n", err)
-				}
-			})
+		if n > 0 && !b.add(buf[:n], o) {
+			return
 		}
 		if err != nil {
 			return
 		}
 	}
+}
+
+// outputBatch is PTY output read by the pump and not yet taken by the
+// owner goroutine.
+type outputBatch struct {
+	mu   sync.Mutex
+	data []byte
+	// posted is set while a take is queued on the owner goroutine and has
+	// not run; data added meanwhile goes out with it.
+	posted bool
+	// taken is signalled (without blocking) whenever the owner takes the
+	// batch, to wake a pump waiting for room.
+	taken chan struct{}
+}
+
+// add appends data to the batch, queueing a take on the owner unless one is
+// already queued. It returns false if the owner has stopped.
+func (b *outputBatch) add(data []byte, o *owner) bool {
+	b.mu.Lock()
+	for b.posted && len(b.data)+len(data) > maxOutputBatch {
+		b.mu.Unlock()
+		select {
+		case <-b.taken:
+		case <-o.done:
+			return false
+		}
+		b.mu.Lock()
+	}
+	// A fresh slice per batch: subscribers keep the one they were given.
+	b.data = append(b.data, data...)
+	post := !b.posted
+	b.posted = true
+	b.mu.Unlock()
+	if post {
+		o.post(func(s *ownerState) {
+			if err := s.publishOutput(b.take()); err != nil {
+				fmt.Fprintf(os.Stderr, "session worker: failed to publish output: %v\n", err)
+			}
+		})
+	}
+	return true
+}
+
+func (b *outputBatch) take() []byte {
+	b.mu.Lock()
+	data := b.data
+	b.data = nil
+	b.posted = false
+	b.mu.Unlock()
+	select {
+	case b.taken <- struct{}{}:
+	default:
+	}
+	return data
 }
