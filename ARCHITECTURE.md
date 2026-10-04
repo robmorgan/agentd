@@ -83,6 +83,17 @@ Two transports exist:
   interface MTU is 1280 including IP and UDP headers, so larger ones never leave it and the
   handshake times out. Path MTU discovery raises the size afterwards where the path allows.
 
+QUIC flow-control windows are set explicitly in `quicConfig`: 512 KiB growing to 4 MiB per
+stream, 4 MiB growing to 16 MiB per connection. A stream whose reader stops (an attachment whose
+terminal is paused) blocks only its own writer once its window is full; its data is kept, not
+dropped, and the connection's other streams keep flowing until about 8 streams have stalled at
+once. The connection window is therefore also the most one client can make the daemon buffer,
+however many of its 256 streams it opens. A client whose address changes mid-connection (a NAT
+rebinding, Wi-Fi to cellular) keeps its connection: the daemon validates the new path and moves to
+it. Streams have no priorities (quic-go has none) and QUIC datagrams are disabled: measurements
+showed no need for the first, and no protocol message is replaceable enough for the second.
+[BENCHMARKS.md](BENCHMARKS.md) has the numbers and the reasoning.
+
 QUIC connections authenticate both ways with pinned keys inside TLS 1.3 (ALPN `agentd`), the way
 SSH uses host keys and `authorized_keys`, with no certificate authority:
 

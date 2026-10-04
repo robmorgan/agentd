@@ -587,12 +587,12 @@ Use independent streams.
 * [ ] Define stream taxonomy
 * [ ] Make attachment streams independent
 * [ ] Separate large transfers from latency-sensitive terminal traffic
-* [ ] Measure flow-control behavior
-* [ ] Test slow attachment while another remains interactive
-* [ ] Test simultaneous large artifact transfer and interactive PTY
-* [ ] Benchmark stream creation cost
-* [ ] Benchmark many concurrent streams
-* [ ] Investigate priority requirements if real workloads demonstrate a need
+* [x] Measure flow-control behavior
+* [x] Test slow attachment while another remains interactive
+* [x] Test simultaneous large artifact transfer and interactive PTY
+* [x] Benchmark stream creation cost
+* [x] Benchmark many concurrent streams
+* [x] Investigate priority requirements if real workloads demonstrate a need
 
 ---
 
@@ -670,10 +670,10 @@ PTY output is generally ordered state transition data and should remain reliable
 
 ## Deliverables
 
-* [ ] Identify genuinely replaceable messages
-* [ ] Benchmark datagrams vs streams
-* [ ] Validate behavior under packet loss
-* [ ] Keep reliable streams as the default
+* [x] Identify genuinely replaceable messages
+* [x] Benchmark datagrams vs streams
+* [x] Validate behavior under packet loss
+* [x] Keep reliable streams as the default
 
 ---
 
@@ -756,9 +756,9 @@ agentd bench sessions --count N
 * [ ] snapshot latency
 * [ ] restore latency
 * [ ] fan-out cost
-* [ ] QUIC memory per connection
-* [ ] QUIC memory per stream
-* [ ] QUIC CPU overhead
+* [x] QUIC memory per connection
+* [x] QUIC memory per stream
+* [x] QUIC CPU overhead
 * [ ] database overhead
 
 ## Target workloads
