@@ -36,39 +36,39 @@ func (s *Server) dialWorker(id string) (transport.Stream, error) {
 	return nil, fmt.Errorf("failed to connect to runtime for session `%s`: %w", id, err)
 }
 
-// proxyRequest forwards a single request to the session's worker and relays
-// its single response.
-func (s *Server) proxyRequest(client transport.Stream, id string, req *protocol.Request) error {
+// forward sends a single request to the session's worker and returns its
+// single response.
+func (s *Server) forward(id string, req *protocol.Request) *protocol.Response {
 	worker, err := s.dialWorker(id)
 	if err != nil {
-		return protocol.WriteResponse(client, protocol.ErrorResponsef("%v", err))
+		return protocol.ErrorResponsef("%v", err)
 	}
 	defer worker.Close()
 	resp, err := exchange(worker, req)
 	if err != nil {
-		return protocol.WriteResponse(client, protocol.ErrorResponsef("session `%s` runtime: %v", id, err))
+		return protocol.ErrorResponsef("session `%s` runtime: %v", id, err)
 	}
-	return protocol.WriteResponse(client, resp)
+	return resp
 }
 
 // history serves live history from the worker, falling back to the logs a
 // worker writes when its session ends (including when the worker exits
 // between the lookup and the request).
-func (s *Server) history(client transport.Stream, req *protocol.Request) error {
+func (s *Server) history(req *protocol.Request) *protocol.Response {
 	id := req.GetHistory.SessionID
 	if worker, err := transport.DialUnix(s.paths.SessionSocketPath(id), workerDialTimeout); err == nil {
 		resp, err := exchange(worker, req)
 		worker.Close()
 		if err == nil {
-			return protocol.WriteResponse(client, resp)
+			return resp
 		}
 	}
 	rec, err := s.getSession(id)
 	if err != nil {
-		return protocol.WriteResponse(client, protocol.ErrorResponsef("%v", err))
+		return protocol.ErrorResponsef("%v", err)
 	}
 	if rec == nil {
-		return protocol.WriteResponse(client, protocol.ErrorResponsef("session `%s` not found", id))
+		return protocol.ErrorResponsef("session `%s` not found", id)
 	}
 	path := s.paths.RenderedLogPath(id)
 	if req.GetHistory.VT {
@@ -76,12 +76,12 @@ func (s *Server) history(client transport.Stream, req *protocol.Request) error {
 	}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return protocol.WriteResponse(client, protocol.ErrorResponsef("history for session `%s` is not available", id))
+		return protocol.ErrorResponsef("history for session `%s` is not available", id)
 	}
 	if err != nil {
-		return protocol.WriteResponse(client, protocol.ErrorResponsef("failed to read %s: %v", path, err))
+		return protocol.ErrorResponsef("failed to read %s: %v", path, err)
 	}
-	return protocol.WriteResponse(client, &protocol.Response{History: &protocol.History{Data: string(data)}})
+	return &protocol.Response{History: &protocol.History{Data: string(data)}}
 }
 
 // exchange sends one request to a worker and reads its one response.

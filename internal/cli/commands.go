@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -436,7 +437,36 @@ func (c *client) printDaemonStatus() error {
 	default:
 		fmt.Println("remote: off")
 	}
+	fmt.Printf("open_streams: %d\n", s.OpenStreams)
+	printConnections(os.Stdout, s.Connections, time.Now())
 	return nil
+}
+
+// printConnections lists remote connections, one per line.
+func printConnections(w io.Writer, conns []protocol.ManagementConnection, now time.Time) {
+	for _, c := range conns {
+		who := c.Fingerprint
+		if c.Name != "" {
+			who = c.Name + " " + c.Fingerprint
+		}
+		fmt.Fprintf(w, "connection: %s from %s, up %s, streams %d open/%d total, rtt %s, sent %s, received %s, lost %d/%d packets\n",
+			escapeControls(who), c.Remote, formatElapsed(int64(now.Sub(c.ConnectedAt).Seconds())), c.StreamsOpen, c.StreamsOpened,
+			(time.Duration(c.RTTMicros) * time.Microsecond).Round(10*time.Microsecond), formatBytes(c.BytesSent), formatBytes(c.BytesReceived),
+			c.PacketsLost, c.PacketsSent)
+	}
+}
+
+func formatBytes(n uint64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := uint64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 func printSession(s *session.Record) {

@@ -623,3 +623,54 @@ func TestIsConnectionLost(t *testing.T) {
 		}
 	}
 }
+
+// The listener reports each open connection with its stream counts and
+// QUIC's own statistics.
+func TestQUICConnectionInfo(t *testing.T) {
+	server, client := mustIdentity(t), mustIdentity(t)
+	l, err := ListenQUIC("127.0.0.1:0", server, QUICOptions{Authorized: func(string) bool { return true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), quicTestTimeout)
+	defer cancel()
+	qc, err := DialQUIC(ctx, l.Addr(), client, server.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer qc.Close()
+	streams := make([]Stream, 3)
+	for i := range streams {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		s, err := qc.OpenStream(ctx)
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.Write([]byte("x")) // a stream reaches the daemon with its first byte
+		streams[i] = s
+	}
+	accepted := make([]Stream, 3)
+	for i := range accepted {
+		s, err := l.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		accepted[i] = s
+	}
+	accepted[0].Close()
+	conns := l.Connections()
+	if len(conns) != 1 {
+		t.Fatalf("connections = %#v", conns)
+	}
+	c := conns[0]
+	if c.Fingerprint != client.Fingerprint || c.StreamsOpened != 3 || c.StreamsOpen != 2 || c.Remote == "" ||
+		c.BytesReceived == 0 || c.BytesSent == 0 || c.RTT <= 0 || time.Since(c.ConnectedAt) > time.Minute {
+		t.Fatalf("connection info = %#v", c)
+	}
+	accepted[0].Close() // closing twice counts once
+	if got := l.Connections()[0].StreamsOpen; got != 2 {
+		t.Fatalf("open streams after double close = %d", got)
+	}
+}

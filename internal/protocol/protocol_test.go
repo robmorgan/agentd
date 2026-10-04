@@ -128,7 +128,7 @@ func TestUnknownKindsAndVersionsAreRejected(t *testing.T) {
 	e.str("demo")
 	payload := e.buf
 
-	for _, k := range []uint16{0, 19, 99, 100, 118, 999} {
+	for _, k := range []uint16{0, 99, 100, 999, 9999} {
 		var buf bytes.Buffer
 		if err := writeFrame(&buf, ProtocolVersion, k, payload); err != nil {
 			t.Fatal(err)

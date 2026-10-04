@@ -78,6 +78,8 @@ type Server struct {
 	remoteAddr atomic.Pointer[string]
 	// remoteErr is why a configured QUIC listener is not bound (yet).
 	remoteErr atomic.Pointer[string]
+	// remoteListener is the bound QUIC listener, for connection status.
+	remoteListener atomic.Pointer[transport.QUICListener]
 
 	// createMu serialises session name allocation and row insertion.
 	createMu sync.Mutex
@@ -252,6 +254,7 @@ func (s *Server) startRemote() {
 		}
 		bound := l.Addr()
 		s.remoteAddr.Store(&bound)
+		s.remoteListener.Store(l)
 		s.remoteErr.Store(nil)
 		fmt.Fprintf(os.Stderr, "agentd: accepting remote clients over QUIC on %s (key %s)\n", bound, id.Fingerprint)
 		return l
@@ -269,6 +272,7 @@ func (s *Server) startRemote() {
 				default:
 				}
 				s.remoteAddr.Store(nil)
+				s.remoteListener.Store(nil)
 				s.setRemoteError(errors.New("the QUIC listener stopped; binding it again"))
 				fmt.Fprintf(os.Stderr, "agentd: the QUIC listener stopped; binding it again\n")
 			}
@@ -345,6 +349,44 @@ func (s *Server) track(stream transport.Stream) bool {
 	s.conns[stream] = struct{}{}
 	s.handlers.Add(1)
 	return true
+}
+
+// openStreams counts the streams being served.
+func (s *Server) openStreams() int {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	return len(s.conns)
+}
+
+// remoteConnections describes the open QUIC connections.
+func (s *Server) remoteConnections() []protocol.ManagementConnection {
+	l := s.remoteListener.Load()
+	if l == nil {
+		return nil
+	}
+	names := map[string]string{}
+	if clients, err := transport.ReadAuthorized(s.paths.AuthorizedClientsPath()); err == nil {
+		for _, c := range clients {
+			names[c.Fingerprint] = c.Name
+		}
+	}
+	var out []protocol.ManagementConnection
+	for _, c := range l.Connections() {
+		out = append(out, protocol.ManagementConnection{
+			Fingerprint:   c.Fingerprint,
+			Name:          names[c.Fingerprint],
+			Remote:        c.Remote,
+			ConnectedAt:   c.ConnectedAt.UTC(),
+			StreamsOpened: c.StreamsOpened,
+			StreamsOpen:   c.StreamsOpen,
+			RTTMicros:     c.RTT.Microseconds(),
+			BytesSent:     c.BytesSent,
+			BytesReceived: c.BytesReceived,
+			PacketsSent:   c.PacketsSent,
+			PacketsLost:   c.PacketsLost,
+		})
+	}
+	return out
 }
 
 func (s *Server) untrack(stream transport.Stream) {
@@ -429,6 +471,8 @@ func (s *Server) handleManagement(conn transport.Stream, req *protocol.Managemen
 			RunningSessions: running,
 			Remote:          s.RemoteAddr(),
 			RemoteError:     s.remoteError(),
+			OpenStreams:     s.openStreams(),
+			Connections:     s.remoteConnections(),
 		}})
 	case req.Shutdown != nil:
 		// A remote client can stop the daemon but not start it again, so
@@ -451,97 +495,117 @@ func (s *Server) handleManagement(conn transport.Stream, req *protocol.Managemen
 }
 
 func (s *Server) handleRequest(conn transport.Stream, reader *bufio.Reader, req *protocol.Request) error {
-	reply := func(resp *protocol.Response) error { return protocol.WriteResponse(conn, resp) }
-	replyErr := func(err error) error { return reply(protocol.ErrorResponsef("%v", err)) }
+	switch req.Role() {
+	case protocol.RoleControl:
+		return s.serveControl(conn, reader, req.Hello)
+	case protocol.RoleAttach:
+		if id := req.AttachSession.SessionID; !session.ValidName(id) {
+			return protocol.WriteResponse(conn, protocol.ErrorResponsef("session `%s` not found", id))
+		}
+		return s.proxyAttach(conn, reader, req.AttachSession)
+	}
+	resp, after := s.respond(req)
+	err := protocol.WriteResponse(conn, resp)
+	if after != nil {
+		after()
+	}
+	return err
+}
+
+// respond answers a request that has a single response: every request but
+// Hello and AttachSession. after, if set, runs once the response is
+// written. It is safe to call concurrently, as a control stream does.
+func (s *Server) respond(req *protocol.Request) (resp *protocol.Response, after func()) {
+	fail := func(err error) (*protocol.Response, func()) { return protocol.ErrorResponsef("%v", err), nil }
 
 	// Session ids become socket and log paths, so anything that could not
 	// have been created as a session name (e.g. "../x") is refused here,
 	// before any path is built from it.
 	if id, ok := requestSessionID(req); ok && !session.ValidName(id) {
-		return reply(protocol.ErrorResponsef("session `%s` not found", id))
+		return protocol.ErrorResponsef("session `%s` not found", id), nil
 	}
 
 	switch {
 	case req.GetDaemonInfo != nil:
-		return reply(&protocol.Response{DaemonInfo: &protocol.DaemonInfo{
+		return &protocol.Response{DaemonInfo: &protocol.DaemonInfo{
 			DaemonVersion: Version, ProtocolVersion: protocol.ProtocolVersion,
-		}})
+		}}, nil
 	case req.ShutdownDaemon != nil:
 		running, err := s.hasRunningSessions()
 		if err != nil {
-			return replyErr(err)
+			return fail(err)
 		}
 		if running {
-			return reply(protocol.ErrorResponsef("cannot shut down agentd while sessions are running"))
+			return protocol.ErrorResponsef("cannot shut down agentd while sessions are running"), nil
 		}
-		err = reply(protocol.OkResponse())
-		s.Shutdown()
-		return err
+		return protocol.OkResponse(), s.Shutdown
 	case req.CreateSession != nil:
 		result, err := s.createSession(req.CreateSession)
 		if err != nil {
-			return replyErr(err)
+			return fail(err)
 		}
-		return reply(&protocol.Response{CreateSession: result})
+		return &protocol.Response{CreateSession: result}, nil
 	case req.KillSession != nil:
 		k := req.KillSession
 		result, err := s.killSession(k.SessionID, k.Remove)
 		if err != nil {
-			return replyErr(err)
+			return fail(err)
 		}
-		return reply(&protocol.Response{KillSession: result})
+		return &protocol.Response{KillSession: result}, nil
+	case req.Hello != nil:
+		return protocol.ErrorResponsef("hello is only valid as the first request on a stream"), nil
 	case req.AttachSession != nil:
-		return s.proxyAttach(conn, reader, req.AttachSession)
+		return protocol.ErrorResponsef("attach needs a stream of its own"), nil
 	case req.AttachSnapshot != nil:
-		return reply(protocol.ErrorResponsef("attach snapshot requests are only valid during an active attach"))
+		return protocol.ErrorResponsef("attach snapshot requests are only valid during an active attach"), nil
 	case req.AttachInput != nil:
-		return reply(protocol.ErrorResponsef("attach_input is only valid during an attached session"))
+		return protocol.ErrorResponsef("attach_input is only valid during an attached session"), nil
 	case req.AttachResize != nil:
-		return reply(protocol.ErrorResponsef("attach_resize is only valid during an attached session"))
+		return protocol.ErrorResponsef("attach_resize is only valid during an attached session"), nil
 	case req.DetachSession != nil:
-		return s.proxyRequest(conn, req.DetachSession.SessionID, req)
+		return s.forward(req.DetachSession.SessionID, req), nil
 	case req.DetachAttachment != nil:
-		return s.proxyRequest(conn, req.DetachAttachment.SessionID, req)
+		return s.forward(req.DetachAttachment.SessionID, req), nil
 	case req.SendInput != nil:
-		return s.proxyRequest(conn, req.SendInput.SessionID, req)
+		return s.forward(req.SendInput.SessionID, req), nil
 	case req.ListAttachments != nil:
-		return s.proxyRequest(conn, req.ListAttachments.SessionID, req)
+		return s.forward(req.ListAttachments.SessionID, req), nil
 	case req.GetHistory != nil:
-		return s.history(conn, req)
+		return s.history(req), nil
 	case req.GetSession != nil:
 		rec, err := s.getSession(req.GetSession.SessionID)
 		if err != nil {
-			return replyErr(err)
+			return fail(err)
 		}
 		if rec == nil {
-			return reply(protocol.ErrorResponsef("session `%s` not found", req.GetSession.SessionID))
+			return protocol.ErrorResponsef("session `%s` not found", req.GetSession.SessionID), nil
 		}
-		return reply(&protocol.Response{Session: rec})
+		return &protocol.Response{Session: rec}, nil
 	case req.ListSessions != nil:
 		recs, err := s.listSessions()
 		if err != nil {
-			return replyErr(err)
+			return fail(err)
 		}
-		return reply(&protocol.Response{Sessions: &recs})
+		return &protocol.Response{Sessions: &recs}, nil
 	case req.ListWorkspaces != nil:
 		ws, err := s.db.ListWorkspaces()
 		if err != nil {
-			return replyErr(err)
+			return fail(err)
 		}
-		return reply(&protocol.Response{Workspaces: &ws})
+		return &protocol.Response{Workspaces: &ws}, nil
 	case req.AddWorkspace != nil:
 		w, err := s.addWorkspace(req.AddWorkspace)
 		if err != nil {
-			return replyErr(err)
+			return fail(err)
 		}
-		return reply(&protocol.Response{Workspace: w})
+		return &protocol.Response{Workspace: w}, nil
 	case req.RemoveWorkspace != nil:
 		if err := s.removeWorkspace(req.RemoveWorkspace.Name); err != nil {
-			return replyErr(err)
+			return fail(err)
 		}
-		return reply(protocol.OkResponse())
+		return protocol.OkResponse(), nil
 	}
-	return reply(protocol.ErrorResponsef("unsupported request"))
+	return protocol.ErrorResponsef("unsupported request"), nil
 }
 
 // requestSessionID returns the existing session a request refers to.

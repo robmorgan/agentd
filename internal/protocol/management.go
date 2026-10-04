@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"time"
 )
 
 // The daemon management protocol is a separate, deliberately tiny protocol
@@ -46,6 +47,28 @@ type ManagementStatus struct {
 	// is off or not listening yet, in which case RemoteError says why.
 	Remote      string `json:"remote,omitempty"`
 	RemoteError string `json:"remote_error,omitempty"`
+	// OpenStreams counts the streams the daemon is serving over every
+	// transport: requests, control streams and attachments.
+	OpenStreams int `json:"open_streams"`
+	// Connections lists the open remote (QUIC) connections.
+	Connections []ManagementConnection `json:"connections,omitempty"`
+}
+
+// ManagementConnection describes one open remote connection.
+type ManagementConnection struct {
+	Fingerprint string `json:"fingerprint"`
+	// Name is the name the key was authorized under, if any.
+	Name          string    `json:"name,omitempty"`
+	Remote        string    `json:"remote"`
+	ConnectedAt   time.Time `json:"connected_at"`
+	StreamsOpened uint64    `json:"streams_opened"`
+	StreamsOpen   int64     `json:"streams_open"`
+	// RTTMicros is QUIC's smoothed round-trip time, in microseconds.
+	RTTMicros     int64  `json:"rtt_us"`
+	BytesSent     uint64 `json:"bytes_sent"`
+	BytesReceived uint64 `json:"bytes_received"`
+	PacketsSent   uint64 `json:"packets_sent"`
+	PacketsLost   uint64 `json:"packets_lost"`
 }
 
 type ManagementShutdownResult struct {
@@ -81,8 +104,11 @@ func ReadIncoming(r io.Reader) (*Request, *ManagementRequest, error) {
 		}
 		return nil, m, nil
 	}
-	if h.version != ProtocolVersion {
+	if !supportedVersion(h.version) {
 		return nil, nil, &VersionError{Version: h.version}
+	}
+	if h.tagged {
+		return nil, nil, &DecodeError{Version: h.version, Err: errUnexpectedTag}
 	}
 	req, err := decodeRequest(kind(h.kind), payload)
 	if err != nil {
