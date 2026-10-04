@@ -309,6 +309,125 @@ costs.
 5. **One frame per PTY read per client.** Fan-out to 100 clients collapses because every 1 KiB
    read becomes a frame for every client. Writing the chunks queued for a client as one frame
    would cut frames and system calls by about an order of magnitude; it changes throughput, not
-   per-session cost, and fits with the planned resync of lagging clients.
+   per-session cost, and fits with the planned resync of lagging clients. The worker now batches PTY
+   reads that arrive while it is busy into one chunk (see "Terminal and worker"), which cut frames
+   2.7 times for small reads; coalescing what is queued for a slow client is still open.
 6. **ListSessions dials every running worker** to check it is alive: 11 ms at 500 sessions, against
    1.5 ms for state.db.
+
+## Terminal and worker
+
+In-process measurements of a session worker: the libghostty boundary, the reattach snapshot, PTY
+output through a real worker, fan-out and attach. The benchmarks are in `internal/worker`
+(`terminal_test.go`, `worker_bench_test.go`); the PTY and attach ones run `Run` against a real PTY
+and `/bin/sh`, and talk to the worker over its socket as the daemon does.
+
+Measured on an Apple M1 Max (10 cores, 64 GiB), macOS 27.0.1, Go 1.26.3, libghostty-vt
+`ReleaseFast` at ghostty `27e8b3f`, on the branch that added them (on top of `651a4cd`, rebased onto `c154564`). The
+machine was shared with other jobs (load average 5-40), so the median of three runs is given.
+
+```sh
+make libghostty
+export PKG_CONFIG_PATH=$PWD/.build/ghostty-out/share/pkgconfig
+go test ./internal/worker -run '^$' -bench 'VTWrite|TerminalFeed|TerminalSnapshot|RecordedStream|NewTerminal' -benchmem -count 3
+go test ./internal/worker -run '^$' -bench 'PTYThroughput|FanOut|Attach' -benchmem -count 3
+```
+
+### The libghostty boundary
+
+`BenchmarkVTWriteChunkSize` feeds the same 64 KiB of colored clang diagnostics in chunks of each
+size, one `VTWrite` per chunk:
+
+| Chunk | Throughput | Per call |
+| --- | --- | --- |
+| 1 B | 18.6 MB/s | 54 ns |
+| 64 B | 193 MB/s | 332 ns |
+| 1 KiB | 239 MB/s | 4.3 µs |
+| 8 KiB | 258 MB/s | 31.8 µs |
+| 64 KiB | 267 MB/s | 245 µs |
+
+A call costs about 50 ns of its own (the 1-byte case is almost all call), so at 1 KiB per call the
+overhead is about 1% and at 64 bytes about 25%. Plain line output parses at 630-680 MB/s
+(`BenchmarkTerminalFeed`, 8 KiB chunks); creating and freeing a terminal takes 9.6 µs.
+
+The worker makes one `VTWrite` per chunk of PTY output, and nothing on the output path crosses
+the boundary per cell or per character. A snapshot is a few getters, one formatter run (two when
+blank rows at the bottom need padding), one render-state update for the cursor shape, and with
+the alternate screen up a binary snapshot and decode of the terminal.
+
+PTY reads can be much smaller than a chunk. With `yes 'line padding…' | head -c 8M` writing to a
+PTY, a bare read loop on macOS got 480,000 reads, almost all of 33 to 128 bytes, at 25.8 MB/s.
+(The "Sessions at scale" numbers above saw about 1 KiB per read from `yes` writing directly; read
+sizes follow how the program writes.) So the worker's PTY pump batches reads that arrive while the
+owner goroutine is busy, up to 8 KiB, and hands them over as one chunk: one trip through the owner's
+queue, one `VTWrite` and one frame per client. An idle owner gets every read at once, so batching
+adds no latency.
+
+### PTY throughput
+
+`BenchmarkPTYThroughput`: the agent writes 8 MiB of short lines; one client attached over the
+worker's socket reads until the end marker. CPU is the test process's (worker and client), not the
+agent's.
+
+| Pump | Throughput | Frames per 8 MiB | CPU per 8 MiB | Allocations |
+| --- | --- | --- | --- | --- |
+| One chunk per read (before) | 20-27 MB/s | 85,000 | 1.11 s | 1.03 million |
+| Batched (now) | 26.4 MB/s | 31,400 | 0.79 s | 0.41 million |
+
+Throughput is the kernel's: about what a bare read loop gets from the same PTY. Batching cuts the
+frames (and with them `VTWrite` calls, owner trips and socket writes) by 2.7 times, CPU by 30% and
+allocations by 60%. A profile of the batched worker is almost all system calls (PTY reads 22%,
+socket writes 16%, reads 10%) and scheduler wake-ups; libghostty's parsing is a few percent.
+
+### Snapshots
+
+`BenchmarkTerminalSnapshot` (160x48, 1 MB of line output in scrollback) and
+`BenchmarkRecordedStreamSnapshot` (each recorded stream at 120x40, stopped before the program
+exits, so the editors and agents still have the alternate screen up):
+
+| Terminal | Snapshot | Time |
+| --- | --- | --- |
+| 1 MB of scrollback, primary screen | 288 KiB | 1.9 ms |
+| 1 MB of scrollback, alternate screen up | 289 KiB | 3.7 ms |
+| clang, 500 KB of diagnostics | 539 KiB | 7.2 ms |
+| Neovim | 11 KiB | 127 µs |
+| Vim | 4.0 KiB | 117 µs |
+| Claude Code | 2.1 KiB | 76 µs |
+| Codex | 0.5 KiB | 66 µs |
+| bash | 2.3 KiB | 40 µs |
+| `go test -v` | 2.0 KiB | 29 µs |
+
+Formatting costs about 2 ms per MB of plain scrollback, more for styled output (clang's 500 KB
+take 7 ms). With the alternate screen up the primary screen
+under it is formatted from a copy of the terminal, which doubles the cost; at the 10 MB scrollback
+limit that is about 40 ms per attach, against 20 ms. The snapshot no longer carries the 256-entry
+palette (about 6 KiB) unless a program changed colors.
+
+### Attach
+
+`BenchmarkAttach`: connect to the worker's socket, send `AttachSession`, receive `Attached` with
+the snapshot, disconnect. The session is a shell script at 160x48.
+
+| Session | Snapshot | Round trip |
+| --- | --- | --- |
+| Idle, a line on screen | 255 B | 0.50 ms |
+| 1 MB of scrollback | 298 KiB | 4.9 ms |
+
+The idle round trip was 0.09 ms before attachment ids were numbered in `state.db` (see "Sessions,
+Incarnations And Attachments" in ARCHITECTURE.md); that update is most of it now.
+
+### Fan-out
+
+`BenchmarkFanOut`: publishing an 8 KiB chunk to 1, 10 and 100 subscribers, each drained by its own
+goroutine as attached clients are:
+
+| Subscribers | Per publish |
+| --- | --- |
+| 1 | 150 ns |
+| 10 | 1.5 µs |
+| 100 | 3.6 µs |
+
+Publishing never blocks or copies (every subscriber gets the same slice), so it is cheap; what
+limits many clients is writing a frame to each of them (see "PTY throughput and fan-out" above).
+The share of chunks that reach the in-process subscribers varies from run to run (25-90%):
+publishing outruns them, and the slow-consumer policy drops what does not fit.

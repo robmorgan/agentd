@@ -165,24 +165,30 @@ Before changing implementation language or transport architecture, document the 
 
 ## Deliverables
 
-* [ ] Document task lifecycle states
-* [ ] Document session lifecycle states
+* [x] Document task lifecycle states (ARCHITECTURE.md, "Lifecycles": today a task is a session)
+* [x] Document session lifecycle states (ARCHITECTURE.md, "Lifecycles")
 * [x] Document attachment lifecycle (ARCHITECTURE.md, "Sessions, Incarnations And Attachments")
-* [ ] Version the binary protocol explicitly
-* [ ] Create protocol fixture tests
-* [ ] Record representative PTY streams from:
+* [x] Version the binary protocol explicitly (the frame header's `version`: `TestUnknownKindsAndVersionsAreRejected`,
+      `TestReadIncomingVersionMismatch`, daemon `TestProtocolVersionMismatch`)
+* [x] Create protocol fixture tests (golden frames: `TestAttachSessionGoldenFrame`, `TestSharedGoldenFrames`,
+      `TestManagementShutdownGoldenFrame`)
+* [x] Record representative PTY streams from (`internal/worker/testdata/streams`):
 
-  * [ ] Claude Code
-  * [ ] Codex
-  * [ ] shell
-  * [ ] Vim/Neovim
-  * [ ] test runners
-  * [ ] large compiler output
-* [ ] Create attach/detach integration tests
-* [ ] Create resize integration tests
-* [ ] Test multiple simultaneous attachers
-* [ ] Document daemon restart behavior
-* [x] Establish baseline benchmarks (`agentd bench sessions`; BENCHMARKS.md, "Sessions at scale")
+  * [x] Claude Code
+  * [x] Codex
+  * [x] shell
+  * [x] Vim/Neovim
+  * [x] test runners
+  * [x] large compiler output
+* [x] Create attach/detach integration tests (worker `TestAttachDetachReattach`, daemon
+      `TestCreateAttachDetachReattach`, CLI `TestAttachEndToEnd`)
+* [x] Create resize integration tests (worker `TestResize`, `TestZeroGeometryKeepsCurrentSize`,
+      `TestReattachSnapshotFitsNewSize`; CLI `TestAttachEndToEnd` resizes its PTY)
+* [x] Test multiple simultaneous attachers (worker `TestMultipleAttachers`, `TestSlowAttacherDoesNotStallOthers`;
+      daemon `TestMultipleAttachersThroughDaemon`)
+* [x] Document daemon restart behavior (ARCHITECTURE.md, "Lifecycles")
+* [x] Establish baseline benchmarks (`agentd bench sessions`; BENCHMARKS.md, "Sessions at scale" and
+      "Terminal and worker")
 
 Baseline metrics should include:
 
@@ -302,18 +308,18 @@ PTY output
 * [x] Integrate Go bindings for `libghostty-vt` (`go.mitchellh.com/libghostty`)
 * [x] Feed every PTY output stream into terminal state
 * [x] Generate terminal snapshots for newly attached clients
-* [ ] Restore:
+* [x] Restore (`internal/worker/restore_test.go`; ARCHITECTURE.md lists what a snapshot cannot restore):
 
-  * [ ] primary screen
-  * [ ] alternate screen
-  * [ ] cursor position
-  * [ ] styles
-  * [ ] scrollback
-  * [ ] terminal dimensions
-* [ ] Validate behavior against real TUIs
-* [ ] Benchmark cgo boundary overhead
-* [ ] Minimize high-frequency Go ↔ Zig calls
-* [ ] Add fuzz/property tests around snapshot restoration
+  * [x] primary screen
+  * [x] alternate screen (and the primary screen under it)
+  * [x] cursor position
+  * [x] styles
+  * [x] scrollback
+  * [x] terminal dimensions (the snapshot is laid out for the attaching client's size)
+* [x] Validate behavior against real TUIs (recorded streams replayed and cut at many points)
+* [x] Benchmark cgo boundary overhead (BENCHMARKS.md, "Terminal and worker")
+* [x] Minimize high-frequency Go ↔ Zig calls (small PTY reads are batched into one `VTWrite`)
+* [x] Add fuzz/property tests around snapshot restoration (`FuzzSnapshotRestore`)
 
 ## Important constraint
 

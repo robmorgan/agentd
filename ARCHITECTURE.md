@@ -66,6 +66,85 @@ The daemon supervises the workers it spawned: it reaps them and records a worker
 session. Sessions whose worker disappeared while no daemon was running are marked
 `unknown_recovered` at startup or on the next `ls`.
 
+## Lifecycles
+
+### Tasks and sessions
+
+Today a task is a session: one run of one agent in one working directory, under a name, with one
+record in `state.db` and one worker process. The roadmap's task concepts (attention, elapsed time,
+exit status, git state) are columns of that record or read from its working directory, so a task's
+lifecycle is its session's, and there is no separate task table. If a task later spans several runs
+(a retry, a follow-up agent), each run will still be a session and the task the grouping above
+them; the session stays the unit that owns a PTY, a process and terminal state. Attachments, a
+client's view of a session, are described in "Sessions, Incarnations And Attachments".
+
+### Session states
+
+A session's `status` in `state.db` changes only through the guarded updates in `internal/db`. Both
+the daemon and the session's worker write it: the worker the outcome it knows first-hand, the
+daemon what it can only infer.
+
+```text
+                 agent new (the daemon inserts the record)
+                      │
+                      ▼
+                 ┌──────────┐   cwd missing, spawn failed, worker not up in 5 s,
+                 │ creating │── worker exited first, or the daemon restarted ───► failed
+                 └────┬─────┘
+                      │ worker: agent spawned under the PTY, socket bound
+                      ▼
+                 ┌──────────┐   agent exits 0, or after kill ──────────────────► exited
+                 │ running  │── agent exits non-zero or by a signal ──────────► failed
+                 └──────────┘── worker crashes while its daemon supervises it ─► failed
+                      │
+                      │ worker gone, found by probing its socket
+                      ▼ (it died while no daemon supervised it)
+              unknown_recovered
+
+  agent rm (or kill --rm): stops the session if it runs, then deletes the record and logs
+```
+
+* `creating`: the daemon has allocated the name and UID and is starting `agentd session-worker`.
+  The worker passes the row's creation time to `MarkRunning`, which applies only to that
+  incarnation and only while it is still `creating`, so a worker the daemon gave up on, or whose
+  session was removed and recreated meanwhile, cannot claim it.
+* `running`: the worker spawned the agent and bound `sessions/<id>.sock`. Only a worker that
+  accepts a connection on that socket counts as live; recorded pids are informational.
+* `exited`: the agent exited with status 0, or exited after a kill (the worker records a deliberate
+  stop as `exited` whatever the status). The daemon also records `exited` if a worker it asked to
+  stop disappears without recording an outcome.
+* `failed`: the worker recorded why it could not start (missing directory, spawn or socket
+  failure) or that the agent exited non-zero or by a signal; or the daemon recorded a failed start,
+  a creation interrupted by a daemon restart, or a worker it spawned that died without recording an
+  outcome (`MarkWorkerLost`, keyed on that worker's pid).
+* `unknown_recovered`: the record says `running` but nothing listens on the socket, so the worker
+  died while no daemon supervised it (SIGKILL, a reboot). This is found at daemon startup or on the
+  next lookup (`ls`, `status` and the like), and is set only over `running`, so it never overwrites
+  an outcome a worker wrote on its way out.
+
+`exited`, `failed` and `unknown_recovered` are final: a session never restarts. Its history stays
+readable (`agent history` reads the logs the worker wrote at exit) until `agent rm` deletes the
+record and logs; the name can then be used again, by a new incarnation with a new UID.
+
+### Daemon restarts
+
+The daemon holds no session state that is not in `state.db` or in a worker, so restarting it is
+safe:
+
+* Workers run in their own process sessions and keep running, with their agents, PTYs and
+  terminal state, while no daemon runs. A worker records its agent's exit in `state.db` itself.
+* Stopping the daemon closes its client connections, which ends every attachment it was proxying
+  (remote CLIs reconnect and reattach by themselves; local ones exit). Sessions are untouched.
+* A starting daemon takes the lock, removes a stale socket, and reconciles: `running` sessions
+  whose workers answer stay running and are reachable again; those whose workers are gone become
+  `unknown_recovered`; sessions still `creating` become `failed` (a worker still starting is then
+  refused by `MarkRunning`, stops its agent and exits).
+* A daemon supervises only the workers it spawned. A worker that crashes under a later daemon is
+  found by probing its socket, so its session becomes `unknown_recovered` rather than `failed`.
+* `agent daemon restart` stops the daemon even with sessions running. A plain shutdown request is
+  refused while sessions run, and `agent daemon upgrade` refuses too, since running workers are the
+  old binary.
+
 ## Transports
 
 The protocol runs over any bidirectional byte stream that supports half-close. Each stream has one
@@ -563,9 +642,11 @@ lifecycle, all in the worker (`internal/worker/worker.go`, `serveAttach`):
 1. **Attach.** The worker numbers it `<kind>-<n>` (`attach-3`, `tui-1`), where `n` counts in the
    session's row in `state.db`: ids are never reused within an incarnation, not even by a later
    worker for the same session. (Reuse would let a client that names an old id, to replace it or
-   `agent detach --attach` it, hit someone else's attachment.) On the owner goroutine it then takes
-   the snapshot, applies the client's size, subscribes the attachment to output and lists it, in one
-   step, so the snapshot is an exact boundary: the output that follows continues it. `Attached`
+   `agent detach --attach` it, hit someone else's attachment.) On the owner goroutine it then applies
+   the client's size, takes the snapshot (laid out for that size), subscribes the attachment to
+   output and lists it, in one step, so the snapshot is an exact boundary: the output that follows
+   continues it. If the output so far ends inside an escape sequence, that step waits for the rest
+   of it (at most 100 ms; see "libghostty-vt"). `Attached`
    carries the id and the snapshot (and with `session-uid`, the UID).
 2. **Live.** Output flows to the client through its bounded queue (below); its input, resizes and
    snapshot requests flow back. Several attachments may be live at once; input is shared and resize
@@ -630,8 +711,8 @@ Output, per attachment, from the PTY to the screen:
 
 | Stage | Bound | When full |
 |---|---|---|
-| PTY read (worker) | 8 KiB per read, published on the owner goroutine | never full: publish never blocks |
-| Subscriber queue (worker, `broadcast.go`) | 1024 reads and 1 MiB, whichever first | the chunk is dropped and the attachment marked lagged |
+| PTY reads (worker) | batched into chunks of up to 8 KiB, published on the owner goroutine | a full batch stops the PTY reader until the owner takes it; publish never blocks |
+| Subscriber queue (worker, `broadcast.go`) | 1024 chunks and 1 MiB, whichever first | the chunk is dropped and the attachment marked lagged |
 | Attach handler (worker) | one frame being written: 8 KiB of output, or one snapshot | blocks: the queue above fills |
 | Worker to daemon Unix socket | kernel socket buffers (8 KiB each way on macOS, about 200 KiB on Linux) | blocks the handler |
 | Daemon proxy (`proxy.go`) | one 32 KiB copy buffer | blocks: stops reading the worker |
@@ -723,7 +804,80 @@ the client receives so it can re-hydrate clients that connect to the session. Th
 left off as if they didn't disconnect from the terminal session at all.
 
 The worker uses `go.mitchellh.com/libghostty`, whose pinned `libghostty-vt` needs Zig 0.16 and is
-built `ReleaseFast` under `.build/` by `scripts/build-libghostty.sh`. The FFI boundary is
-coarse: whole PTY reads go in, whole snapshots come out. Only the worker links it: the `agent` CLI
-never imports the worker (or the daemon and its SQLite store), and a test keeps it buildable with
-`CGO_ENABLED=0`.
+built `ReleaseFast` under `.build/` by `scripts/build-libghostty.sh`. Only the worker links it:
+the `agent` CLI never imports the worker (or the daemon and its SQLite store), and a test keeps it
+buildable with `CGO_ENABLED=0`.
+
+### The FFI boundary
+
+The boundary is coarse: output goes in as whole buffers, snapshots come out whole. Nothing on the
+output path crosses it per cell or per character. PTY reads can be small (on macOS, a program
+that writes in small pieces, such as `yes | head`, gives mostly 30 to 130 bytes per read), so the
+PTY pump batches them: reads that arrive while the owner
+goroutine is busy are handed over together, up to 8 KiB, as one `VTWrite` and one chunk for each
+client; an idle owner gets each read at once, so batching adds no latency. A snapshot is a few
+getters, one or two formatter runs and one render-state update. [BENCHMARKS.md](BENCHMARKS.md)
+has the measurements: a `VTWrite` costs about 50 ns plus the parsing, and at 1 KiB per call the
+call overhead is under 1%, while output through the worker is limited by the kernel's PTY.
+
+### The reattach snapshot
+
+The snapshot is VT bytes that the CLI writes to the user's terminal after clearing it, laid out
+for that terminal's size: the worker resizes the PTY and its terminal to the attaching client
+first. It is built from libghostty's VT formatter, with these additions (`terminal.go`):
+
+* **An exact boundary.** It is taken only where the parser is between escape sequences and UTF-8
+  characters (`VTGround`). If an attach arrives mid-sequence, it waits for the next PTY read and
+  feeds only the bytes that finish the sequence (`VTWriteUntilGround`) before taking it, at most
+  100 ms. Otherwise the client would get the sequence's tail as live output and print it.
+* **The primary screen under the alternate one.** The formatter only formats the active screen,
+  so while a program has the alternate screen up the worker copies the terminal (its binary
+  snapshot, decoded), leaves the alternate screen in the copy, and formats the primary screen and
+  scrollback from that first. The alternate screen's formatting then switches the client over with
+  the mode the program used, so when the program exits, the shell and its scrollback are back. The
+  scrolling region is emitted once, after the switch (it is terminal-wide), and the pen is reset
+  after the switch so the alternate screen does not inherit the primary one's.
+* **Blank rows at the bottom.** The formatter leaves them out, so with scrollback the rows it
+  writes would land too low (after a clear screen, the prompt at the bottom, under old output).
+  The missing line feeds are added after the screen contents.
+* **Only changed colors.** The formatter's palette option sets all 256 colors to libghostty's
+  defaults, overwriting the user's theme; the snapshot sets only the palette entries and default
+  foreground, background and cursor colors that a program changed.
+* **Cursor shape.** A bar or underline cursor (DECSCUSR) is restored; a block cursor is left to
+  the client's default.
+
+Tests restore snapshots into a second terminal and compare them cell by cell
+(`restore_test.go`), replay recorded streams from Claude Code, Codex, a shell, Vim, Neovim,
+`go test` and clang cut at many points (`streams_test.go`, `testdata/streams`), and fuzz it
+(`FuzzSnapshotRestore`).
+
+What a snapshot does not restore, because the formatter does not emit it or because a VT stream
+written to someone else's terminal cannot carry it (`TestSnapshotKnownLimits` demonstrates the
+formatter's):
+
+* **Colors of blank cells.** The formatter skips cells that hold only a background (written by an
+  erase while a background color is set) and writes a row of them as an empty line, so an
+  editor's background shows the client's default on empty rows until the program redraws them.
+  It also writes the gap before later text on a row as spaces in the pen of the text before the
+  gap. Both are fixable in libghostty's formatter (`PageFormatter`), which is where the fix
+  belongs.
+* **The cursor in origin mode** (DECOM): the formatter enables the mode before an absolute cursor
+  position, which then lands relative to the top margin.
+* **Soft wraps and hyperlinks of text already on screen.** Every row is written with a line
+  break after it, so a wrapped line comes back as separate lines that a later resize does not
+  reflow; hyperlinks (OSC 8) are only emitted for the pen, not for text.
+* **A pending wrap over a blank cell** (possible after restoring a saved cursor): the formatter
+  restores a pending wrap by printing the cell under the cursor again, which does nothing when
+  that cell is blank, so the next character lands on the same row instead of the next.
+* **A wide character printed in the DEC line-drawing charset**: libghostty maps it but keeps it
+  two columns wide, and the formatter writes the mapped character in one, so the rest of the row
+  lands a column to the left.
+* **The saved cursor** (DECSC, mode 1048), the kitty keyboard flag stack (only the current flags
+  are set), kitty graphics and sixel images.
+* **The window title and working directory** (OSC 0/2 and 7), deliberately: the CLI sets its own
+  title, and the directory is a path on the session's host.
+* **The client's own state.** The snapshot assumes a terminal in its default state: modes are
+  emitted only where they differ from the defaults, and a block cursor is not emitted. The CLI
+  clears the screen first and resets the common modes when it detaches.
+* **Other clients' sizes.** The snapshot fits the attaching client; any other client attached at
+  another size keeps getting output laid out for the PTY's size, which the last resize set.
