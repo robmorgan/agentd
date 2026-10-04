@@ -538,31 +538,22 @@ func TestSlowAttacherDoesNotStallOthers(t *testing.T) {
 }
 
 // pingUntilEchoed proves the attachment is live even if some of its output
-// was dropped while it lagged: it keeps sending pings until one echoes back.
+// was dropped while it lagged: the echo arrives as output, or within the
+// snapshot of a resync that replaced output it fell behind on. Frames are
+// only ever read whole (a read deadline that fires mid-frame would leave
+// the reader out of step with the stream).
 func (c *client) pingUntilEchoed() {
 	c.t.Helper()
-	deadline := time.Now().Add(testTimeout)
-	for i := 0; ; i++ {
-		c.input(fmt.Sprintf("ping%d\n", i))
-		c.conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
-		for {
-			resp, err := protocol.ReadResponse(c.r)
-			if err != nil {
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
-					break
-				}
-				c.t.Fatalf("ping: %v", err)
-			}
-			if resp == nil || resp.PtyOutput == nil {
-				c.t.Fatalf("ping: unexpected response %#v", resp)
-			}
+	c.input("ping\n")
+	for !strings.Contains(c.output.String(), "got:ping") {
+		resp := c.read()
+		switch {
+		case resp.PtyOutput != nil:
 			c.output.Write(resp.PtyOutput.Data)
-			if strings.Contains(c.output.String(), "got:ping") {
-				return
-			}
-		}
-		if time.Now().After(deadline) {
-			c.t.Fatal("attachment never echoed a ping")
+		case resp.AttachResync != nil:
+			c.output.Write(resp.AttachResync.Data)
+		default:
+			c.t.Fatalf("ping: unexpected response %#v", resp)
 		}
 	}
 }

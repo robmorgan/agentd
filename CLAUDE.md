@@ -360,7 +360,7 @@ Particularly consider:
 - concurrent input
 - slow remote clients
 
-Run the Go race detector as part of development.
+Run the Go race detector as part of development. Linux behaves differently from macOS (PTYs, process reaping): run `make test-linux` (Docker) for changes there.
 
 # Backpressure
 

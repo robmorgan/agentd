@@ -264,11 +264,12 @@ func TestEventStreamResumesAndFollows(t *testing.T) {
 	onlyA := h.subscribe(&protocol.SubscribeEvents{SessionID: &a, AfterID: &all[3].ID})
 	h.sendInput(b, "\a\n")
 	h.sendInput(a, "\a\n")
-	if ev := sub.until(session.EventBell); ev[0].SessionID != b {
-		t.Fatalf("first live event %#v", ev)
-	}
-	if ev := sub.next(); ev.Kind != session.EventBell || ev.SessionID != a {
-		t.Fatalf("second live event %#v", ev)
+	// Each session's worker records its own bell, so they may land in
+	// either order.
+	first := sub.until(session.EventBell)
+	second := sub.until(session.EventBell)
+	if got := []string{first[len(first)-1].SessionID, second[len(second)-1].SessionID}; !(got[0] == a && got[1] == b || got[0] == b && got[1] == a) {
+		t.Fatalf("live events %#v then %#v", first, second)
 	}
 	if ev := onlyA.next(); ev.Kind != session.EventBell || ev.SessionID != a {
 		t.Fatalf("filtered %#v", ev)

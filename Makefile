@@ -1,4 +1,4 @@
-.PHONY: libghostty build agent agentd test vet dev-run install
+.PHONY: libghostty build agent agentd test test-linux vet dev-run install
 
 ZIG ?= zig
 VERSION ?= 0.1.0
@@ -25,6 +25,10 @@ agent:
 
 test: libghostty
 	go test -race ./...
+
+# The same suite on Linux, in Docker (scripts/test-linux.sh).
+test-linux:
+	./scripts/test-linux.sh
 
 vet: libghostty
 	go vet ./...
