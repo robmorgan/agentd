@@ -337,7 +337,13 @@ the previous running session with `Ctrl-[`, or switch to the next running sessio
 `agent detach <name> --all` to disconnect every attached client on the session.
 Use `agent attachments <name>` to inspect the current attachment ids.
 Attach clears the visible screen and repaints from the daemon's retained terminal state; if the
-restored session was using the alternate screen, replay restores that state naturally.
+restored session was using the alternate screen, replay restores that state naturally. A client
+that falls behind a fast agent (a slow link, a stalled terminal) never slows the agent down: it
+skips output it cannot keep up with and is repainted from the current screen once it catches up.
+
+Every session has a UID (`agent status` shows it) as well as its name. A name can be reused once
+its session is removed; the UID never is, so a reconnecting client can tell that the session under
+a name is no longer the one it was attached to.
 Multiple interactive attachers are allowed per session, and the TUI uses the same shared attach
 path when a worker is focused. Background PTY writes are still available with
 `agent send-input <name> -- <text>`.
@@ -409,7 +415,12 @@ authorized machine, restores the screen. An attachment that loses its connection
 itself: the bottom row says it is reconnecting, typing is ignored until it is back, and `Ctrl-\`
 gives up. It keeps trying (every 5 seconds at most) until the devbox answers, so a laptop that slept
 picks up where it was when it wakes. It stops if the devbox refuses this machine's key or the
-session is gone. Without `--agent`, `new` uses the devbox's `default_agent`.
+session is gone, or was removed and replaced by a new session of the same name while you were away.
+A network change that keeps the connection alive (a new address behind the same NAT) needs no
+reconnect at all. Commands whose connection drops after they were sent are sent again once the
+devbox answers: lookups always, and `new`, `kill`, `rm` and `workspace add|rm` because they carry a
+token that lets the devbox do them only once and answer the retry with the first result.
+`send-input` is never sent twice. Without `--agent`, `new` uses the devbox's `default_agent`.
 
 With several hosts, `agent hosts` (or `agent host ls`) checks every one at once, this machine's
 daemon included as `local`:

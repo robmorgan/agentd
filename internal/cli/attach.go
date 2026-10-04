@@ -48,6 +48,12 @@ type attachResult struct {
 // attachSession attaches the terminal to a session until the user detaches
 // or the session ends, following switches to other sessions on the way.
 func (c *client) attachSession(id string) error {
+	return c.attachSessionUID(id, "")
+}
+
+// attachSessionUID is attachSession for a session known by its UID too
+// (one just created), refusing any other incarnation under its name.
+func (c *client) attachSessionUID(id, uid string) error {
 	titled := false
 	defer func() {
 		if titled {
@@ -55,7 +61,7 @@ func (c *client) attachSession(id string) error {
 		}
 	}()
 	for {
-		res, err := c.attachOnce(id, &titled)
+		res, err := c.attachOnce(id, uid, &titled)
 		if err != nil {
 			return err
 		}
@@ -64,11 +70,29 @@ func (c *client) attachSession(id string) error {
 			fmt.Println(formatSessionEnd(res.ended))
 			return nil
 		case outcomeSwitch:
-			id = res.next
+			id, uid = res.next, ""
 		default:
 			return nil
 		}
 	}
+}
+
+// attachIdentity is what a reattach carries over from the attachment it
+// replaces, so that it reaches the same session incarnation and the daemon
+// can drop the old attachment at once (see protocol.CapAttachReplace).
+type attachIdentity struct {
+	// uid is the session incarnation, when the daemon reports it.
+	uid string
+	// attachID is the attachment the connection had.
+	attachID string
+}
+
+// update records what the daemon answered an attach with.
+func (a *attachIdentity) update(attached *protocol.Attached) {
+	if attached.SessionUID != "" {
+		a.uid = attached.SessionUID
+	}
+	a.attachID = attached.AttachID
 }
 
 // frame is one response read from an attach stream.
@@ -127,7 +151,15 @@ func (a *attachStream) stop() {
 // connectAttach opens an attach stream. A session that has already ended
 // answers with SessionEnded instead. Cancelling ctx abandons the attempt,
 // closing the stream if it was opened.
-func (c *client) connectAttach(ctx context.Context, id string) (*attachStream, *protocol.Attached, *protocol.SessionEnded, error) {
+//
+// The attach stream asks for the attach features the daemon's Welcome
+// offered (protocol.AttachFeatures): the session's UID, replacing prev's
+// attachment when prev knows the UID, and resyncs after lag.
+func (c *client) connectAttach(ctx context.Context, id string, prev attachIdentity) (*attachStream, *protocol.Attached, *protocol.SessionEnded, error) {
+	cs, err := c.controlStream(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	s, err := c.open(ctx)
 	if err != nil {
 		return nil, nil, nil, err
@@ -135,11 +167,19 @@ func (c *client) connectAttach(ctx context.Context, id string) (*attachStream, *
 	stopWatch := context.AfterFunc(ctx, func() { s.Close() })
 	defer stopWatch()
 	cols, rows, pw, ph := terminalGeometry()
-	req := &protocol.Request{AttachSession: &protocol.AttachSession{
+	attach := &protocol.AttachSession{
 		SessionID: id,
 		Kind:      session.AttachmentAttach,
 		Geometry:  protocol.Geometry{Cols: cols, Rows: rows, PixelWidth: pw, PixelHeight: ph},
-	}}
+		Features:  protocol.AttachFeatures(cs.features),
+	}
+	if prev.uid != "" && attach.HasFeature(protocol.CapSessionUID) {
+		attach.ExpectUID = prev.uid
+		if attach.HasFeature(protocol.CapAttachReplace) {
+			attach.Replaces = prev.attachID
+		}
+	}
+	req := &protocol.Request{AttachSession: attach}
 	if err := protocol.WriteRequest(s, req); err != nil {
 		s.Close()
 		return nil, nil, nil, err
@@ -177,14 +217,16 @@ func (c *client) connectAttach(ctx context.Context, id string) (*attachStream, *
 // When the connection to a remote daemon is lost, the terminal stays in
 // raw mode while attachOnce reconnects and attaches to the same session
 // again, repainting the screen from the new snapshot; see reattach.
-func (c *client) attachOnce(id string, titled *bool) (attachResult, error) {
-	stream, attached, ended, err := c.connectAttach(context.Background(), id)
+func (c *client) attachOnce(id, uid string, titled *bool) (attachResult, error) {
+	ident := attachIdentity{uid: uid}
+	stream, attached, ended, err := c.connectAttach(context.Background(), id, ident)
 	if err != nil {
 		return attachResult{}, err
 	}
 	if ended != nil {
 		return attachResult{outcome: outcomeEnded, ended: ended}, nil
 	}
+	ident.update(attached)
 	defer func() {
 		if stream != nil {
 			stream.stop()
@@ -218,10 +260,12 @@ func (c *client) attachOnce(id string, titled *bool) (attachResult, error) {
 		stream.stop()
 		stream = nil
 		var r *attachResult
-		stream, snapshot, r, err = c.reattach(id, keys, &parser, err)
+		stream, attached, r, err = c.reattach(id, ident, keys, &parser, err)
 		if stream == nil {
 			return deref(r), err
 		}
+		ident.update(attached)
+		snapshot = attached.Snapshot
 		// An overlay that was open when the connection dropped may have
 		// hidden the cursor.
 		writeOut([]byte("\x1b[?25h"))
@@ -312,11 +356,12 @@ const (
 // bottom row, which the new snapshot paints over. Typed input is dropped
 // rather than sent late to an agent the user cannot see; only the detach
 // key acts, at any point. It gives up on errors a retry cannot fix: a
-// refused or changed key, a session that is gone, a protocol error.
+// refused or changed key, a session that is gone or was replaced by
+// another under the same name (prev's UID), a protocol error.
 //
-// It returns the new stream and its snapshot, or with a nil stream, the
+// It returns the new stream and its Attached, or with a nil stream, the
 // result or error that ends the attachment.
-func (c *client) reattach(id string, keys <-chan []byte, parser *attachParser, cause error) (*attachStream, []byte, *attachResult, error) {
+func (c *client) reattach(id string, prev attachIdentity, keys <-chan []byte, parser *attachParser, cause error) (*attachStream, *protocol.Attached, *attachResult, error) {
 	detached := &attachResult{outcome: outcomeDetached}
 	delay := time.Duration(0)
 	for try := 1; ; try++ {
@@ -346,7 +391,7 @@ func (c *client) reattach(id string, keys <-chan []byte, parser *attachParser, c
 		go func() {
 			defer close(done)
 			var a attempt
-			a.stream, a.attached, a.ended, a.err = c.connectAttach(ctx, id)
+			a.stream, a.attached, a.ended, a.err = c.connectAttach(ctx, id, prev)
 			result <- a
 		}()
 		finished := waitUnlessDetached(done, keys, parser)
@@ -361,7 +406,7 @@ func (c *client) reattach(id string, keys <-chan []byte, parser *attachParser, c
 		case a.err == nil && a.ended != nil:
 			return nil, nil, &attachResult{outcome: outcomeEnded, ended: a.ended}, nil
 		case a.err == nil:
-			return a.stream, a.attached.Snapshot, nil, nil
+			return a.stream, a.attached, nil, nil
 		case !transport.IsConnectionLost(a.err):
 			return nil, nil, nil, a.err
 		}
@@ -429,6 +474,13 @@ func handleFrame(f frame, overlayOpen bool) (attachResult, bool, error) {
 		return attachResult{}, false, nil
 	case f.resp.SessionEnded != nil:
 		return attachResult{outcome: outcomeEnded, ended: f.resp.SessionEnded}, true, nil
+	case f.resp.AttachResync != nil:
+		// The worker dropped output while this client lagged; the
+		// snapshot replaces the screen, and output continues from it.
+		if !overlayOpen {
+			writeOut(resyncBytes(f.resp.AttachResync.Data))
+		}
+		return attachResult{}, false, nil
 	case f.resp.AttachSnapshot != nil:
 		if overlayOpen {
 			return attachResult{}, true, errors.New("unexpected attach snapshot response outside overlay restore")
@@ -482,7 +534,8 @@ func restoreSnapshot(stream *attachStream) ([]byte, *protocol.SessionEnded, erro
 			return nil, nil, errors.New("agentd closed the attach connection")
 		case f.resp.AttachSnapshot != nil:
 			return f.resp.AttachSnapshot.Data, nil, nil
-		case f.resp.PtyOutput != nil:
+		case f.resp.PtyOutput != nil, f.resp.AttachResync != nil:
+			// Superseded by the snapshot asked for.
 		case f.resp.SessionEnded != nil:
 			return nil, f.resp.SessionEnded, nil
 		case f.resp.EndOfStream != nil:
@@ -506,6 +559,13 @@ func attachStartupBytes(snapshot []byte) []byte {
 	out = append(out, attachEnterSequence...)
 	out = append(out, attachClearSequence...)
 	return append(out, snapshot...)
+}
+
+// resyncBytes repaints the screen from a resync snapshot. Unlike
+// attachStartupBytes it pushes no keyboard flags: the attachment's are
+// already in place.
+func resyncBytes(snapshot []byte) []byte {
+	return append([]byte(attachClearSequence), snapshot...)
 }
 
 // terminalTitleBytes sets both the window and icon titles.

@@ -43,10 +43,16 @@ const (
 // Record is the durable description of a session. A session belongs to the
 // daemon, not to any client connection: the record outlives every attach.
 type Record struct {
+	// SessionID is the session's name. It is unique among the sessions
+	// that exist, but may be reused once a session is removed.
 	SessionID string
-	Agent     string
-	Model     *string
-	Mode      Mode
+	// UID identifies this incarnation of the session: random, immutable,
+	// and never reused, unlike the name. A future multi-host id is the
+	// host's identity plus the UID.
+	UID   string
+	Agent string
+	Model *string
+	Mode  Mode
 	// Cwd is the directory the agent process runs in. It may or may not be a
 	// git repository; the daemon does not care.
 	Cwd              string
@@ -78,9 +84,11 @@ type Workspace struct {
 
 type CreateResult struct {
 	SessionID string
-	Cwd       string
-	Status    Status
-	Mode      Mode
+	// UID is the new session's incarnation id (see Record.UID).
+	UID    string
+	Cwd    string
+	Status Status
+	Mode   Mode
 }
 
 type AttachmentRecord struct {

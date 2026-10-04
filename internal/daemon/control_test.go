@@ -19,6 +19,8 @@ type controlClient struct {
 	// welcome is the daemon's answer to Hello.
 	welcome  *protocol.Welcome
 	features protocol.Features
+	// nextID numbers the requests sent with call.
+	nextID uint32
 }
 
 func (h *harness) control() *controlClient {

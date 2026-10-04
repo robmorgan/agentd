@@ -67,7 +67,7 @@ func (a *app) commands() []*cobra.Command {
 		if err != nil {
 			return err
 		}
-		return c.attachSession(resp.CreateSession.SessionID)
+		return c.attachSessionUID(resp.CreateSession.SessionID, resp.CreateSession.UID)
 	})
 	newCmd.Flags().StringVar(&cwd, "cwd", "", "Directory the agent runs in (default: the current directory, or the workspace root with --workspace, where DIR is relative to it)")
 	newCmd.Flags().StringVar(&agent, "agent", "", "")
@@ -622,6 +622,9 @@ func formatBytes(n uint64) string {
 
 func printSession(s *session.Record) {
 	fmt.Printf("name: %s\n", s.SessionID)
+	if s.UID != "" {
+		fmt.Printf("uid: %s\n", s.UID)
+	}
 	fmt.Printf("agent: %s\n", s.Agent)
 	if s.Model != nil {
 		fmt.Printf("model: %s\n", *s.Model)

@@ -3,6 +3,8 @@ package cli
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -219,23 +221,104 @@ func (c *client) request(req *protocol.Request, timeout time.Duration) (*protoco
 
 // controlRequest sends req on the control stream. A stream that turns out
 // to have ended before req was written (the daemon restarted since it was
-// opened, say) is replaced once; a request that was sent is never repeated,
-// since the daemon may have acted on it.
+// opened, say) is replaced once.
+//
+// A request that was sent is repeated only when that is safe: a read, or a
+// request with side effects that carries a request token, which the daemon
+// answers with its original answer if it already acted on it (see
+// protocol.CapRequestTokens). Such a request is sent again, on a new
+// connection, when the connection to a remote daemon was lost, backing off
+// like an attachment's reconnect, until it is answered, fails for another
+// reason, or ctx (or, without a deadline, retryBudget) runs out. Requests
+// without a token (send-input, detach) are never repeated, since the daemon
+// may have acted on them.
 func (c *client) controlRequest(ctx context.Context, req *protocol.Request) (*protocol.Response, error) {
+	if slot := req.TokenSlot(); slot != nil && *slot == "" {
+		// Set once, so every attempt carries the same token. It is only
+		// sent if the daemon supports tokens.
+		*slot = newRequestToken()
+	}
+	start := time.Now()
+	delay := time.Duration(0)
+	// sent is set once req has been written: only then is a lost
+	// connection retried. A daemon that was never reached fails at once.
+	sent := false
 	for attempt := 0; ; attempt++ {
 		cs, err := c.controlStream(ctx)
-		if err != nil {
+		if err == nil {
+			var resp *protocol.Response
+			if resp, err = cs.roundTrip(ctx, req); err == nil {
+				return resp, nil
+			}
+			var se *sentError
+			if errors.As(err, &se) {
+				if !c.mayResend(cs, req) {
+					return nil, se.err
+				}
+				sent = true
+				err = se.err
+			} else if attempt == 0 {
+				continue // the stream had ended before req was written
+			}
+		}
+		if !sent || !c.mayRetry(ctx, err, start) {
 			return nil, err
 		}
-		resp, err := cs.roundTrip(ctx, req)
-		var sent *sentError
-		if err == nil || errors.As(err, &sent) || attempt > 0 {
-			if sent != nil {
-				err = sent.err
-			}
-			return resp, err
+		// The connection is dead: the next attempt dials a new one.
+		c.close()
+		delay = min(max(2*delay, reconnectFirstRetry), reconnectMaxRetry)
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, err
 		}
 	}
+}
+
+// retryBudget bounds how long a request without its own deadline keeps
+// retrying after lost connections.
+const retryBudget = time.Minute
+
+// mayResend reports whether req may be sent again after it was sent on cs:
+// a read always, a request with side effects only with a token the daemon
+// understands.
+func (c *client) mayResend(cs *controlStream, req *protocol.Request) bool {
+	if req.TokenSlot() != nil {
+		return cs.features.Has(protocol.CapRequestTokens)
+	}
+	return isRead(req)
+}
+
+// mayRetry reports whether a request that failed with err is worth another
+// attempt: only a remote one whose connection was lost, within its time.
+func (c *client) mayRetry(ctx context.Context, err error, start time.Time) bool {
+	if c.host == nil || ctx.Err() != nil || !transport.IsConnectionLost(err) {
+		return false
+	}
+	if _, ok := ctx.Deadline(); !ok && time.Since(start) > retryBudget {
+		return false
+	}
+	return true
+}
+
+// isRead reports whether req only reads state, so sending it twice is
+// harmless.
+func isRead(req *protocol.Request) bool {
+	switch {
+	case req.GetDaemonInfo != nil, req.GetSession != nil, req.ListSessions != nil,
+		req.ListAttachments != nil, req.ListWorkspaces != nil:
+		return true
+	}
+	return false
+}
+
+// newRequestToken returns a random request token.
+func newRequestToken() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(fmt.Sprintf("crypto/rand failed: %v", err))
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // controlStream returns the open control stream, opening one (and with it

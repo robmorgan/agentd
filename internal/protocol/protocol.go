@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"time"
 	"unicode/utf8"
 
@@ -79,19 +80,31 @@ type CreateSession struct {
 	Model *string
 	// Workspace names a directory in the daemon's config (`[workspaces]`).
 	Workspace *string
+	// Token (CapRequestTokens) identifies this request across retries; see
+	// RequestToken. Empty means none.
+	Token string
 }
 
 // AddWorkspace registers Path under Name. Path is resolved on the daemon's
 // machine: it must be absolute or start with `~/`, and exist.
 type AddWorkspace struct {
 	Name, Path string
+	// Token (CapRequestTokens); see CreateSession.Token.
+	Token string
 }
 
-type WorkspaceRef struct{ Name string }
+// WorkspaceRef names a workspace to remove.
+type WorkspaceRef struct {
+	Name string
+	// Token (CapRequestTokens); see CreateSession.Token.
+	Token string
+}
 
 type KillSession struct {
 	SessionID string
 	Remove    bool
+	// Token (CapRequestTokens); see CreateSession.Token.
+	Token string
 }
 
 type Geometry struct {
@@ -102,7 +115,25 @@ type AttachSession struct {
 	SessionID string
 	Kind      session.AttachmentKind
 	Geometry
+	// Features (CapAttachFeatures) are the attach-stream capabilities the
+	// client wants on this stream. Attach streams have no handshake, so a
+	// client sends them only if the daemon's Welcome listed them; they are
+	// encoded after Geometry when non-empty, followed by the fields of the
+	// features listed, in the order below.
+	Features []string
+	// ExpectUID (CapSessionUID) refuses the attach unless the session's
+	// current incarnation has this UID: a reattach must never land on a
+	// new session that reused the name. Empty means any incarnation.
+	ExpectUID string
+	// Replaces (CapAttachReplace) is the id of an attachment this one
+	// replaces (the client's own, on a connection it lost). It is honoured
+	// only together with a matching ExpectUID, since attach ids are only
+	// unique within one incarnation.
+	Replaces string
 }
+
+// HasFeature reports whether the attach stream asked for capability c.
+func (a *AttachSession) HasFeature(c string) bool { return slices.Contains(a.Features, c) }
 
 type DetachSession struct {
 	SessionID string
@@ -149,6 +180,11 @@ type Response struct {
 	ArtifactChunk  *Bytes
 	SessionStats   *SessionStats
 	DaemonStats    *DaemonStats
+	// AttachResync (CapAttachResync) is an unsolicited snapshot on an
+	// attach stream: the worker dropped output this client fell behind
+	// on, and this replaces the screen. Like AttachSnapshot it is an exact
+	// boundary: the output that follows continues from it.
+	AttachResync *Bytes
 }
 
 type DaemonInfo struct {
@@ -160,7 +196,18 @@ type KillSessionResult struct{ Removed, WasRunning bool }
 type Attached struct {
 	AttachID string
 	Snapshot []byte
+	// Features are the attach-stream capabilities in effect, sent (after
+	// Snapshot) only when the AttachSession listed some. Fields of the
+	// features listed follow in the order below.
+	Features []string
+	// SessionUID (CapSessionUID) is the UID of the incarnation attached
+	// to, for the client to expect on a reattach.
+	SessionUID string
 }
+
+// HasFeature reports whether the attach stream uses capability c.
+func (a *Attached) HasFeature(c string) bool { return slices.Contains(a.Features, c) }
+
 type History struct{ Data string }
 type ErrorResponse struct{ Message string }
 
@@ -236,6 +283,9 @@ const (
 	// 170-179: resource usage (stats.go).
 	kSessionStatsResponse kind = 170
 	kDaemonStatsResponse  kind = 171
+
+	// Session resumption (kinds 150-159).
+	kAttachResyncResponse kind = 150
 )
 
 // ---------------------------------------------------------------------------
@@ -471,16 +521,27 @@ func encodeRequest(req *Request, f Features) (kind, []byte, error) {
 		e.str(c.Agent)
 		e.optStr(c.Model)
 		e.optStr(c.Workspace)
+		e.token(c.Token)
 		return kCreateSessionRequest, e.buf, e.err
 	case req.KillSession != nil:
 		e.str(req.KillSession.SessionID)
 		e.bool(req.KillSession.Remove)
+		e.token(req.KillSession.Token)
 		return kKillSessionRequest, e.buf, e.err
 	case req.AttachSession != nil:
 		a := req.AttachSession
 		e.str(a.SessionID)
 		e.attachmentKind(a.Kind)
 		e.geometry(a.Geometry)
+		if len(a.Features) > 0 {
+			e.strs(a.Features)
+			if a.HasFeature(CapSessionUID) {
+				e.str(a.ExpectUID)
+			}
+			if a.HasFeature(CapAttachReplace) {
+				e.str(a.Replaces)
+			}
+		}
 		return kAttachSessionRequest, e.buf, e.err
 	case req.AttachResize != nil:
 		e.geometry(*req.AttachResize)
@@ -520,9 +581,11 @@ func encodeRequest(req *Request, f Features) (kind, []byte, error) {
 	case req.AddWorkspace != nil:
 		e.str(req.AddWorkspace.Name)
 		e.str(req.AddWorkspace.Path)
+		e.token(req.AddWorkspace.Token)
 		return kAddWorkspaceRequest, e.buf, e.err
 	case req.RemoveWorkspace != nil:
 		e.str(req.RemoveWorkspace.Name)
+		e.token(req.RemoveWorkspace.Token)
 		return kRemoveWorkspaceRequest, e.buf, e.err
 	case req.Hello != nil:
 		h := req.Hello
@@ -567,11 +630,24 @@ func decodeRequest(k kind, payload []byte, f Features) (*Request, error) {
 			Model:     d.optStr(),
 			Workspace: d.optStr(),
 		}
+		req.CreateSession.Token = d.token()
 	case kKillSessionRequest:
 		req.KillSession = &KillSession{SessionID: d.str(), Remove: d.bool()}
+		req.KillSession.Token = d.token()
 	case kAttachSessionRequest:
 		a := &AttachSession{SessionID: d.str(), Kind: d.attachmentKind()}
 		a.Geometry = d.geometry()
+		// The feature list is the attach stream's handshake, so its
+		// presence, not the decoder's features, says whether it is there.
+		if d.more() {
+			a.Features = d.strs()
+			if a.HasFeature(CapSessionUID) {
+				a.ExpectUID = d.str()
+			}
+			if a.HasFeature(CapAttachReplace) {
+				a.Replaces = d.str()
+			}
+		}
 		req.AttachSession = a
 	case kAttachResizeRequest:
 		g := d.geometry()
@@ -598,8 +674,10 @@ func decodeRequest(k kind, payload []byte, f Features) (*Request, error) {
 		req.ListWorkspaces = Empty
 	case kAddWorkspaceRequest:
 		req.AddWorkspace = &AddWorkspace{Name: d.str(), Path: d.str()}
+		req.AddWorkspace.Token = d.token()
 	case kRemoveWorkspaceRequest:
 		req.RemoveWorkspace = &WorkspaceRef{Name: d.str()}
+		req.RemoveWorkspace.Token = d.token()
 	case kHelloRequest:
 		req.Hello = &Hello{MinVersion: d.u16(), MaxVersion: d.u16(), Client: d.str(), Capabilities: d.strs()}
 	case kGetGitStateRequest:
@@ -634,14 +712,24 @@ func encodeResponse(resp *Response, f Features) (kind, []byte, error) {
 		e.str(c.Cwd)
 		e.status(c.Status)
 		e.mode(c.Mode)
+		if e.f.Has(CapSessionUID) {
+			e.str(c.UID)
+		}
 		return kCreateSessionResponse, e.buf, e.err
 	case resp.KillSession != nil:
 		e.bool(resp.KillSession.Removed)
 		e.bool(resp.KillSession.WasRunning)
 		return kKillSessionResponse, e.buf, e.err
 	case resp.Attached != nil:
-		e.str(resp.Attached.AttachID)
-		e.bytes(resp.Attached.Snapshot)
+		a := resp.Attached
+		e.str(a.AttachID)
+		e.bytes(a.Snapshot)
+		if len(a.Features) > 0 {
+			e.strs(a.Features)
+			if a.HasFeature(CapSessionUID) {
+				e.str(a.SessionUID)
+			}
+		}
 		return kAttachedResponse, e.buf, e.err
 	case resp.AttachSnapshot != nil:
 		e.bytes(resp.AttachSnapshot.Data)
@@ -730,6 +818,9 @@ func encodeResponse(resp *Response, f Features) (kind, []byte, error) {
 		e.processStats(&resp.DaemonStats.Daemon)
 		e.u32(resp.DaemonStats.OpenStreams)
 		return kDaemonStatsResponse, e.buf, e.err
+	case resp.AttachResync != nil:
+		e.bytes(resp.AttachResync.Data)
+		return kAttachResyncResponse, e.buf, e.err
 	}
 	return 0, nil, errors.New("empty response")
 }
@@ -744,10 +835,20 @@ func decodeResponse(k kind, payload []byte, f Features) (*Response, error) {
 		resp.CreateSession = &session.CreateResult{
 			SessionID: d.str(), Cwd: d.str(), Status: d.status(), Mode: d.mode(),
 		}
+		if d.f.Has(CapSessionUID) {
+			resp.CreateSession.UID = d.str()
+		}
 	case kKillSessionResponse:
 		resp.KillSession = &KillSessionResult{Removed: d.bool(), WasRunning: d.bool()}
 	case kAttachedResponse:
-		resp.Attached = &Attached{AttachID: d.str(), Snapshot: d.bytes()}
+		a := &Attached{AttachID: d.str(), Snapshot: d.bytes()}
+		if d.more() {
+			a.Features = d.strs()
+			if a.HasFeature(CapSessionUID) {
+				a.SessionUID = d.str()
+			}
+		}
+		resp.Attached = a
 	case kAttachSnapshotResponse:
 		resp.AttachSnapshot = &Bytes{d.bytes()}
 	case kSessionEndedResponse:
@@ -818,6 +919,8 @@ func decodeResponse(k kind, payload []byte, f Features) (*Response, error) {
 		resp.SessionStats = d.sessionStats()
 	case kDaemonStatsResponse:
 		resp.DaemonStats = &DaemonStats{Daemon: d.processStats(), OpenStreams: d.u32()}
+	case kAttachResyncResponse:
+		resp.AttachResync = &Bytes{d.bytes()}
 	default:
 		return nil, fmt.Errorf("unexpected message kind `%d` while decoding response", k)
 	}
@@ -993,6 +1096,16 @@ func (e *encoder) sessionRecord(s *session.Record) {
 	e.datetime(s.UpdatedAt)
 	e.optDatetime(s.ExitedAt)
 	e.optStr(s.Workspace)
+	if e.f.Has(CapSessionUID) {
+		e.str(s.UID)
+	}
+}
+
+// token writes a request token (CapRequestTokens).
+func (e *encoder) token(t string) {
+	if e.f.Has(CapRequestTokens) {
+		e.str(t)
+	}
 }
 
 func (e *encoder) workspace(w *session.Workspace) {
@@ -1251,7 +1364,7 @@ func (d *decoder) mode() session.Mode {
 }
 
 func (d *decoder) sessionRecord() session.Record {
-	return session.Record{
+	rec := session.Record{
 		SessionID:        d.str(),
 		Agent:            d.str(),
 		Model:            d.optStr(),
@@ -1269,6 +1382,18 @@ func (d *decoder) sessionRecord() session.Record {
 		ExitedAt:         d.optDatetime(),
 		Workspace:        d.optStr(),
 	}
+	if d.f.Has(CapSessionUID) {
+		rec.UID = d.str()
+	}
+	return rec
+}
+
+// token reads a request token (CapRequestTokens).
+func (d *decoder) token() string {
+	if d.f.Has(CapRequestTokens) {
+		return d.str()
+	}
+	return ""
 }
 
 func (d *decoder) workspace() session.Workspace {

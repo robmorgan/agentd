@@ -167,7 +167,7 @@ Before changing implementation language or transport architecture, document the 
 
 * [ ] Document task lifecycle states
 * [ ] Document session lifecycle states
-* [ ] Document attachment lifecycle
+* [x] Document attachment lifecycle (ARCHITECTURE.md, "Sessions, Incarnations And Attachments")
 * [ ] Version the binary protocol explicitly
 * [ ] Create protocol fixture tests
 * [ ] Record representative PTY streams from:
@@ -498,12 +498,12 @@ One slow session should not unnecessarily stall unrelated sessions.
   * [x] `history`
   * [x] `diff` (`agent diff HOST/SESSION`, and `agent artifact` for the other artifacts)
   * [x] `kill`
-* [ ] Preserve sessions across network loss
-* [ ] Reconnect cleanly
-* [ ] Restore terminal state after reconnect
-* [ ] Handle slow consumers safely
-* [ ] Bound buffering
-* [ ] Implement stream-level backpressure
+* [x] Preserve sessions across network loss (`TestRemoteAttachReconnects`, `TestQUICNoticesSilentClient`, `TestReattachAfterExtendedOutage`)
+* [x] Reconnect cleanly (the CLI reattaches by itself, to the same incarnation, replacing its lost attachment)
+* [x] Restore terminal state after reconnect (snapshot on reattach; `TestRemoteAttachReconnects`, `TestReattachAfterExtendedOutage`)
+* [x] Handle slow consumers safely (lagging clients are resynced from an exact-boundary snapshot; `TestSlowRemoteClientIsBoundedAndResynced`)
+* [x] Bound buffering (every stage per attachment, with worst cases, in ARCHITECTURE.md)
+* [x] Implement stream-level backpressure (each stage blocks its producer, one QUIC stream per attachment; the worker's fan-out is the one place that drops, then resyncs)
 * [x] Implement connection-level resource limits (per-connection stream limit, idle timeout)
 * [x] Add heartbeat/liveness semantics where necessary (QUIC keep-alive)
 
@@ -633,16 +633,16 @@ The application must not depend on transport connection identity as session iden
 
 ## Deliverables
 
-* [ ] Stable session IDs
-* [ ] Stable attachment semantics
+* [x] Stable session IDs (a random UID per incarnation; a reattach must match it)
+* [x] Stable attachment semantics (documented lifecycle; ids never reused within an incarnation; a reattach replaces the lost attachment)
 * [x] Reattachment after complete connection loss
 * [x] Snapshot on reattach
-* [ ] Sequence/output position tracking if required
-* [ ] Duplicate/replayed request handling where necessary
-* [ ] Idempotency for lifecycle commands where useful
-* [ ] Test network switching
-* [ ] Test extended offline periods
-* [ ] Test repeated reconnect loops
+* [x] Sequence/output position tracking if required (not required: every snapshot, on attach or resync, is an exact boundary in the client's stream, and a terminal needs the current screen rather than the missed bytes; see ARCHITECTURE.md, "Output positions")
+* [x] Duplicate/replayed request handling where necessary (request tokens; reads are retried freely, `send-input` never)
+* [x] Idempotency for lifecycle commands where useful (`new`, `kill`, `rm`, `workspace add|rm` answer a retried token with the original result, `new` even across a daemon restart)
+* [x] Test network switching (`TestAttachSurvivesAddressChange`, `TestReattachAfterNetworkSwitchReplacesTheLostAttachment`)
+* [x] Test extended offline periods (`TestReattachAfterExtendedOutage`)
+* [x] Test repeated reconnect loops (`TestRepeatedReconnectsLeakNothing`, `TestRepeatedReattachLeaksNothing`)
 
 QUIC connection migration may improve transient network changes, but `agentd` must remain correct even when migration is unavailable and a completely new connection is required.
 

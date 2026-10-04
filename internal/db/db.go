@@ -4,7 +4,9 @@
 package db
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -18,10 +20,11 @@ import (
 
 // CurrentSchemaVersion 2 added workspaces (the table and sessions.workspace),
 // 3 the git base a session started from (sessions.git_base and
-// git_base_branch). Changes must be additive, applied by migrate: session
-// workers open the database once at startup and keep writing to it across
-// daemon upgrades.
-const CurrentSchemaVersion = 3
+// git_base_branch), 4 session UIDs, create tokens and attach sequence
+// numbers. Changes must be additive, applied by migrate: session workers
+// open the database once at startup and keep writing to it across daemon
+// upgrades.
+const CurrentSchemaVersion = 4
 
 // rfc3339 matches chrono's `to_rfc3339()` for UTC values (a `+00:00` offset,
 // fractional seconds only when non-zero), which is what the CLI parses.
@@ -64,8 +67,20 @@ const migrateToV3 = `
 ALTER TABLE sessions ADD COLUMN git_base TEXT;
 ALTER TABLE sessions ADD COLUMN git_base_branch TEXT;`
 
+// Version 4. uid identifies a session incarnation (see session.Record.UID);
+// rows from before it get a random one. create_token is the request token
+// of the CreateSession that made the row, so a retried create finds it even
+// across a daemon restart. attach_seq numbers the session's attachments, so
+// attach ids are never reused within an incarnation, even by a new worker.
+const migrateToV4 = `
+ALTER TABLE sessions ADD COLUMN uid TEXT;
+ALTER TABLE sessions ADD COLUMN create_token TEXT;
+ALTER TABLE sessions ADD COLUMN attach_seq INTEGER NOT NULL DEFAULT 0;
+UPDATE sessions SET uid = lower(hex(randomblob(16))) WHERE uid IS NULL;
+CREATE UNIQUE INDEX sessions_create_token ON sessions (create_token) WHERE create_token IS NOT NULL;`
+
 // migrations[v] upgrades a database from version v+1 to v+2.
-var migrations = []string{migrateToV2, migrateToV3}
+var migrations = []string{migrateToV2, migrateToV3, migrateToV4}
 
 type Database struct {
 	path string
@@ -175,6 +190,8 @@ func (d *Database) exec(query string, args ...any) error {
 // NewSession holds the columns known when a session row is first created.
 type NewSession struct {
 	SessionID string
+	// UID is the incarnation's id; InsertSession generates one if empty.
+	UID       string
 	Agent     string
 	Model     *string
 	Mode      session.Mode
@@ -183,14 +200,29 @@ type NewSession struct {
 	// GitBase and GitBaseBranch record the repository's HEAD commit and
 	// branch when the session starts in one; empty otherwise.
 	GitBase, GitBaseBranch string
+	// CreateToken is the request token of the CreateSession, if any.
+	CreateToken string
 }
+
+// NewUID returns a random session UID: 128 bits, hex-encoded.
+func NewUID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(fmt.Sprintf("crypto/rand failed: %v", err))
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// ErrCreateTokenUsed is returned by InsertSession when another session was
+// already created with the same token.
+var ErrCreateTokenUsed = errors.New("create token already used")
 
 // InsertSession creates a session row in `creating`. The returned creation
 // timestamp identifies this incarnation of the session: a worker passes it
 // back to MarkRunning, so a stale worker can never claim a newer session
 // that reused the name.
 func (d *Database) InsertSession(s NewSession) (string, error) {
-	var model, workspace, gitBase, gitBranch any
+	var model, workspace, gitBase, gitBranch, token any
 	if s.Model != nil {
 		model = *s.Model
 	}
@@ -200,13 +232,23 @@ func (d *Database) InsertSession(s NewSession) (string, error) {
 	if s.GitBase != "" {
 		gitBase, gitBranch = s.GitBase, s.GitBaseBranch
 	}
+	if s.CreateToken != "" {
+		token = s.CreateToken
+	}
+	if s.UID == "" {
+		s.UID = NewUID()
+	}
 	createdAt := now()
-	return createdAt, d.exec(`INSERT INTO sessions (
+	err := d.exec(`INSERT INTO sessions (
                 session_id, agent, model, mode, cwd, status, attention, attention_summary, created_at, updated_at,
-                workspace, git_base, git_base_branch
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12)`,
+                workspace, git_base, git_base_branch, uid, create_token
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12, ?13, ?14)`,
 		s.SessionID, s.Agent, model, string(s.Mode), s.Cwd, string(session.StatusCreating),
-		string(session.AttentionInfo), s.SessionID, createdAt, workspace, gitBase, gitBranch)
+		string(session.AttentionInfo), s.SessionID, createdAt, workspace, gitBase, gitBranch, s.UID, token)
+	if err != nil && token != nil && strings.Contains(err.Error(), "sessions.create_token") {
+		return "", ErrCreateTokenUsed
+	}
+	return createdAt, err
 }
 
 // GitBase returns the commit and branch a session recorded when it started
@@ -228,6 +270,44 @@ func (d *Database) GitBase(sessionID string) (commit, branch string, ok bool, er
 	}
 	return c.String, b.String, true, nil
 }
+
+// SessionByCreateToken returns the session created by the CreateSession
+// with this request token, or nil, nil.
+func (d *Database) SessionByCreateToken(token string) (*session.Record, error) {
+	conn, err := d.connect()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	rec, err := scanSession(conn.QueryRow(selectSession+" WHERE create_token = ?1", token))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return rec, err
+}
+
+// NextAttachID numbers a new attachment of the incarnation uid of a session.
+// The counter lives in the row, so ids are never reused within an
+// incarnation, not even by a later worker for the same session. It returns
+// ErrNoSuchIncarnation if the session is gone or was recreated.
+func (d *Database) NextAttachID(sessionID, uid string) (uint64, error) {
+	conn, err := d.connect()
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+	var seq uint64
+	err = conn.QueryRow(`UPDATE sessions SET attach_seq = attach_seq + 1
+             WHERE session_id = ?1 AND uid = ?2 RETURNING attach_seq`, sessionID, uid).Scan(&seq)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNoSuchIncarnation
+	}
+	return seq, err
+}
+
+// ErrNoSuchIncarnation means a session row with the given UID no longer
+// exists.
+var ErrNoSuchIncarnation = errors.New("session incarnation no longer exists")
 
 // MarkRunning records that a worker has its agent running. It only applies
 // to the incarnation of the session created at createdAt, and only while it
@@ -330,7 +410,7 @@ func (d *Database) DeleteSession(sessionID string) error {
 }
 
 const selectSession = `SELECT session_id, agent, model, mode, cwd, status, worker_pid, agent_pid, exit_code, error,
-        attention, attention_summary, created_at, updated_at, exited_at, workspace
+        attention, attention_summary, created_at, updated_at, exited_at, workspace, uid
  FROM sessions`
 
 // GetSession returns nil, nil when the session does not exist.
@@ -378,14 +458,14 @@ func scanSession(row scanner) (*session.Record, error) {
 	var (
 		rec                               session.Record
 		model, errText, summary, exitedAt sql.NullString
-		workspace                         sql.NullString
+		workspace, uid                    sql.NullString
 		mode, status, attention           string
 		workerPID, agentPID, exitCode     sql.NullInt64
 		createdAt, updatedAt              string
 	)
 	if err := row.Scan(&rec.SessionID, &rec.Agent, &model, &mode, &rec.Cwd, &status,
 		&workerPID, &agentPID, &exitCode, &errText, &attention, &summary, &createdAt, &updatedAt,
-		&exitedAt, &workspace); err != nil {
+		&exitedAt, &workspace, &uid); err != nil {
 		return nil, err
 	}
 	var err error
@@ -402,6 +482,7 @@ func scanSession(row scanner) (*session.Record, error) {
 	rec.Error = nullStr(errText)
 	rec.AttentionSummary = nullStr(summary)
 	rec.Workspace = nullStr(workspace)
+	rec.UID = uid.String
 	if workerPID.Valid {
 		v := uint32(workerPID.Int64)
 		rec.WorkerPID = &v

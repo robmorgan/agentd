@@ -511,7 +511,7 @@ Document architectural decisions that would otherwise be difficult to infer from
 # Current state and next milestone
 
 Done:
-- The Go daemon and per-session workers, on protocol v1 and state schema v2.
+- The Go daemon and per-session workers, on protocol v1 and state schema v4.
 - Sessions survive client disconnects and daemon restarts.
 - Liveness is checked through the worker sockets, and a flock enforces a single daemon.
 - Attach fan-out and PTY input are bounded, and the runtime root is private to the user.
@@ -521,6 +521,7 @@ Done:
 - The CLI's QUIC client: `agent --host NAME` and `NAME/session` addresses, `agent host add|ls|rm` (confirm-on-first-use key pinning in `hosts.toml`), and `agent remote id` (`remote/client.key`).
 - Dead remote clients are noticed within 15s, and a remote attachment that loses its connection reconnects and reattaches by itself.
 - Git state and artifacts, read-only (`internal/repo`): a session records its base commit at creation; `GetGitState` (commits and changed files since the base, untracked included) and artifact streams (`diff`, `patch`, `history`, `history.vt`) in bounded chunks under flow control; `agent diff`, `agent artifacts`, `agent artifact`, and a git section in `agent status`, locally and over QUIC.
+- Session resumption: per-incarnation session UIDs (a reattach never lands on a recreated session), attach ids unique per incarnation, reattach replaces the lost attachment at once, lagging clients are resynced from an exact-boundary snapshot, every output/input buffer is bounded (ARCHITECTURE.md lists them), and lifecycle requests carry tokens so a remote CLI retries them safely after a lost connection.
 - The connection handshake (`Hello`/`Welcome`): version and capability negotiation, host description, and a control stream of tagged requests; stream roles are set by a stream's first frame.
 
 - Host health (`agent hosts`), machine capabilities (`agent host info`), and placement hints (`agent --host auto new`).
@@ -532,7 +533,6 @@ Next:
 
 Known gaps:
 - History is only saved when a session exits.
-- A lagging attach client loses output until the program repaints. The fix is an unsolicited snapshot resync, which needs CLI support.
 - Agents are not sandboxed: they run as the daemon's user and can reach its socket, although `AGENTD_SOCKET` is no longer injected.
 
 Do not begin QUIC before the transport split: the session and ownership model has to be clean first.

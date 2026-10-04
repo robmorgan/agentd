@@ -100,6 +100,11 @@ func exchange(worker transport.Stream, req *protocol.Request) (*protocol.Respons
 // stream. When the worker's stream ends (detach, session end, worker exit)
 // both connections are closed, which also unblocks the client->worker copy.
 func (s *Server) proxyAttach(client transport.Stream, clientReader *bufio.Reader, req *protocol.AttachSession) error {
+	if len(req.Features) > 0 {
+		if err := s.negotiateAttach(req); err != nil {
+			return protocol.WriteResponse(client, protocol.ErrorResponsef("%v", err))
+		}
+	}
 	worker, err := s.dialWorker(req.SessionID)
 	if err != nil {
 		return protocol.WriteResponse(client, protocol.ErrorResponsef("%v", err))
@@ -127,4 +132,53 @@ func (s *Server) proxyAttach(client transport.Stream, clientReader *bufio.Reader
 		return copyErr
 	}
 	return nil
+}
+
+// negotiateAttach settles an attach stream's features before the request
+// goes to the worker. The client lists only features this daemon
+// advertised, but the session's worker may be an older build (workers keep
+// running across daemon upgrades), so the list is cut down to what the
+// worker supports; fields of dropped features are cleared, and the
+// worker's Attached tells the client what is in effect.
+//
+// An ExpectUID is checked here too, against state.db, so a reattach never
+// reaches another incarnation even through a worker too old to check it;
+// a current worker checks again itself, closing the gap between this
+// lookup and the dial.
+func (s *Server) negotiateAttach(req *protocol.AttachSession) error {
+	if req.HasFeature(protocol.CapSessionUID) && req.ExpectUID != "" {
+		rec, err := s.db.GetSession(req.SessionID)
+		switch {
+		case err != nil:
+			return err
+		case rec == nil:
+			return fmt.Errorf("session `%s` not found", req.SessionID)
+		case rec.UID != req.ExpectUID:
+			return errors.New(protocol.SessionReplacedMessage(req.SessionID))
+		}
+	}
+	req.Features = protocol.IntersectCapabilities(req.Features, s.workerAttachCapabilities(req.SessionID))
+	if !req.HasFeature(protocol.CapSessionUID) {
+		req.ExpectUID = ""
+	}
+	if !req.HasFeature(protocol.CapAttachReplace) {
+		req.Replaces = ""
+	}
+	return nil
+}
+
+// workerAttachCapabilities asks a session's worker which attach-stream
+// features it supports. A worker from before attach features answers Hello
+// with an error, and supports none.
+func (s *Server) workerAttachCapabilities(id string) []string {
+	worker, err := transport.DialUnix(s.paths.SessionSocketPath(id), workerDialTimeout)
+	if err != nil {
+		return nil
+	}
+	defer worker.Close()
+	resp, err := exchange(worker, &protocol.Request{Hello: protocol.NewHello("agentd " + Version)})
+	if err != nil || resp.Welcome == nil {
+		return nil
+	}
+	return resp.Welcome.Capabilities
 }
