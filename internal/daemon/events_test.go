@@ -218,11 +218,12 @@ func TestAttachAcknowledgesAttention(t *testing.T) {
 		t.Fatalf("attention before attach = %s", rec.Attention)
 	}
 
+	// The acknowledgement is written beside the attach, not before it.
 	c := h.attach(id)
+	ack := h.waitEvent(id, session.EventAcknowledged)
 	if rec := h.session(id); rec.Attention != session.AttentionInfo || rec.AttentionSummary != nil {
 		t.Fatalf("attention after attach = %s %v", rec.Attention, rec.AttentionSummary)
 	}
-	ack := h.waitEvent(id, session.EventAcknowledged)
 	if ack.Summary != "seen: attached" {
 		t.Fatalf("ack = %#v", ack)
 	}
@@ -234,7 +235,8 @@ func TestAttachAcknowledgesAttention(t *testing.T) {
 	c.conn.Close()
 	h.eventually("detach to acknowledge", func() bool { return h.session(id).Attention == session.AttentionInfo })
 
-	// An attachment that ends with the session leaves its end unseen.
+	// An attachment that ends with the session leaves its end unseen,
+	// although the attach's own acknowledgement may be written after it.
 	c = h.attach(id)
 	c.input("quit\n")
 	c.expectEnd()

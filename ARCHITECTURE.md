@@ -564,7 +564,10 @@ replace the attention instead, since an agent that has stopped is no longer wait
 asked. Acknowledging resets the attention to info and records an `acknowledged` event, if there was
 anything to clear. Attaching interactively (`attach`, or focusing a session in the picker)
 acknowledges, and so does detaching from a session that is still running: either way the user has
-seen its screen. An attachment that ends because the session ended does not, and output reaching
+seen its screen. The daemon writes an attach's acknowledgement beside the attach rather than
+before relaying it, so attaching never waits on the database; it only clears attention raised
+before the attach began (`db.AcknowledgeBefore`), so a session that fails at once keeps its
+attention. An attachment that ends because the session ended does not, and output reaching
 an attached client does not either, since an attached terminal may be a background tab. An ended
 session's attention stays until it is removed.
 
@@ -761,10 +764,12 @@ name.
 An attachment is one client's live view of one incarnation, from `AttachSession` until it ends. Its
 lifecycle, all in the worker (`internal/worker/worker.go`, `serveAttach`):
 
-1. **Attach.** The worker numbers it `<kind>-<n>` (`attach-3`, `tui-1`), where `n` counts in the
-   session's row in `state.db`: ids are never reused within an incarnation, not even by a later
-   worker for the same session. (Reuse would let a client that names an old id, to replace it or
-   `agent detach --attach` it, hit someone else's attachment.) On the owner goroutine it then applies
+1. **Attach.** The worker numbers it `<kind>-<n>` (`attach-3`, `tui-1`), where `n` comes from
+   a block of 16 numbers the worker reserves in the session's row in `state.db` when it starts and
+   whenever the block runs out, so an attach rarely waits on a database write. Ids are never
+   reused within an incarnation, not even by a later worker for the same session, though a worker
+   that stops (or hands off) before using its block leaves a gap. (Reuse would let a client that
+   names an old id, to replace it or `agent detach --attach` it, hit someone else's attachment.) On the owner goroutine it then applies
    the client's size, takes the snapshot (laid out for that size), subscribes the attachment to
    output and lists it, in one step, so the snapshot is an exact boundary: the output that follows
    continues it. If the output so far ends inside an escape sequence, that step waits for the rest
@@ -915,7 +920,12 @@ The selected root contains:
 * `agentd.lock` (held by the running daemon)
 * `agentd.pid` (informational)
 * `state.db` (schema v5; older versions are migrated forward, newer ones refused. Migrations
-  must be additive, because session workers keep writing to the file across daemon upgrades)
+  must be additive, because session workers keep writing to the file across daemon upgrades), and
+  its `state.db-wal` and `state.db-shm`: the daemon and every worker share it, so it uses
+  write-ahead logging, where reads never wait for writes, and each process keeps a connection open
+  rather than opening one per call. In SQLite's default journal every access waited for any write,
+  sleeping in steps of up to 100 ms, which with many sessions made attaches take hundreds of
+  milliseconds.
 * `sessions/` (one socket per live session; a handoff's state file is created here and unlinked
   at once, living on only as a descriptor inherited by the new image)
 * `agentd.log` (output of a daemonized daemon)

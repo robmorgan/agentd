@@ -109,9 +109,39 @@ func (d *Database) RecordEvent(e NewEvent) (uint64, error) {
 // records an acknowledged event with summary, and reports true, only when
 // there was something to clear.
 func (d *Database) Acknowledge(sessionID, summary string) (bool, error) {
-	return d.transition(NewEvent{SessionID: sessionID, Kind: session.EventAcknowledged, Summary: summary},
-		`UPDATE sessions SET attention = 'info', attention_summary = NULL, attention_at = NULL
+	return d.AcknowledgeBefore(sessionID, summary, time.Time{})
+}
+
+// AcknowledgeBefore is Acknowledge for what the user could have seen by
+// time before: if an event recorded after it raised the session's attention
+// again, that attention is newer than what they saw and stays. A zero
+// before acknowledges whatever is pending.
+//
+// Event times are UTC RFC 3339 with trailing zeros trimmed from the
+// fraction, which order correctly as text, so the comparison is done in
+// SQL on the stored strings.
+func (d *Database) AcknowledgeBefore(sessionID, summary string, before time.Time) (bool, error) {
+	// Most attaches find nothing to acknowledge; a read answers that without
+	// taking the write lock a transaction begins with.
+	conn, err := d.connect()
+	if err != nil {
+		return false, err
+	}
+	var attention string
+	err = conn.QueryRow(`SELECT attention FROM sessions WHERE session_id = ?1`, sessionID).Scan(&attention)
+	conn.Close()
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && attention == string(session.AttentionInfo)) {
+		return false, nil
+	}
+	ev := NewEvent{SessionID: sessionID, Kind: session.EventAcknowledged, Summary: summary}
+	if before.IsZero() {
+		return d.transition(ev, `UPDATE sessions SET attention = 'info', attention_summary = NULL, attention_at = NULL
              WHERE session_id = ?1 AND attention != 'info'`, sessionID)
+	}
+	return d.transition(ev, `UPDATE sessions SET attention = 'info', attention_summary = NULL, attention_at = NULL
+         WHERE session_id = ?1 AND attention != 'info'
+           AND NOT EXISTS (SELECT 1 FROM events WHERE session_id = ?1 AND at > ?2 AND attention != 'info')`,
+		sessionID, before.UTC().Format(rfc3339))
 }
 
 // Activity is what a worker reports about its running session.

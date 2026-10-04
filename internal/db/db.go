@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -104,7 +105,25 @@ var migrations = []string{migrateToV2, migrateToV3, migrateToV4, migrateToV5}
 
 type Database struct {
 	path string
+	// pool holds this process's connections to the database, opened on
+	// first use and kept for the life of the process. Opening and closing
+	// one per call made every call pay for opening the file, and under
+	// write-ahead logging closing a process's last connection checkpoints
+	// and truncates the log, which needs the database's locks.
+	poolOnce sync.Once
+	pool     *sql.DB
+	poolErr  error
 }
+
+// A process keeps one connection open between calls (enough to keep the
+// write-ahead log from being checkpointed away after every call) and opens
+// more while it is busy, up to maxConns. A write waiting for the write lock
+// holds its connection meanwhile, so with too few a process's reads (an
+// attach looking up the newest event, say) would queue behind its writes.
+const (
+	maxConns     = 32
+	maxIdleConns = 1
+)
 
 // errUnsupportedSchema marks init failures caused by the database's layout
 // rather than by I/O or locking, so only those are reported as a schema
@@ -131,21 +150,78 @@ func Open(path string) (*Database, error) {
 	if err := os.Chmod(path, 0o600); err != nil {
 		return nil, fmt.Errorf("failed to restrict %s: %w", path, err)
 	}
+	// Write-ahead logging, set once the file is private (SQLite creates the
+	// -wal and -shm files with the database's permissions), and kept by the
+	// file from then on. The daemon and every session worker share this
+	// database. In the default rollback journal a reader waits for a writer
+	// and every writer for any other access, and SQLite's busy handler
+	// waits by sleeping in steps of up to 100 ms, so with many sessions an
+	// attach could stall for hundreds of milliseconds behind unrelated
+	// writes. With WAL, readers never wait and writers wait only for each
+	// other.
+	if err := d.enableWAL(); err != nil {
+		return nil, fmt.Errorf("failed to enable write-ahead logging in %s: %w", path, err)
+	}
 	return d, nil
 }
 
-// connect opens a connection. _txlock=immediate makes every transaction take
-// the write lock when it begins, so concurrent openers (daemon, workers, the
-// CLI's local mode) queue on busy_timeout instead of deadlocking on a lock
-// upgrade, which SQLite reports as SQLITE_BUSY without waiting.
-func (d *Database) connect() (*sql.DB, error) {
-	conn, err := sql.Open("sqlite", d.path+"?_pragma=busy_timeout(5000)&_txlock=immediate")
+// enableWAL switches the database to write-ahead logging unless it already
+// is. Switching needs the database to itself and SQLite does not wait for
+// it (busy_timeout does not apply), so processes opening a new database at
+// the same moment retry briefly; once one has switched, the others find it
+// done.
+func (d *Database) enableWAL() error {
+	conn, err := d.connect()
 	if err != nil {
-		return nil, fmt.Errorf("failed to open %s: %w", d.path, err)
+		return err
 	}
-	conn.SetMaxOpenConns(1)
-	return conn, nil
+	defer conn.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var mode string
+		if err = conn.QueryRow("PRAGMA journal_mode").Scan(&mode); err == nil && mode == "wal" {
+			return nil
+		}
+		if err == nil {
+			err = conn.QueryRow("PRAGMA journal_mode=WAL").Scan(&mode)
+			if err == nil && mode == "wal" {
+				return nil
+			}
+		}
+		if time.Now().After(deadline) {
+			if err == nil {
+				err = fmt.Errorf("journal mode is %q", mode)
+			}
+			return err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
+
+// connect returns the process's connection pool. Close on the result is a
+// no-op, so callers keep the open-use-close shape of a connection. With
+// _txlock=immediate every transaction takes the write lock when it begins,
+// so concurrent writers (daemon, workers) queue on busy_timeout instead of
+// deadlocking on a lock upgrade, which SQLite reports as SQLITE_BUSY
+// without waiting.
+func (d *Database) connect() (pooled, error) {
+	d.poolOnce.Do(func() {
+		pool, err := sql.Open("sqlite", d.path+"?_pragma=busy_timeout(5000)&_txlock=immediate")
+		if err != nil {
+			d.poolErr = fmt.Errorf("failed to open %s: %w", d.path, err)
+			return
+		}
+		pool.SetMaxOpenConns(maxConns)
+		pool.SetMaxIdleConns(maxIdleConns)
+		d.pool = pool
+	})
+	return pooled{d.pool}, d.poolErr
+}
+
+// pooled is the shared pool, whose Close does nothing.
+type pooled struct{ *sql.DB }
+
+func (pooled) Close() error { return nil }
 
 func (d *Database) init() error {
 	conn, err := d.connect()
@@ -352,23 +428,25 @@ func (d *Database) SessionByCreateToken(token string) (*session.Record, error) {
 	return rec, err
 }
 
-// NextAttachID numbers a new attachment of the incarnation uid of a session.
-// The counter lives in the row, so ids are never reused within an
-// incarnation, not even by a later worker for the same session. It returns
-// ErrNoSuchIncarnation if the session is gone or was recreated.
-func (d *Database) NextAttachID(sessionID, uid string) (uint64, error) {
+// ReserveAttachIDs reserves n attachment numbers for the incarnation uid of
+// a session and returns the first; the worker hands them out without
+// touching the database again until they run out. Numbers are never reused
+// within an incarnation, even by a later worker (after a handoff), though
+// one that stops before using its block leaves a gap. It returns
+// ErrNoSuchIncarnation once that incarnation's row is gone.
+func (d *Database) ReserveAttachIDs(sessionID, uid string, n uint64) (uint64, error) {
 	conn, err := d.connect()
 	if err != nil {
 		return 0, err
 	}
 	defer conn.Close()
-	var seq uint64
-	err = conn.QueryRow(`UPDATE sessions SET attach_seq = attach_seq + 1
-             WHERE session_id = ?1 AND uid = ?2 RETURNING attach_seq`, sessionID, uid).Scan(&seq)
+	var last uint64
+	err = conn.QueryRow(`UPDATE sessions SET attach_seq = attach_seq + ?3
+             WHERE session_id = ?1 AND uid = ?2 RETURNING attach_seq`, sessionID, uid, n).Scan(&last)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, ErrNoSuchIncarnation
 	}
-	return seq, err
+	return last - n + 1, err
 }
 
 // ErrNoSuchIncarnation means a session row with the given UID no longer

@@ -332,26 +332,27 @@ func TestSessionIncarnations(t *testing.T) {
 	if rec, err := store.SessionByCreateToken("other"); err != nil || rec != nil {
 		t.Fatalf("unknown token = %+v, %v", rec, err)
 	}
-	for want := uint64(1); want <= 3; want++ {
-		if got, err := store.NextAttachID("s", first.UID); err != nil || got != want {
-			t.Fatalf("attach id = %d, %v; want %d", got, err, want)
+	// Blocks follow each other.
+	for _, want := range []uint64{1, 17, 33} {
+		if got, err := store.ReserveAttachIDs("s", first.UID, 16); err != nil || got != want {
+			t.Fatalf("attach id block = %d, %v; want %d", got, err, want)
 		}
 	}
 
 	if err := store.DeleteSession("s"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.NextAttachID("s", first.UID); !errors.Is(err, ErrNoSuchIncarnation) {
+	if _, err := store.ReserveAttachIDs("s", first.UID, 16); !errors.Is(err, ErrNoSuchIncarnation) {
 		t.Fatalf("attach id of a removed incarnation: %v", err)
 	}
 	second := insert("")
 	if second.UID == first.UID {
 		t.Fatal("a recreated session reused the UID")
 	}
-	if _, err := store.NextAttachID("s", first.UID); !errors.Is(err, ErrNoSuchIncarnation) {
+	if _, err := store.ReserveAttachIDs("s", first.UID, 16); !errors.Is(err, ErrNoSuchIncarnation) {
 		t.Fatalf("attach id of a replaced incarnation: %v", err)
 	}
-	if got, err := store.NextAttachID("s", second.UID); err != nil || got != 1 {
+	if got, err := store.ReserveAttachIDs("s", second.UID, 16); err != nil || got != 1 {
 		t.Fatalf("new incarnation attach id = %d, %v", got, err)
 	}
 	if _, err := store.InsertSession(NewSession{SessionID: "t", Agent: "sh", Mode: session.ModeExecute, Cwd: "/w", CreateToken: "tok-2"}); err != nil {
@@ -359,5 +360,38 @@ func TestSessionIncarnations(t *testing.T) {
 	}
 	if _, err := store.InsertSession(NewSession{SessionID: "u", Agent: "sh", Mode: session.ModeExecute, Cwd: "/w", CreateToken: "tok-2"}); !errors.Is(err, ErrCreateTokenUsed) {
 		t.Fatalf("reused token: %v", err)
+	}
+}
+
+// state.db uses write-ahead logging, so the daemon's and workers' reads
+// never wait for each other's writes, and its log files are as private as
+// the database.
+func TestWriteAheadLogging(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := store.connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	var mode string
+	if err := conn.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil || mode != "wal" {
+		t.Fatalf("journal mode = %q, %v", mode, err)
+	}
+	if _, err := store.InsertSession(NewSession{SessionID: "s", Agent: "sh", Mode: session.ModeExecute, Cwd: "/w"}); err != nil {
+		t.Fatal(err)
+	}
+	// conn is still open, so the log and shared-memory files exist.
+	for _, suffix := range []string{"-wal", "-shm"} {
+		info, err := os.Stat(path + suffix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Errorf("%s%s is %o, want 600", path, suffix, perm)
+		}
 	}
 }

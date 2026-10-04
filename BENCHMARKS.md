@@ -423,7 +423,25 @@ the snapshot, disconnect. The session is a shell script at 160x48.
 | 1 MB of scrollback | 298 KiB | 4.9 ms |
 
 The idle round trip was 0.09 ms before attachment ids were numbered in `state.db` (see "Sessions,
-Incarnations And Attachments" in ARCHITECTURE.md); that update is most of it now.
+Incarnations And Attachments" in ARCHITECTURE.md), and 0.50 ms with a database write per attach.
+Workers now reserve ids in blocks, so an attach no longer writes.
+
+### Attach latency through the daemon
+
+`agentd bench sessions --count 10 --fill-lines 0`, attaching to each idle session once, one at a
+time (`--parallel 1`) or eight at once (`--parallel 8`, the default). Later work had put two
+database writes on every attach (numbering the attachment, acknowledging the session's attention),
+in SQLite's default rollback journal, where every access waits for any write by sleeping in steps
+of up to 100 ms. Moving state.db to write-ahead logging with a long-lived connection per process,
+reserving attachment ids in blocks, and writing the acknowledgement beside the attach brought it
+back:
+
+| | One at a time (p50) | Eight at once (p50) |
+| --- | --- | --- |
+| Before | 3.3 ms | 26-470 ms (one run's p99: 950 ms) |
+| After | 0.58-0.81 ms | 1.7-2.9 ms |
+
+Same machine, under a load average of 3-9 from other work, so the spread between runs is wide.
 
 ### Fan-out
 

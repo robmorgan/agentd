@@ -344,6 +344,12 @@ func TestRepeatedReconnectsLeakNothing(t *testing.T) {
 	warm := h.dialQUIC(client, h.srv.RemoteAddr())
 	mustAttachOn(t, openStream(t, warm), id, protocol.AttachSession{Features: allAttachFeatures})
 	warm.Close()
+	// The daemon keeps a database connection open, which opens the
+	// write-ahead log on its first write; write once now so that is part
+	// of the baseline rather than counted as a leak.
+	if resp := h.addWorkspace("warm", h.cwd); resp.Workspace == nil {
+		t.Fatalf("add workspace: %#v", resp)
+	}
 	idle := func() bool {
 		return len(h.attachments(id)) == 0 && len(h.srv.remoteConnections()) == 0 && h.srv.openStreams() == 0
 	}

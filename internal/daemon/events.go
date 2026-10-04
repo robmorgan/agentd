@@ -248,7 +248,13 @@ func (s *Server) serveEvents(conn transport.Stream, reader *bufio.Reader, req *p
 // acknowledge records that the user has looked at a session, clearing its
 // attention. how says what they did, for the event's summary.
 func (s *Server) acknowledge(id, how string) {
-	changed, err := s.db.Acknowledge(id, how)
+	s.acknowledgeBefore(id, how, time.Time{})
+}
+
+// acknowledgeBefore acknowledges the attention raised before a time
+// (db.AcknowledgeBefore).
+func (s *Server) acknowledgeBefore(id, how string, before time.Time) {
+	changed, err := s.db.AcknowledgeBefore(id, how, before)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agentd: acknowledging %s: %v\n", id, err)
 		return

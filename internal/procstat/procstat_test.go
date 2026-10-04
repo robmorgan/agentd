@@ -56,7 +56,15 @@ func TestReadOtherProcess(t *testing.T) {
 	}
 	defer cmd.Wait()
 	defer cmd.Process.Kill()
-	p, err := Read(cmd.Process.Pid)
+	// Until the child has exec'd, there is little to read; give it a moment.
+	var p Process
+	var err error
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		p, err = Read(cmd.Process.Pid)
+		if err != nil || p.RSS > 0 || time.Now().After(deadline) {
+			break
+		}
+	}
 	if err == ErrUnsupported {
 		t.Skip(err)
 	}
