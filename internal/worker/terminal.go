@@ -2,10 +2,18 @@ package worker
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 
 	"go.mitchellh.com/libghostty"
 )
+
+// continuationMaxBytes bounds the unfinished escape sequence (or UTF-8
+// character) the shadow terminal tracks so a handoff can carry it to the next
+// worker image exactly. A longer one (a huge OSC 52 clipboard write, say)
+// makes the continuation unavailable until the parser is back at ground, and
+// a handoff attempted meanwhile is refused rather than restored inexactly.
+const continuationMaxBytes = 1 << 20
 
 // terminalState wraps a libghostty terminal that shadows the PTY stream so a
 // reattaching client can be rehydrated with a snapshot of the screen. Its
@@ -35,25 +43,114 @@ func newTerminalState(cols, rows uint16, maxScrollbackBytes uint) (*terminalStat
 	term, err := libghostty.NewTerminal(
 		libghostty.WithSize(cols, rows),
 		libghostty.WithMaxScrollbackBytes(maxScrollbackBytes),
-		libghostty.WithWritePty(func(_ *libghostty.Terminal, data []byte) {
-			s.pending = append(s.pending, append([]byte(nil), data...))
-		}),
-		libghostty.WithSizeReport(func(_ *libghostty.Terminal) (libghostty.SizeReportSize, bool) {
-			return s.size, true
-		}),
-		libghostty.WithBell(func(_ *libghostty.Terminal) { s.effects.bells++ }),
-		libghostty.WithDesktopNotification(func(_ *libghostty.Terminal, n libghostty.TerminalDesktopNotification) {
-			if len(s.effects.notifications) < maxNotificationsPerFeed {
-				s.effects.notifications = append(s.effects.notifications, n)
-			}
-		}),
-		libghostty.WithTitleChanged(func(_ *libghostty.Terminal) { s.effects.titleChanged = true }),
+		libghostty.WithContinuationMaxBytes(continuationMaxBytes),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create terminal state: %w", err)
 	}
-	s.term = term
+	s.adopt(term)
 	return s, nil
+}
+
+// adopt makes term the shadow terminal, wiring the callbacks through which
+// it answers terminal queries and reports bells, notifications and title
+// changes.
+func (s *terminalState) adopt(term *libghostty.Terminal) {
+	term.SetEffectWritePty(func(_ *libghostty.Terminal, data []byte) {
+		s.pending = append(s.pending, append([]byte(nil), data...))
+	})
+	term.SetEffectSize(func(_ *libghostty.Terminal) (libghostty.SizeReportSize, bool) {
+		return s.size, true
+	})
+	term.SetEffectBell(func(_ *libghostty.Terminal) { s.effects.bells++ })
+	term.SetEffectDesktopNotification(func(_ *libghostty.Terminal, n libghostty.TerminalDesktopNotification) {
+		if len(s.effects.notifications) < maxNotificationsPerFeed {
+			s.effects.notifications = append(s.effects.notifications, n)
+		}
+	})
+	term.SetEffectTitleChanged(func(_ *libghostty.Terminal) { s.effects.titleChanged = true })
+	s.term = term
+}
+
+// handoffState is the shadow terminal's state carried across a worker
+// handoff: libghostty's binary snapshot, which is exact (every screen and
+// its scrollback, cursor, modes, and the parser's unfinished input), and as
+// a fallback the VT rendering a reattaching client gets, in case the next
+// image cannot decode the snapshot (its format is not yet stable across
+// libghostty versions).
+type terminalHandoff struct {
+	Snapshot []byte
+	VT       []byte
+	Size     libghostty.SizeReportSize
+}
+
+func (s *terminalState) handoff() (*terminalHandoff, error) {
+	snapshot, err := s.term.Snapshot()
+	if err != nil {
+		// Most likely an unfinished sequence longer than
+		// continuationMaxBytes, which the snapshot cannot carry.
+		return nil, fmt.Errorf("failed to snapshot the terminal (it may be in the middle of a very long escape sequence; try again): %w", err)
+	}
+	vt, err := s.format(true)
+	if err != nil {
+		return nil, err
+	}
+	return &terminalHandoff{Snapshot: snapshot, VT: vt, Size: s.size}, nil
+}
+
+// restoreTerminal rebuilds the shadow terminal from a handoff, from the
+// exact binary snapshot when it decodes. Otherwise it rebuilds it from the VT
+// rendering, which keeps the screen and scrollback text and most modes but
+// not, for example, an unfinished escape sequence, and reports why in
+// inexact. err is set only if neither worked.
+func restoreTerminal(h *terminalHandoff) (s *terminalState, inexact error, err error) {
+	term, snapErr := decodeSnapshot(h.Snapshot)
+	if snapErr == nil {
+		limit := maxScrollbackBytes
+		if snapErr = term.SetScrollbackMaxBytes(&limit); snapErr != nil {
+			term.Close()
+		}
+	}
+	if snapErr == nil {
+		s = &terminalState{size: h.Size}
+		s.adopt(term)
+		return s, nil, nil
+	}
+	cols, rows := h.Size.Columns, h.Size.Rows
+	if cols == 0 || rows == 0 {
+		cols, rows = defaultPtyCols, defaultPtyRows
+	}
+	s, err = newTerminalState(cols, rows, maxScrollbackBytes)
+	if err != nil {
+		return nil, nil, errors.Join(snapErr, err)
+	}
+	s.size = h.Size
+	s.feed(h.VT)
+	return s, snapErr, nil
+}
+
+func decodeSnapshot(data []byte) (*libghostty.Terminal, error) {
+	if len(data) == 0 {
+		return nil, errors.New("no terminal snapshot")
+	}
+	d, err := libghostty.NewSnapshotDecoderBytes(data)
+	if err != nil {
+		return nil, err
+	}
+	defer d.Close()
+	// Keep tracking the parser's unfinished input in the restored
+	// terminal, so the next handoff carries it too.
+	if err := d.SetMaxContinuationBytes(continuationMaxBytes); err != nil {
+		return nil, err
+	}
+	if err := d.SetRetainContinuation(true); err != nil {
+		return nil, err
+	}
+	term, err := d.Decode()
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode the terminal snapshot: %w", err)
+	}
+	return term, nil
 }
 
 // feed parses PTY output and returns any responses the terminal wants to

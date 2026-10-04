@@ -49,7 +49,7 @@ func (h *harness) tryAttach(req protocol.AttachSession) (*client, *protocol.Resp
 func TestWorkerAnswersHelloWithItsAttachFeatures(t *testing.T) {
 	h := startWorker(t)
 	resp := h.request(&protocol.Request{Hello: protocol.NewHello("test")})
-	if resp.Welcome == nil || !reflect.DeepEqual(resp.Welcome.Capabilities, protocol.AttachCapabilities()) {
+	if resp.Welcome == nil || !reflect.DeepEqual(resp.Welcome.Capabilities, append(protocol.AttachCapabilities(), protocol.CapWorkerHandoff)) {
 		t.Fatalf("hello = %#v", resp)
 	}
 	h.sendInput("done\n")

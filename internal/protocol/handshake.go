@@ -168,6 +168,14 @@ const (
 	// identifier (GlobalSessionID). Sent only to a client whose Hello
 	// listed it.
 	CapDaemonID = "daemon-id"
+	// CapSessionRestart (attach stream): the stream may end with
+	// SessionRestarting when the session's worker restarts (a live handoff
+	// to a new agentd binary); the client then attaches again.
+	CapSessionRestart = "session-restart"
+	// CapWorkerHandoff: a session worker accepts HandoffSession. Workers
+	// list it in their answer to Hello, so agentd can tell a worker that
+	// supports handoff from one started by an older binary.
+	CapWorkerHandoff = "worker-handoff"
 )
 
 // GlobalSessionID identifies one incarnation of a session across every
@@ -188,13 +196,13 @@ const MinProtocolVersion uint16 = 1
 // Capabilities is what this build supports.
 func Capabilities() []string {
 	return []string{CapControlStream, CapGitState, CapArtifacts, CapSessionUID, CapRequestTokens, CapAttachFeatures, CapAttachReplace, CapAttachResync, CapRuntimeStats,
-		CapEvents, CapSessionActivity, CapDaemonID}
+		CapEvents, CapSessionActivity, CapDaemonID, CapSessionRestart, CapWorkerHandoff}
 }
 
 // AttachCapabilities are the capabilities that apply to an attach stream,
 // listed in AttachSession.Features.
 func AttachCapabilities() []string {
-	return []string{CapSessionUID, CapAttachReplace, CapAttachResync}
+	return []string{CapSessionUID, CapAttachReplace, CapAttachResync, CapSessionRestart}
 }
 
 // AttachFeatures is the attach-stream features a client may ask for given

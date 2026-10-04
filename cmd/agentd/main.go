@@ -2,7 +2,8 @@
 // session worker:
 //
 //	agentd serve [--daemonize]   run the daemon (the agent CLI starts it)
-//	agentd upgrade               replace a running daemon with this binary
+//	agentd upgrade               replace the running daemon, and hand running
+//	                             sessions' workers, over to this binary
 //	agentd bench sessions ...    measure what sessions cost, on a private daemon
 //	agentd session-worker ...    one session's PTY owner (started by serve)
 package main
@@ -162,16 +163,30 @@ func runBench(argv []string) int {
 	return 0
 }
 
+// runUpgrade replaces the daemon with this binary and hands every running
+// session over to it. A session whose handoff fails keeps running on the
+// binary it had, which is reported but does not fail the upgrade.
 func runUpgrade() int {
 	p, exe, err := discover()
+	var results []daemon.HandoffResult
 	if err == nil {
-		err = daemon.Upgrade(p, exe)
+		results, err = daemon.Upgrade(p, exe)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
 		return 1
 	}
 	fmt.Println("✓ Upgraded daemon")
+	for _, r := range results {
+		switch {
+		case r.HandedOff != nil:
+			fmt.Printf("✓ Session %s now runs %s (live handoff, pid %d)\n", r.SessionID, r.HandedOff.Executable, r.HandedOff.WorkerPID)
+		case r.Lost:
+			fmt.Printf("✗ Session %s was lost during its handoff: %v\n", r.SessionID, r.Err)
+		default:
+			fmt.Printf("! Session %s keeps running on its previous binary: %v\n", r.SessionID, r.Err)
+		}
+	}
 	return 0
 }
 
@@ -491,8 +506,21 @@ func runSessionWorker(argv []string) int {
 	fs.StringVar(&args.Command, "command", "", "agent command")
 	fs.StringVar(&args.Model, "model", "", "model")
 	fs.Var(&extra, "arg", "agent argument (repeatable)")
+	probe := fs.Bool("handoff-probe", false, "print the handoff formats this binary can resume from")
+	resumeFD := fs.Int("resume-fd", -1, "resume a session handed off by a previous image (internal)")
 	if err := fs.Parse(argv); err != nil {
 		return 2
+	}
+	switch {
+	case *probe:
+		fmt.Println(worker.HandoffProbe())
+		return 0
+	case *resumeFD >= 0:
+		if err := worker.Resume(*resumeFD); err != nil {
+			fmt.Fprintf(os.Stderr, "session worker failed: %v\n", err)
+			return 1
+		}
+		return 0
 	}
 	args.Args = extra
 	for name, v := range map[string]string{

@@ -68,6 +68,9 @@ type Request struct {
 	SubscribeEvents *SubscribeEvents
 	// ListEvents is a one-shot query of recorded events (CapEvents).
 	ListEvents *ListEvents
+	// HandoffSession asks a session worker to replace its executable
+	// without stopping the agent (CapWorkerHandoff); see handoff.go.
+	HandoffSession *HandoffSession
 }
 
 type SessionRef struct{ SessionID string }
@@ -216,6 +219,11 @@ type Response struct {
 	AttachResync *Bytes
 	Event        *session.Event
 	Events       *[]session.Event
+	// HandedOff answers HandoffSession (CapWorkerHandoff).
+	HandedOff *HandedOff
+	// SessionRestarting (CapSessionRestart) ends an attach stream whose
+	// session worker is about to restart; see handoff.go.
+	SessionRestarting *SessionRestarting
 }
 
 type DaemonInfo struct {
@@ -292,6 +300,8 @@ const (
 	// 70-79: resource usage (stats.go).
 	kGetSessionStatsRequest kind = 70
 	kGetDaemonStatsRequest  kind = 71
+	// 60-69: worker handoff (handoff.go).
+	kHandoffSessionRequest kind = 60
 
 	kDaemonInfoResponse     kind = 101
 	kCreateSessionResponse  kind = 102
@@ -323,6 +333,10 @@ const (
 
 	// Session resumption (kinds 150-159).
 	kAttachResyncResponse kind = 150
+
+	// Worker handoff (kinds 160-169).
+	kHandedOffResponse         kind = 160
+	kSessionRestartingResponse kind = 161
 )
 
 // ---------------------------------------------------------------------------
@@ -659,6 +673,10 @@ func encodeRequest(req *Request, f Features) (kind, []byte, error) {
 		e.optStr(l.SessionID)
 		e.u32(l.Limit)
 		return kListEventsRequest, e.buf, e.err
+	case req.HandoffSession != nil:
+		e.str(req.HandoffSession.SessionID)
+		e.str(req.HandoffSession.Executable)
+		return kHandoffSessionRequest, e.buf, e.err
 	}
 	return 0, nil, errors.New("empty request")
 }
@@ -743,6 +761,8 @@ func decodeRequest(k kind, payload []byte, f Features) (*Request, error) {
 		req.SubscribeEvents = &SubscribeEvents{AfterID: d.optU64(), SessionID: d.optStr(), Tail: d.u32()}
 	case kListEventsRequest:
 		req.ListEvents = &ListEvents{AfterID: d.optU64(), SessionID: d.optStr(), Limit: d.u32()}
+	case kHandoffSessionRequest:
+		req.HandoffSession = &HandoffSession{SessionID: d.str(), Executable: d.str()}
 	default:
 		return nil, fmt.Errorf("unexpected message kind `%d` while decoding request", k)
 	}
@@ -888,6 +908,17 @@ func encodeResponse(resp *Response, f Features) (kind, []byte, error) {
 			e.event(&(*resp.Events)[i])
 		}
 		return kEventsResponse, e.buf, e.err
+	case resp.HandedOff != nil:
+		h := resp.HandedOff
+		e.str(h.SessionID)
+		e.u32(h.WorkerPID)
+		e.str(h.Executable)
+		e.u32(h.Handoffs)
+		return kHandedOffResponse, e.buf, e.err
+	case resp.SessionRestarting != nil:
+		e.str(resp.SessionRestarting.SessionID)
+		e.str(resp.SessionRestarting.Reason)
+		return kSessionRestartingResponse, e.buf, e.err
 	}
 	return 0, nil, errors.New("empty response")
 }
@@ -1001,6 +1032,10 @@ func decodeResponse(k kind, payload []byte, f Features) (*Response, error) {
 			events = append(events, d.event())
 		}
 		resp.Events = &events
+	case kHandedOffResponse:
+		resp.HandedOff = &HandedOff{SessionID: d.str(), WorkerPID: d.u32(), Executable: d.str(), Handoffs: d.u32()}
+	case kSessionRestartingResponse:
+		resp.SessionRestarting = &SessionRestarting{SessionID: d.str(), Reason: d.str()}
 	default:
 		return nil, fmt.Errorf("unexpected message kind `%d` while decoding response", k)
 	}

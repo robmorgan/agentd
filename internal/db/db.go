@@ -422,6 +422,35 @@ func (d *Database) end(sessionID string, e ending) error {
 	return err
 }
 
+// ErrNotResumable is returned by MarkResumed when the session is no longer
+// running under the worker that handed off.
+var ErrNotResumable = errors.New("session is no longer running under this worker")
+
+// MarkResumed records that a running session's worker came back from a
+// live handoff to a new executable. The worker and agent pids are unchanged
+// (the worker re-executed in place), so only the update time changes. It
+// applies only to the incarnation created at createdAt, still running under
+// workerPID; otherwise it returns ErrNotResumable and changes nothing.
+func (d *Database) MarkResumed(sessionID, createdAt string, workerPID int) error {
+	conn, err := d.connect()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	res, err := conn.Exec(`UPDATE sessions SET updated_at = ?4
+             WHERE session_id = ?1 AND created_at = ?2 AND status = 'running' AND worker_pid = ?3`,
+		sessionID, createdAt, workerPID, now())
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return fmt.Errorf("session %s: %w", sessionID, ErrNotResumable)
+	}
+	return nil
+}
+
 func (d *Database) MarkFailed(sessionID, errMsg string) error {
 	return d.end(sessionID, ending{kind: session.EventFailed, status: session.StatusFailed, summary: errMsg, set: ", error = ?4"})
 }
@@ -463,6 +492,18 @@ func (d *Database) MarkUnknownRecovered(sessionID string) error {
 func (d *Database) MarkFailedIfActive(sessionID, errMsg string) error {
 	return d.end(sessionID, ending{kind: session.EventFailed, status: session.StatusFailed, summary: errMsg,
 		set: ", error = ?4", where: " AND status IN ('creating', 'running')"})
+}
+
+// MarkFailedIfCreating marks a session failed only while it is still being
+// created. A starting daemon uses it for sessions a previous daemon was
+// creating: their worker may claim the session (MarkRunning) at any moment,
+// and one that got there first keeps it.
+func (d *Database) MarkFailedIfCreating(sessionID, errMsg string) error {
+	return d.exec(`UPDATE sessions
+             SET status = ?2, worker_pid = NULL, agent_pid = NULL, error = ?3,
+                 attention = ?4, attention_summary = ?3, updated_at = ?5
+             WHERE session_id = ?1 AND status = 'creating'`,
+		sessionID, string(session.StatusFailed), errMsg, string(session.AttentionAction), now())
 }
 
 // MarkWorkerLost marks a running session failed when the given worker died

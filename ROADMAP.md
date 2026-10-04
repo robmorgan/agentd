@@ -729,13 +729,13 @@ agentd v2
 
 ## Deliverables
 
-* [ ] Document restart guarantees
-* [ ] Preserve task metadata across restart
-* [ ] Investigate live PTY handoff
-* [ ] Prototype FD transfer
-* [ ] Prototype daemon upgrade
-* [ ] Ensure clients can reconnect after upgrade
-* [ ] Add crash-recovery tests
+* [x] Document restart guarantees (ARCHITECTURE.md, "Restart Guarantees")
+* [x] Preserve task metadata across restart (`state.db` plus per-session workers; `TestSessionSurvivesDaemonRestart`, `TestDaemonSIGKILLWithLiveSessions`, `TestUpgradeWithLiveSessions`)
+* [x] Investigate live PTY handoff (workers re-exec in place keeping the PTY, socket and agent; ARCHITECTURE.md, "Live Handoff")
+* [x] Prototype FD transfer (exec-inherited descriptors in `internal/worker/handoff.go`; the rejected SCM_RIGHTS design in `internal/worker/fdpass_test.go`)
+* [x] Prototype daemon upgrade (`agentd upgrade` / `agent daemon upgrade` hand running sessions to the new binary)
+* [x] Ensure clients can reconnect after upgrade (attachments reattach on `SessionRestarting` and when the local daemon goes away)
+* [x] Add crash-recovery tests (`internal/daemon/crash_test.go`, `handoff_failure_test.go`)
 
 This phase should be driven by feasibility rather than becoming a blocker for earlier releases.
 

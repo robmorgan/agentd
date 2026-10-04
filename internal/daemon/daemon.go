@@ -93,6 +93,10 @@ type Server struct {
 	// remoteListener is the bound QUIC listener, for connection status.
 	remoteListener atomic.Pointer[transport.QUICListener]
 
+	// supervised holds the pids of the workers this daemon spawned and has
+	// not yet reaped (int -> struct{}); see refresh.
+	supervised sync.Map
+
 	// createMu serialises session name allocation and row insertion.
 	createMu sync.Mutex
 	// replays remembers the answers to tokened requests; see replay.go.
@@ -620,6 +624,8 @@ func (s *Server) respond(req *protocol.Request, f protocol.Features) (resp *prot
 		})
 	case req.Hello != nil:
 		return protocol.ErrorResponsef("hello is only valid as the first request on a stream"), nil
+	case req.HandoffSession != nil:
+		return protocol.ErrorResponsef("session handoff is between agentd and its session workers; run `agentd upgrade` on the daemon's machine"), nil
 	case req.AttachSession != nil:
 		return protocol.ErrorResponsef("attach needs a stream of its own"), nil
 	case req.SubscribeEvents != nil:

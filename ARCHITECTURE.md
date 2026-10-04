@@ -23,10 +23,10 @@ Both binaries are one Go module at the repository root.
 
 | Package | What it does |
 |---|---|
-| `cmd/agentd` | `serve [--daemonize]`, `upgrade`, `remote enable\|disable\|status` (set `[remote] listen` and restart the daemon), `remote id\|list\|authorize\|revoke`, `bench sessions` (`internal/bench`: measures sessions on a private daemon), `session-worker`. The agent CLI runs `serve --daemonize`. |
+| `cmd/agentd` | `serve [--daemonize]`, `upgrade`, `remote enable\|disable\|status` (set `[remote] listen` and restart the daemon), `remote id\|list\|authorize\|revoke`, `bench sessions` (`internal/bench`: measures sessions on a private daemon), `session-worker` (also `--handoff-probe` and `--resume-fd`, for live handoff). `upgrade` replaces the daemon, then hands running sessions' workers over to the new binary. The agent CLI runs `serve --daemonize`. |
 | `cmd/agent`, `internal/cli` | The `agent` CLI: commands, the session picker, attach and the Ctrl-Y overlay (plain ANSI), and `hosts.toml` for remote hosts. Pure Go: it never imports `worker`, `daemon` or `db`, and `cmd/agent`'s tests check that, then drive both real binaries through PTYs. |
 | `internal/daemon` | `agentd serve`: lock/socket/pid file lifecycle, create/kill/rm/ls/get, attach and request proxies to workers, history, daemon management, worker supervision and startup reconciliation. Tests run the daemon in-process against real worker processes. |
-| `internal/worker` | One session: PTY via `creack/pty`, shadow terminal via `go.mitchellh.com/libghostty`, per-session Unix socket, and activity and attention detection from the PTY stream. Real-PTY tests run under `-race`. |
+| `internal/worker` | One session: PTY via `creack/pty`, shadow terminal via `go.mitchellh.com/libghostty`, per-session Unix socket, activity and attention detection from the PTY stream, and live handoff to a new binary (`handoff.go`; OS-specific waits in `sys_linux.go`, `sys_darwin.go`). Real-PTY tests run under `-race`. |
 | `internal/repo` | Read-only views of the git repository a session works in, for the daemon: git state, the diff and patch artifacts. Runs the system `git`; tests use real temporary repositories. |
 | `internal/transport` | The seam between the protocol and the network: `Stream` (one request or attach session), `Listener`, the shared accept loop, the Unix socket transport, and the QUIC transport with pinned-key identities (`quic-go`). `transporttest` has a UDP relay that tests use as the network. |
 | `internal/protocol` | The framed binary protocol and the small daemon management protocol, used by both binaries. Golden-frame tests pin the bytes. |
@@ -134,7 +134,7 @@ safe:
 * Workers run in their own process sessions and keep running, with their agents, PTYs and
   terminal state, while no daemon runs. A worker records its agent's exit in `state.db` itself.
 * Stopping the daemon closes its client connections, which ends every attachment it was proxying
-  (remote CLIs reconnect and reattach by themselves; local ones exit). Sessions are untouched.
+  (CLIs, local and remote, reconnect and reattach by themselves). Sessions are untouched.
 * A starting daemon takes the lock, removes a stale socket, and reconciles: `running` sessions
   whose workers answer stay running and are reachable again; those whose workers are gone become
   `unknown_recovered`; sessions still `creating` become `failed` (a worker still starting is then
@@ -142,8 +142,109 @@ safe:
 * A daemon supervises only the workers it spawned. A worker that crashes under a later daemon is
   found by probing its socket, so its session becomes `unknown_recovered` rather than `failed`.
 * `agent daemon restart` stops the daemon even with sessions running. A plain shutdown request is
-  refused while sessions run, and `agent daemon upgrade` refuses too, since running workers are the
-  old binary.
+  refused while sessions run. `agent daemon upgrade` replaces the daemon and then hands each running
+  worker over to the new binary (see "Live Handoff").
+* A worker that claims its session (`MarkRunning`) while a starting daemon reconciles keeps it:
+  reconciliation fails only rows still `creating`, so a session is never recorded failed while its
+  worker runs. A daemon also leaves the outcome of a worker it spawned to that worker's supervisor,
+  which records a crash as `failed`, rather than probe it as `unknown_recovered` first.
+Workers are not tied to a binary either: an upgrade hands each one over to the new executable
+while its agent keeps running (see "Live Handoff" below).
+
+## Restart Guarantees
+
+What survives each kind of restart or crash, and how the next daemon reconciles what it finds.
+`state.db` holds every session's metadata (name, agent, cwd, workspace, status, pids, exit
+state, attention); the live PTY, agent process and terminal state live in the session's worker.
+
+| Event | Survives | Lost | Reconciled by |
+|---|---|---|---|
+| Daemon restart (`agent daemon restart`, SIGTERM) | Every session: workers, agents, PTYs, terminal state, metadata | Open connections: attachments and control streams end (CLIs reattach and repaint), and a one-shot request in flight fails (the CLI never resends one it wrote) | The new daemon reads `state.db`; running sessions whose socket answers stay running |
+| Daemon crash (SIGKILL, panic, OOM) | Same as a restart | Same as a restart, plus supervision of the workers it spawned: a worker that dies later is found by a socket probe (`unknown_recovered`) rather than reaped (`failed`) | The kernel releases the lock; the next daemon removes the stale socket and reconciles as above. A session it was creating is either never inserted, `failed` ("agentd stopped while the session was starting", and its worker, refused by `MarkRunning`, kills its agent and exits), or `running` if the worker got there first |
+| Worker crash (SIGKILL) | Metadata | The session: its PTY is hung up, so the kernel sends the agent SIGHUP; terminal history not yet written to `logs/` (it is written when a session ends) | Recorded `failed` by the daemon that spawned the worker, or `unknown_recovered` when a probe finds its socket refusing. An agent that ignores SIGHUP survives, orphaned, with a dead terminal: agentd does not signal recorded pids, which may have been reused |
+| Agent exits or crashes | Metadata, history (written to `logs/`) | The live session | The worker records `exited` (exit 0, or a kill) or `failed` with the reason, and sends `SessionEnded` to attached clients |
+| Machine reboot | Metadata, history of ended sessions, keys, config | Every live session (processes and PTYs), and the unsaved history of those sessions | Sessions recorded running are `unknown_recovered` once the next daemon finds their sockets refusing or gone |
+| Upgrade with live handoff (`agent daemon upgrade`, `agentd upgrade`) | Everything a daemon restart keeps, and the worker itself moves to the new binary: same pid, same agent (still its child), same PTY, socket path, exact terminal state, attach numbering; queued input reaches the agent first, and output written during the handoff waits in the PTY | Attachments end with `SessionRestarting` (clients that do not know it are detached instead); a connection arriving during the exec just waits for the new image | The new image restores the state and touches the session's row (`MarkResumed`); nothing else changes in `state.db` |
+| Upgrade without handoff (the handoff was refused or failed before the exec) | The session, unchanged, on its previous binary | Attachments, if the failure came after clients were told to restart (they reattach to the same worker) | Nothing to reconcile; `agentd upgrade` names the session and the reason |
+| New image dies after the exec | Metadata | The session, as for a worker crash | As for a worker crash; `agentd upgrade` reports the session as lost |
+
+Tests: `TestSessionSurvivesDaemonRestart`, `TestDaemonSIGKILLWithLiveSessions`,
+`TestCrashDuringCreate`, `TestWorkerSIGKILLHangsUpTheAgent`, `TestWorkerLostWhileDaemonDown`,
+`TestRecycledPidsAreNeverSignalled` and the handoff tests in `internal/daemon` (all against real
+workers and PTYs), and `TestLocalAttachSurvivesUpgradeAndRestart` end to end.
+
+## Live Handoff (Upgrading Workers)
+
+A worker runs the binary it was started from, so upgrading the daemon alone leaves every running
+session on the old code. `agentd upgrade` therefore replaces the daemon (stop, start the new
+binary, wait for it), then sends each running session's worker `HandoffSession` with the new
+executable, one session at a time, and reports each outcome. The request is a worker message: the
+daemon refuses it from clients. A worker that predates handoff does not list `worker-handoff` in
+its answer to `Hello` and is left alone.
+
+The worker re-executes itself in place (`execve`). Two designs were prototyped:
+
+* **Exec in place (chosen).** The pid does not change, so the agent stays the worker's child and
+  its exit status can still be collected with `wait4`. The PTY master, the listening socket and the
+  connection that asked for the handoff are inherited by clearing close-on-exec; the rest of the
+  state travels in an unlinked temporary file (in `sessions/`) whose descriptor is inherited too.
+  The socket path never stops listening, so the daemon never sees the session as dead, and
+  connections made during the exec wait in the socket's backlog for the new image. The risk is
+  that there is no way back once the exec has happened, so the old image first runs
+  `<exe> session-worker --handoff-probe` (the binary must run here and resume this state format),
+  and the new image falls back to a lossy terminal restore rather than give up.
+* **SCM_RIGHTS to a new process (rejected).** Starting a second worker and passing it the PTY and
+  socket over a Unix socket works at the descriptor level (`internal/worker/fdpass_test.go`), but
+  the agent would not be the new worker's child: its exit status would be lost to the new worker
+  (only the old worker, or init after it exits, may reap it), which could only poll for the exit
+  (pidfd, kqueue `NOTE_EXIT`) and never learn the code, and for a while two processes could read
+  the PTY. Exec in place has none of these problems.
+
+The old image's steps (`internal/worker/handoff.go`), each undone in reverse if a later one fails,
+including the exec itself:
+
+1. Probe the new executable.
+2. Hold back reaping the agent: the agent watcher waits for the exit without reaping
+   (`waitid(WNOWAIT)` on Linux, kqueue `NOTE_EXIT` on macOS) and reaps under a lock the handoff
+   holds until the exec, so the exit status is never collected by an image that is about to
+   disappear; an agent that has already exited calls the handoff off.
+3. Stop accepting connections, keeping a duplicate of the listening socket.
+4. End every attachment with `SessionRestarting` and wait for every connection handler.
+5. Stop the PTY pump. The pump waits for the PTY to be readable (`poll`, or `select` on macOS,
+   whose `poll` does not support terminals) before each read rather than blocking in `read`, so it
+   stops without consuming anything; from here on the agent's output stays in the kernel's PTY
+   buffer (an agent that fills it blocks) for the new image to read.
+6. Wait for queued input to reach the PTY, so no write is cut short and none is lost. An agent that
+   is not reading its input calls the handoff off after two seconds.
+7. Snapshot the shadow terminal and exec.
+
+The new image (`session-worker --resume-fd`) restores the terminal, starts the owner, pump, agent
+watcher and accept loop, and answers the waiting `HandoffSession` with `HandedOff` (worker pid,
+executable, handoff count). A kill requested just before the exec is carried over.
+
+The shadow terminal crosses the exec as libghostty's binary snapshot (`Terminal.Snapshot`,
+decoded with `NewSnapshotDecoderBytes`): both screens and their scrollback, cursor, modes, title,
+and, since the terminal tracks it (`WithContinuationMaxBytes`, 1 MiB), the parser's state in the
+middle of an escape sequence or UTF-8 character, so the rest of a sequence the agent was writing
+is parsed the same way after the handoff. Tests compare the terminals before and after (VT and
+plain renderings, cursor, active screen, modes) across real execs, and check that continuous
+output across five handoffs ends up in the shadow terminal exactly once and in order. The snapshot
+format is not yet stable across libghostty versions, so the state also carries the VT rendering;
+a new image that cannot decode the snapshot rebuilds the terminal from that (screen and scrollback
+text, most modes) and logs it. An unfinished sequence longer than 1 MiB cannot be snapshotted, and
+the handoff is refused until it completes.
+
+Clients follow: the CLI asks for `session-restart` in `AttachSession` when the daemon's Welcome
+lists it, and on `SessionRestarting` attaches again and repaints, like after a lost connection.
+An attach request carrying capabilities is only forwarded with those the session's worker also
+lists (the daemon asks it with `Hello`), since a worker left on an older binary would refuse fields
+it does not know.
+
+Known limits: a SIGTERM delivered to a worker in the instant between its last check and the exec
+kills the new image before it handles signals, losing the session as for a worker crash (agentd
+never sends workers SIGTERM itself). A handoff waits at most about three seconds for clients that
+do not read their last frames, and is refused if they still have not.
+
 
 ## Transports
 
@@ -237,8 +338,13 @@ dead (see "Sessions, Incarnations And Attachments"). Retries back off from 0.5 t
 continue until they succeed or fail for a reason a retry cannot fix (a refused or changed key, a
 session that is gone or was replaced, a protocol error). Meanwhile the bottom row shows the status,
 and typed input is dropped rather than delivered late; only the detach key acts. Output written
-while disconnected is not replayed; the snapshot shows the screen as it is now. Local attachments do
-not reconnect: the Unix socket only fails when the daemon itself goes away.
+while disconnected is not replayed; the snapshot shows the screen as it is now.
+
+Local attachments do the same when the daemon goes away (restarts, upgrades or crashes): the
+stream ends without a final frame, and the CLI retries the socket until a daemon answers, starting
+one itself, as any command would, if none is back after a few attempts. Both also reattach when
+the session's worker restarts for an upgrade (`SessionRestarting`, see "Live Handoff"), through
+the same path, with the expected UID and the attachment being replaced.
 
 A path change that QUIC can follow needs no reconnect at all: when a client's address changes
 mid-connection (NAT rebinding, or Wi-Fi to cellular behind the same NAT), quic-go validates the new
@@ -346,6 +452,8 @@ features both listed. Today there is one protocol version (1), and these capabil
 | `daemon-id` | the daemon's id appended to `Welcome` |
 | `events` | events streams (`SubscribeEvents`), `ListEvents` |
 | `session-activity` | the activity fields appended to session records (after the UID): activity, foreground command, title, last output and attention times |
+| `session-restart` | attach stream: the worker may end it with `SessionRestarting` when it restarts for a live handoff |
+| `worker-handoff` | `HandoffSession` and `HandedOff`, between agentd and a session worker only (a worker lists it in its answer to `Hello`) |
 
 The protocol grows without breaking older peers this way: a new message kind, or a field appended
 to the end of an existing message or struct (a session record, even inside a list), comes with a
@@ -357,7 +465,7 @@ silently misread. Changing an existing encoding needs a new protocol version.
 
 Attach streams have no `Hello`, so `AttachSession` carries their handshake: when the daemon's
 `Welcome` listed `attach-features`, the CLI appends the attach-stream capabilities it wants that the
-daemon also listed (`session-uid`, `attach-replace`, `attach-resync`), followed by the fields of the
+daemon also listed (`session-uid`, `attach-replace`, `attach-resync`, `session-restart`), followed by the fields of the
 ones listed. The daemon cuts the list down to what the session's worker supports (it asks the worker
 with a `Hello` on the worker socket; a worker started by an older daemon build may support fewer,
 and one from before attach features supports none), and the worker's `Attached` echoes the list in
@@ -401,11 +509,12 @@ tokened request after a lost remote connection (see "Duplicate And Replayed Requ
 | `GetSessionStats` | `SessionStats` (`runtime-stats`) | request |
 | `GetDaemonStats` | `DaemonStats` (`runtime-stats`) | request |
 | `SubscribeEvents` | `Event`, repeated | events |
-| `AttachSession` | `Attached` (or `SessionEnded` for a finished session), then `PtyOutput`, `AttachSnapshot`, `AttachResync`, and finally `SessionEnded`, `EndOfStream` or `Error` | attach |
+| `AttachSession` | `Attached` (or `SessionEnded` for a finished session), then `PtyOutput`, `AttachSnapshot`, `AttachResync`, and finally `SessionEnded`, `EndOfStream`, `SessionRestarting` or `Error` | attach |
+| `HandoffSession` | `HandedOff` (from the new image) | request, agentd to a worker only |
 
 Any request may instead be answered with `Error`. Kinds are numbered by area so that parallel work
 does not collide: 1-19 and 101-118 are the base protocol, 30-39 and 130-139 git state and
-artifacts, 150-159 session resumption (`AttachResync` is 150).
+artifacts, 150-159 session resumption (`AttachResync` is 150), 60-69 and 160-169 worker handoff.
 
 `attach` is the bidirectional case. After the initial `AttachSession` request and `Attached`
 response (which carries a snapshot of the current screen), the worker streams `PtyOutput` frames
@@ -795,7 +904,8 @@ The selected root contains:
 * `agentd.pid` (informational)
 * `state.db` (schema v5; older versions are migrated forward, newer ones refused. Migrations
   must be additive, because session workers keep writing to the file across daemon upgrades)
-* `sessions/` (one socket per live session)
+* `sessions/` (one socket per live session; a handoff's state file is created here and unlinked
+  at once, living on only as a descriptor inherited by the new image)
 * `agentd.log` (output of a daemonized daemon)
 * `remote/` (`daemon.key`, `authorized_clients`, and the CLI's `client.key`)
 * `hosts.toml` (remote hosts known to the CLI, with pinned daemon keys)

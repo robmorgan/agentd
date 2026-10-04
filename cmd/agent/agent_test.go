@@ -715,3 +715,35 @@ func TestEventsEndToEnd(t *testing.T) {
 		t.Fatalf("bell shown %d times:\n%s", n, follow.output())
 	}
 }
+
+// A local attachment survives `agent daemon upgrade`, which replaces the
+// daemon and hands the session's worker over to the new binary while the
+// shell keeps running, and `agent daemon restart`: both times the CLI
+// attaches again by itself and the same shell answers.
+func TestLocalAttachSurvivesUpgradeAndRestart(t *testing.T) {
+	e := newEnv(t, "")
+	tm := e.start("new", "demo")
+	m := tm.expect(0, "attached to demo")
+	tm.write("export N=before; echo $N-1\r")
+	m = tm.expect(m, "before-1")
+
+	out := e.mustRun("agent", "daemon", "upgrade")
+	if !strings.Contains(out, "Session demo now runs") {
+		t.Fatalf("upgrade did not hand the session off:\n%s", out)
+	}
+	// The daemon restarts first and the worker hands off right after, so
+	// the CLI may reattach once or twice (the second time on the worker's
+	// SessionRestarting), depending on timing; either way it repaints.
+	m = tm.expect(m, "reconnecting")
+	m = tm.expect(m, "before-1")
+	tm.write("echo $N-2\r")
+	m = tm.expect(m, "before-2")
+
+	e.mustRun("agent", "daemon", "restart")
+	m = tm.expect(m, "connection to agentd lost, reconnecting")
+	m = tm.expect(m, "before-2")
+	tm.write("echo $N-3\r")
+	m = tm.expect(m, "before-3")
+	tm.write("\x1c")
+	tm.wait()
+}
