@@ -887,12 +887,12 @@ agent attach devbox-1/auth-tests
 
 * [x] Host configuration (`agent host add|ls|rm`, `hosts.toml`)
 * [x] Host aliases (`--host NAME`, `NAME/session`)
-* [ ] Host health
+* [x] Host health (`agent hosts` / `agent host ls`: online, offline, unauthorized, latency, load)
 * [ ] Cross-host session discovery
 * [ ] Stable global session identifiers
 * [ ] Host-aware CLI UX
-* [ ] Machine capabilities
-* [ ] Simple placement hints
+* [x] Machine capabilities (`Welcome` host description; `agent host info`)
+* [x] Simple placement hints (`agent --host auto new`: least running sessions per CPU among hosts with the agent and workspace)
 
 Avoid implementing a scheduler until real usage requires one.
 

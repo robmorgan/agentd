@@ -350,11 +350,35 @@ gives up. It keeps trying (every 5 seconds at most) until the devbox answers, so
 picks up where it was when it wakes. It stops if the devbox refuses this machine's key or the
 session is gone. Without `--agent`, `new` uses the devbox's `default_agent`.
 
+With several hosts, `agent hosts` (or `agent host ls`) checks every one at once, this machine's
+daemon included as `local`:
+
+```text
+NAME    ADDRESS          STATUS   LATENCY  SESSIONS  CPUS  AGENTS        VERSION
+local   (this machine)   online   310µs    2/5       10    claude,codex  0.1.0
+devbox  100.64.0.5:7433  online   23ms     3/7       32    claude        0.1.0
+gpu-01  10.0.0.9:7433    offline  -        -         -     -             -
+```
+
+`SESSIONS` is running/total. A host can also be `unauthorized` (it refuses this machine's key) or
+`key changed`. `agent host info devbox` shows its machine (OS, CPUs, memory), its agents, daemon
+version, capabilities and pinned key. `--host local` (or `local/session`) is this machine.
+
+`agent --host auto new` lets the CLI choose: among the hosts that are online, have the agent, and
+(with `--workspace`) have that workspace, it picks the one with the fewest running sessions per
+CPU, and says which and why. It is a hint for spreading work, not a scheduler. It needs
+`--workspace` or an absolute or `~/` `--cwd`, which mean the same on every host:
+
+```sh
+agent --host auto new --workspace mono fix-flaky-tests
+```
+
 Managing keys and hosts:
 
 ```sh
 agent remote id                  # this machine's client key fingerprint
-agent host ls
+agent host ls                    # with --no-probe: hosts.toml as is, with pinned keys
+agent host info devbox
 agent host rm devbox
 agentd remote list               # on the devbox: authorized clients
 agentd remote revoke SHA256:...

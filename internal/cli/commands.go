@@ -48,6 +48,11 @@ func (a *app) commands() []*cobra.Command {
 	var cwd, agent, workspace string
 	newCmd := a.command("new [NAME]", "Start and attach to a new session", optionalArg, func(args []string) error {
 		name := firstArg(args)
+		if a.host == autoHostName {
+			if err := a.placeSession(agent, workspace, cwd); err != nil {
+				return err
+			}
+		}
 		var req *protocol.CreateSession
 		c, err := a.connect([]*string{&name}, "", func(c *client) (err error) {
 			// Checked before a daemon may be started, so a bad --cwd or
@@ -306,23 +311,21 @@ func (a *app) commands() []*cobra.Command {
 	})
 	hostAdd.Flags().StringVar(&fingerprint, "fingerprint", "", "Expected daemon key (from `agentd remote id` on the host); skips the prompt")
 	withValue(hostAdd, "fingerprint", "FP")
+	var noProbe bool
+	listHosts := func([]string) error { return a.listHosts(noProbe) }
+	hostList := visibleAlias(a.command("list", "List hosts and whether they are reachable", noArgs, listHosts), "ls")
+	hostList.Flags().BoolVar(&noProbe, "no-probe", false, "List hosts.toml without contacting the hosts (shows their keys)")
+	hosts := a.command("hosts", "List hosts and whether they are reachable (same as `agent host ls`)", noArgs, listHosts)
+	hosts.Flags().BoolVar(&noProbe, "no-probe", false, "List hosts.toml without contacting the hosts (shows their keys)")
+	cmds = append(cmds, hosts)
 	cmds = append(cmds, group("host", "Manage remote hosts this machine can reach",
 		"Remote hosts running agentd with `[remote] listen` set.",
-		"Examples:\n  agent host add devbox 100.64.0.5:7433\n  agent --host devbox ls\n  agent attach devbox/auth-refactor",
+		"Examples:\n  agent host add devbox 100.64.0.5:7433\n  agent host ls\n  agent --host devbox ls\n  agent attach devbox/auth-refactor\n  agent --host auto new --workspace mono fix-tests",
 		annotate(hostAdd, "[OPTIONS] <NAME> <ADDRESS>", "<NAME>     \n<ADDRESS>  HOST:PORT of the remote agentd's QUIC listener"),
-		visibleAlias(a.command("list", "List configured hosts", noArgs, func([]string) error {
-			hosts, err := transport.ReadHosts(a.paths.HostsPath())
-			if err != nil {
-				return err
-			}
-			if len(hosts) == 0 {
-				fmt.Println("no hosts; add one with `agent host add NAME HOST:PORT`")
-			}
-			for _, h := range hosts {
-				fmt.Printf("%s\t%s\t%s\n", h.Name, h.Address, h.Fingerprint)
-			}
-			return nil
-		}), "ls"),
+		hostList,
+		annotate(a.command("info NAME", "Show a host's machine, daemon, and capabilities", oneArg, func(args []string) error {
+			return a.hostInfo(args[0])
+		}), "<NAME>", "<NAME>  A host from `agent host ls`, or `local`"),
 		annotate(a.command("rm NAME", "Forget a host", oneArg, func(args []string) error {
 			removed, err := transport.RemoveHost(a.paths.HostsPath(), args[0])
 			if err != nil {
@@ -362,6 +365,79 @@ func (a *app) commands() []*cobra.Command {
 		cmd.Flags().BoolP("help", "h", false, "Print help")
 	}
 	return cmds
+}
+
+// listHosts prints every host with what probing it found, or with
+// noProbe, hosts.toml as it is.
+func (a *app) listHosts(noProbe bool) error {
+	if noProbe {
+		hosts, err := transport.ReadHosts(a.paths.HostsPath())
+		if err != nil {
+			return err
+		}
+		if len(hosts) == 0 {
+			fmt.Println("no hosts; add one with `agent host add NAME HOST:PORT`")
+		}
+		for _, h := range hosts {
+			fmt.Printf("%s\t%s\t%s\n", h.Name, h.Address, h.Fingerprint)
+		}
+		return nil
+	}
+	probes, err := a.probeHosts(false)
+	if err != nil {
+		return err
+	}
+	renderHosts(os.Stdout, probes)
+	if len(probes) == 1 {
+		fmt.Println("no remote hosts; add one with `agent host add NAME HOST:PORT`")
+	}
+	return nil
+}
+
+// hostInfo prints one host's machine and daemon.
+func (a *app) hostInfo(name string) error {
+	p := &hostProbe{name: localHostName, address: a.paths.Socket}
+	if name != localHostName {
+		host, err := transport.LookupHost(a.paths.HostsPath(), name)
+		if err != nil {
+			return err
+		}
+		p = &hostProbe{name: host.Name, address: host.Address, host: &host}
+	}
+	a.probe(p, false)
+	renderHostInfo(os.Stdout, p)
+	return nil
+}
+
+// placeSession resolves `agent new --host auto` to a host, telling the user
+// which and why. A session placed on another machine needs a directory that
+// means the same there: a workspace, or an absolute or ~/ --cwd.
+func (a *app) placeSession(agent, workspace, cwd string) error {
+	if workspace == "" && !(strings.HasPrefix(cwd, "/") || cwd == "~" || strings.HasPrefix(cwd, "~/")) {
+		return errors.New("`--host auto` needs --workspace NAME or an absolute or ~/ --cwd, which mean the same on every host")
+	}
+	// Placement may pick this machine, whose daemon is started like any
+	// command's.
+	local := &client{paths: a.paths}
+	err := local.ensureDaemon()
+	local.close()
+	if err != nil {
+		return err
+	}
+	probes, err := a.probeHosts(workspace != "")
+	if err != nil {
+		return err
+	}
+	p, err := choosePlacement(probes, agent, workspace)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "placing the session on %s (%s)\n", p.probe.name, p.reason)
+	a.host = p.probe.name
+	if p.probe.host == nil {
+		a.host = ""
+	}
+	return nil
 }
 
 func firstArg(args []string) string {

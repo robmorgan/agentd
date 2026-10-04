@@ -105,16 +105,26 @@ func (c *client) remoteConnection(ctx context.Context) (*transport.QUICClient, e
 	var changed *transport.KeyChangedError
 	switch {
 	case errors.As(err, &changed):
-		return nil, fmt.Errorf("the key of host `%s` (%s) has changed!\n  pinned:    %s\n  presented: %s\n"+
+		return nil, &hostKeyChangedError{changed: changed, msg: fmt.Sprintf("the key of host `%s` (%s) has changed!\n  pinned:    %s\n  presented: %s\n"+
 			"This could mean someone is intercepting the connection, or the daemon's key was recreated.\n"+
 			"If you trust the new key, run `agent host rm %s` and add the host again.",
-			c.host.Name, c.host.Address, c.host.Fingerprint, changed.Presented, c.host.Name)
+			c.host.Name, c.host.Address, c.host.Fingerprint, changed.Presented, c.host.Name)}
 	case err != nil:
 		return nil, fmt.Errorf("could not reach agentd on `%s` (%s): %w", c.host.Name, c.host.Address, err)
 	}
 	c.quic = conn
 	return conn, nil
 }
+
+// hostKeyChangedError explains a changed host key to the user, and still
+// unwraps to the *transport.KeyChangedError.
+type hostKeyChangedError struct {
+	changed *transport.KeyChangedError
+	msg     string
+}
+
+func (e *hostKeyChangedError) Error() string { return e.msg }
+func (e *hostKeyChangedError) Unwrap() error { return e.changed }
 
 // close ends the control stream and the remote connection, if any, so the
 // daemon sees this client go away at once rather than after an idle
