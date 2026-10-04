@@ -387,7 +387,7 @@ The protocol should operate over explicit message and stream abstractions rather
 * [x] Define protocol version negotiation (version ranges in `Hello`, the daemon picks)
 * [x] Add request IDs (frame flag + `u32` id on control streams)
 * [x] Define request/response messages (catalog in ARCHITECTURE.md)
-* [ ] Define long-lived event streams
+* [x] Define long-lived event streams (`SubscribeEvents`: an events stream, a resumable cursor over persisted events)
 * [x] Define bidirectional attachment streams
 * [x] Define structured error frames
 * [x] Add connection-level metrics (per QUIC connection: streams, RTT, bytes, loss)
@@ -584,7 +584,7 @@ Use independent streams.
 
 ## Deliverables
 
-* [ ] Define stream taxonomy
+* [x] Define stream taxonomy (request, control, attach, events, artifact; ARCHITECTURE.md "Streams and their roles")
 * [ ] Make attachment streams independent
 * [x] Separate large transfers from latency-sensitive terminal traffic (artifacts stream on their
       own stream as bounded `ArtifactChunk` frames, held back by flow control)
@@ -840,17 +840,17 @@ agent appears stalled
 
 ## Deliverables
 
-* [ ] Formalize attention events
-* [ ] Add event persistence
-* [ ] Surface attention in CLI
-* [ ] Surface attention in TUI
-* [ ] Track task elapsed time
-* [ ] Track agent/process status
+* [x] Formalize attention events (`session.Event`: lifecycle, bell, notification, idle, stalled, acknowledged)
+* [x] Add event persistence (`events` in `state.db`, newest 500 per session)
+* [x] Surface attention in CLI (`agent ls`, `agent status`, `agent events`)
+* [x] Surface attention in TUI (picker and `Ctrl-Y` switcher order and mark sessions needing action)
+* [x] Track task elapsed time (`agent ls` age, `agent status` elapsed)
+* [x] Track agent/process status (activity, PTY foreground process, title)
 * [x] Expose Git state (`GetGitState`, `agent status`; the base is recorded at session creation)
 * [x] Expose produced commits (commits since the base; the `patch` artifact)
 * [x] Expose changed files (staged, unstaged and untracked since the base; `agent diff --stat`)
 * [x] Expose artifacts (`agent artifacts`, `agent artifact`: diff, patch, history)
-* [ ] Support task-level notifications
+* [x] Support task-level notifications (`agent events --follow --notify | --exec`)
 
 ## Principle
 

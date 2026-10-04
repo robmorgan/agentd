@@ -27,17 +27,21 @@ const (
 	pickerVisibleRows     = 8
 
 	sessionListDefaultWidth    = 120
+	sessionListSummaryWidth    = 160
 	sessionListRunWidth        = 3
 	sessionListAgeWidth        = 5
+	sessionListActivityWidth   = 11
+	sessionListSummaryMinWidth = 20
 	sessionListNameMinWidth    = 10
 	sessionListNameMaxWidth    = 26
 	sessionListNameFloorWidth  = 8
 	sessionListCwdMinWidth     = 16
 	sessionListCwdMaxWidth     = 48
+	sessionListCwdSummaryWidth = 32
 	sessionListCwdFloorWidth   = 10
-	sessionListStructuralWidth = 8
+	sessionListStructuralWidth = 10
 	pickerSessionPrefixWidth   = 4
-	pickerSessionStructural    = 2
+	pickerSessionStructural    = 3
 
 	// codexDefaultModel is the model sessions started from the picker or
 	// overlay ask codex for.
@@ -47,7 +51,9 @@ const (
 // `agent list`
 
 type sessionListLayout struct {
-	visible, run, age, name, cwd int
+	visible, run, age, name, activity, cwd int
+	// summary is the attention column's width; 0 hides it.
+	summary int
 }
 
 // fitColumns grows cwd then name into spare width, or shrinks name then cwd
@@ -75,32 +81,72 @@ func fitColumns(name, cwd *int, available, fixed int) {
 	shrink(cwd, sessionListCwdFloorWidth)
 }
 
-func listLayout(width int) sessionListLayout {
-	l := sessionListLayout{
-		visible: min(max(width, 1), sessionListDefaultWidth),
-		run:     sessionListRunWidth,
-		age:     sessionListAgeWidth,
-		name:    sessionListNameMinWidth,
-		cwd:     sessionListCwdMinWidth,
+// listLayout fits the columns of `agent list` into width. With summaries
+// (some session has attention to explain) an ATTENTION column takes what
+// the others leave, and the list may be wider.
+func listLayout(width int, summaries bool) sessionListLayout {
+	limit := sessionListDefaultWidth
+	if summaries {
+		limit = sessionListSummaryWidth
 	}
-	fitColumns(&l.name, &l.cwd, l.visible, sessionListStructuralWidth+l.run+l.age)
+	l := sessionListLayout{
+		visible:  min(max(width, 1), limit),
+		run:      sessionListRunWidth,
+		age:      sessionListAgeWidth,
+		name:     sessionListNameMinWidth,
+		activity: sessionListActivityWidth,
+		cwd:      sessionListCwdMinWidth,
+	}
+	fixed := sessionListStructuralWidth + l.run + l.age + l.activity
+	if !summaries {
+		fitColumns(&l.name, &l.cwd, l.visible, fixed)
+		return l
+	}
+	// The attention column, with its separator, gets what is left once
+	// name and cwd have their usual widths; without room for it, they keep
+	// the room. `agent status` shows the summary in full.
+	fitColumns(&l.name, &l.cwd, l.visible-sessionListSummaryMinWidth, fixed+2)
+	if l.name < sessionListNameMinWidth || l.cwd < sessionListCwdMinWidth {
+		l.name, l.cwd = sessionListNameMinWidth, sessionListCwdMinWidth
+		fitColumns(&l.name, &l.cwd, l.visible, fixed)
+		return l
+	}
+	// What needs attention matters more than the end of a long path.
+	l.cwd = min(l.cwd, sessionListCwdSummaryWidth)
+	l.summary = l.visible - fixed - 2 - l.name - l.cwd
 	return l
 }
 
 func renderSessionListLines(sessions []session.Record, width int, now time.Time) []string {
-	l := listLayout(width)
-	headerRow := fmt.Sprintf("  %s  %s  %s  %s", formatCell("RUN", l.run), formatCell("AGE", l.age), formatCell("NAME", l.name), formatCell("CWD", l.cwd))
+	rows := make([]displayRow, 0, len(sessions))
+	summaries := false
+	for _, s := range orderedSessions(sessions) {
+		row := buildDisplayRow(s, now)
+		summaries = summaries || row.summary != ""
+		rows = append(rows, row)
+	}
+	l := listLayout(width, summaries)
+	headerRow := fmt.Sprintf("  %s  %s  %s  %s  %s", formatCell("RUN", l.run), formatCell("AGE", l.age), formatCell("NAME", l.name),
+		formatCell("ACTIVITY", l.activity), formatCell("CWD", l.cwd))
+	if l.summary > 0 {
+		headerRow += "  " + formatCell("ATTENTION", l.summary)
+	}
 	lines := []string{pickerQueryBG + pickerTextFG + takeRunes(headerRow, l.visible) + ansiReset}
 	if len(sessions) == 0 {
 		return append(lines, truncateCell("  No sessions.", l.visible))
 	}
-	for _, s := range orderedSessions(sessions) {
-		row := buildDisplayRow(s, now)
-		lines = append(lines, fmt.Sprintf("  %s  %s  %s  %s",
-			styleRun(formatCell(runIcon(row.run), l.run), row.run),
+	for _, row := range rows {
+		icon, iconStyle := rowIcon(row)
+		line := fmt.Sprintf("  %s  %s  %s  %s  %s",
+			iconStyle+formatCell(icon, l.run)+ansiReset,
 			styleAge(formatCell(row.age, l.age)),
 			styleName(formatCell(row.name, l.name)),
-			styleCwd(formatPathCell(row.cwd, l.cwd))))
+			formatCell(row.activity, l.activity),
+			styleCwd(formatPathCell(row.cwd, l.cwd)))
+		if l.summary > 0 && row.summary != "" {
+			line += "  " + styleSummary(truncateCell(row.summary, l.summary), row.attention)
+		}
+		lines = append(lines, line)
 	}
 	return lines
 }
@@ -575,16 +621,30 @@ func createRow(label string, width int, selected bool) string {
 	return style + prefix + truncateCell(label, max(lineWidth(width)-runeLen(prefix), 0)) + ansiReset
 }
 
+// pickerSessionRow is one session in the picker: icon, age, name,
+// activity and cwd, then what needs attention, if anything, in what width
+// is left.
 func pickerSessionRow(s *session.Record, width int, selected bool, now time.Time) string {
 	row := buildDisplayRow(s, now)
 	leader, style := "  ", ""
 	if selected {
 		leader, style = "› ", pickerSelectedStyle
 	}
-	age, name, cwd := sessionListAgeWidth, sessionListNameMinWidth, sessionListCwdMinWidth
-	fitColumns(&name, &cwd, max(lineWidth(width)-pickerSessionPrefixWidth, 0), pickerSessionStructural+age)
-	return fmt.Sprintf("%s%s%s%s %s%s %s %s%s", style, leader, ansiReset, styleRun(runIcon(row.run), row.run), style,
-		styleAge(formatCell(row.age, age)), styleName(formatCell(row.name, name)), styleCwd(formatPathCell(row.cwd, cwd)), ansiReset)
+	available := max(lineWidth(width)-pickerSessionPrefixWidth, 0)
+	age, name, activity, cwd := sessionListAgeWidth, sessionListNameMinWidth, sessionListActivityWidth, sessionListCwdMinWidth
+	fixed := pickerSessionStructural + age + activity
+	if row.summary != "" {
+		available -= sessionListSummaryMinWidth
+	}
+	fitColumns(&name, &cwd, available, fixed)
+	icon, iconStyle := rowIcon(row)
+	line := fmt.Sprintf("%s%s%s%s %s%s %s %s %s%s", style, leader, ansiReset, iconStyle+icon+ansiReset, style,
+		styleAge(formatCell(row.age, age)), styleName(formatCell(row.name, name)), formatCell(row.activity, activity),
+		styleCwd(formatPathCell(row.cwd, cwd)), ansiReset)
+	if rest := lineWidth(width) - pickerSessionPrefixWidth - fixed - name - cwd - 1; row.summary != "" && rest >= 8 {
+		line += " " + styleSummary(truncateCell(row.summary, rest), row.attention)
+	}
+	return line
 }
 
 // legendRow explains the icons of the sessions shown, in as many entries
@@ -593,14 +653,19 @@ func legendRow(width int, sessions []*session.Record) string {
 	entries := []struct {
 		run   runState
 		label string
-	}{{runRunning, "running"}, {runExited, "exited"}, {runRecovered, "lost"}, {runFailed, "failed"}}
+	}{{runRunning, "running"}, {-1, "needs you"}, {runExited, "exited"}, {runRecovered, "lost"}, {runFailed, "failed"}}
 	maxChars := lineWidth(width)
 	line := "  "
 	visible, shown := 0, 0
 	for _, e := range entries {
 		present := false
+		icon, style := runIcon(e.run), runStyle(e.run)
 		for _, s := range sessions {
-			if sessionRunState(s) == e.run {
+			row := displayRow{run: sessionRunState(s), attention: s.Attention}
+			rowIcon, rowStyle := rowIcon(row)
+			if e.run < 0 && rowIcon == "⚠" {
+				present, icon, style = true, rowIcon, rowStyle
+			} else if e.run >= 0 && row.run == e.run && rowIcon != "⚠" {
 				present = true
 			}
 		}
@@ -621,7 +686,7 @@ func legendRow(width int, sessions []*session.Record) string {
 			line += pickerLegendStyle + " • " + ansiReset
 			visible += 3
 		}
-		line += styleRun(runIcon(e.run), e.run) + pickerLegendStyle + " " + e.label + ansiReset
+		line += style + icon + ansiReset + pickerLegendStyle + " " + e.label + ansiReset
 		visible += runeLen(e.label)
 		shown++
 	}

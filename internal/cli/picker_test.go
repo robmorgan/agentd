@@ -278,10 +278,62 @@ func TestSessionList(t *testing.T) {
 		t.Fatal("list has a legend")
 	}
 	for _, width := range []int{200, 80} {
-		l := listLayout(width)
+		l := listLayout(width, false)
 		header := stripANSI(renderSessionListLines(nil, width, now)[0])
-		if got, want := runeLen(header), 8+l.run+l.age+l.name+l.cwd; got != want {
+		if got, want := runeLen(header), 10+l.run+l.age+l.name+l.activity+l.cwd; got != want {
 			t.Errorf("width %d: header is %d wide, want %d", width, got, want)
 		}
+	}
+}
+
+func TestSessionListShowsAttention(t *testing.T) {
+	ask := needing("asks", session.StatusRunning, session.AttentionAction, "Claude needs your permission to use Bash", time.Minute)
+	ask.Activity = session.ActivityWaiting
+	now := ask.AttentionAt.Add(time.Minute)
+	quiet := demo("quiet")
+	quiet.Activity = session.ActivityIdle
+	quiet.LastOutputAt = &now
+	lines := renderSessionListLines([]session.Record{quiet, ask}, 160, now)
+	header := stripANSI(lines[0])
+	if !strings.Contains(header, "ACTIVITY") || !strings.Contains(header, "ATTENTION") {
+		t.Fatalf("header %q", header)
+	}
+	first := stripANSI(lines[1])
+	if !strings.Contains(first, "⚠") || !strings.Contains(first, "asks") || !strings.Contains(first, "waiting 1m") ||
+		!strings.Contains(first, "Claude needs your permission to use Bash") || !strings.Contains(lines[1], ansiAction) {
+		t.Fatalf("first row %q", first)
+	}
+	if second := stripANSI(lines[2]); !strings.Contains(second, "quiet") || !strings.Contains(second, "idle 0s") || strings.Contains(second, "⚠") {
+		t.Fatalf("second row %q", second)
+	}
+	l := listLayout(160, true)
+	if got, want := runeLen(header), 12+l.run+l.age+l.name+l.activity+l.cwd+l.summary; got != want || l.summary < sessionListSummaryMinWidth {
+		t.Fatalf("header is %d wide, want %d (summary %d)", got, want, l.summary)
+	}
+	// Narrow terminals drop the summary before anything else.
+	if narrow := listLayout(60, true); narrow.summary != 0 {
+		t.Fatalf("narrow summary %d", narrow.summary)
+	}
+}
+
+func TestPickerShowsAttention(t *testing.T) {
+	ask := needing("asks", session.StatusRunning, session.AttentionAction, "Approve the command?", time.Minute)
+	ask.Activity = session.ActivityWaiting
+	now := ask.AttentionAt.Add(time.Minute)
+	row := pickerSessionRow(&ask, 120, false, now)
+	if plain := stripANSI(row); !strings.Contains(plain, "⚠") || !strings.Contains(plain, "waiting 1m") || !strings.Contains(plain, "Approve the command?") {
+		t.Fatalf("row %q", plain)
+	}
+	if runeLen(stripANSI(row)) > lineWidth(120) {
+		t.Fatalf("row is %d wide", runeLen(stripANSI(row)))
+	}
+	// Sessions needing action come first, and the legend explains the sign.
+	p := testPicker(t, demo("alpha"), ask)
+	if rows := p.rows(); rows[0] != "asks" {
+		t.Fatalf("rows %v", rows)
+	}
+	rendered := stripANSI(strings.Join(p.renderLines(120, true), "\n"))
+	if !strings.Contains(rendered, "⚠ needs you") || !strings.Contains(rendered, "● running") {
+		t.Fatalf("legend:\n%s", rendered)
 	}
 }

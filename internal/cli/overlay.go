@@ -200,8 +200,7 @@ func (o *overlay) run(mode overlayMode) error {
 		if err != nil {
 			return err
 		}
-		s := resp.Session
-		o.detailText = fmt.Sprintf("name       %s\nagent      %s\ncwd        %s\nstatus     %s", s.SessionID, s.Agent, escapeControls(s.Cwd), sessionStatusText(s))
+		o.detailText = sessionDetails(resp.Session, o.now())
 		o.detailScroll = 0
 	}
 	o.mode = mode
@@ -292,6 +291,22 @@ func (o *overlay) handleStop(ev keyEvent) (overlayOutcome, error) {
 		return overlayOutcome{}, err
 	}
 	return overlayOutcome{kind: overlayClose}, nil
+}
+
+// sessionDetails is the overlay's Session Details text.
+func sessionDetails(s *session.Record, now time.Time) string {
+	text := fmt.Sprintf("name       %s\nagent      %s\ncwd        %s\nstatus     %s\nelapsed    %s\nactivity   %s",
+		s.SessionID, s.Agent, escapeControls(s.Cwd), sessionStatusText(s), elapsedLabel(s, now), activityText(s, now))
+	if s.Foreground != nil {
+		text += "\nforeground " + escapeControls(*s.Foreground)
+	}
+	if s.Title != nil {
+		text += "\ntitle      " + escapeControls(*s.Title)
+	}
+	if row := buildDisplayRow(s, now); row.summary != "" {
+		text += fmt.Sprintf("\nattention  %s: %s", s.Attention, row.summary)
+	}
+	return text
 }
 
 func sessionStatusText(s *session.Record) string {
@@ -445,8 +460,17 @@ func (o *overlay) body(width, height int) []line {
 			if i == o.switcherSelected {
 				style = styleCyanBold
 			}
-			put(2+i, line{{runStyle(row.run), runIcon(row.run)}, {"", "  "}, {styleSubtle, row.age}, {"", "  "},
-				{style, s.SessionID}, {"", "  "}, {styleSubtle, row.cwd}})
+			icon, iconStyle := rowIcon(row)
+			l := line{{iconStyle, icon}, {"", "  "}, {styleSubtle, row.age}, {"", "  "},
+				{style, s.SessionID}, {"", "  "}, {"", row.activity}, {"", "  "}, {styleSubtle, row.cwd}}
+			if row.summary != "" {
+				summaryStyle := ""
+				if row.attention == session.AttentionAction {
+					summaryStyle = ansiAction
+				}
+				l = append(l, span{"", "  "}, span{summaryStyle, row.summary})
+			}
+			put(2+i, l)
 		}
 	case overlayNewSession:
 		field := func(top int, label, value string, active bool) {

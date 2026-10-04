@@ -64,11 +64,13 @@ List running tasks:
 ```sh
 agent ls
 
-NAME                 AGENT    STATUS      ELAPSED   TOKENS      COST
-● fix-tests          codex    running     12m       2.3k/900    $0.18
-⚠ dependency-bump    claude   running     4m        800/120     $0.07
-✔ docs-readme        codex    completed   6m        1.1k/420    $0.05
+  RUN  AGE    NAME            ACTIVITY     CWD                 ATTENTION
+  ⚠    4m     dep-bump        waiting 1m   ~/src/app           Claude needs your permission to use Bash
+  ●    12m    fix-tests       working      ~/src/app
+  ○    6m     docs-readme     exited       ~/src/docs          finished (exit 0)
 ```
+
+Sessions that need you come first; see [Attention model](#attention-model).
 
 You can attach to a running agent to open the underlying PTY session:
 
@@ -147,15 +149,75 @@ Run the `agent` command without any arguments to open the TUI.
 
 Multiple agents create an **attention problem**.
 
-Instead of streaming logs constantly, tasks emit attention signals:
+Instead of streaming logs constantly, sessions emit attention signals:
 
 ```
 info      background update
-notice    something meaningful happened
-action    user intervention required
+notice    something meaningful happened (an agent went quiet, a session finished)
+action    user intervention required (a bell, a permission prompt, a failure)
 ```
 
-Clients surface tasks based on attention instead of raw output.
+Clients surface sessions based on attention instead of raw output. `agentd` reads the signals from
+each session's terminal output, without any cooperation from the agent beyond what terminals
+already understand: the bell, desktop notifications (OSC 9 and OSC 777), output stopping and
+starting, and the process in the foreground. They are recorded as events, and a session needs
+attention until you look at it: attaching to it (or detaching from it) acknowledges it.
+
+```sh
+agent ls
+
+  RUN  AGE    NAME            ACTIVITY     CWD                 ATTENTION
+  ⚠    12m    fix-tests       waiting 2m   ~/src/app           Claude needs your permission to use Bash
+  ●    40m    dep-bump        idle 5m      ~/src/app           idle after 4m of output
+  ●    3m     docs            working      ~/src/docs
+  ○    1h     refactor        exited       ~/src/app           finished (exit 0)
+```
+
+Sessions that need you come first, in `agent ls`, in the picker (`agent`) and in the `Ctrl-Y`
+switcher. `agent status NAME` shows the details: activity, foreground command, terminal title,
+elapsed time and what needs attention.
+
+Every session's history of events is kept (the newest 500 per session):
+
+```sh
+agent events                       # the latest events of every session
+agent events fix-tests --follow    # follow one session
+agent events --follow --notify     # ring the bell and post a desktop notification when a session needs you
+agent events --follow --level action --exec 'say "$AGENTD_EVENT_SESSION needs you"'
+agent events --json --after 120    # for scripts: everything after event 120
+```
+
+`--notify` writes to your terminal, so it pops a desktop notification wherever your terminal
+supports one (iTerm2, Ghostty, WezTerm, kitty and others use OSC 9; GNOME Terminal and other VTE
+terminals, foot and urxvt use OSC 777; inside tmux, `set -g allow-passthrough on`). `--exec` runs a
+command for each event with `AGENTD_EVENT_ID`, `_HOST`, `_SESSION`, `_KIND`, `_ATTENTION`,
+`_SUMMARY` and `_TIME` set. Following reconnects by itself (after a daemon restart, or a lost
+connection to a remote host) and resumes after the last event it printed.
+
+### Making agents ask out loud
+
+A bell or a desktop notification is the clearest signal that an agent is waiting for you. Without
+one, `agentd` still notices an agent going quiet (`idle`), but cannot tell finishing from asking.
+
+- **Claude Code** sends a notification when it needs permission and when it has been waiting for
+  input for a minute. Its default channel depends on the terminal it thinks it runs in, which
+  under `agentd` is whatever terminal the daemon was started from, and is often none. Choose one
+  explicitly: run `/config` in Claude Code and set **Notifications** to **iTerm2 (OSC 9)**,
+  **Ghostty (OSC 777)** or **Terminal Bell** (stored as `preferredNotifChannel` in
+  `~/.claude.json`). Do not choose Kitty (OSC 99): `agentd` cannot read it.
+- **Codex** sends notifications when a turn completes or it needs approval, once enabled in
+  `~/.codex/config.toml`. Codex only notifies when it thinks its terminal is unfocused, which
+  under `agentd` it cannot tell, so ask for always:
+
+  ```toml
+  [tui]
+  notifications = true
+  notification_method = "osc9"       # or "bel"
+  notification_condition = "always"
+  ```
+
+- **Anything else** that rings the bell (`printf '\a'`) or prints `\e]9;message\e\\` is heard the
+  same way.
 
 ## Architecture
 
@@ -319,8 +381,8 @@ The daemon injects:
 
 The daemon socket is not passed to agents. They are not sandboxed, though: an agent runs as your
 user, so it can still reach the daemon at its usual path. There is no structured event channel for
-agents. Session status, attention, and history are the
-supported runtime surfaces.
+agents: `agentd` reads attention from what they print (see [Attention model](#attention-model)).
+Session status, attention, events, and history are the supported runtime surfaces.
 
 Everything lives under one root, `~/.agentd` on macOS and Linux alike, unless `AGENTD_DIR` names
 another. Without a home directory, `XDG_RUNTIME_DIR/agentd`, `TMPDIR/agentd-<uid>` and then
@@ -407,6 +469,7 @@ agent attach devbox/auth-refactor
 agent send-input devbox/auth-refactor -- "run the tests"
 agent history devbox/auth-refactor
 agent diff devbox/auth-refactor --stat
+agent --host devbox events --follow --notify             # tell me when a devbox session needs me
 agent rm devbox/auth-refactor
 ```
 
@@ -506,5 +569,7 @@ Current capabilities include:
 - per-session PTY history held by the session while it runs and saved to `logs/` when it ends
 - git state and artifacts of a session's repository (`agent diff`, `agent artifacts`), locally and
   remotely, with large transfers on their own streams so they never stall an attachment
+- attention and activity read from each session's terminal output, kept as events, followed with
+  `agent events --follow` and surfaced in `agent ls`, `agent status` and the TUI
 
 Sessions whose worker dies while no daemon is running are shown as `unknown_recovered`.

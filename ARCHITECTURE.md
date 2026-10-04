@@ -26,12 +26,12 @@ Both binaries are one Go module at the repository root.
 | `cmd/agentd` | `serve [--daemonize]`, `upgrade`, `remote enable\|disable\|status` (set `[remote] listen` and restart the daemon), `remote id\|list\|authorize\|revoke`, `bench sessions` (`internal/bench`: measures sessions on a private daemon), `session-worker`. The agent CLI runs `serve --daemonize`. |
 | `cmd/agent`, `internal/cli` | The `agent` CLI: commands, the session picker, attach and the Ctrl-Y overlay (plain ANSI), and `hosts.toml` for remote hosts. Pure Go: it never imports `worker`, `daemon` or `db`, and `cmd/agent`'s tests check that, then drive both real binaries through PTYs. |
 | `internal/daemon` | `agentd serve`: lock/socket/pid file lifecycle, create/kill/rm/ls/get, attach and request proxies to workers, history, daemon management, worker supervision and startup reconciliation. Tests run the daemon in-process against real worker processes. |
-| `internal/worker` | One session: PTY via `creack/pty`, shadow terminal via `go.mitchellh.com/libghostty`, per-session Unix socket. Real-PTY tests run under `-race`. |
+| `internal/worker` | One session: PTY via `creack/pty`, shadow terminal via `go.mitchellh.com/libghostty`, per-session Unix socket, and activity and attention detection from the PTY stream. Real-PTY tests run under `-race`. |
 | `internal/repo` | Read-only views of the git repository a session works in, for the daemon: git state, the diff and patch artifacts. Runs the system `git`; tests use real temporary repositories. |
 | `internal/transport` | The seam between the protocol and the network: `Stream` (one request or attach session), `Listener`, the shared accept loop, the Unix socket transport, and the QUIC transport with pinned-key identities (`quic-go`). `transporttest` has a UDP relay that tests use as the network. |
 | `internal/protocol` | The framed binary protocol and the small daemon management protocol, used by both binaries. Golden-frame tests pin the bytes. |
 | `internal/session`, `internal/paths`, `internal/config` | The session model (and name rules), runtime-root resolution, and `config.toml`, shared by both binaries. |
-| `internal/db` | `state.db`: schema, and the guarded session state transitions the daemon and workers use. Uses `modernc.org/sqlite` (pure Go). Only the daemon and its workers open it. |
+| `internal/db` | `state.db`: schema, the guarded session state transitions the daemon and workers use, and session events. Uses `modernc.org/sqlite` (pure Go). Only the daemon and its workers open it. |
 | `internal/procstat` | A process's resource usage from the OS (libproc on macOS, `/proc` on Linux) and the Go runtime's own numbers, for session stats and the bench. |
 | `scripts/` | The libghostty-vt build helper. |
 
@@ -69,8 +69,8 @@ session. Sessions whose worker disappeared while no daemon was running are marke
 ## Transports
 
 The protocol runs over any bidirectional byte stream that supports half-close. Each stream has one
-role (a request, the control stream, an attachment, a transfer; see "Streams and their roles"
-below). Everything above `internal/transport` sees
+role (a request, the control stream, an attachment, a transfer, an event subscription; see
+"Streams and their roles" below). Everything above `internal/transport` sees
 only that `Stream` and a `Listener` that yields streams, so the daemon does not know or care which
 transport a client used. The daemon-to-worker link is always a local Unix socket.
 
@@ -231,12 +231,18 @@ separate negotiation round trip is needed (`protocol.Request.Role`):
 | request | any one-shot request | one response, then the stream ends |
 | control | `Hello` | `Welcome`, then any number of tagged one-shot requests and their tagged responses, in any order |
 | attach | `AttachSession` | `Attached` with a snapshot, then `PtyOutput` (and `AttachResync`, if negotiated) frames one way and `AttachInput`, `AttachResize`, `AttachSnapshot` the other, until either side ends it |
+| events | `SubscribeEvents` | `Event` frames, server to client, in id order: the backlog the request asked for, then live ones, until the client closes the stream |
 | artifact | `GetArtifact` | `ArtifactChunk` frames, then `EndOfStream` (or an `Error`: the artifact is incomplete). On a stream of its own, a large transfer never delays the control stream or an attachment |
 | artifact | `GetHistory` | one `History` response holding the whole history (the `history` artifacts stream the same content) |
 | management | a version-0 frame | one JSON response |
 
-Over QUIC each stream has its own flow control, so a stalled attachment or a large transfer never
-blocks another stream on the same connection, and a client never needs more than one connection.
+This is the stream taxonomy, and each kind of traffic has its place in it: small commands share the
+control stream; each interactive attachment, being latency-sensitive and long-lived, has a stream of
+its own; notice that something happened flows on events streams; and anything large (history,
+diffs, patches, logs) goes on an artifact stream, so a big transfer never sits in front of a
+keystroke or a small request. Over QUIC each stream has its own flow control, so
+a stalled attachment or a large transfer never blocks another stream on the same connection, and a
+client never needs more than one connection.
 
 ### Handshake, versions and capabilities
 
@@ -258,6 +264,8 @@ features both listed. Today there is one protocol version (1), and these capabil
 | `attach-replace` | attach stream: `AttachSession.Replaces`, the attachment this one replaces |
 | `attach-resync` | attach stream: the worker may send `AttachResync` |
 | `runtime-stats` | `GetSessionStats`, `GetDaemonStats` |
+| `events` | events streams (`SubscribeEvents`), `ListEvents` |
+| `session-activity` | the activity fields appended to session records (after the UID): activity, foreground command, title, last output and attention times |
 
 The protocol grows without breaking older peers this way: a new message kind, or a field appended
 to the end of an existing message or struct (a session record, even inside a list), comes with a
@@ -305,12 +313,14 @@ tokened request after a lost remote connection (see "Duplicate And Replayed Requ
 | `ListWorkspaces` | `Workspaces` | request |
 | `AddWorkspace` | `Workspace` | request |
 | `RemoveWorkspace` | `Ok` | request |
+| `ListEvents` | `Events` | request |
 | `GetHistory` | `History` | artifact |
 | `GetGitState` | `GitState` | request |
 | `ListArtifacts` | `Artifacts` | request |
 | `GetArtifact` | `ArtifactChunk` frames, then `EndOfStream` (or `Error`) | artifact |
 | `GetSessionStats` | `SessionStats` (`runtime-stats`) | request |
 | `GetDaemonStats` | `DaemonStats` (`runtime-stats`) | request |
+| `SubscribeEvents` | `Event`, repeated | events |
 | `AttachSession` | `Attached` (or `SessionEnded` for a finished session), then `PtyOutput`, `AttachSnapshot`, `AttachResync`, and finally `SessionEnded`, `EndOfStream` or `Error` | attach |
 
 Any request may instead be answered with `Error`. Kinds are numbered by area so that parallel work
@@ -322,6 +332,92 @@ response (which carries a snapshot of the current screen), the worker streams `P
 while the client sends `AttachInput`, `AttachResize`, and `AttachSnapshot` frames on the same
 stream until either side closes. The daemon forwards the attach stream as raw bytes and never
 buffers PTY output itself.
+
+## Events and Attention
+
+`agentd` answers "which agent needs me?" with events. An event (`session.Event`) is something that
+happened to a session: an id, the session, a time, a kind, an attention level (`info`, `notice` or
+`action`) and a one-line summary. The kinds and their default levels are defined in
+`internal/session/event.go`:
+
+| Kind | Level | Recorded by, when |
+|---|---|---|
+| `created` | info | the daemon, when it creates the session row |
+| `started` | info | the worker, once the agent runs in its PTY |
+| `exited` | notice | the worker, when the agent exits with status 0 |
+| `killed` | info | the worker (or the daemon), when the agent stopped on request |
+| `failed` | action | the worker or daemon, when the session fails to start or the agent exits non-zero |
+| `worker_lost` | action | the daemon, when a worker died without recording an outcome |
+| `recovered` | info | a starting daemon, for each session whose worker kept running |
+| `bell` | action | the worker, when the program rings the bell |
+| `notification` | action | the worker, for a desktop notification (OSC 9, OSC 777); the summary is its text |
+| `idle` | notice (info while a client is attached) | the worker, when output stops for 10s after activity |
+| `working` | info | the worker, when output resumes after an idle event |
+| `stalled` | notice | the worker, after 30 minutes without output while a command other than the agent holds the PTY's foreground |
+| `acknowledged` | info | the daemon, when the user looked at the session (below) |
+
+Kinds travel as strings, so a client shows kinds newer than itself instead of failing to decode them.
+
+**Persistence.** Events are rows of the `events` table in `state.db`, written by the daemon and
+the workers. Ids come from `AUTOINCREMENT`, so they increase per runtime root and are never reused;
+because every write is an immediate transaction, ids are committed in order, and a reader that has
+seen id N never later finds a new event below N. An id is therefore a cursor. Each session keeps
+its newest 500 events, pruned in the transaction that inserts a new one, and removing a session
+removes its events, so the table is bounded by the sessions retained. A lifecycle change and its
+event are written in one transaction.
+
+**Attention.** A session record's `attention`, `attention_summary` and `attention_at` are the
+highest-level unacknowledged event since the user last looked, and that event's summary. An event
+raises the attention to its level unless something more urgent is pending (an equal level replaces
+the summary; info events never change it). Lifecycle endings (exited, killed, failed, worker lost)
+replace the attention instead, since an agent that has stopped is no longer waiting for whatever it
+asked. Acknowledging resets the attention to info and records an `acknowledged` event, if there was
+anything to clear. Attaching interactively (`attach`, or focusing a session in the picker)
+acknowledges, and so does detaching from a session that is still running: either way the user has
+seen its screen. An attachment that ends because the session ended does not, and output reaching
+an attached client does not either, since an attached terminal may be a background tab. An ended
+session's attention stays until it is removed.
+
+**Activity.** The worker also keeps the session's `activity` (`working`; `idle` after 10 seconds
+without output; `waiting` after a bell or notification, until someone types; `exited`), the name of
+the process in the PTY's foreground (`tcgetpgrp` on the master, sampled every second: the agent
+itself, or a command a shell runs there under job control), the terminal title, and when the program
+last wrote output. It writes them on transitions only, never per output chunk, and never bumps
+`updated_at`, so lists do not reshuffle as agents go idle and back. Elapsed time is derived from
+`created_at` and `exited_at`.
+
+**Detection.** Bells, desktop notifications (OSC 9 and OSC 777) and title changes come from
+libghostty's parser, through its effect callbacks, out of the `VTWrite` the worker already makes
+for each PTY read; the added cost per chunk is a clock read. The owner goroutine never touches the
+database for this: events and activity go to a recorder goroutine through a queue of at most 64
+events (dropped, and logged, while it is full) and a single activity slot (a newer snapshot
+replaces an unwritten one). Noise is bounded: a bell is recorded unless another was seen in the
+last 10 seconds with no input since, so a program ringing in a loop records one event; a repeated
+notification text likewise; a bell within 2 seconds of a notification is the same request; and
+idle events are at most one per 30 seconds. OSC 99 (kitty's notification protocol) is not parsed
+by libghostty and is not detected.
+
+**Events streams.** `SubscribeEvents{AfterID, SessionID, Tail}` opens an events stream: the daemon
+sends every retained event after `AfterID` (or, without it, the newest `Tail` events), then new
+ones as they are recorded, until the client closes the stream. Each subscriber is a cursor over the
+table: its handler reads at most 256 events after its cursor, writes them, and repeats, waiting
+once it has caught up. The daemon thus holds at most one batch per subscriber and never buffers for
+a slow one: a subscriber that stops reading blocks only its own handler, in a write, while events
+accumulate in the table (one that falls behind past the retention limit skips what was pruned).
+Workers write the table directly, so while anyone is subscribed the daemon polls the newest id
+(`sqlite_sequence`) every 250ms and wakes subscribers when it changes; events the daemon records
+itself wake them at once. A poll costs about 130µs (`BenchmarkLastEventID`, mostly opening the
+connection), under 0.1% of a core, and none is made without subscribers. `ListEvents{AfterID,
+SessionID, Limit}` is the one-shot form on the control stream (at most 1000 per answer).
+
+**Clients.** `agent events [SESSION] [--follow]` prints events or follows them; following keeps
+the id of the last event it handled and, when the stream ends (a daemon restart, a lost
+connection), subscribes again after it, so nothing is missed or repeated. `--notify` rings the bell
+and asks the user's terminal for a desktop notification (OSC 9, or OSC 777 on VTE terminals, foot
+and urxvt; passed through tmux) for action-level events, and `--exec CMD` runs a command per event
+with the event in `AGENTD_EVENT_*` variables: these are the task-level notifications, and they work
+the same against a remote host. `agent ls`, `agent status`, the picker and the Ctrl-Y overlay show
+attention and activity, and order live sessions needing action first.
 
 ## Creating a Session
 
@@ -359,7 +455,8 @@ sync them.
 
 For each session there are three kinds of state:
 
-- durable metadata in SQLite for status, working directory, attention, and exit state
+- durable metadata in SQLite for status, working directory, attention, activity, exit state, and
+  the session's events
 - terminal state and scrollback in the worker's `libghostty-vt` instance, written to
   `logs/<id>.log` (VT) and `logs/<id>.rendered.log` (plain) when the session ends
 - the worker's live PTY and output fan-out used by `attach` and `send-input`
@@ -595,7 +692,7 @@ The selected root contains:
 * `agentd.sock`
 * `agentd.lock` (held by the running daemon)
 * `agentd.pid` (informational)
-* `state.db` (schema v4; older versions are migrated forward, newer ones refused. Migrations
+* `state.db` (schema v5; older versions are migrated forward, newer ones refused. Migrations
   must be additive, because session workers keep writing to the file across daemon upgrades)
 * `sessions/` (one socket per live session)
 * `agentd.log` (output of a daemonized daemon)

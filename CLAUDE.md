@@ -448,6 +448,7 @@ agent artifacts
 agent artifact
 agent send-input
 agent status
+agent events
 agent kill
 agent rm
 agent daemon info | restart | upgrade
@@ -511,7 +512,7 @@ Document architectural decisions that would otherwise be difficult to infer from
 # Current state and next milestone
 
 Done:
-- The Go daemon and per-session workers, on protocol v1 and state schema v4.
+- The Go daemon and per-session workers, on protocol v1 and state schema v5.
 - Sessions survive client disconnects and daemon restarts.
 - Liveness is checked through the worker sockets, and a flock enforces a single daemon.
 - Attach fan-out and PTY input are bounded, and the runtime root is private to the user.
@@ -523,6 +524,7 @@ Done:
 - Git state and artifacts, read-only (`internal/repo`): a session records its base commit at creation; `GetGitState` (commits and changed files since the base, untracked included) and artifact streams (`diff`, `patch`, `history`, `history.vt`) in bounded chunks under flow control; `agent diff`, `agent artifacts`, `agent artifact`, and a git section in `agent status`, locally and over QUIC.
 - Session resumption: per-incarnation session UIDs (a reattach never lands on a recreated session), attach ids unique per incarnation, reattach replaces the lost attachment at once, lagging clients are resynced from an exact-boundary snapshot, every output/input buffer is bounded (ARCHITECTURE.md lists them), and lifecycle requests carry tokens so a remote CLI retries them safely after a lost connection.
 - The connection handshake (`Hello`/`Welcome`): version and capability negotiation, host description, and a control stream of tagged requests; stream roles are set by a stream's first frame.
+- Events and attention: workers read bells, OSC 9/777 notifications, idleness and the PTY's foreground process; lifecycle and attention events persist in `state.db` (resumable ids, bounded per session); attach acknowledges; events streams (`SubscribeEvents`) feed `agent events --follow [--notify|--exec]`, locally or remotely; `ls`, `status`, the picker and the overlay show attention and activity.
 
 - Host health (`agent hosts`), machine capabilities (`agent host info`), and placement hints (`agent --host auto new`).
 - Resource usage: workers and the daemon report their own (`GetSessionStats`/`GetDaemonStats`, `agent status --stats`, `agent daemon stats`), and `agentd bench sessions` measures sessions at scale (BENCHMARKS.md, "Sessions at scale").

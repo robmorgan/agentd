@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -230,7 +231,7 @@ func (a *app) commands() []*cobra.Command {
 		if err != nil {
 			return err
 		}
-		printSession(resp.Session)
+		printSession(os.Stdout, resp.Session, time.Now())
 		// The git section is extra: a daemon without it, or git failing,
 		// never fails the status.
 		if w, err := c.welcome(); err == nil && protocol.HasCapability(w.Capabilities, protocol.CapGitState) {
@@ -292,6 +293,36 @@ func (a *app) commands() []*cobra.Command {
 	artifact.Flags().StringVarP(&artifactOutput, "output", "o", "", "Write to FILE instead of stdout (only once complete)")
 	withValue(artifact, "output", "FILE")
 	cmds = append(cmds, annotate(artifact, "[OPTIONS] <SESSION_ID> <NAME>", "<SESSION_ID>\n<NAME>        diff, patch, history or history.vt (see `agent artifacts`)"))
+
+	var ev eventsOptions
+	events := a.command("events [SESSION]", "Show session events: lifecycle and attention", optionalArg, func(args []string) error {
+		return a.events(firstArg(args), ev)
+	})
+	events.Flags().BoolVarP(&ev.follow, "follow", "f", false, "Keep printing events as they happen")
+	events.Flags().IntVarP(&ev.lines, "lines", "n", 20, "How many past events to show first")
+	events.Flags().StringVar(&ev.level, "level", "", "Only events at or above this attention: info, notice or action")
+	events.Flags().BoolVar(&ev.json, "json", false, "Print one JSON object per event")
+	events.Flags().BoolVar(&ev.notify, "notify", false, "Ring the bell and post a desktop notification for action-level events")
+	events.Flags().StringVar(&ev.exec, "exec", "", "Run CMD with sh for each event, described in AGENTD_EVENT_* variables")
+	events.Flags().Func("after", "Start after event ID (from an earlier run) instead of with the newest events", func(v string) error {
+		id, err := strconv.ParseUint(v, 10, 64)
+		ev.after, ev.afterSet = id, true
+		return err
+	})
+	withValue(events, "lines", "N")
+	withValue(events, "level", "LEVEL")
+	withValue(events, "exec", "CMD")
+	withValue(events, "after", "ID")
+	events.Annotations = map[string]string{"after": `Examples:
+  agent events                     the last 20 events of every session
+  agent events fix-tests -f        follow one session
+  agent --host devbox events -f --notify
+                                   alert when a session on devbox needs you
+  agent events -f --level action --exec 'say "$AGENTD_EVENT_SESSION needs you"'
+
+--exec gets AGENTD_EVENT_ID, _HOST, _SESSION, _KIND, _ATTENTION, _SUMMARY and
+_TIME. Following reconnects by itself and resumes after the last event shown.`}
+	cmds = append(cmds, annotate(events, "[OPTIONS] [SESSION_ID]", "[SESSION_ID]"))
 
 	cmds = append(cmds, group("workspace", "Manage named working directories on the daemon's machine",
 		"Name directories on the daemon's machine, then start sessions in them\nwith `agent new --workspace NAME`.",
@@ -620,35 +651,52 @@ func formatBytes(n uint64) string {
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
-func printSession(s *session.Record) {
-	fmt.Printf("name: %s\n", s.SessionID)
+func printSession(w io.Writer, s *session.Record, now time.Time) {
+	p := func(format string, args ...any) { fmt.Fprintf(w, format, args...) }
+	p("name: %s\n", s.SessionID)
 	if s.UID != "" {
-		fmt.Printf("uid: %s\n", s.UID)
+		p("uid: %s\n", s.UID)
 	}
-	fmt.Printf("agent: %s\n", s.Agent)
+	p("agent: %s\n", s.Agent)
 	if s.Model != nil {
-		fmt.Printf("model: %s\n", *s.Model)
+		p("model: %s\n", *s.Model)
 	}
-	fmt.Printf("status: %s\n", s.Status)
-	fmt.Printf("attention: %s\n", s.Attention)
+	p("status: %s\n", s.Status)
+	p("elapsed: %s\n", elapsedLabel(s, now))
+	if s.Activity != session.ActivityUnknown {
+		p("activity: %s\n", activityText(s, now))
+	}
+	if s.Foreground != nil {
+		p("foreground: %s\n", escapeControls(*s.Foreground))
+	}
+	if s.Title != nil {
+		p("title: %s\n", escapeControls(*s.Title))
+	}
+	if s.LastOutputAt != nil {
+		p("last_output: %s ago\n", formatElapsed(int64(now.Sub(*s.LastOutputAt)/time.Second)))
+	}
+	p("attention: %s\n", s.Attention)
 	if s.AttentionSummary != nil {
-		fmt.Printf("attention_summary: %s\n", *s.AttentionSummary)
+		p("attention_summary: %s\n", escapeControls(*s.AttentionSummary))
 	}
-	fmt.Printf("cwd: %s\n", escapeControls(s.Cwd))
+	if s.AttentionAt != nil {
+		p("attention_since: %s ago\n", formatElapsed(max(int64(now.Sub(*s.AttentionAt)/time.Second), 0)))
+	}
+	p("cwd: %s\n", escapeControls(s.Cwd))
 	if s.Workspace != nil {
-		fmt.Printf("workspace: %s\n", escapeControls(*s.Workspace))
+		p("workspace: %s\n", escapeControls(*s.Workspace))
 	}
 	if s.WorkerPID != nil {
-		fmt.Printf("worker_pid: %d\n", *s.WorkerPID)
+		p("worker_pid: %d\n", *s.WorkerPID)
 	}
 	if s.AgentPID != nil {
-		fmt.Printf("agent_pid: %d\n", *s.AgentPID)
+		p("agent_pid: %d\n", *s.AgentPID)
 	}
 	if s.ExitCode != nil {
-		fmt.Printf("exit_code: %d\n", *s.ExitCode)
+		p("exit_code: %d\n", *s.ExitCode)
 	}
 	if s.Error != nil {
-		fmt.Printf("error: %s\n", *s.Error)
+		p("error: %s\n", escapeControls(*s.Error))
 	}
 }
 

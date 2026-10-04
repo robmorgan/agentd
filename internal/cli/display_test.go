@@ -154,3 +154,77 @@ func TestHeader(t *testing.T) {
 		t.Error("256 colours are not true colour")
 	}
 }
+
+// needing returns a session with pending attention raised ago before now.
+func needing(id string, status session.Status, level session.AttentionLevel, summary string, ago time.Duration) session.Record {
+	s := demoWith(id, status)
+	at := time.Now().Add(-ago)
+	s.Attention, s.AttentionSummary, s.AttentionAt = level, &summary, &at
+	return s
+}
+
+func TestOrderedSessionsPutLiveSessionsNeedingActionFirst(t *testing.T) {
+	older := needing("older-ask", session.StatusRunning, session.AttentionAction, "bell", 5*time.Minute)
+	newer := needing("newer-ask", session.StatusRunning, session.AttentionAction, "Approve?", time.Minute)
+	notice := needing("went-idle", session.StatusRunning, session.AttentionNotice, "idle", time.Minute)
+	working := demo("working")
+	failed := needing("failed", session.StatusFailed, session.AttentionAction, "exit 1", time.Minute)
+	finished := needing("finished", session.StatusExited, session.AttentionNotice, "finished", time.Minute)
+	seen := demoWith("seen", session.StatusExited)
+	var got []string
+	for _, s := range orderedSessions([]session.Record{seen, finished, failed, working, notice, older, newer}) {
+		got = append(got, s.SessionID)
+	}
+	if strings.Join(got, " ") != "newer-ask older-ask went-idle working failed finished seen" {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestActivityText(t *testing.T) {
+	now := time.Now()
+	s := demo("a")
+	if got := activityText(&s, now); got != "running" {
+		t.Fatalf("unknown activity: %q", got)
+	}
+	s.Activity = session.ActivityIdle
+	last := now.Add(-3 * time.Minute)
+	s.LastOutputAt = &last
+	if got := activityText(&s, now); got != "idle 3m" {
+		t.Fatalf("idle: %q", got)
+	}
+	s.Activity, s.AttentionAt = session.ActivityWaiting, &last
+	if got := activityText(&s, now); got != "waiting 3m" {
+		t.Fatalf("waiting: %q", got)
+	}
+	s.Activity = "something-new"
+	if got := activityText(&s, now); got != "something-new" {
+		t.Fatalf("unknown: %q", got)
+	}
+	e := demoWith("e", session.StatusExited)
+	e.Activity = session.ActivityWaiting
+	if got := activityText(&e, now); got != "exited" {
+		t.Fatalf("exited: %q", got)
+	}
+}
+
+func TestPrintSessionShowsActivityAndAttention(t *testing.T) {
+	s := needing("fix", session.StatusRunning, session.AttentionAction, "Claude needs your permission", 2*time.Minute)
+	now := s.AttentionAt.Add(2 * time.Minute)
+	s.CreatedAt = now.Add(-time.Hour)
+	fg, title := "claude", "✳ Fix tests"
+	s.Activity, s.Foreground, s.Title, s.LastOutputAt = session.ActivityWaiting, &fg, &title, s.AttentionAt
+	var b strings.Builder
+	printSession(&b, &s, now)
+	for _, want := range []string{"elapsed: 1h\n", "activity: waiting 2m\n", "foreground: claude\n", "title: ✳ Fix tests\n",
+		"attention: action\n", "attention_summary: Claude needs your permission\n", "attention_since: 2m ago\n"} {
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("missing %q in\n%s", want, b.String())
+		}
+	}
+	details := sessionDetails(&s, now)
+	for _, want := range []string{"activity   waiting 2m", "foreground claude", "attention  action: Claude needs your permission"} {
+		if !strings.Contains(details, want) {
+			t.Errorf("details lack %q:\n%s", want, details)
+		}
+	}
+}

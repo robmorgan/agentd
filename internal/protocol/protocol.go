@@ -64,6 +64,10 @@ type Request struct {
 	// Resource usage; see stats.go.
 	GetSessionStats *GetSessionStats
 	GetDaemonStats  *struct{}
+	// SubscribeEvents opens an events stream (CapEvents).
+	SubscribeEvents *SubscribeEvents
+	// ListEvents is a one-shot query of recorded events (CapEvents).
+	ListEvents *ListEvents
 }
 
 type SessionRef struct{ SessionID string }
@@ -155,6 +159,31 @@ type GetHistory struct {
 	VT        bool
 }
 
+// SubscribeEvents opens an events stream: the daemon sends recorded events
+// (see session.Event) as Event frames, first the backlog and then live, in
+// id order, until the client closes the stream.
+type SubscribeEvents struct {
+	// AfterID resumes after the event with this id: every retained event
+	// with a higher id is sent. Without it the stream starts with the
+	// newest Tail events.
+	AfterID *uint64
+	// SessionID limits the stream to one session's events.
+	SessionID *string
+	// Tail is how many past events to send first when AfterID is unset
+	// (0: only new ones).
+	Tail uint32
+}
+
+// ListEvents asks for recorded events, answered with Events, oldest first.
+type ListEvents struct {
+	// AfterID pages forward: the oldest Limit events after it. Without
+	// it, the newest Limit events.
+	AfterID   *uint64
+	SessionID *string
+	// Limit caps the answer (0: the daemon's default).
+	Limit uint32
+}
+
 // Response is the union of all responses. Exactly one field is set.
 type Response struct {
 	DaemonInfo     *DaemonInfo
@@ -185,6 +214,8 @@ type Response struct {
 	// on, and this replaces the screen. Like AttachSnapshot it is an exact
 	// boundary: the output that follows continues from it.
 	AttachResync *Bytes
+	Event        *session.Event
+	Events       *[]session.Event
 }
 
 type DaemonInfo struct {
@@ -252,9 +283,12 @@ const (
 	kAddWorkspaceRequest     kind = 17
 	kRemoveWorkspaceRequest  kind = 18
 	kHelloRequest            kind = 19
-	kGetGitStateRequest      kind = 30
-	kListArtifactsRequest    kind = 31
-	kGetArtifactRequest      kind = 32
+	// 20-29: session events (events.go in the daemon).
+	kSubscribeEventsRequest kind = 20
+	kListEventsRequest      kind = 21
+	kGetGitStateRequest     kind = 30
+	kListArtifactsRequest   kind = 31
+	kGetArtifactRequest     kind = 32
 	// 70-79: resource usage (stats.go).
 	kGetSessionStatsRequest kind = 70
 	kGetDaemonStatsRequest  kind = 71
@@ -277,9 +311,12 @@ const (
 	kWorkspacesResponse     kind = 116
 	kWorkspaceResponse      kind = 117
 	kWelcomeResponse        kind = 118
-	kGitStateResponse       kind = 130
-	kArtifactsResponse      kind = 131
-	kArtifactChunkResponse  kind = 132
+	// 120-129: session events.
+	kEventResponse         kind = 120
+	kEventsResponse        kind = 121
+	kGitStateResponse      kind = 130
+	kArtifactsResponse     kind = 131
+	kArtifactChunkResponse kind = 132
 	// 170-179: resource usage (stats.go).
 	kSessionStatsResponse kind = 170
 	kDaemonStatsResponse  kind = 171
@@ -610,6 +647,18 @@ func encodeRequest(req *Request, f Features) (kind, []byte, error) {
 		return kGetSessionStatsRequest, e.buf, e.err
 	case req.GetDaemonStats != nil:
 		return kGetDaemonStatsRequest, nil, nil
+	case req.SubscribeEvents != nil:
+		s := req.SubscribeEvents
+		e.optU64(s.AfterID)
+		e.optStr(s.SessionID)
+		e.u32(s.Tail)
+		return kSubscribeEventsRequest, e.buf, e.err
+	case req.ListEvents != nil:
+		l := req.ListEvents
+		e.optU64(l.AfterID)
+		e.optStr(l.SessionID)
+		e.u32(l.Limit)
+		return kListEventsRequest, e.buf, e.err
 	}
 	return 0, nil, errors.New("empty request")
 }
@@ -690,6 +739,10 @@ func decodeRequest(k kind, payload []byte, f Features) (*Request, error) {
 		req.GetSessionStats = &GetSessionStats{SessionID: d.str(), Snapshot: d.bool()}
 	case kGetDaemonStatsRequest:
 		req.GetDaemonStats = Empty
+	case kSubscribeEventsRequest:
+		req.SubscribeEvents = &SubscribeEvents{AfterID: d.optU64(), SessionID: d.optStr(), Tail: d.u32()}
+	case kListEventsRequest:
+		req.ListEvents = &ListEvents{AfterID: d.optU64(), SessionID: d.optStr(), Limit: d.u32()}
 	default:
 		return nil, fmt.Errorf("unexpected message kind `%d` while decoding request", k)
 	}
@@ -821,6 +874,15 @@ func encodeResponse(resp *Response, f Features) (kind, []byte, error) {
 	case resp.AttachResync != nil:
 		e.bytes(resp.AttachResync.Data)
 		return kAttachResyncResponse, e.buf, e.err
+	case resp.Event != nil:
+		e.event(resp.Event)
+		return kEventResponse, e.buf, e.err
+	case resp.Events != nil:
+		e.length(len(*resp.Events))
+		for i := range *resp.Events {
+			e.event(&(*resp.Events)[i])
+		}
+		return kEventsResponse, e.buf, e.err
 	}
 	return 0, nil, errors.New("empty response")
 }
@@ -921,6 +983,16 @@ func decodeResponse(k kind, payload []byte, f Features) (*Response, error) {
 		resp.DaemonStats = &DaemonStats{Daemon: d.processStats(), OpenStreams: d.u32()}
 	case kAttachResyncResponse:
 		resp.AttachResync = &Bytes{d.bytes()}
+	case kEventResponse:
+		ev := d.event()
+		resp.Event = &ev
+	case kEventsResponse:
+		n := d.length()
+		events := make([]session.Event, 0, d.capacity(n))
+		for i := 0; i < n && d.err == nil; i++ {
+			events = append(events, d.event())
+		}
+		resp.Events = &events
 	default:
 		return nil, fmt.Errorf("unexpected message kind `%d` while decoding response", k)
 	}
@@ -1099,6 +1171,13 @@ func (e *encoder) sessionRecord(s *session.Record) {
 	if e.f.Has(CapSessionUID) {
 		e.str(s.UID)
 	}
+	if e.f.Has(CapSessionActivity) {
+		e.str(string(s.Activity))
+		e.optStr(s.Foreground)
+		e.optStr(s.Title)
+		e.optDatetime(s.LastOutputAt)
+		e.optDatetime(s.AttentionAt)
+	}
 }
 
 // token writes a request token (CapRequestTokens).
@@ -1106,6 +1185,18 @@ func (e *encoder) token(t string) {
 	if e.f.Has(CapRequestTokens) {
 		e.str(t)
 	}
+}
+
+// event encodes an event. Its kind is a string, so kinds added later reach
+// older clients as text they can show rather than a value they cannot
+// decode.
+func (e *encoder) event(ev *session.Event) {
+	e.u64(ev.ID)
+	e.str(ev.SessionID)
+	e.datetime(ev.At)
+	e.str(string(ev.Kind))
+	e.attention(ev.Attention)
+	e.str(ev.Summary)
 }
 
 func (e *encoder) workspace(w *session.Workspace) {
@@ -1385,6 +1476,13 @@ func (d *decoder) sessionRecord() session.Record {
 	if d.f.Has(CapSessionUID) {
 		rec.UID = d.str()
 	}
+	if d.f.Has(CapSessionActivity) {
+		rec.Activity = session.Activity(d.str())
+		rec.Foreground = d.optStr()
+		rec.Title = d.optStr()
+		rec.LastOutputAt = d.optDatetime()
+		rec.AttentionAt = d.optDatetime()
+	}
 	return rec
 }
 
@@ -1394,6 +1492,13 @@ func (d *decoder) token() string {
 		return d.str()
 	}
 	return ""
+}
+
+func (d *decoder) event() session.Event {
+	return session.Event{
+		ID: d.u64(), SessionID: d.str(), At: d.datetime(), Kind: session.EventKind(d.str()),
+		Attention: d.attention(), Summary: d.str(),
+	}
 }
 
 func (d *decoder) workspace() session.Workspace {

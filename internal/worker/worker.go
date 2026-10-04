@@ -91,6 +91,8 @@ type runtime struct {
 	killed atomic.Bool
 	// startedAt is when the worker started, for its uptime in stats.
 	startedAt time.Time
+	// recorder writes events and activity to state.db (activity.go).
+	recorder *recorder
 }
 
 // terminateAgent asks the agent's whole process group to exit and escalates
@@ -220,6 +222,7 @@ func Run(args Args) error {
 		ended:     &endedSignal{ch: make(chan struct{})},
 		agentPID:  cmd.Process.Pid,
 		startedAt: startedAt,
+		recorder:  newRecorder(store, args.SessionID, os.Getpid()),
 	}
 
 	// The daemon stops a session by sending the worker SIGTERM.
@@ -242,6 +245,7 @@ func Run(args Args) error {
 		attachments: make(map[string]*ownerAttachment),
 		output:      newBroadcaster(),
 		input:       newPTYInput(ptmx),
+		activity:    newActivityTracker(rt.recorder, cmd.Process.Pid, time.Now()),
 	}
 
 	ownerDone := make(chan struct{})
@@ -253,6 +257,20 @@ func Run(args Args) error {
 	go func() {
 		pumpPty(ptmx, rt.owner)
 		close(pumpDone)
+	}()
+	// Drives activity detection (idleness, stalls, the foreground
+	// process) until the session ends.
+	go func() {
+		ticker := time.NewTicker(activityTick)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-rt.ended.ch:
+				return
+			case <-ticker.C:
+				rt.owner.post(func(s *ownerState) { s.tickActivity() })
+			}
+		}
 	}()
 	go func() {
 		err := cmd.Wait()
@@ -325,6 +343,9 @@ func (rt *runtime) onChildExited(s *ownerState, exitCode *int32) {
 	if err := os.WriteFile(rt.paths.LogPath(rt.sessionID), []byte(vt), 0o600); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to write VT history for %s: %v\n", rt.sessionID, err)
 	}
+	// Events the agent caused before exiting come before its end.
+	s.activity = nil
+	rt.recorder.close()
 	if err := rt.finalizeExit(exitCode); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to finalize %s: %v\n", rt.sessionID, err)
 	}
@@ -345,7 +366,10 @@ func (rt *runtime) finalizeExit(exitCode *int32) error {
 	if rec.Status == session.StatusFailed {
 		return nil
 	}
-	if rt.killed.Load() || (exitCode != nil && *exitCode == 0) {
+	if rt.killed.Load() {
+		return rt.db.MarkKilled(rt.sessionID, exitCode)
+	}
+	if exitCode != nil && *exitCode == 0 {
 		return rt.db.MarkExited(rt.sessionID, exitCode)
 	}
 	msg := "agent exited unexpectedly"

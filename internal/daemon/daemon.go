@@ -13,10 +13,13 @@
 //   - One handler per client connection: ends when its request is answered,
 //     or for attach when either side of the proxy closes. Shutdown closes
 //     every tracked connection, which unblocks all handlers.
-//   - One extra goroutine per attach proxy (client -> worker direction).
 //   - One git process per one-shot git request (bounded by its timeout) and
 //     per artifact stream, plus a goroutine that kills the latter at
 //     shutdown; both end with the stream (see artifacts.go).
+//   - One extra goroutine per attach proxy (client -> worker direction),
+//     and one per events stream reading the client's side until it closes.
+//   - The event feed (events.go): polls state.db for events written by
+//     workers while anyone is subscribed; ends at shutdown.
 //   - One supervisor per worker this daemon spawned: blocks in cmd.Wait, so
 //     workers are reaped, and records a failure if the worker died without
 //     recording its own outcome. It lives exactly as long as the worker; if
@@ -92,6 +95,9 @@ type Server struct {
 	// replays remembers the answers to tokened requests; see replay.go.
 	replays *replayCache
 
+	// events wakes events-stream subscribers when events are recorded.
+	events *eventFeed
+
 	shutdownOnce sync.Once
 	shutdown     chan struct{}
 
@@ -131,6 +137,7 @@ func New(p *paths.AppPaths, workerBin string) (*Server, error) {
 		lockWait:  defaultLockWait,
 		startedAt: time.Now(),
 		replays:   newReplayCache(),
+		events:    newEventFeed(store),
 		shutdown:  make(chan struct{}),
 		conns:     make(map[transport.Stream]struct{}),
 	}, nil
@@ -173,6 +180,13 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 
 	s.startRemote()
+
+	feedDone := make(chan struct{})
+	go func() {
+		defer close(feedDone)
+		s.events.run(s.shutdown)
+	}()
+	defer func() { <-feedDone }()
 
 	acceptDone := make(chan struct{})
 	go func() {
@@ -525,6 +539,8 @@ func (s *Server) handleRequest(conn transport.Stream, reader *bufio.Reader, req 
 			}
 			return s.serveArtifact(conn, req.GetArtifact)
 		}
+	case protocol.RoleEvents:
+		return s.serveEvents(conn, reader, req.SubscribeEvents)
 	}
 	resp, after := s.respond(req, protocol.Features{})
 	err := protocol.WriteResponse(conn, resp)
@@ -535,7 +551,7 @@ func (s *Server) handleRequest(conn transport.Stream, reader *bufio.Reader, req 
 }
 
 // respond answers a request that has a single response: every request but
-// Hello, AttachSession and GetArtifact. f is the features the client's stream agreed
+// Hello, AttachSession, GetArtifact and SubscribeEvents. f is the features the client's stream agreed
 // on. after, if set, runs once the response is written. It is safe to call
 // concurrently, as a control stream does.
 func (s *Server) respond(req *protocol.Request, f protocol.Features) (resp *protocol.Response, after func()) {
@@ -596,6 +612,14 @@ func (s *Server) respond(req *protocol.Request, f protocol.Features) (resp *prot
 		return protocol.ErrorResponsef("hello is only valid as the first request on a stream"), nil
 	case req.AttachSession != nil:
 		return protocol.ErrorResponsef("attach needs a stream of its own"), nil
+	case req.SubscribeEvents != nil:
+		return protocol.ErrorResponsef("an events subscription needs a stream of its own"), nil
+	case req.ListEvents != nil:
+		events, err := s.listEvents(req.ListEvents)
+		if err != nil {
+			return fail(err)
+		}
+		return &protocol.Response{Events: &events}, nil
 	case req.AttachSnapshot != nil:
 		return protocol.ErrorResponsef("attach snapshot requests are only valid during an active attach"), nil
 	case req.AttachInput != nil:

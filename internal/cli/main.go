@@ -31,6 +31,7 @@ Core flows:
   Inspect sessions     agent list
   Reconnect live PTY   agent attach <name>
   Review its work      agent diff <name>
+  Hear who needs you   agent events --follow --notify
   Run somewhere else   agent new --cwd ../wt/fix fix`
 
 const rootExamples = `Examples:

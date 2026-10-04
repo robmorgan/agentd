@@ -70,6 +70,24 @@ type Record struct {
 	// resolved from it at creation; later changes to the workspace do not
 	// move the session.
 	Workspace *string
+
+	// The fields below are reported by the session's worker as they
+	// change (see Activity), and travel only to clients that negotiated
+	// protocol.CapSessionActivity.
+
+	Activity Activity
+	// Foreground is the name of the process in the PTY's foreground (the
+	// agent itself, or a command it or a shell runs there).
+	Foreground *string
+	// Title is the terminal title the program last set (OSC 0/2). It is
+	// recorded along with activity changes, so it may lag behind.
+	Title *string
+	// LastOutputAt is when the program last wrote output, as of the last
+	// activity change.
+	LastOutputAt *time.Time
+	// AttentionAt is when the current attention was raised; nil when
+	// nothing is pending.
+	AttentionAt *time.Time
 }
 
 // Workspace names a directory on the daemon's machine, so clients can start
