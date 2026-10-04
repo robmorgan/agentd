@@ -3,12 +3,14 @@
 //
 //	agentd serve [--daemonize]   run the daemon (the agent CLI starts it)
 //	agentd upgrade               replace a running daemon with this binary
+//	agentd bench sessions ...    measure what sessions cost, on a private daemon
 //	agentd session-worker ...    one session's PTY owner (started by serve)
 package main
 
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -19,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/robmorgan/agentd/internal/bench"
 	"github.com/robmorgan/agentd/internal/config"
 	"github.com/robmorgan/agentd/internal/daemon"
 	"github.com/robmorgan/agentd/internal/paths"
@@ -44,6 +47,8 @@ func main() {
 		os.Exit(runUpgrade())
 	case "remote":
 		os.Exit(runRemote(os.Args[2:]))
+	case "bench":
+		os.Exit(runBench(os.Args[2:]))
 	case "session-worker":
 		os.Exit(runSessionWorker(os.Args[2:]))
 	default:
@@ -57,6 +62,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       agentd upgrade")
 	fmt.Fprintln(os.Stderr, "       agentd remote enable [ADDRESS] [--yes] | disable | status")
 	fmt.Fprintln(os.Stderr, "       agentd remote id | list | authorize FINGERPRINT [NAME] | revoke FINGERPRINT")
+	fmt.Fprintln(os.Stderr, "       agentd bench sessions [--count N] [--output-heavy N] [--attach K] [--duration D] [--fill-lines L] [--json] [--json-file F]")
 	fmt.Fprintln(os.Stderr, "       agentd session-worker --session-id ID --cwd DIR --created-at TS --agent-name NAME --command CMD [--model M] [--arg A]...")
 }
 
@@ -91,6 +97,68 @@ func runServe(argv []string) int {
 		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
 		return 1
 	}
+	return 0
+}
+
+// runBench runs `agentd bench sessions`, which measures what sessions cost
+// on a private daemon in a temporary root, never the user's.
+func runBench(argv []string) int {
+	if len(argv) == 0 || argv[0] != "sessions" {
+		usage()
+		return 2
+	}
+	fs := flag.NewFlagSet("bench sessions", flag.ContinueOnError)
+	var opts bench.Options
+	fs.IntVar(&opts.Count, "count", 10, "idle sessions to create")
+	fs.IntVar(&opts.OutputHeavy, "output-heavy", 0, "sessions that write output continuously")
+	fs.IntVar(&opts.Attach, "attach", 0, "clients to attach to one output-heavy session")
+	fs.DurationVar(&opts.Duration, "duration", 5*time.Second, "how long to measure idle CPU, throughput and fan-out")
+	fs.IntVar(&opts.FillLines, "fill-lines", 200_000, "lines printed by the full-scrollback session (0 skips it)")
+	fs.IntVar(&opts.Parallel, "parallel", 8, "requests in flight while creating and sampling sessions")
+	asJSON := fs.Bool("json", false, "print the report as JSON")
+	jsonFile := fs.String("json-file", "", "also write the report as JSON to this file")
+	quiet := fs.Bool("quiet", false, "do not print progress")
+	if err := fs.Parse(argv[1:]); err != nil {
+		return 2
+	}
+	if fs.NArg() > 0 {
+		usage()
+		return 2
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+		return 1
+	}
+	opts.Exe = exe
+	if !*quiet {
+		opts.Log = os.Stderr
+	}
+	// Ctrl-C stops the run; Run then stops everything it started.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	report, err := bench.Run(ctx, opts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agentd bench: %v\n", err)
+		return 1
+	}
+	data, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agentd bench: %v\n", err)
+		return 1
+	}
+	data = append(data, '\n')
+	if *jsonFile != "" {
+		if err := os.WriteFile(*jsonFile, data, 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "agentd bench: %v\n", err)
+			return 1
+		}
+	}
+	if *asJSON {
+		os.Stdout.Write(data)
+		return 0
+	}
+	report.Print(os.Stdout)
 	return 0
 }
 
