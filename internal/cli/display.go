@@ -20,6 +20,7 @@ const (
 	ansiInactive = "\x1b[90m"
 	ansiEmphasis = "\x1b[1m"
 	ansiDimText  = "\x1b[2m\x1b[90m"
+	ansiAction   = "\x1b[33m"
 )
 
 // runState is how a session is shown: its status, with creating shown as
@@ -52,17 +53,70 @@ type displayRow struct {
 	run            runState
 	age, name, cwd string
 	needsAttention bool
+	// attention is the session's pending attention, and summary its
+	// text when it is above info (else "").
+	attention session.AttentionLevel
+	summary   string
+	activity  string
 }
 
 func buildDisplayRow(s *session.Record, now time.Time) displayRow {
 	run := sessionRunState(s)
-	return displayRow{
+	row := displayRow{
 		run:            run,
 		age:            elapsedLabel(s, now),
 		name:           s.SessionID,
 		cwd:            displayCwd(s.Cwd, os.Getenv("HOME")),
 		needsAttention: run == runFailed || s.Attention == session.AttentionAction,
+		attention:      s.Attention,
+		activity:       activityText(s, now),
 	}
+	if s.Attention.Rank() > 0 && s.AttentionSummary != nil {
+		row.summary = escapeControls(strings.Join(strings.Fields(*s.AttentionSummary), " "))
+	}
+	return row
+}
+
+// activityText is what a session is doing, for lists: "working", "idle 5m"
+// (since its last output), "waiting", or for one that is not running its
+// state.
+func activityText(s *session.Record, now time.Time) string {
+	switch sessionRunState(s) {
+	case runStarting:
+		return "starting"
+	case runExited, runFailed, runRecovered:
+		return "exited"
+	}
+	switch s.Activity {
+	case session.ActivityUnknown:
+		return "running"
+	case session.ActivityIdle:
+		if s.LastOutputAt != nil {
+			return "idle " + formatElapsed(max(int64(now.Sub(*s.LastOutputAt)/time.Second), 0))
+		}
+	case session.ActivityWaiting:
+		if s.AttentionAt != nil {
+			return "waiting " + formatElapsed(max(int64(now.Sub(*s.AttentionAt)/time.Second), 0))
+		}
+	}
+	return escapeControls(string(s.Activity))
+}
+
+// rowIcon is the icon a list shows for a session: its run state, or a
+// warning sign for a live session that needs action.
+func rowIcon(row displayRow) (icon, style string) {
+	if row.attention == session.AttentionAction && (row.run == runRunning || row.run == runStarting) {
+		return "⚠", ansiAction
+	}
+	return runIcon(row.run), runStyle(row.run)
+}
+
+// styleSummary styles an attention summary: action stands out.
+func styleSummary(text string, a session.AttentionLevel) string {
+	if a == session.AttentionAction {
+		return ansiAction + text + ansiReset
+	}
+	return text
 }
 
 // displayCwd shortens a session cwd for list views by replacing the home
@@ -156,23 +210,37 @@ func formatElapsed(seconds int64) string {
 	return fmt.Sprintf("%dd", seconds/(60*60*24))
 }
 
-// sessionSortBucket orders sessions for every list: live ones first, then
-// failed or lost ones, then those asking for action, then finished ones.
+// sessionSortBucket orders sessions for every list: live ones needing
+// action first, then live ones with something to notice, the other live
+// ones, failed or lost ones, ended ones whose end is unseen (action, then
+// notice), and finished ones last. Ended sessions stay below live ones
+// even when they need action: only removing them clears it, and they
+// would otherwise crowd out the sessions the user can still act in.
 func sessionSortBucket(s *session.Record) int {
-	if s.Status == session.StatusCreating || s.Status == session.StatusRunning {
-		return 0
-	}
-	row := buildDisplayRow(s, time.Time{})
+	live := s.Status == session.StatusCreating || s.Status == session.StatusRunning
 	switch {
-	case row.run == runFailed || row.run == runRecovered:
-		return 2
-	case row.needsAttention:
+	case live:
+		return 2 - s.Attention.Rank()
+	case s.Status == session.StatusFailed || s.Status == session.StatusUnknownRecovered:
 		return 3
+	case s.Attention == session.AttentionAction:
+		return 4
+	case s.Attention == session.AttentionNotice:
+		return 5
 	}
-	return 4
+	return 6
 }
 
-// orderedSessions sorts by bucket, most recently updated first within one.
+// sortTime orders sessions within a bucket, newest first: when their
+// attention was raised, or else when they last changed.
+func sortTime(s *session.Record) time.Time {
+	if s.Attention.Rank() > 0 && s.AttentionAt != nil {
+		return *s.AttentionAt
+	}
+	return s.UpdatedAt
+}
+
+// orderedSessions sorts by bucket, most recent first within one.
 func orderedSessions(sessions []session.Record) []*session.Record {
 	out := make([]*session.Record, len(sessions))
 	for i := range sessions {
@@ -182,13 +250,13 @@ func orderedSessions(sessions []session.Record) []*session.Record {
 		if d := sessionSortBucket(a) - sessionSortBucket(b); d != 0 {
 			return d
 		}
-		return b.UpdatedAt.Compare(a.UpdatedAt)
+		return sortTime(b).Compare(sortTime(a))
 	})
 	return out
 }
 
 func sessionSearchText(s *session.Record) string {
-	return fmt.Sprintf("%s %s %s %s %s", s.SessionID, s.Agent, s.Cwd, s.Status, s.Attention)
+	return fmt.Sprintf("%s %s %s %s %s %s", s.SessionID, s.Agent, s.Cwd, s.Status, s.Attention, s.Activity)
 }
 
 func matchesQuery(haystack, query string) bool {

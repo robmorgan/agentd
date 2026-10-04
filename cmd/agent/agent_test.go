@@ -437,6 +437,13 @@ func TestRemoteAttachEndToEnd(t *testing.T) {
 	tm.expect(0, "attached to placed")
 	tm.write("\x1c")
 	tm.wait()
+	// Events come over QUIC too, named by host.
+	if out := e.mustRun("agent", "events", "dev/demo"); !strings.Contains(out, "dev/demo  info    created") {
+		t.Fatalf("remote events:\n%s", out)
+	}
+	follow := e.start("--host", "dev", "events", "--follow", "--lines", "0")
+	e.mustRun("agent", "--host", "dev", "send-input", "demo", `printf '\a'`+"\r")
+	follow.expect(0, "dev/demo  action  bell")
 
 	// Attach over QUIC with a host/session address.
 	tm = e.start("attach", "dev/demo")
@@ -625,5 +632,54 @@ func TestRemoteReattachRefusesARecreatedSession(t *testing.T) {
 	}
 	if out := e.mustRun("agent", "attachments", "demo"); strings.Contains(out, "attach-") {
 		t.Fatalf("the new session got an attachment:\n%s", out)
+	}
+}
+
+// A bell in a session reaches `agent events --follow --notify` (and the
+// user's terminal as a notification), shows in `agent ls` and `status`,
+// and attaching acknowledges it. Following survives a daemon restart.
+func TestEventsEndToEnd(t *testing.T) {
+	e := newEnv(t, "")
+	e.startAndDetach("demo")
+
+	follow := e.start("events", "demo", "--follow", "--notify")
+	m := follow.expect(0, "created")
+	m = follow.expect(m, "started")
+
+	// The shell echoes the command as typed; only running it rings.
+	e.mustRun("agent", "send-input", "demo", `printf '\a'`+"\r")
+	m = follow.expect(m, "action  bell          bell")
+	m = follow.expect(m, "\a\x1b]9;agentd: demo: bell")
+
+	ls := e.mustRun("agent", "ls")
+	if !strings.Contains(ls, "⚠") || !strings.Contains(ls, "waiting") || !strings.Contains(ls, "ATTENTION") {
+		t.Fatalf("ls:\n%s", ls)
+	}
+	status := e.mustRun("agent", "status", "demo")
+	for _, want := range []string{"attention: action", "attention_summary: bell", "activity: waiting", "elapsed: "} {
+		if !strings.Contains(status, want) {
+			t.Fatalf("status lacks %q:\n%s", want, status)
+		}
+	}
+	if out := e.mustRun("agent", "events", "--json", "--level", "action"); !strings.Contains(out, `"kind":"bell"`) || strings.Contains(out, `"kind":"created"`) {
+		t.Fatalf("events --json:\n%s", out)
+	}
+
+	// Looking at the session acknowledges it.
+	tm := e.start("attach", "demo")
+	tm.expect(0, "attached to demo")
+	tm.write("\x1c")
+	tm.wait()
+	m = follow.expect(m, "acknowledged")
+	if ls := e.mustRun("agent", "ls"); strings.Contains(ls, "⚠") {
+		t.Fatalf("ls after attach:\n%s", ls)
+	}
+
+	// The follower resumes after a restart without repeating anything.
+	e.mustRun("agent", "daemon", "restart")
+	m = follow.expect(m, "reconnecting")
+	m = follow.expect(m, "recovered")
+	if n := strings.Count(follow.output(), "  bell   "); n != 1 {
+		t.Fatalf("bell shown %d times:\n%s", n, follow.output())
 	}
 }

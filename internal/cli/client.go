@@ -650,6 +650,10 @@ func describeResponse(r *protocol.Response) string {
 		return "Artifacts"
 	case r.ArtifactChunk != nil:
 		return "ArtifactChunk"
+	case r.Event != nil:
+		return "Event"
+	case r.Events != nil:
+		return "Events"
 	}
 	return "unknown"
 }

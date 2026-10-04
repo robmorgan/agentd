@@ -30,6 +30,9 @@ type ownerState struct {
 	// (session stats).
 	outputBytes  uint64
 	outputChunks uint64
+	// activity tracks what the agent is doing; nil in tests that build
+	// an ownerState without a session.
+	activity *activityTracker
 }
 
 type ownerAttachment struct {
@@ -125,7 +128,23 @@ func (s *ownerState) hasLiveAttachTerminal() bool {
 
 // writeInput queues client input for the PTY; see ptyInput.
 func (s *ownerState) writeInput(data []byte) error {
-	return s.input.enqueue(data)
+	if err := s.input.enqueue(data); err != nil {
+		return err
+	}
+	if s.activity != nil {
+		s.activity.input(time.Now(), s.watched())
+	}
+	return nil
+}
+
+// watched reports whether an interactive client is attached.
+func (s *ownerState) watched() bool { return len(s.attachments) > 0 }
+
+// tickActivity checks idleness and samples the PTY's foreground process.
+func (s *ownerState) tickActivity() {
+	if s.activity != nil {
+		s.activity.tick(time.Now(), foregroundPGID(s.ptmx), s.watched())
+	}
 }
 
 // resize applies a client's geometry. A zero row or column count (a client
@@ -151,7 +170,14 @@ func (s *ownerState) resize(g protocol.Geometry) error {
 func (s *ownerState) publishOutput(data []byte) error {
 	s.outputBytes += uint64(len(data))
 	s.outputChunks++
-	writes := s.terminal.feed(data)
+	writes, effects := s.terminal.feed(data)
+	if s.activity != nil {
+		title := ""
+		if effects.titleChanged {
+			title = s.terminal.title()
+		}
+		s.activity.output(time.Now(), effects, title, s.watched())
+	}
 	if !s.hasLiveAttachTerminal() {
 		for _, response := range writes {
 			if err := s.input.enqueue(response); err != nil {

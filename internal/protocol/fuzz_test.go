@@ -28,6 +28,8 @@ func seedFrames(f *testing.F) {
 		{GetGitState: &SessionRef{"ab"}},
 		{GetArtifact: &GetArtifact{SessionID: "ab", Name: "diff"}},
 		{GetSessionStats: &GetSessionStats{SessionID: "ab", Snapshot: true}},
+		{SubscribeEvents: &SubscribeEvents{AfterID: u64p(7), SessionID: strp("ab"), Tail: 3}},
+		{ListEvents: &ListEvents{Limit: 5}},
 	}
 	resps := []*Response{
 		{Welcome: &Welcome{Version: 1, Capabilities: []string{CapControlStream}, Host: HostInfo{Agents: []string{"a"}}}},
@@ -42,6 +44,8 @@ func seedFrames(f *testing.F) {
 		{ArtifactChunk: &Bytes{Data: []byte("@@ -1 +1 @@")}},
 		{SessionStats: &SessionStats{SessionID: "ab", Worker: ProcessStats{PID: 1, RSSBytes: 2}, Snapshot: &SnapshotStats{Bytes: 3}}},
 		{DaemonStats: &DaemonStats{Daemon: ProcessStats{PID: 1}, OpenStreams: 2}},
+		{Event: &session.Event{ID: 9, SessionID: "ab", At: now, Kind: session.EventBell, Attention: session.AttentionAction, Summary: "bell"}},
+		{Events: &[]session.Event{{ID: 1, SessionID: "ab", At: now, Kind: "future-kind", Attention: session.AttentionInfo}}},
 	}
 	for _, r := range reqs {
 		var buf bytes.Buffer
@@ -57,6 +61,9 @@ func seedFrames(f *testing.F) {
 		f.Add(buf.Bytes())
 		buf.Reset()
 		WriteTaggedResponse(&buf, Features{}, 3, r)
+		f.Add(buf.Bytes())
+		buf.Reset()
+		WriteTaggedResponse(&buf, allFeatures(), 3, r)
 		f.Add(buf.Bytes())
 	}
 	var buf bytes.Buffer
@@ -90,25 +97,31 @@ func FuzzReadRequest(f *testing.F) {
 func FuzzReadResponse(f *testing.F) {
 	seedFrames(f)
 	f.Fuzz(func(t *testing.T, data []byte) {
-		resp, id, tagged, err := ReadTaggedResponse(bytes.NewReader(data), Features{})
-		if err != nil || resp == nil {
-			return
-		}
-		var buf bytes.Buffer
-		if tagged {
-			err = WriteTaggedResponse(&buf, Features{}, id, resp)
-		} else {
-			err = WriteResponse(&buf, resp)
-		}
-		if err != nil {
-			t.Fatalf("decoded response does not encode: %v (%#v)", err, resp)
-		}
-		again, id2, tagged2, err := ReadTaggedResponse(&buf, Features{})
-		if err != nil || id2 != id || tagged2 != tagged || !reflect.DeepEqual(again, resp) {
-			t.Fatalf("response round trip changed it:\n%#v\n%#v (%v)", resp, again, err)
+		// Responses are decoded both in the base encoding and with every
+		// optional field.
+		for _, features := range []Features{{}, allFeatures()} {
+			resp, id, tagged, err := ReadTaggedResponse(bytes.NewReader(data), features)
+			if err != nil || resp == nil {
+				continue
+			}
+			var buf bytes.Buffer
+			if tagged {
+				err = WriteTaggedResponse(&buf, features, id, resp)
+			} else {
+				err = WriteResponseWith(&buf, features, resp)
+			}
+			if err != nil {
+				t.Fatalf("decoded response does not encode: %v (%#v)", err, resp)
+			}
+			again, id2, tagged2, err := ReadTaggedResponse(&buf, features)
+			if err != nil || id2 != id || tagged2 != tagged || !reflect.DeepEqual(again, resp) {
+				t.Fatalf("response round trip changed it:\n%#v\n%#v (%v)", resp, again, err)
+			}
 		}
 	})
 }
+
+func allFeatures() Features { return NegotiateFeatures(Capabilities(), Capabilities()) }
 
 // FuzzReadIncoming covers the daemon's first read, which also accepts the
 // JSON management protocol.

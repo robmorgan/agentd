@@ -142,8 +142,15 @@ func (s *Server) reconcileSessions() error {
 		rec := &recs[i]
 		switch rec.Status {
 		case session.StatusRunning:
-			if _, err := s.refresh(rec); err != nil {
-				return err
+			switch state, _ := s.workerState(rec.SessionID); state {
+			case workerGone:
+				if err := s.db.MarkUnknownRecovered(rec.SessionID); err != nil {
+					return err
+				}
+			case workerLive:
+				if err := s.db.MarkRecovered(rec.SessionID); err != nil {
+					return err
+				}
 			}
 		case session.StatusCreating:
 			// The daemon that was creating it is gone. If its worker is
@@ -309,7 +316,9 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 	if err != nil {
 		return fail(err)
 	}
-	if err := s.waitWorkerReady(id, cmd, exited); err != nil {
+	err = s.waitWorkerReady(id, cmd, exited)
+	s.events.notify()
+	if err != nil {
 		return nil, err
 	}
 	return &session.CreateResult{
@@ -473,6 +482,7 @@ func (s *Server) killSession(id string, remove bool) (*protocol.KillSessionResul
 			return nil, err
 		}
 	}
+	s.events.notify()
 	return &protocol.KillSessionResult{Removed: remove, WasRunning: wasRunning}, nil
 }
 

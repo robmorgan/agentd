@@ -60,6 +60,9 @@ func TestCommandsParse(t *testing.T) {
 		{[]string{"--host", "dev", "diff", "--name-only", "demo"}, "agent diff", []string{"demo"}, map[string]string{"name-only": "true", "host": "dev"}},
 		{[]string{"artifacts", "demo"}, "agent artifacts", []string{"demo"}, nil},
 		{[]string{"artifact", "demo", "patch", "-o", "out.mbox"}, "agent artifact", []string{"demo", "patch"}, map[string]string{"output": "out.mbox"}},
+		{[]string{"events"}, "agent events", nil, map[string]string{"follow": "false", "lines": "20"}},
+		{[]string{"events", "dev/demo", "-f", "--json", "--notify", "--level", "action", "--exec", "echo hi", "-n", "5", "--after", "42"},
+			"agent events", []string{"dev/demo"}, map[string]string{"follow": "true", "json": "true", "notify": "true", "level": "action", "exec": "echo hi", "lines": "5"}},
 	} {
 		cmd, pos := parse(t, tc.args...)
 		if cmd.CommandPath() != tc.path || strings.Join(pos, " ") != strings.Join(tc.pos, " ") {

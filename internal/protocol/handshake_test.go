@@ -151,7 +151,7 @@ func TestStreamRoles(t *testing.T) {
 // A list's count comes off the wire; a frame claiming billions of elements
 // must fail on its missing bytes, not allocate room for them first.
 func TestLyingListCountsDoNotAllocate(t *testing.T) {
-	for _, k := range []kind{kSessionsResponse, kAttachmentsResponse, kWorkspacesResponse} {
+	for _, k := range []kind{kSessionsResponse, kAttachmentsResponse, kWorkspacesResponse, kEventsResponse} {
 		var buf bytes.Buffer
 		writeFrame(&buf, ProtocolVersion, uint16(k), []byte{0xff, 0xff, 0xff, 0xff})
 		allocs := testing.AllocsPerRun(1, func() {

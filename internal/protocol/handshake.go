@@ -25,6 +25,11 @@ import (
 //   - artifact: GetArtifact or GetHistory. One large transfer, kept off the
 //     control stream so it never delays small requests behind it, and off
 //     attachments so it never delays terminal traffic (artifact.go).
+//   - events: SubscribeEvents. A long-lived, server-to-client stream of
+//     session events (lifecycle and attention), in id order, until the
+//     client closes it. Events are persisted, so each subscriber is a
+//     cursor over state.db: the daemon holds at most one batch of events
+//     for it and never buffers for a slow one (see internal/daemon/events.go).
 //
 // Over QUIC every stream has its own flow control, so a stalled attachment
 // or a large transfer never blocks another stream on the same connection.
@@ -35,6 +40,7 @@ const (
 	RoleControl
 	RoleAttach
 	RoleArtifact
+	RoleEvents
 )
 
 func (r StreamRole) String() string {
@@ -45,6 +51,8 @@ func (r StreamRole) String() string {
 		return "attach"
 	case RoleArtifact:
 		return "artifact"
+	case RoleEvents:
+		return "events"
 	}
 	return "request"
 }
@@ -58,6 +66,8 @@ func (r *Request) Role() StreamRole {
 		return RoleAttach
 	case r.GetHistory != nil, r.GetArtifact != nil:
 		return RoleArtifact
+	case r.SubscribeEvents != nil:
+		return RoleEvents
 	}
 	return RoleRequest
 }
@@ -143,6 +153,13 @@ const (
 	// fresh snapshot that replaces the screen, when it had to drop output
 	// for this client because it fell behind.
 	CapAttachResync = "attach-resync"
+	// CapEvents: the daemon records session events and serves them on
+	// events streams (SubscribeEvents) and to ListEvents on the control
+	// stream.
+	CapEvents = "events"
+	// CapSessionActivity: session records carry the activity fields
+	// appended to them (session.Record.Activity onwards).
+	CapSessionActivity = "session-activity"
 )
 
 // MinProtocolVersion is the oldest protocol version this build speaks.
@@ -151,7 +168,8 @@ const MinProtocolVersion uint16 = 1
 
 // Capabilities is what this build supports.
 func Capabilities() []string {
-	return []string{CapControlStream, CapGitState, CapArtifacts, CapSessionUID, CapRequestTokens, CapAttachFeatures, CapAttachReplace, CapAttachResync, CapRuntimeStats}
+	return []string{CapControlStream, CapGitState, CapArtifacts, CapSessionUID, CapRequestTokens, CapAttachFeatures, CapAttachReplace, CapAttachResync, CapRuntimeStats,
+		CapEvents, CapSessionActivity}
 }
 
 // AttachCapabilities are the capabilities that apply to an attach stream,

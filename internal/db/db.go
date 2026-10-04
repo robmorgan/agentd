@@ -21,10 +21,10 @@ import (
 // CurrentSchemaVersion 2 added workspaces (the table and sessions.workspace),
 // 3 the git base a session started from (sessions.git_base and
 // git_base_branch), 4 session UIDs, create tokens and attach sequence
-// numbers. Changes must be additive, applied by migrate: session workers
-// open the database once at startup and keep writing to it across daemon
-// upgrades.
-const CurrentSchemaVersion = 4
+// numbers, 5 the events table and the sessions' live activity columns.
+// Changes must be additive, applied by migrate: session workers open the
+// database once at startup and keep writing to it across daemon upgrades.
+const CurrentSchemaVersion = 5
 
 // rfc3339 matches chrono's `to_rfc3339()` for UTC values (a `+00:00` offset,
 // fractional seconds only when non-zero), which is what the CLI parses.
@@ -79,8 +79,28 @@ ALTER TABLE sessions ADD COLUMN attach_seq INTEGER NOT NULL DEFAULT 0;
 UPDATE sessions SET uid = lower(hex(randomblob(16))) WHERE uid IS NULL;
 CREATE UNIQUE INDEX sessions_create_token ON sessions (create_token) WHERE create_token IS NOT NULL;`
 
+// Version 5: session events (see events.go) and the activity a session's
+// worker reports. Event ids come from AUTOINCREMENT, so an id is never
+// reused, even after the newest events are deleted with their session:
+// clients use ids as cursors.
+const migrateToV5 = `
+ALTER TABLE sessions ADD COLUMN activity TEXT;
+ALTER TABLE sessions ADD COLUMN foreground TEXT;
+ALTER TABLE sessions ADD COLUMN title TEXT;
+ALTER TABLE sessions ADD COLUMN last_output_at TEXT;
+ALTER TABLE sessions ADD COLUMN attention_at TEXT;
+CREATE TABLE events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    at TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    attention TEXT NOT NULL CHECK (attention IN ('info', 'notice', 'action')),
+    summary TEXT NOT NULL
+);
+CREATE INDEX events_by_session ON events (session_id, id);`
+
 // migrations[v] upgrades a database from version v+1 to v+2.
-var migrations = []string{migrateToV2, migrateToV3, migrateToV4}
+var migrations = []string{migrateToV2, migrateToV3, migrateToV4, migrateToV5}
 
 type Database struct {
 	path string
@@ -187,6 +207,46 @@ func (d *Database) exec(query string, args ...any) error {
 	return err
 }
 
+// tx runs fn in one write transaction.
+func (d *Database) tx(fn func(*sql.Tx) error) error {
+	conn, err := d.connect()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	tx, err := conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// transition applies one guarded UPDATE of a session row and, if it
+// changed the row, records ev in the same transaction, so a lifecycle
+// change and its event are never seen apart. It reports whether the row
+// changed.
+func (d *Database) transition(ev NewEvent, query string, args ...any) (bool, error) {
+	changed := false
+	err := d.tx(func(tx *sql.Tx) error {
+		res, err := tx.Exec(query, args...)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil || n == 0 {
+			return err
+		}
+		changed = true
+		_, err = insertEvent(tx, ev)
+		return err
+	})
+	return changed, err
+}
+
 // NewSession holds the columns known when a session row is first created.
 type NewSession struct {
 	SessionID string
@@ -221,6 +281,10 @@ var ErrCreateTokenUsed = errors.New("create token already used")
 // timestamp identifies this incarnation of the session: a worker passes it
 // back to MarkRunning, so a stale worker can never claim a newer session
 // that reused the name.
+// InsertSession creates a session row in `creating` and records its created
+// event. The returned creation timestamp identifies this incarnation of the
+// session: a worker passes it back to MarkRunning, so a stale worker can
+// never claim a newer session that reused the name.
 func (d *Database) InsertSession(s NewSession) (string, error) {
 	var model, workspace, gitBase, gitBranch, token any
 	if s.Model != nil {
@@ -239,12 +303,14 @@ func (d *Database) InsertSession(s NewSession) (string, error) {
 		s.UID = NewUID()
 	}
 	createdAt := now()
-	err := d.exec(`INSERT INTO sessions (
+	_, err := d.transition(NewEvent{SessionID: s.SessionID, Kind: session.EventCreated,
+		Summary: fmt.Sprintf("created: %s in %s", s.Agent, s.Cwd)},
+		`INSERT INTO sessions (
                 session_id, agent, model, mode, cwd, status, attention, attention_summary, created_at, updated_at,
                 workspace, git_base, git_base_branch, uid, create_token
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12, ?13, ?14)`,
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8, ?9, ?10, ?11, ?12, ?13)`,
 		s.SessionID, s.Agent, model, string(s.Mode), s.Cwd, string(session.StatusCreating),
-		string(session.AttentionInfo), s.SessionID, createdAt, workspace, gitBase, gitBranch, s.UID, token)
+		string(session.AttentionInfo), createdAt, workspace, gitBase, gitBranch, s.UID, token)
 	if err != nil && token != nil && strings.Contains(err.Error(), "sessions.create_token") {
 		return "", ErrCreateTokenUsed
 	}
@@ -315,102 +381,127 @@ var ErrNoSuchIncarnation = errors.New("session incarnation no longer exists")
 // daemon gave up on, or whose session was removed (and perhaps recreated
 // under the same name) meanwhile, cannot claim it.
 func (d *Database) MarkRunning(sessionID, createdAt string, workerPID, agentPID int) error {
-	conn, err := d.connect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	res, err := conn.Exec(`UPDATE sessions
+	changed, err := d.transition(NewEvent{SessionID: sessionID, Kind: session.EventStarted,
+		Summary: fmt.Sprintf("agent running (pid %d)", agentPID)},
+		`UPDATE sessions
              SET status = ?2, worker_pid = ?3, agent_pid = ?4,
-                 exit_code = NULL, error = NULL, attention = ?5, attention_summary = ?6,
-                 updated_at = ?7, exited_at = NULL
+                 exit_code = NULL, error = NULL, attention = ?5, attention_summary = NULL, attention_at = NULL,
+                 updated_at = ?6, exited_at = NULL, activity = ?7, last_output_at = NULL
              WHERE session_id = ?1 AND status = 'creating' AND created_at = ?8`,
 		sessionID, string(session.StatusRunning), workerPID, agentPID,
-		string(session.AttentionInfo), "running", now(), createdAt)
-	if err != nil {
-		return err
-	}
-	if n, err := res.RowsAffected(); err != nil {
-		return err
-	} else if n == 0 {
+		string(session.AttentionInfo), now(), string(session.ActivityWorking), createdAt)
+	if err == nil && !changed {
 		return ErrNotCreating
 	}
-	return nil
+	return err
+}
+
+// The transitions below end a session (or record that its fate is
+// unknown). Each replaces the session's attention with its own event's,
+// since the end supersedes whatever the agent asked for while it ran.
+
+// ending is a transition that ends a session. Its query sets the status
+// (?2), the attention (?3) and its summary (?4) and time (?5); set adds
+// columns and where adds conditions, with args numbered from ?6.
+type ending struct {
+	kind       session.EventKind
+	status     session.Status
+	summary    string
+	set, where string
+	args       []any
+}
+
+func (d *Database) end(sessionID string, e ending) error {
+	at := now()
+	level := e.kind.DefaultAttention()
+	query := `UPDATE sessions SET status = ?2, worker_pid = NULL, agent_pid = NULL,
+                 attention = ?3, attention_summary = ?4, attention_at = ?5, updated_at = ?5,
+                 activity = 'exited'` + e.set + " WHERE session_id = ?1" + e.where
+	_, err := d.transition(NewEvent{SessionID: sessionID, Kind: e.kind, Attention: level, Summary: e.summary},
+		query, append([]any{sessionID, string(e.status), string(level), e.summary, at}, e.args...)...)
+	return err
 }
 
 func (d *Database) MarkFailed(sessionID, errMsg string) error {
-	return d.exec(`UPDATE sessions
-             SET status = ?2, worker_pid = NULL, agent_pid = NULL, error = ?3,
-                 attention = ?4, attention_summary = ?3, updated_at = ?5
-             WHERE session_id = ?1`,
-		sessionID, string(session.StatusFailed), errMsg, string(session.AttentionAction), now())
+	return d.end(sessionID, ending{kind: session.EventFailed, status: session.StatusFailed, summary: errMsg, set: ", error = ?4"})
 }
 
+// MarkExited records that the agent exited on its own.
 func (d *Database) MarkExited(sessionID string, exitCode *int32) error {
+	return d.markExited(session.EventExited, sessionID, exitCode)
+}
+
+// MarkKilled records that the agent exited after a stop request.
+func (d *Database) MarkKilled(sessionID string, exitCode *int32) error {
+	return d.markExited(session.EventKilled, sessionID, exitCode)
+}
+
+func (d *Database) markExited(kind session.EventKind, sessionID string, exitCode *int32) error {
 	summary := "finished"
+	if kind == session.EventKilled {
+		summary = "stopped"
+	}
 	var code any
 	if exitCode != nil {
-		summary = fmt.Sprintf("finished (exit %d)", *exitCode)
+		summary = fmt.Sprintf("%s (exit %d)", summary, *exitCode)
 		code = *exitCode
 	}
-	return d.exec(`UPDATE sessions
-             SET status = ?2, worker_pid = NULL, agent_pid = NULL, exit_code = ?3,
-                 attention = ?4, attention_summary = ?5,
-                 updated_at = ?6, exited_at = ?6
-             WHERE session_id = ?1`,
-		sessionID, string(session.StatusExited), code,
-		string(session.AttentionNotice), summary, now())
+	return d.end(sessionID, ending{kind: kind, status: session.StatusExited, summary: summary,
+		set: ", exit_code = ?6, exited_at = ?5", args: []any{code}})
 }
 
 // MarkUnknownRecovered records that a running session's worker is gone. It
 // only applies to rows still marked running, so it never clobbers the final
 // state a worker wrote on its way out.
 func (d *Database) MarkUnknownRecovered(sessionID string) error {
-	return d.exec(`UPDATE sessions
-             SET status = ?2, worker_pid = NULL, agent_pid = NULL, attention = ?3,
-                 attention_summary = ?4, updated_at = ?5
-             WHERE session_id = ?1 AND status = 'running'`,
-		sessionID, string(session.StatusUnknownRecovered), string(session.AttentionAction),
-		"daemon lost the live process", now())
+	return d.end(sessionID, ending{kind: session.EventWorkerLost, status: session.StatusUnknownRecovered,
+		summary: "daemon lost the live process", where: " AND status = 'running'"})
 }
 
 // MarkFailedIfActive marks a creating or running session failed. The daemon
 // uses it when a worker dies without recording its own outcome.
 func (d *Database) MarkFailedIfActive(sessionID, errMsg string) error {
-	return d.exec(`UPDATE sessions
-             SET status = ?2, worker_pid = NULL, agent_pid = NULL, error = ?3,
-                 attention = ?4, attention_summary = ?3, updated_at = ?5
-             WHERE session_id = ?1 AND status IN ('creating', 'running')`,
-		sessionID, string(session.StatusFailed), errMsg, string(session.AttentionAction), now())
+	return d.end(sessionID, ending{kind: session.EventFailed, status: session.StatusFailed, summary: errMsg,
+		set: ", error = ?4", where: " AND status IN ('creating', 'running')"})
 }
 
 // MarkWorkerLost marks a running session failed when the given worker died
 // without recording an outcome. Keyed on the worker's pid, it never touches a
 // newer session that reused the name.
 func (d *Database) MarkWorkerLost(sessionID string, workerPID int, errMsg string) error {
-	return d.exec(`UPDATE sessions
-             SET status = ?3, worker_pid = NULL, agent_pid = NULL, error = ?4,
-                 attention = ?5, attention_summary = ?4, updated_at = ?6
-             WHERE session_id = ?1 AND worker_pid = ?2 AND status = 'running'`,
-		sessionID, workerPID, string(session.StatusFailed), errMsg, string(session.AttentionAction), now())
+	return d.end(sessionID, ending{kind: session.EventWorkerLost, status: session.StatusFailed, summary: errMsg,
+		set: ", error = ?4", where: " AND worker_pid = ?6 AND status = 'running'", args: []any{workerPID}})
 }
 
-// MarkExitedIfActive is MarkExited restricted to sessions that have not
-// already recorded an outcome.
+// MarkExitedIfActive records the end of a session the daemon stopped
+// itself (its worker did not record the outcome), unless one is recorded.
 func (d *Database) MarkExitedIfActive(sessionID string) error {
-	return d.exec(`UPDATE sessions
-             SET status = ?2, worker_pid = NULL, agent_pid = NULL,
-                 attention = ?3, attention_summary = ?4, updated_at = ?5, exited_at = ?5
-             WHERE session_id = ?1 AND status IN ('creating', 'running')`,
-		sessionID, string(session.StatusExited), string(session.AttentionNotice), "finished", now())
+	return d.end(sessionID, ending{kind: session.EventKilled, status: session.StatusExited, summary: "stopped",
+		set: ", exited_at = ?5", where: " AND status IN ('creating', 'running')"})
 }
 
+// MarkRecovered records that a starting daemon found the session's worker
+// still running.
+func (d *Database) MarkRecovered(sessionID string) error {
+	_, err := d.RecordEvent(NewEvent{SessionID: sessionID, Kind: session.EventRecovered,
+		Summary: "agentd restarted; the session kept running"})
+	return err
+}
+
+// DeleteSession removes a session and its events.
 func (d *Database) DeleteSession(sessionID string) error {
-	return d.exec("DELETE FROM sessions WHERE session_id = ?1", sessionID)
+	return d.tx(func(tx *sql.Tx) error {
+		if _, err := tx.Exec("DELETE FROM events WHERE session_id = ?1", sessionID); err != nil {
+			return err
+		}
+		_, err := tx.Exec("DELETE FROM sessions WHERE session_id = ?1", sessionID)
+		return err
+	})
 }
 
 const selectSession = `SELECT session_id, agent, model, mode, cwd, status, worker_pid, agent_pid, exit_code, error,
-        attention, attention_summary, created_at, updated_at, exited_at, workspace, uid
+        attention, attention_summary, created_at, updated_at, exited_at, workspace, uid,
+        activity, foreground, title, last_output_at, attention_at
  FROM sessions`
 
 // GetSession returns nil, nil when the session does not exist.
@@ -462,13 +553,26 @@ func scanSession(row scanner) (*session.Record, error) {
 		mode, status, attention           string
 		workerPID, agentPID, exitCode     sql.NullInt64
 		createdAt, updatedAt              string
+		activity, foreground, title       sql.NullString
+		lastOutputAt, attentionAt         sql.NullString
 	)
 	if err := row.Scan(&rec.SessionID, &rec.Agent, &model, &mode, &rec.Cwd, &status,
 		&workerPID, &agentPID, &exitCode, &errText, &attention, &summary, &createdAt, &updatedAt,
-		&exitedAt, &workspace, &uid); err != nil {
+		&exitedAt, &workspace, &uid, &activity, &foreground, &title, &lastOutputAt, &attentionAt); err != nil {
 		return nil, err
 	}
 	var err error
+	if rec.Activity, err = session.ParseActivity(activity.String); err != nil {
+		return nil, err
+	}
+	rec.Foreground = nullStr(foreground)
+	rec.Title = nullStr(title)
+	if rec.LastOutputAt, err = nullTime(lastOutputAt); err != nil {
+		return nil, err
+	}
+	if rec.AttentionAt, err = nullTime(attentionAt); err != nil {
+		return nil, err
+	}
 	if rec.Mode, err = session.ParseMode(mode); err != nil {
 		return nil, err
 	}
@@ -509,6 +613,14 @@ func scanSession(row scanner) (*session.Record, error) {
 		rec.ExitedAt = &t
 	}
 	return &rec, nil
+}
+
+func nullTime(v sql.NullString) (*time.Time, error) {
+	if !v.Valid {
+		return nil, nil
+	}
+	t, err := parseTime(v.String)
+	return &t, err
 }
 
 func nullStr(v sql.NullString) *string {

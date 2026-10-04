@@ -95,6 +95,12 @@ func exchange(worker transport.Stream, req *protocol.Request) (*protocol.Respons
 // the AttachSession request it is a plain byte pipe in both directions; the
 // worker speaks the attach stream directly to the client.
 //
+// Attaching acknowledges the session's attention, as does detaching from a
+// session that is still running: either way the user has seen its screen.
+// An attachment that ends because the session ended leaves the end's
+// attention in place, since a client may be attached in a terminal nobody
+// is looking at.
+//
 // Termination: when the client stops sending (detach or disconnect) the
 // worker side is half-closed so the worker drops the attachment and ends its
 // stream. When the worker's stream ends (detach, session end, worker exit)
@@ -113,6 +119,12 @@ func (s *Server) proxyAttach(client transport.Stream, clientReader *bufio.Reader
 	if err := protocol.WriteRequest(worker, &protocol.Request{AttachSession: req}); err != nil {
 		return protocol.WriteResponse(client, protocol.ErrorResponsef("session `%s` runtime: %v", req.SessionID, err))
 	}
+	s.acknowledge(req.SessionID, "seen: attached")
+	defer func() {
+		if rec, err := s.db.GetSession(req.SessionID); err == nil && rec != nil && rec.Status == session.StatusRunning {
+			s.acknowledge(req.SessionID, "seen: detached")
+		}
+	}()
 
 	clientDone := make(chan struct{})
 	go func() {
