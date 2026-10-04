@@ -143,7 +143,6 @@ func Run(args Args) error {
 	cmd.Env = append(os.Environ(),
 		"AGENTD_SESSION_ID="+args.SessionID,
 		"AGENTD_SESSION_NAME="+args.SessionID,
-		"AGENTD_SOCKET="+p.Socket,
 		"AGENTD_CWD="+args.Cwd,
 	)
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: defaultPtyRows, Cols: defaultPtyCols})

@@ -16,6 +16,13 @@ import (
 // ALPN identifies the agent protocol inside QUIC's TLS handshake.
 const ALPN = "agentd"
 
+// DeadPeerTimeout is how long a connection may go without hearing from its
+// peer before it is closed. A client that vanishes without closing (a laptop
+// lid shut, a network dropped) is noticed within this time, which ends its
+// attachments. Both peers advertise it and QUIC uses the smaller of the two,
+// so a daemon applies it to older clients too.
+const DeadPeerTimeout = 15 * time.Second
+
 // QUIC carries the agent protocol remotely: one QUIC connection per client,
 // one bidirectional QUIC stream per request or attach session. Each QUIC
 // stream is a Stream, so nothing above this package changes.
@@ -24,12 +31,13 @@ const ALPN = "agentd"
 // accepts client keys it has authorized, and a client only accepts the
 // daemon key it has pinned. Certificates are self-signed and never checked
 // against a CA.
-func quicConfig() *quic.Config {
+func quicConfig(idleTimeout time.Duration) *quic.Config {
 	return &quic.Config{
-		// Keep idle-but-open client connections (for example a long
-		// attach with no output) alive through NATs and firewalls.
-		KeepAlivePeriod: 15 * time.Second,
-		MaxIdleTimeout:  60 * time.Second,
+		// Keep idle-but-open connections (for example a long attach with
+		// no output) alive, through NATs and firewalls too. Pinging three
+		// times per idle timeout lets two pings be lost in a row.
+		KeepAlivePeriod: idleTimeout / 3,
+		MaxIdleTimeout:  idleTimeout,
 		// Start at QUIC's minimum datagram size, not quic-go's 1280 bytes:
 		// Tailscale's interface MTU is 1280 including the 28 bytes of IP and
 		// UDP headers, so a 1280-byte datagram with Don't Fragment set never
@@ -55,6 +63,9 @@ type QUICOptions struct {
 	// RecheckInterval is how often open connections are checked against
 	// Authorized; zero means every 5 seconds.
 	RecheckInterval time.Duration
+	// IdleTimeout is how long a connection may go without hearing from
+	// its client before it is closed; zero means DeadPeerTimeout.
+	IdleTimeout time.Duration
 }
 
 // QUICListener yields the streams clients open on their QUIC connections.
@@ -83,6 +94,9 @@ func ListenQUIC(addr string, id *Identity, opts QUICOptions) (*QUICListener, err
 	if opts.RecheckInterval <= 0 {
 		opts.RecheckInterval = 5 * time.Second
 	}
+	if opts.IdleTimeout <= 0 {
+		opts.IdleTimeout = DeadPeerTimeout
+	}
 	tlsConf := &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{id.cert},
@@ -107,7 +121,7 @@ func ListenQUIC(addr string, id *Identity, opts QUICOptions) (*QUICListener, err
 			return nil
 		},
 	}
-	l, err := quic.ListenAddr(addr, tlsConf, quicConfig())
+	l, err := quic.ListenAddr(addr, tlsConf, quicConfig(opts.IdleTimeout))
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen for QUIC on %s: %w", addr, err)
 	}
@@ -308,6 +322,33 @@ func IsKeyRefused(err error) bool {
 	return errors.As(err, &te) && te.Remote && te.ErrorCode.IsCryptoError()
 }
 
+// IsConnectionLost reports whether err means a QUIC connection, or an
+// attempt to make one, failed in a way that a later attempt may not: the
+// daemon went silent or unreachable, or closed the connection itself (to
+// restart, say). A client may connect again after it. A refused or changed
+// key, a protocol error, or this client closing the connection is not lost.
+func IsConnectionLost(err error) bool {
+	if err == nil || IsKeyRefused(err) {
+		return false
+	}
+	var (
+		idle      *quic.IdleTimeoutError
+		handshake *quic.HandshakeTimeoutError
+		reset     *quic.StatelessResetError
+		app       *quic.ApplicationError
+		netErr    net.Error
+	)
+	switch {
+	case errors.As(err, &idle), errors.As(err, &handshake), errors.As(err, &reset):
+		return true
+	case errors.As(err, &app):
+		return app.Remote
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &netErr):
+		return true
+	}
+	return false
+}
+
 // dialEach tries every address addr resolves to. With a pin it stops at the
 // first connection, or at a daemon presenting another key; without one
 // (pinned == "") it stops at the first daemon that presents a key, whether
@@ -369,7 +410,7 @@ func dialOne(ctx context.Context, addr string, id *Identity, pinned string) (*qu
 			return nil
 		},
 	}
-	conn, err := quic.DialAddr(ctx, addr, tlsConf, quicConfig())
+	conn, err := quic.DialAddr(ctx, addr, tlsConf, quicConfig(DeadPeerTimeout))
 	return conn, presented, err
 }
 

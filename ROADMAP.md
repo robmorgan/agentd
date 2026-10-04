@@ -632,8 +632,8 @@ The application must not depend on transport connection identity as session iden
 
 * [ ] Stable session IDs
 * [ ] Stable attachment semantics
-* [ ] Reattachment after complete connection loss
-* [ ] Snapshot on reattach
+* [x] Reattachment after complete connection loss
+* [x] Snapshot on reattach
 * [ ] Sequence/output position tracking if required
 * [ ] Duplicate/replayed request handling where necessary
 * [ ] Idempotency for lifecycle commands where useful

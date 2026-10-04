@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/robmorgan/agentd/internal/protocol"
 	"github.com/robmorgan/agentd/internal/session"
@@ -123,12 +125,15 @@ func (a *attachStream) stop() {
 }
 
 // connectAttach opens an attach stream. A session that has already ended
-// answers with SessionEnded instead.
-func (c *client) connectAttach(id string) (*attachStream, *protocol.Attached, *protocol.SessionEnded, error) {
-	s, err := c.open(context.Background())
+// answers with SessionEnded instead. Cancelling ctx abandons the attempt,
+// closing the stream if it was opened.
+func (c *client) connectAttach(ctx context.Context, id string) (*attachStream, *protocol.Attached, *protocol.SessionEnded, error) {
+	s, err := c.open(ctx)
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	stopWatch := context.AfterFunc(ctx, func() { s.Close() })
+	defer stopWatch()
 	cols, rows, pw, ph := terminalGeometry()
 	req := &protocol.Request{AttachSession: &protocol.AttachSession{
 		SessionID: id,
@@ -148,6 +153,9 @@ func (c *client) connectAttach(id string) (*attachStream, *protocol.Attached, *p
 	case resp == nil:
 		s.Close()
 		return nil, nil, nil, errors.New("agentd closed the connection")
+	case !stopWatch():
+		// ctx was cancelled after the answer arrived, closing s.
+		return nil, nil, nil, ctx.Err()
 	case resp.Attached != nil:
 		return startAttachStream(s, r), resp.Attached, nil, nil
 	case resp.SessionEnded != nil:
@@ -165,15 +173,23 @@ func (c *client) connectAttach(id string) (*attachStream, *protocol.Attached, *p
 // fed by three sources: stdin chunks (the process-wide reader), the attach
 // stream's frames, and SIGWINCH. Output is written to stdout as it
 // arrives; while stdout is slow, the loop, and with it input, waits.
+//
+// When the connection to a remote daemon is lost, the terminal stays in
+// raw mode while attachOnce reconnects and attaches to the same session
+// again, repainting the screen from the new snapshot; see reattach.
 func (c *client) attachOnce(id string, titled *bool) (attachResult, error) {
-	stream, attached, ended, err := c.connectAttach(id)
+	stream, attached, ended, err := c.connectAttach(context.Background(), id)
 	if err != nil {
 		return attachResult{}, err
 	}
 	if ended != nil {
 		return attachResult{outcome: outcomeEnded, ended: ended}, nil
 	}
-	defer stream.stop()
+	defer func() {
+		if stream != nil {
+			stream.stop()
+		}
+	}()
 
 	writeOut(terminalTitleBytes(id + " - " + attachExitTitle))
 	*titled = true
@@ -190,9 +206,31 @@ func (c *client) attachOnce(id string, titled *bool) (attachResult, error) {
 	signal.Notify(winch, syscall.SIGWINCH)
 	defer signal.Stop(winch)
 
-	writeOut(attachStartupBytes(attached.Snapshot))
 	keys := stdinChunks()
 	var parser attachParser
+	snapshot := attached.Snapshot
+	for {
+		writeOut(attachStartupBytes(snapshot))
+		res, err := c.runAttachment(id, stream, keys, &parser, winch)
+		if err == nil || c.host == nil || !transport.IsConnectionLost(err) {
+			return res, err
+		}
+		stream.stop()
+		stream = nil
+		var r *attachResult
+		stream, snapshot, r, err = c.reattach(id, keys, &parser, err)
+		if stream == nil {
+			return deref(r), err
+		}
+		// An overlay that was open when the connection dropped may have
+		// hidden the cursor.
+		writeOut([]byte("\x1b[?25h"))
+	}
+}
+
+// runAttachment runs one attach stream until it ends, the user detaches or
+// switches, or it fails.
+func (c *client) runAttachment(id string, stream *attachStream, keys <-chan []byte, parser *attachParser, winch <-chan os.Signal) (attachResult, error) {
 	var ov *overlay
 	redraw := false
 	for {
@@ -259,6 +297,113 @@ func (c *client) attachOnce(id string, titled *bool) (attachResult, error) {
 			}
 		}
 	}
+}
+
+// Reconnection backs off from the first retry up to the maximum, and keeps
+// trying until it succeeds, fails for good, or the user detaches. A laptop
+// that slept for hours reconnects when it wakes.
+const (
+	reconnectFirstRetry = 500 * time.Millisecond
+	reconnectMaxRetry   = 5 * time.Second
+)
+
+// reattach reconnects to the remote daemon after the connection was lost
+// (cause) and attaches to session id again. It shows a status line on the
+// bottom row, which the new snapshot paints over. Typed input is dropped
+// rather than sent late to an agent the user cannot see; only the detach
+// key acts, at any point. It gives up on errors a retry cannot fix: a
+// refused or changed key, a session that is gone, a protocol error.
+//
+// It returns the new stream and its snapshot, or with a nil stream, the
+// result or error that ends the attachment.
+func (c *client) reattach(id string, keys <-chan []byte, parser *attachParser, cause error) (*attachStream, []byte, *attachResult, error) {
+	detached := &attachResult{outcome: outcomeDetached}
+	delay := time.Duration(0)
+	for try := 1; ; try++ {
+		// The old connection is dead; the next stream dials a new one.
+		c.close()
+		writeOut(reconnectStatusBytes(c.host.Name, try, cause))
+
+		retry := make(chan struct{})
+		timer := time.AfterFunc(delay, func() { close(retry) })
+		if !waitUnlessDetached(retry, keys, parser) {
+			timer.Stop()
+			return nil, nil, detached, nil
+		}
+
+		// The attempt runs on its own goroutine so the detach key works
+		// while it waits; cancelling ctx ends it promptly, and it is
+		// always waited for, so none outlives reattach.
+		type attempt struct {
+			stream   *attachStream
+			attached *protocol.Attached
+			ended    *protocol.SessionEnded
+			err      error
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan attempt, 1)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			var a attempt
+			a.stream, a.attached, a.ended, a.err = c.connectAttach(ctx, id)
+			result <- a
+		}()
+		finished := waitUnlessDetached(done, keys, parser)
+		cancel()
+		a := <-result
+		switch {
+		case !finished:
+			if a.stream != nil {
+				a.stream.stop()
+			}
+			return nil, nil, detached, nil
+		case a.err == nil && a.ended != nil:
+			return nil, nil, &attachResult{outcome: outcomeEnded, ended: a.ended}, nil
+		case a.err == nil:
+			return a.stream, a.attached.Snapshot, nil, nil
+		case !transport.IsConnectionLost(a.err):
+			return nil, nil, nil, a.err
+		}
+		cause = a.err
+		delay = min(max(2*delay, reconnectFirstRetry), reconnectMaxRetry)
+	}
+}
+
+// waitUnlessDetached waits until done fires, dropping typed input. It
+// returns false if the user pressed the detach key first, or stdin ended.
+func waitUnlessDetached(done <-chan struct{}, keys <-chan []byte, parser *attachParser) bool {
+	for {
+		select {
+		case <-done:
+			return true
+		case chunk, ok := <-keys:
+			if !ok {
+				return false
+			}
+			for _, action := range parser.push(chunk) {
+				if action.kind == actionDetach {
+					return false
+				}
+			}
+		}
+	}
+}
+
+// reconnectStatusBytes draws the reconnect status on the bottom row,
+// leaving the cursor where it was.
+func reconnectStatusBytes(host string, try int, cause error) []byte {
+	cols, rows, _, _ := terminalGeometry()
+	msg := fmt.Sprintf("connection to %s lost, reconnecting", host)
+	if try > 1 {
+		msg += fmt.Sprintf(" (attempt %d)", try)
+	}
+	msg += fmt.Sprintf(": %v. Ctrl-\\ detaches", cause)
+	line := []rune(" " + strings.Join(strings.Fields(msg), " ") + " ")
+	if cols > 0 && len(line) > int(cols) {
+		line = line[:cols]
+	}
+	return []byte(fmt.Sprintf("\x1b7\x1b[%d;1H\x1b[2K\x1b[7m%s\x1b[0m\x1b8", rows, string(line)))
 }
 
 func deref(r *attachResult) attachResult {

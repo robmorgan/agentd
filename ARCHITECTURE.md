@@ -75,8 +75,8 @@ Two transports exist:
 * **Unix socket** (`agentd.sock`): local clients, always on.
 * **QUIC** (off unless `[remote] listen` is set): remote clients. Each client holds one QUIC
   connection and opens one bidirectional QUIC stream per request or attachment, so long-lived
-  attachments and short requests are multiplexed without blocking each other. Keep-alives hold
-  idle connections open, and each connection may have at most 256 streams. The daemon's first
+  attachments and short requests are multiplexed without blocking each other. Both peers ping
+  every 5 seconds to hold idle connections open, and each connection may have at most 256 streams. The daemon's first
   datagrams are 1200 bytes, QUIC's minimum, rather than quic-go's default 1280: Tailscale's
   interface MTU is 1280 including IP and UDP headers, so larger ones never leave it and the
   handshake times out. Path MTU discovery raises the size afterwards where the path allows.
@@ -124,8 +124,24 @@ previous setting is restored. A daemon whose listen address cannot be bound, or 
 stops, keeps local service and binds again every 5 seconds until shutdown, reporting the reason in
 its management status.
 
-A client that disappears without closing (a laptop lid, a lost network) is noticed by the daemon's
-60-second idle timeout; until then its attachment is still listed. The session is unaffected.
+A client that disappears without closing (a laptop lid, a lost network) is noticed once the daemon
+has heard nothing from it for 15 seconds (`transport.DeadPeerTimeout`); until then its attachment
+is still listed. Closing the connection ends its attachments; the session is unaffected. QUIC uses
+the smaller of the two peers' idle timeouts, so this holds for older clients too. Both ends notice a
+silent peer this way, so an outage longer than that ends the attachment even if the network comes
+back.
+
+The CLI hides that: when an attach stream fails because its connection was lost
+(`transport.IsConnectionLost`: an idle or handshake timeout, an unreachable network, or the daemon
+closing the connection, say to restart), it stays in raw mode, dials a new connection and attaches
+to the same session again, then repaints from the new snapshot. Session identity never depended on
+the connection, so nothing on the daemon is resumed: the old attachment is simply dropped when the
+daemon notices it. Retries back off from 0.5 to 5 seconds and continue until they succeed or fail
+for a reason a retry cannot fix (a refused or changed key, a session that is gone, a protocol
+error). Meanwhile the bottom row shows the status, and typed input is dropped rather than delivered
+late; only the detach key acts. Output written while disconnected is not replayed; the snapshot
+shows the screen as it is now. Local attachments do not reconnect: the Unix socket only fails when
+the daemon itself goes away.
 
 The daemon's tests run full sessions over QUIC, and over a TCP stand-in, to keep the seam honest.
 
@@ -187,7 +203,9 @@ When you create a session (`agent new [--cwd DIR] [NAME]`), the daemon:
 4. Waits for the worker to report the session running and bind its socket.
 
 The worker spawns the configured agent inside a PTY in `cwd`, with `AGENTD_SESSION_ID`,
-`AGENTD_SOCKET` and `AGENTD_CWD` injected.
+`AGENTD_SESSION_NAME` and `AGENTD_CWD` injected. The daemon socket is deliberately not passed in.
+That is not a boundary: agents run as the socket owner and can still find the socket at its
+well-known path, so isolating them needs a sandbox around the agent process.
 
 The daemon does not manage git worktrees or branches. That responsibility sits with whatever starts
 the session (the user, a wrapper, a skill, or the agent itself); the README shows the worktree

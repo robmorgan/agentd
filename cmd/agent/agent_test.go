@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -393,4 +394,50 @@ func TestRemoteAttachEndToEnd(t *testing.T) {
 	tm.expect(m, "over-quic")
 	tm.write("\x1c")
 	tm.wait()
+}
+
+// A remote attachment survives the daemon going away: the CLI shows that it
+// is reconnecting, attaches to the same session again when the daemon is
+// back, and the detach key still works while it waits.
+func TestRemoteAttachReconnects(t *testing.T) {
+	// A fixed port, so the restarted daemon listens where the host points.
+	probe, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := probe.LocalAddr().String()
+	probe.Close()
+	e := newEnv(t, "\n[remote]\nlisten = \""+addr+"\"\n")
+	e.startAndDetach("demo")
+	e.mustRun("agent", "host", "add", "dev", addr, "--fingerprint", strings.TrimSpace(e.mustRun("agentd", "remote", "id")))
+	e.mustRun("agentd", "remote", "authorize", strings.TrimSpace(e.mustRun("agent", "remote", "id")), "test")
+
+	tm := e.start("attach", "dev/demo")
+	m := tm.expect(0, "attached to demo")
+	tm.write("export N=before; echo $N-1\r")
+	m = tm.expect(m, "before-1")
+
+	e.mustRun("agent", "daemon", "restart")
+	m = tm.expect(m, "connection to dev lost, reconnecting")
+	// The session's screen is repainted, and input reaches it again.
+	m = tm.expect(m, "before-1")
+	tm.write("echo $N-2\r")
+	m = tm.expect(m, "before-2")
+
+	// With the daemon gone for good, the CLI keeps retrying until the user
+	// detaches.
+	s, err := transport.DialUnix(paths.FromRoot(e.root).Socket, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetDeadline(time.Now().Add(5 * time.Second))
+	protocol.WriteManagementRequest(s, &protocol.ManagementRequest{Shutdown: &protocol.ManagementShutdown{Force: true}})
+	protocol.ReadManagementResponse(s)
+	s.Close()
+	m = tm.expect(m, "connection to dev lost, reconnecting")
+	tm.expect(m, "(attempt 2)")
+	tm.write("\x1c")
+	tm.wait()
+	// Start the daemon again so cleanup can stop the session.
+	e.mustRun("agent", "ls")
 }

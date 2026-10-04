@@ -509,16 +509,16 @@ Done:
 - The daemon's QUIC listener (off unless `[remote] listen` is set): one QUIC stream per request or attachment, mutual TLS with pinned Ed25519 keys, managed with `agentd remote id|list|authorize|revoke`.
 - `agentd remote enable [ADDRESS] | disable | status`: detects a Tailscale address (or asks about the default-route one), edits `[remote] listen`, restarts the daemon; an unbindable listen address is retried in the background.
 - The CLI's QUIC client: `agent --host NAME` and `NAME/session` addresses, `agent host add|ls|rm` (confirm-on-first-use key pinning in `hosts.toml`), and `agent remote id` (`remote/client.key`).
+- Dead remote clients are noticed within 15s, and a remote attachment that loses its connection reconnects and reattaches by itself.
 
 Next:
-1. Automatic reattach after a network drop, and noticing dead clients faster than the 60s idle timeout.
-2. Cross-host discovery (`agent ls` across hosts) and host health.
-3. Per-client permissions and audit, if remote peers need to be limited.
+1. Cross-host discovery (`agent ls` across hosts) and host health.
+2. Per-client permissions and audit, if remote peers need to be limited.
 
 Known gaps:
 - History is only saved when a session exits.
 - A lagging attach client loses output until the program repaints. The fix is an unsolicited snapshot resync, which needs CLI support.
-- Agents receive `AGENTD_SOCKET` and are trusted peers of the daemon.
+- Agents are not sandboxed: they run as the daemon's user and can reach its socket, although `AGENTD_SOCKET` is no longer injected.
 
 Do not begin QUIC before the transport split: the session and ownership model has to be clean first.
 
