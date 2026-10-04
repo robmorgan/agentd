@@ -24,6 +24,8 @@ func seedFrames(f *testing.F) {
 		{AttachSession: &AttachSession{SessionID: "ab", Kind: session.AttachmentAttach, Geometry: Geometry{80, 24, 0, 0}}},
 		{SendInput: &SendInput{SessionID: "ab", Data: []byte("hi\r")}},
 		{ListSessions: Empty},
+		{GetGitState: &SessionRef{"ab"}},
+		{GetArtifact: &GetArtifact{SessionID: "ab", Name: "diff"}},
 	}
 	resps := []*Response{
 		{Welcome: &Welcome{Version: 1, Capabilities: []string{CapControlStream}, Host: HostInfo{Agents: []string{"a"}}}},
@@ -31,6 +33,9 @@ func seedFrames(f *testing.F) {
 		{Attached: &Attached{AttachID: "attach-1", Snapshot: []byte("\x1b[H")}},
 		{Attachments: &[]session.AttachmentRecord{{AttachID: "a", SessionID: "b", Kind: session.AttachmentTui, ConnectedAt: now}}},
 		ErrorResponsef("no"),
+		{GitState: sampleGitState()},
+		{Artifacts: &[]session.Artifact{{Name: "diff", Kind: "diff", Size: u64p(9)}}},
+		{ArtifactChunk: &Bytes{Data: []byte("@@ -1 +1 @@")}},
 	}
 	for _, r := range reqs {
 		var buf bytes.Buffer

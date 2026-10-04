@@ -16,10 +16,12 @@ import (
 	"github.com/robmorgan/agentd/internal/session"
 )
 
-// CurrentSchemaVersion 2 added workspaces (the table and sessions.workspace).
-// Changes must be additive, applied by migrate: session workers open the
-// database once at startup and keep writing to it across daemon upgrades.
-const CurrentSchemaVersion = 2
+// CurrentSchemaVersion 2 added workspaces (the table and sessions.workspace),
+// 3 the git base a session started from (sessions.git_base and
+// git_base_branch). Changes must be additive, applied by migrate: session
+// workers open the database once at startup and keep writing to it across
+// daemon upgrades.
+const CurrentSchemaVersion = 3
 
 // rfc3339 matches chrono's `to_rfc3339()` for UTC values (a `+00:00` offset,
 // fractional seconds only when non-zero), which is what the CLI parses.
@@ -55,8 +57,15 @@ CREATE TABLE workspaces (
     created_at TEXT NOT NULL
 );`
 
+// Version 3: the commit and branch HEAD pointed at when a session started in
+// a git repository, so what the agent produced can be measured from there.
+// NULL for sessions created elsewhere or before this version.
+const migrateToV3 = `
+ALTER TABLE sessions ADD COLUMN git_base TEXT;
+ALTER TABLE sessions ADD COLUMN git_base_branch TEXT;`
+
 // migrations[v] upgrades a database from version v+1 to v+2.
-var migrations = []string{migrateToV2}
+var migrations = []string{migrateToV2, migrateToV3}
 
 type Database struct {
 	path string
@@ -171,6 +180,9 @@ type NewSession struct {
 	Mode      session.Mode
 	Cwd       string
 	Workspace *string
+	// GitBase and GitBaseBranch record the repository's HEAD commit and
+	// branch when the session starts in one; empty otherwise.
+	GitBase, GitBaseBranch string
 }
 
 // InsertSession creates a session row in `creating`. The returned creation
@@ -178,20 +190,43 @@ type NewSession struct {
 // back to MarkRunning, so a stale worker can never claim a newer session
 // that reused the name.
 func (d *Database) InsertSession(s NewSession) (string, error) {
-	var model, workspace any
+	var model, workspace, gitBase, gitBranch any
 	if s.Model != nil {
 		model = *s.Model
 	}
 	if s.Workspace != nil {
 		workspace = *s.Workspace
 	}
+	if s.GitBase != "" {
+		gitBase, gitBranch = s.GitBase, s.GitBaseBranch
+	}
 	createdAt := now()
 	return createdAt, d.exec(`INSERT INTO sessions (
                 session_id, agent, model, mode, cwd, status, attention, attention_summary, created_at, updated_at,
-                workspace
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)`,
+                workspace, git_base, git_base_branch
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12)`,
 		s.SessionID, s.Agent, model, string(s.Mode), s.Cwd, string(session.StatusCreating),
-		string(session.AttentionInfo), s.SessionID, createdAt, workspace)
+		string(session.AttentionInfo), s.SessionID, createdAt, workspace, gitBase, gitBranch)
+}
+
+// GitBase returns the commit and branch a session recorded when it started
+// in a git repository: empty strings if it recorded none, and ok false if
+// the session does not exist.
+func (d *Database) GitBase(sessionID string) (commit, branch string, ok bool, err error) {
+	conn, err := d.connect()
+	if err != nil {
+		return "", "", false, err
+	}
+	defer conn.Close()
+	var c, b sql.NullString
+	err = conn.QueryRow("SELECT git_base, git_base_branch FROM sessions WHERE session_id = ?1", sessionID).Scan(&c, &b)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	return c.String, b.String, true, nil
 }
 
 // MarkRunning records that a worker has its agent running. It only applies

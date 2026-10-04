@@ -13,6 +13,7 @@ import (
 
 	"github.com/robmorgan/agentd/internal/db"
 	"github.com/robmorgan/agentd/internal/protocol"
+	"github.com/robmorgan/agentd/internal/repo"
 	"github.com/robmorgan/agentd/internal/session"
 	"github.com/robmorgan/agentd/internal/transport"
 )
@@ -155,7 +156,7 @@ func (s *Server) reconcileSessions() error {
 	return nil
 }
 
-func (s *Server) allocateSession(name *string, agent string, model *string, cwd string, workspace *string) (id, createdAt string, err error) {
+func (s *Server) allocateSession(name *string, agent string, model *string, cwd string, workspace *string, base repo.Base) (id, createdAt string, err error) {
 	s.createMu.Lock()
 	defer s.createMu.Unlock()
 
@@ -185,6 +186,7 @@ func (s *Server) allocateSession(name *string, agent string, model *string, cwd 
 	}
 	createdAt, err = s.db.InsertSession(db.NewSession{
 		SessionID: id, Agent: agent, Model: model, Mode: session.ModeExecute, Cwd: cwd, Workspace: workspace,
+		GitBase: base.Commit, GitBaseBranch: base.Branch,
 	})
 	return id, createdAt, err
 }
@@ -230,7 +232,10 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 		return nil, err
 	}
 
-	id, createdAt, err := s.allocateSession(name, req.Agent, req.Model, cwd, workspace)
+	// What the agent produces is measured from the repository's HEAD now.
+	// The daemon only reads it; it never creates branches or worktrees.
+	base := probeBase(cwd)
+	id, createdAt, err := s.allocateSession(name, req.Agent, req.Model, cwd, workspace, base)
 	if err != nil {
 		return nil, err
 	}

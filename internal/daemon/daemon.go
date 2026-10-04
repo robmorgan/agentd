@@ -14,6 +14,9 @@
 //     or for attach when either side of the proxy closes. Shutdown closes
 //     every tracked connection, which unblocks all handlers.
 //   - One extra goroutine per attach proxy (client -> worker direction).
+//   - One git process per one-shot git request (bounded by its timeout) and
+//     per artifact stream, plus a goroutine that kills the latter at
+//     shutdown; both end with the stream (see artifacts.go).
 //   - One supervisor per worker this daemon spawned: blocks in cmd.Wait, so
 //     workers are reaped, and records a failure if the worker died without
 //     recording its own outcome. It lives exactly as long as the worker; if
@@ -503,6 +506,13 @@ func (s *Server) handleRequest(conn transport.Stream, reader *bufio.Reader, req 
 			return protocol.WriteResponse(conn, protocol.ErrorResponsef("session `%s` not found", id))
 		}
 		return s.proxyAttach(conn, reader, req.AttachSession)
+	case protocol.RoleArtifact:
+		if req.GetArtifact != nil {
+			if id := req.GetArtifact.SessionID; !session.ValidName(id) {
+				return protocol.WriteResponse(conn, protocol.ErrorResponsef("session `%s` not found", id))
+			}
+			return s.serveArtifact(conn, req.GetArtifact)
+		}
 	}
 	resp, after := s.respond(req, protocol.Features{})
 	err := protocol.WriteResponse(conn, resp)
@@ -513,7 +523,7 @@ func (s *Server) handleRequest(conn transport.Stream, reader *bufio.Reader, req 
 }
 
 // respond answers a request that has a single response: every request but
-// Hello and AttachSession. f is the features the client's stream agreed
+// Hello, AttachSession and GetArtifact. f is the features the client's stream agreed
 // on. after, if set, runs once the response is written. It is safe to call
 // concurrently, as a control stream does.
 func (s *Server) respond(req *protocol.Request, f protocol.Features) (resp *protocol.Response, after func()) {
@@ -573,6 +583,12 @@ func (s *Server) respond(req *protocol.Request, f protocol.Features) (resp *prot
 		return s.forward(req.ListAttachments.SessionID, req), nil
 	case req.GetHistory != nil:
 		return s.history(req), nil
+	case req.GetGitState != nil:
+		return s.gitState(req.GetGitState.SessionID), nil
+	case req.ListArtifacts != nil:
+		return s.listArtifacts(req.ListArtifacts.SessionID), nil
+	case req.GetArtifact != nil:
+		return protocol.ErrorResponsef("an artifact needs a stream of its own"), nil
 	case req.GetSession != nil:
 		rec, err := s.getSession(req.GetSession.SessionID)
 		if err != nil {
@@ -628,6 +644,12 @@ func requestSessionID(req *protocol.Request) (string, bool) {
 		return req.ListAttachments.SessionID, true
 	case req.GetHistory != nil:
 		return req.GetHistory.SessionID, true
+	case req.GetGitState != nil:
+		return req.GetGitState.SessionID, true
+	case req.ListArtifacts != nil:
+		return req.ListArtifacts.SessionID, true
+	case req.GetArtifact != nil:
+		return req.GetArtifact.SessionID, true
 	}
 	return "", false
 }

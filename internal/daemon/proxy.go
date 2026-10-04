@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"time"
 
 	"github.com/robmorgan/agentd/internal/protocol"
@@ -51,35 +50,18 @@ func (s *Server) forward(id string, req *protocol.Request) *protocol.Response {
 	return resp
 }
 
-// history serves live history from the worker, falling back to the logs a
-// worker writes when its session ends (including when the worker exits
-// between the lookup and the request).
+// history serves a session's whole history in one response (GetHistory):
+// live from the worker, or from the logs a worker writes when its session
+// ends. The `history` artifacts stream the same content in chunks.
 func (s *Server) history(req *protocol.Request) *protocol.Response {
-	id := req.GetHistory.SessionID
-	if worker, err := transport.DialUnix(s.paths.SessionSocketPath(id), workerDialTimeout); err == nil {
-		resp, err := exchange(worker, req)
-		worker.Close()
-		if err == nil {
-			return resp
-		}
-	}
-	rec, err := s.getSession(id)
+	src, err := s.historySource(req.GetHistory.SessionID, req.GetHistory.VT)
 	if err != nil {
 		return protocol.ErrorResponsef("%v", err)
 	}
-	if rec == nil {
-		return protocol.ErrorResponsef("session `%s` not found", id)
-	}
-	path := s.paths.RenderedLogPath(id)
-	if req.GetHistory.VT {
-		path = s.paths.LogPath(id)
-	}
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return protocol.ErrorResponsef("history for session `%s` is not available", id)
-	}
+	defer src.Close()
+	data, err := io.ReadAll(src)
 	if err != nil {
-		return protocol.ErrorResponsef("failed to read %s: %v", path, err)
+		return protocol.ErrorResponsef("failed to read history: %v", err)
 	}
 	return &protocol.Response{History: &protocol.History{Data: string(data)}}
 }
