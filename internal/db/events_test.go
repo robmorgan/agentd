@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/robmorgan/agentd/internal/session"
 )
@@ -290,5 +291,37 @@ func BenchmarkRecordEvent(b *testing.B) {
 		if _, err := store.RecordEvent(NewEvent{SessionID: "s", Kind: session.EventBell, Summary: "bell"}); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// An acknowledgement bounded by a time leaves attention raised after it,
+// and clears attention raised before it.
+func TestAcknowledgeBefore(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertSession(NewSession{SessionID: "s", Agent: "sh", Mode: session.ModeExecute, Cwd: "/w"}); err != nil {
+		t.Fatal(err)
+	}
+	bell := func(at time.Time) {
+		t.Helper()
+		if _, err := store.RecordEvent(NewEvent{SessionID: "s", Kind: session.EventBell, Summary: "bell", At: at}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Times that only differ in their fractional seconds, which the
+	// stored text drops trailing zeros from, still order correctly.
+	looked := time.Date(2026, 10, 4, 2, 0, 5, 500_000_000, time.UTC)
+	bell(looked.Add(-400 * time.Millisecond)) // 05.1
+	bell(looked.Add(10 * time.Microsecond))   // 05.50001, after the client looked
+	if changed, err := store.AcknowledgeBefore("s", "seen", looked); err != nil || changed {
+		t.Fatalf("acknowledged attention raised later: %v %v", changed, err)
+	}
+	if changed, err := store.AcknowledgeBefore("s", "seen", looked.Add(time.Second)); err != nil || !changed {
+		t.Fatalf("did not acknowledge: %v %v", changed, err)
+	}
+	if changed, err := store.AcknowledgeBefore("s", "seen", looked.Add(time.Second)); err != nil || changed {
+		t.Fatalf("acknowledged twice: %v %v", changed, err)
 	}
 }

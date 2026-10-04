@@ -111,6 +111,13 @@ func (s *Server) proxyAttach(client transport.Stream, clientReader *bufio.Reader
 			return protocol.WriteResponse(client, protocol.ErrorResponsef("%v", err))
 		}
 	}
+	// The attach acknowledges the attention raised so far, written beside
+	// the attach rather than before relaying it, so the client's screen
+	// never touches the database. It is bounded by the time before the
+	// worker takes its snapshot, so it never clears attention raised after
+	// that (the session failing at once, say). The detach's
+	// acknowledgement waits for it, keeping the two in order.
+	attachedAt := time.Now()
 	worker, err := s.dialWorker(req.SessionID)
 	if err != nil {
 		return protocol.WriteResponse(client, protocol.ErrorResponsef("%v", err))
@@ -119,8 +126,13 @@ func (s *Server) proxyAttach(client transport.Stream, clientReader *bufio.Reader
 	if err := protocol.WriteRequest(worker, &protocol.Request{AttachSession: req}); err != nil {
 		return protocol.WriteResponse(client, protocol.ErrorResponsef("session `%s` runtime: %v", req.SessionID, err))
 	}
-	s.acknowledge(req.SessionID, "seen: attached")
+	attachedAck := make(chan struct{})
+	go func() {
+		defer close(attachedAck)
+		s.acknowledgeBefore(req.SessionID, "seen: attached", attachedAt)
+	}()
 	defer func() {
+		<-attachedAck
 		if rec, err := s.db.GetSession(req.SessionID); err == nil && rec != nil && rec.Status == session.StatusRunning {
 			s.acknowledge(req.SessionID, "seen: detached")
 		}

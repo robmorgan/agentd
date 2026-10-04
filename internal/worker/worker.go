@@ -97,8 +97,14 @@ type runtime struct {
 	uid       string
 	paths     *paths.AppPaths
 	db        *db.Database
-	owner     *owner
-	ended     *endedSignal
+	// attachSeqNext..attachSeqLast are the attachment numbers this worker
+	// has reserved and not yet used (nextAttachSeq); zero before the first
+	// reservation. Guarded by attachSeqMu, since attaches are served
+	// concurrently.
+	attachSeqMu                  sync.Mutex
+	attachSeqNext, attachSeqLast uint64
+	owner                        *owner
+	ended                        *endedSignal
 	// handlers counts connection handlers, so shutdown and handoffs can
 	// wait for them.
 	handlers tracker
@@ -355,6 +361,12 @@ func (rt *runtime) run(state *ownerState, ready func()) error {
 			}
 		}
 	}()
+	// Reserve the first block of attachment numbers now, so even the first
+	// attach does not wait on a database write. A failure here is retried
+	// by that attach.
+	if err := rt.reserveAttachSeq(); err != nil {
+		fmt.Fprintf(os.Stderr, "session worker: reserving attachment numbers: %v\n", err)
+	}
 	rt.startAccepting()
 	if ready != nil {
 		ready()
@@ -642,6 +654,44 @@ func (rt *runtime) handleConnection(conn transport.Stream) (keep bool, err error
 	}
 }
 
+// attachIDBlock is how many attachment numbers a worker reserves in
+// state.db at once (db.ReserveAttachIDs), so attaching rarely waits on a
+// database write.
+const attachIDBlock = 16
+
+// nextAttachSeq numbers a new attachment from the worker's reserved block,
+// reserving another when it runs out.
+func (rt *runtime) nextAttachSeq() (uint64, error) {
+	rt.attachSeqMu.Lock()
+	defer rt.attachSeqMu.Unlock()
+	if err := rt.reserveAttachSeqLocked(); err != nil {
+		return 0, err
+	}
+	seq := rt.attachSeqNext
+	rt.attachSeqNext++
+	return seq, nil
+}
+
+// reserveAttachSeq makes sure a block is reserved, without using a number
+// from it.
+func (rt *runtime) reserveAttachSeq() error {
+	rt.attachSeqMu.Lock()
+	defer rt.attachSeqMu.Unlock()
+	return rt.reserveAttachSeqLocked()
+}
+
+func (rt *runtime) reserveAttachSeqLocked() error {
+	if rt.attachSeqNext != 0 && rt.attachSeqNext <= rt.attachSeqLast {
+		return nil
+	}
+	first, err := rt.db.ReserveAttachIDs(rt.sessionID, rt.uid, attachIDBlock)
+	if err != nil {
+		return err
+	}
+	rt.attachSeqNext, rt.attachSeqLast = first, first+attachIDBlock-1
+	return nil
+}
+
 func (rt *runtime) serveAttach(conn transport.Stream, reader *bufio.Reader, req *protocol.AttachSession) error {
 	refuse := func(err error) error {
 		_ = protocol.WriteResponse(conn, protocol.ErrorResponsef("%v", err))
@@ -666,7 +716,7 @@ func (rt *runtime) serveAttach(conn transport.Stream, reader *bufio.Reader, req 
 	// restarts, and attaches again; any other is simply detached.
 	canRestart := slices.Contains(features, protocol.CapSessionRestart)
 
-	seq, err := rt.db.NextAttachID(rt.sessionID, rt.uid)
+	seq, err := rt.nextAttachSeq()
 	if errors.Is(err, db.ErrNoSuchIncarnation) {
 		return refuse(fmt.Errorf("session `%s` is being removed", rt.sessionID))
 	} else if err != nil {

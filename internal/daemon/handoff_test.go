@@ -3,6 +3,7 @@ package daemon
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -124,8 +125,11 @@ func TestLiveHandoffKeepsTheSession(t *testing.T) {
 	if !bytes.Contains(c2.snapshot, []byte("got:before")) {
 		t.Fatalf("snapshot after handoff lost earlier output: %q", c2.snapshot)
 	}
-	if c2.attachID != "attach-2" {
-		t.Fatalf("attach id after handoff = %s, want attach-2", c2.attachID)
+	// Numbers come from a block each worker image reserves, so the new
+	// image's are later than the old one's, not necessarily the next.
+	var n int
+	if _, err := fmt.Sscanf(c2.attachID, "attach-%d", &n); err != nil || n < 2 {
+		t.Fatalf("attach id after handoff = %s, want one after attach-1", c2.attachID)
 	}
 	c2.input("after\n")
 	c2.expectOutput("got:after")

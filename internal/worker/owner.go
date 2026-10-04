@@ -310,7 +310,7 @@ type attachResult struct {
 }
 
 // attach registers a new attachment under attachID, which the caller
-// numbered (see db.NextAttachID), and takes its snapshot. If replaces names
+// numbered (see runtime.nextAttachSeq), and takes its snapshot. If replaces names
 // a live attachment, that one is dropped at once: the client says it was
 // its own, on a connection it has lost.
 func (s *ownerState) attach(attachID string, kind session.AttachmentKind, g protocol.Geometry, replaces string) (*attachResult, error) {
