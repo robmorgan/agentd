@@ -372,13 +372,28 @@ func (s *terminalState) primaryUnderAlternate() ([]byte, error) {
 	}
 	defer cp.Close()
 
-	exit := "\x1b[?47l"
-	if on, _ := s.term.Mode(libghostty.ModeAltScreenSave); on {
-		exit = "\x1b[?1049l"
-	} else if on, _ := s.term.Mode(libghostty.ModeAltScreen); on {
-		exit = "\x1b[?1047l"
+	// Leave the alternate screen with the mode the program used, 1049
+	// first (it restores the saved cursor), and clear any other alternate
+	// screen mode that is also set: a program can set more than one, and
+	// one left set would make this primary screen's formatting enter the
+	// alternate screen again.
+	var exit []byte
+	for _, m := range []struct {
+		mode libghostty.Mode
+		seq  string
+	}{
+		{libghostty.ModeAltScreenSave, "\x1b[?1049l"},
+		{libghostty.ModeAltScreen, "\x1b[?1047l"},
+		{libghostty.ModeAltScreenLegacy, "\x1b[?47l"},
+	} {
+		if on, _ := s.term.Mode(m.mode); on {
+			exit = append(exit, m.seq...)
+		}
 	}
-	cp.VTWrite([]byte(exit))
+	if len(exit) == 0 {
+		exit = []byte("\x1b[?47l")
+	}
+	cp.VTWrite(exit)
 	// The scrolling region belongs to the terminal, not to a screen, and
 	// the alternate screen's formatting sets it. Set here as well, it
 	// would already be in force while the alternate screen's contents are
