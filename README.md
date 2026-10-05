@@ -369,6 +369,14 @@ command = "codex"
 args = []
 ```
 
+`config.toml` also sets how much scrollback `agent attach` copies into your terminal (more
+below):
+
+```toml
+[attach]
+scrollback_rows = 1000
+```
+
 Agent picker order follows the order of the `[agents.*]` tables in this file. `default_agent`
 must name one of those configured agents. Without it, the default is `claude` if configured,
 otherwise the first agent listed. With no `config.toml` at all, `claude` and `codex` are
@@ -400,7 +408,12 @@ the previous running session with `Ctrl-[`, or switch to the next running sessio
 `agent detach <name> --all` to disconnect every attached client on the session.
 Use `agent attachments <name>` to inspect the current attachment ids.
 Attach clears the visible screen and repaints from the daemon's retained terminal state; if the
-restored session was using the alternate screen, replay restores that state naturally. A client
+restored session was using the alternate screen, replay restores that state naturally. It also
+copies the session's most recent 1,000 rows of scrollback into your terminal, so you can scroll
+back through them natively; `agent history` has the rest. `[attach] scrollback_rows` in
+`config.toml` changes how many (`-1` for all of it, `0` for the screen only). When the client
+reconnects by itself, or repaints after the overlay closes or after falling behind, it sends only
+the screen, since your terminal already has the scrollback. A client
 that falls behind a fast agent (a slow link, a stalled terminal) never slows the agent down: it
 skips output it cannot keep up with and is repainted from the current screen once it catches up.
 

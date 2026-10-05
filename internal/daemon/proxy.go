@@ -188,6 +188,9 @@ func (s *Server) negotiateAttach(req *protocol.AttachSession) error {
 	if !req.HasFeature(protocol.CapAttachReplace) {
 		req.Replaces = ""
 	}
+	if !req.HasFeature(protocol.CapAttachScrollback) {
+		req.ScrollbackRows = 0
+	}
 	return nil
 }
 

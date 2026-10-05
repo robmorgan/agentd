@@ -34,7 +34,7 @@ func (rt *runtime) stats(snapshot bool) (*protocol.SessionStats, error) {
 		if snapshot {
 			start := time.Now()
 			var err error
-			if snap, err = s.snapshot(); err != nil {
+			if snap, err = s.snapshot(allScrollback); err != nil {
 				return err
 			}
 			formatTime = time.Since(start)

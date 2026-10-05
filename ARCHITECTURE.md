@@ -865,8 +865,9 @@ a resync each time it drains, which keeps it as current as its link allows. A cl
 outright may do so with a resync already in its blocked write; when it reads again it gets that
 stale one first and, since it lagged meanwhile, a fresh one right after. A client that did not
 ask for resyncs (an older CLI) keeps the old behaviour: its screen is wrong until the program
-repaints or it reattaches. A snapshot is the screen plus retained scrollback (scrollback memory is
-capped at 10 MB), typically some hundreds of KiB.
+repaints or it reattaches. A resync carries only the screen when the attach capped its scrollback
+(`attach-scrollback`), a few KiB; otherwise it carries the retained scrollback too (scrollback
+memory is capped at 10 MB), typically some hundreds of KiB.
 
 Input goes the other way: the CLI's stdin reader queues up to 32 reads of 4 KiB; the CLI writes
 input frames to the stream as the user types, blocking when the stream's window is full; the
@@ -997,6 +998,15 @@ first. It is built from libghostty's VT formatter, with these additions (`termin
   foreground, background and cursor colors that a program changed.
 * **Cursor shape.** A bar or underline cursor (DECSCUSR) is restored; a block cursor is left to
   the client's default.
+* **Bounded scrollback.** An attach that lists `attach-scrollback` (`CapAttachScrollback`) caps
+  the scrollback rows in its snapshot (`AttachSession.ScrollbackRows`; the CLI sends
+  `[attach] scrollback_rows`, 1,000 by default). The formatter is given a selection from that
+  many rows back to the end of the screen, so it reads only those pages. The snapshots that
+  repaint the screen later on the same stream (an overlay closing, a resync) carry no
+  scrollback, and neither does the CLI's own reattach after a lost connection or a worker
+  restart. The client's terminal already holds what scrolled off before them; what scrolled off
+  while it was away is in `agent history`. Without the feature (an older CLI or worker), every
+  snapshot carries all of the scrollback, as before.
 
 Tests restore snapshots into a second terminal and compare them cell by cell
 (`restore_test.go`), replay recorded streams from Claude Code, Codex, a shell, Vim, Neovim,

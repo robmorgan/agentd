@@ -91,7 +91,7 @@ func BenchmarkTerminalSnapshot(b *testing.B) {
 			b.ReportAllocs()
 			var size int
 			for b.Loop() {
-				snap, err := ts.snapshot()
+				snap, err := ts.snapshot(allScrollback)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -122,7 +122,7 @@ func BenchmarkRecordedStreamSnapshot(b *testing.B) {
 			b.ReportAllocs()
 			var size int
 			for b.Loop() {
-				snap, err := ts.snapshot()
+				snap, err := ts.snapshot(allScrollback)
 				if err != nil {
 					b.Fatal(err)
 				}

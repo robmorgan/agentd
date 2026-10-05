@@ -715,6 +715,13 @@ func (rt *runtime) serveAttach(conn transport.Stream, reader *bufio.Reader, req 
 	// A client that asked for CapSessionRestart is told when the worker
 	// restarts, and attaches again; any other is simply detached.
 	canRestart := slices.Contains(features, protocol.CapSessionRestart)
+	// With CapAttachScrollback the client caps the scrollback in its first
+	// snapshot, and the snapshots that repaint its screen later carry none:
+	// its terminal already holds what scrolled off before them.
+	initial, repaint := allScrollback, allScrollback
+	if slices.Contains(features, protocol.CapAttachScrollback) {
+		initial, repaint = scrollbackRows(req.ScrollbackRows), 0
+	}
 
 	seq, err := rt.nextAttachSeq()
 	if errors.Is(err, db.ErrNoSuchIncarnation) {
@@ -725,7 +732,7 @@ func (rt *runtime) serveAttach(conn transport.Stream, reader *bufio.Reader, req 
 	var att *attachResult
 	if err := rt.owner.doAtGround(func(s *ownerState) error {
 		var err error
-		att, err = s.attach(fmt.Sprintf("%s-%d", req.Kind, seq), req.Kind, req.Geometry, replaces)
+		att, err = s.attach(fmt.Sprintf("%s-%d", req.Kind, seq), req.Kind, req.Geometry, replaces, initial)
 		return err
 	}); err != nil {
 		return refuse(err)
@@ -795,7 +802,7 @@ loop:
 			// the previous write went through: the client is draining,
 			// and a snapshot taken now is as fresh as it can use.
 			if resync && att.sub.lagged.Load() {
-				if err := rt.sendSnapshot(conn, att.sub, true); err != nil {
+				if err := rt.sendSnapshot(conn, att.sub, true, repaint); err != nil {
 					return err
 				}
 				continue
@@ -822,7 +829,7 @@ loop:
 			// the session is not lost behind SessionEnded; a client that
 			// lagged gets the final screen instead.
 			if resync && att.sub.lagged.Load() {
-				if err := rt.sendSnapshot(conn, att.sub, true); err != nil {
+				if err := rt.sendSnapshot(conn, att.sub, true, repaint); err != nil {
 					return err
 				}
 			} else if err := drainOutput(conn, att.sub); err != nil {
@@ -856,7 +863,7 @@ loop:
 					break loop
 				}
 			case in.req.AttachSnapshot != nil:
-				if err := rt.sendSnapshot(conn, att.sub, false); err != nil {
+				if err := rt.sendSnapshot(conn, att.sub, false, repaint); err != nil {
 					return err
 				}
 			default:
@@ -874,13 +881,14 @@ loop:
 // on the owner goroutine, so discarding what is queued for this client and
 // taking the snapshot there makes the snapshot an exact boundary: everything
 // before it is in the snapshot, everything after follows it. doAtGround
-// keeps that boundary outside escape sequences.
-func (rt *runtime) sendSnapshot(conn transport.Stream, sub *subscriber, resync bool) error {
+// keeps that boundary outside escape sequences. The snapshot has up to
+// scrollback rows of scrollback (allScrollback for all).
+func (rt *runtime) sendSnapshot(conn transport.Stream, sub *subscriber, resync bool, scrollback int) error {
 	var snapshot []byte
 	if err := rt.owner.doAtGround(func(s *ownerState) error {
 		sub.discard()
 		var err error
-		snapshot, err = s.snapshot()
+		snapshot, err = s.snapshot(scrollback)
 		return err
 	}); err != nil {
 		return err
@@ -890,6 +898,15 @@ func (rt *runtime) sendSnapshot(conn transport.Stream, sub *subscriber, resync b
 		resp = &protocol.Response{AttachResync: &protocol.Bytes{Data: snapshot}}
 	}
 	return protocol.WriteResponse(conn, resp)
+}
+
+// scrollbackRows converts AttachSession.ScrollbackRows to snapshot's
+// argument.
+func scrollbackRows(rows uint32) int {
+	if rows == protocol.AllScrollbackRows {
+		return allScrollback
+	}
+	return int(rows)
 }
 
 func drainOutput(conn transport.Stream, sub *subscriber) error {

@@ -49,7 +49,7 @@ func FuzzSnapshotRestore(f *testing.F) {
 		if origin, _ := ts.term.Mode(libghostty.ModeOrigin); origin {
 			return
 		}
-		snap, err := ts.snapshot()
+		snap, err := ts.snapshot(allScrollback)
 		if err != nil {
 			t.Fatalf("snapshot: %v", err)
 		}

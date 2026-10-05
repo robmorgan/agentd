@@ -155,6 +155,12 @@ const (
 	// fresh snapshot that replaces the screen, when it had to drop output
 	// for this client because it fell behind.
 	CapAttachResync = "attach-resync"
+	// CapAttachScrollback (attach stream): AttachSession.ScrollbackRows
+	// caps the scrollback in Attached's snapshot, and the snapshots that
+	// repaint the screen later on the stream (AttachSnapshot, AttachResync)
+	// carry none: the client's terminal already has what scrolled off
+	// before them.
+	CapAttachScrollback = "attach-scrollback"
 	// CapEvents: the daemon records session events and serves them on
 	// events streams (SubscribeEvents) and to ListEvents on the control
 	// stream.
@@ -199,13 +205,13 @@ const MinProtocolVersion uint16 = 1
 // Capabilities is what this build supports.
 func Capabilities() []string {
 	return []string{CapControlStream, CapGitState, CapArtifacts, CapSessionUID, CapRequestTokens, CapAttachFeatures, CapAttachReplace, CapAttachResync, CapRuntimeStats,
-		CapEvents, CapSessionActivity, CapDaemonID, CapSessionRestart, CapWorkerHandoff, CapTerminalMemory}
+		CapEvents, CapSessionActivity, CapDaemonID, CapSessionRestart, CapWorkerHandoff, CapTerminalMemory, CapAttachScrollback}
 }
 
 // AttachCapabilities are the capabilities that apply to an attach stream,
 // listed in AttachSession.Features.
 func AttachCapabilities() []string {
-	return []string{CapSessionUID, CapAttachReplace, CapAttachResync, CapSessionRestart}
+	return []string{CapSessionUID, CapAttachReplace, CapAttachResync, CapSessionRestart, CapAttachScrollback}
 }
 
 // AttachFeatures is the attach-stream features a client may ask for given

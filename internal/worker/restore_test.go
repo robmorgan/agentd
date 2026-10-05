@@ -231,7 +231,7 @@ const probe = "\tP\x1b[Hq\x1b[99B\r\n\n\nend"
 // screen is active it then leaves it in both and compares the primary
 // screens too. It leaves ts on the primary screen.
 func checkRestore(ts *terminalState) error {
-	snap, err := ts.snapshot()
+	snap, err := ts.snapshot(allScrollback)
 	if err != nil {
 		return err
 	}
@@ -363,7 +363,7 @@ func TestSnapshotOriginModeUnderAlternateScreen(t *testing.T) {
 	} {
 		ts := newTestTerminal(t, 80, 24)
 		ts.feed([]byte(stream))
-		snap, err := ts.snapshot()
+		snap, err := ts.snapshot(allScrollback)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -462,7 +462,7 @@ func TestSnapshotKnownLimits(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ts := newTestTerminal(t, 80, 24)
 			ts.feed([]byte(tc.stream))
-			snap, err := ts.snapshot()
+			snap, err := ts.snapshot(allScrollback)
 			if err != nil {
 				t.Fatal(err)
 			}
