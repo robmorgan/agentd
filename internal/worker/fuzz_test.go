@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"testing"
 
 	"go.mitchellh.com/libghostty"
@@ -60,7 +61,7 @@ func FuzzSnapshotRestore(f *testing.F) {
 		client.VTWrite([]byte("\x1b[2J\x1b[H"))
 		client.VTWrite(snap)
 		if d := diffRestored(ts.term, client); d != "" {
-			if hasWideNarrowCell(ts.term) || pendingWrapOverBlank(ts.term) {
+			if hasWideNarrowCell(ts.term) || pendingWrapOverBlank(ts.term) || alternateScrollback(ts.term) || graphemeModeChanged(ts.term, data) {
 				return // a known limit; see TestSnapshotKnownLimits
 			}
 			t.Fatalf("restored terminal differs:\n%s\nsnapshot: %q", d, snap)
@@ -90,6 +91,27 @@ func hasWideNarrowCell(term *libghostty.Terminal) bool {
 		}
 	}
 	return false
+}
+
+// graphemeModeChanged reports whether the stream may have switched
+// grapheme cluster mode (2027): it is set now, or the stream mentions it
+// (it may have been switched off again). Text printed before a switch was
+// split into cells under the other mode, which the snapshot, setting the
+// mode first, does not reproduce. Only checked once a restore differs, so
+// a rough check is enough.
+func graphemeModeChanged(term *libghostty.Terminal, data []byte) bool {
+	if on, _ := term.Mode(libghostty.ModeGraphemeCluster); on {
+		return true
+	}
+	return bytes.Contains(data, []byte("2027"))
+}
+
+// alternateScrollback reports whether the alternate screen holds
+// scrollback, which only CSI 22 J (scroll the screen into scrollback) can
+// give it and nothing replayed into a client can.
+func alternateScrollback(term *libghostty.Terminal) bool {
+	screen, _ := term.ActiveScreen()
+	return screen == libghostty.ScreenAlternate && must(term.ScrollbackRows()) > 0
 }
 
 // pendingWrapOverBlank reports whether the cursor has a pending wrap over a

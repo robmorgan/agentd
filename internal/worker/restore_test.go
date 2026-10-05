@@ -440,6 +440,20 @@ func TestSnapshotKnownLimits(t *testing.T) {
 			differs: []string{"PendingWrap"},
 		},
 		{
+			// Without grapheme clustering a zero-width codepoint joins the
+			// cell before it; with it, U+061C (a control) starts its own
+			// grapheme and is dropped. Cells do not record which mode
+			// made them, and the snapshot sets the current one first.
+			name: "text printed before grapheme clustering was enabled", stream: "0\u061c\x1b[?2027h",
+			differs: []string{"Text", "Styled", "Cells"},
+		},
+		{
+			// Only CSI 22 J (scroll the screen into scrollback) gives the
+			// alternate screen scrollback, and nothing a client is sent can.
+			name: "scrollback on the alternate screen", stream: "\x1b[?1047h0\x1b[22J0",
+			differs: []string{"ScrollbackRows", "Text", "Styled"},
+		},
+		{
 			// The cursor saved with DECSC (or 1048) is not formatted.
 			name: "saved cursor", stream: "\x1b[5;5H\x1b7\x1b[H", probe: "\x1b8",
 			differs: []string{"CursorX", "CursorY"},
