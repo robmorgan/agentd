@@ -392,6 +392,18 @@ func (s *terminalState) primaryUnderAlternate() (out []byte, shape bool, err err
 	// screen again. 1049 restores the saved cursor, which a client restores
 	// the same way when the program leaves with 1049.
 	cp.VTWrite([]byte("\x1b[?1049l\x1b[?1047l\x1b[?47l"))
+	// Restoring the saved cursor also restores origin mode, which belongs
+	// to the terminal rather than a screen: put it back as it is now, or
+	// this formatting would set it and the alternate screen's (which only
+	// sets modes that differ from the defaults) would leave it set.
+	on, _ := s.term.Mode(libghostty.ModeOrigin)
+	if copied, _ := cp.Mode(libghostty.ModeOrigin); copied != on {
+		if on {
+			cp.VTWrite([]byte("\x1b[?6h"))
+		} else {
+			cp.VTWrite([]byte("\x1b[?6l"))
+		}
+	}
 	// The scrolling region belongs to the terminal, not to a screen, and
 	// the alternate screen's formatting sets it. Set here as well, it
 	// would already be in force while the alternate screen's contents are

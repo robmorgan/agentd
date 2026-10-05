@@ -353,6 +353,37 @@ func withoutKnownLimits(img terminalImage) terminalImage {
 // libghostty update that fixes one shows up here (move the case into
 // TestSnapshotRestores then) and a regression that widens one does not
 // hide behind it. ARCHITECTURE.md explains each.
+// TestSnapshotOriginModeUnderAlternateScreen checks that the copy the
+// primary screen is formatted from, which leaves the alternate screen with
+// 1049 and so restores the saved cursor, does not hand the saved cursor's
+// origin mode to the client: origin mode belongs to the terminal, and the
+// alternate screen's formatting would not clear it. Only the current screen
+// is compared, since the saved cursor itself is a known limit.
+func TestSnapshotOriginModeUnderAlternateScreen(t *testing.T) {
+	for _, stream := range []string{
+		"\x1b[5;20r\x1b[?6h\x1b7\x1b[?6l\x1b[?47hx",
+		"\x1b[?6h\x1b7\x1b[?6l\x1b[?1047hx",
+		"\x1b7\x1b[?6h\x1b[?47hx",
+	} {
+		ts := newTestTerminal(t, 80, 24)
+		ts.feed([]byte(stream))
+		snap, err := ts.snapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		client, err := newClientTerminal(80, 24)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client.VTWrite([]byte("\x1b[2J\x1b[H"))
+		client.VTWrite(snap)
+		if d := diffRestored(ts.term, client); d != "" {
+			t.Errorf("%q: restored terminal differs:\n%s\nsnapshot: %q", stream, d, snap)
+		}
+		client.Close()
+	}
+}
+
 func TestSnapshotKnownLimits(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
