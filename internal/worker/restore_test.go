@@ -321,6 +321,7 @@ func TestSnapshotRestores(t *testing.T) {
 		{"alternate screen entered with two modes", "primary\x1b[?1047h\x1b[?47h alt"},
 		{"cursor shape under the alternate screen", "\x1b[6 q\x1b[?47h"},
 		{"cursor shapes of both screens", "\x1b[4 q\x1b[?1049h\x1b[2 q"},
+		{"cursor shape set on the alternate screen", "\x1b[?47h\x1b[6 q0"},
 		{"primary pen under the alternate screen (1049)", "\x1b[41;1mred\x1b[?1049h\x1b[0m\x1b[2J\x1b[1;5Hx\x1b[3;3H"},
 		{"primary pen under the alternate screen (1047)", "\x1b[41;1mred\x1b[?1047h\x1b[0m\x1b[2J\x1b[1;5Hx\x1b[3;3H"},
 		{"primary pen under the alternate screen (47)", "\x1b[41;1mred\x1b[?47h\x1b[0m\x1b[2J\x1b[1;5Hx\x1b[3;3H"},
