@@ -349,10 +349,6 @@ func withoutKnownLimits(img terminalImage) terminalImage {
 	return img
 }
 
-// TestSnapshotKnownLimits pins what the snapshot does not restore, so a
-// libghostty update that fixes one shows up here (move the case into
-// TestSnapshotRestores then) and a regression that widens one does not
-// hide behind it. ARCHITECTURE.md explains each.
 // TestSnapshotOriginModeUnderAlternateScreen checks that the copy the
 // primary screen is formatted from, which leaves the alternate screen with
 // 1049 and so restores the saved cursor, does not hand the saved cursor's
@@ -384,6 +380,10 @@ func TestSnapshotOriginModeUnderAlternateScreen(t *testing.T) {
 	}
 }
 
+// TestSnapshotKnownLimits pins what the snapshot does not restore, so a
+// libghostty update that fixes one shows up here (move the case into
+// TestSnapshotRestores then) and a regression that widens one does not
+// hide behind it. ARCHITECTURE.md explains each.
 func TestSnapshotKnownLimits(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
