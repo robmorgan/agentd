@@ -148,10 +148,15 @@ func (a *activityTracker) input(now time.Time, watched bool) {
 func (a *activityTracker) tick(now time.Time, fgPGID int, watched bool) {
 	fgChanged := false
 	if fgPGID > 0 && fgPGID != a.fgPGID {
-		a.fgPGID = fgPGID
-		if name := processName(fgPGID); name != "" && name != a.foreground {
-			a.foreground = name
-			fgChanged = true
+		// The group is remembered only once its name is known: a process
+		// that has just started (or a busy machine) can fail the lookup,
+		// which the next tick then tries again.
+		if name := processName(fgPGID); name != "" {
+			a.fgPGID = fgPGID
+			if name != a.foreground {
+				a.foreground = name
+				fgChanged = true
+			}
 		}
 	}
 	a.update(now, watched, fgChanged)

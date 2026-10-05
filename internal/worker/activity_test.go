@@ -63,7 +63,7 @@ const signalAgent = `stty -echo; echo ready
 while IFS= read -r l; do
   case "$l" in
     bell) printf '\a';;
-    bells) i=0; while [ $i -lt 20 ]; do printf '\a'; sleep 0.02; i=$((i+1)); done;;
+    bells) i=0; while [ $i -lt 20 ]; do printf '\a'; sleep 0.02; i=$((i+1)); done; echo bells-done;;
     notify) printf '\033]777;notify;Codex;Approve the command?\033\\';;
     title) printf '\033]0;Fixing the tests\007';;
     burst) i=0; while [ $i -lt 4 ]; do echo tick; sleep 0.1; i=$((i+1)); done;;
@@ -136,7 +136,9 @@ func TestActivityAndAttentionFromThePTY(t *testing.T) {
 	if rec := h.record(); rec.Attention != session.AttentionAction || *rec.AttentionSummary != "bell" {
 		t.Fatalf("after bell: %s %v", rec.Attention, *rec.AttentionSummary)
 	}
-	time.Sleep(600 * time.Millisecond)
+	// The loop takes its own time (twenty sleeps); input sent while it
+	// still rings would be answered by the next bell, so wait it out.
+	h.eventually("the bell loop to finish", func() bool { return strings.Contains(h.history(), "bells-done") })
 	for _, ev := range h.eventsSince(bell.ID) {
 		if ev.Kind == session.EventBell {
 			t.Fatalf("a bell loop recorded a second event: %#v", ev)
