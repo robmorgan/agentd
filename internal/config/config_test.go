@@ -73,6 +73,9 @@ func TestWriteDefault(t *testing.T) {
 			t.Fatalf("%s: %+v", name, agent)
 		}
 	}
+	if got, want := cfg.Attach.AttachScrollbackRows(), want.Attach.AttachScrollbackRows(); got != want {
+		t.Fatalf("attach scrollback rows = %d, built-in default %d", got, want)
+	}
 	os.WriteFile(path, []byte("default_agent = \"zed\"\n"), 0o600)
 	if err := WriteDefault(path); err != nil {
 		t.Fatal(err)
@@ -94,5 +97,38 @@ func TestAgentNamesKeepFileOrder(t *testing.T) {
 	}
 	if got := cfg.AgentNames(); !slices.Equal(got, []string{"claude", "zed", "codex"}) {
 		t.Fatalf("got %v", got)
+	}
+}
+
+func TestAttachScrollbackRows(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		text string
+		want int
+		bad  bool
+	}{
+		{"", DefaultAttachScrollbackRows, false},
+		{"[attach]\nscrollback_rows = 0\n", 0, false},
+		{"[attach]\nscrollback_rows = -1\n", -1, false},
+		{"[attach]\nscrollback_rows = 250\n", 250, false},
+		{"[attach]\nscrollback_rows = -2\n", 0, true},
+	} {
+		path := filepath.Join(dir, "config.toml")
+		if err := os.WriteFile(path, []byte(tc.text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load(path)
+		if tc.bad {
+			if err == nil {
+				t.Fatalf("%q: loaded", tc.text)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("%q: %v", tc.text, err)
+		}
+		if got := cfg.Attach.AttachScrollbackRows(); got != tc.want {
+			t.Fatalf("%q: scrollback rows = %d, want %d", tc.text, got, tc.want)
+		}
 	}
 }

@@ -297,8 +297,8 @@ func (s *ownerState) history(vt bool) (string, error) {
 	return string(data), nil
 }
 
-func (s *ownerState) snapshot() ([]byte, error) {
-	return s.terminal.snapshot()
+func (s *ownerState) snapshot(scrollback int) ([]byte, error) {
+	return s.terminal.snapshot(scrollback)
 }
 
 type attachResult struct {
@@ -310,10 +310,11 @@ type attachResult struct {
 }
 
 // attach registers a new attachment under attachID, which the caller
-// numbered (see runtime.nextAttachSeq), and takes its snapshot. If replaces names
+// numbered (see runtime.nextAttachSeq), and takes its snapshot, with up to
+// scrollback rows of scrollback (allScrollback for all). If replaces names
 // a live attachment, that one is dropped at once: the client says it was
 // its own, on a connection it has lost.
-func (s *ownerState) attach(attachID string, kind session.AttachmentKind, g protocol.Geometry, replaces string) (*attachResult, error) {
+func (s *ownerState) attach(attachID string, kind session.AttachmentKind, g protocol.Geometry, replaces string, scrollback int) (*attachResult, error) {
 	connectedAt := time.Now().UTC()
 	if old, ok := s.attachments[replaces]; ok && replaces != "" {
 		// Its handler may be blocked writing to the dead connection; it
@@ -330,7 +331,7 @@ func (s *ownerState) attach(attachID string, kind session.AttachmentKind, g prot
 	if err := s.resize(g); err != nil {
 		return nil, err
 	}
-	snapshot, err := s.snapshot()
+	snapshot, err := s.snapshot(scrollback)
 	if err != nil {
 		return nil, err
 	}

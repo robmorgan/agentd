@@ -452,6 +452,16 @@ the snapshot, disconnect. The session is a shell script at 160x48.
 | Idle, a line on screen | 255 B | 0.50 ms |
 | 1 MB of scrollback | 298 KiB | 4.9 ms |
 
+With the attach capping its scrollback (`attach-scrollback`; the CLI's default is 1,000 rows),
+the snapshot holds only the last rows of scrollback, and the formatter reads only their pages.
+Same session, median of three runs (load average 12):
+
+| 1 MB of scrollback | Snapshot | Round trip |
+| --- | --- | --- |
+| All of it (no cap) | 298 KiB | 4.29 ms |
+| Last 1,000 rows (the CLI default) | 45 KiB | 0.72 ms |
+| Screen only (a repaint: resync, overlay closed, reconnect) | 2.1 KiB | 0.13 ms |
+
 The idle round trip was 0.09 ms before attachment ids were numbered in `state.db` (see "Sessions,
 Incarnations And Attachments" in ARCHITECTURE.md), and 0.50 ms with a database write per attach.
 Workers now reserve ids in blocks, so an attach no longer writes.

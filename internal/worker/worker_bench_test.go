@@ -132,9 +132,16 @@ func BenchmarkFanOut(b *testing.B) {
 // a few lines on screen; "scrollback" has ~1 MB of scrollback.
 func BenchmarkAttach(b *testing.B) {
 	g := protocol.Geometry{Cols: defaultPtyCols, Rows: defaultPtyRows}
-	for _, tc := range []struct{ name, input, wait string }{
-		{"idle", "", "ready"},
-		{"scrollback", "flood\n", "flood-done"},
+	// With a scrollback cap (CapAttachScrollback) the snapshot carries only
+	// the last rows of scrollback; -1 sends no feature, so all of it.
+	for _, tc := range []struct {
+		name, input, wait string
+		scrollback        int
+	}{
+		{"idle", "", "ready", -1},
+		{"scrollback", "flood\n", "flood-done", -1},
+		{"scrollback-capped-1000", "flood\n", "flood-done", 1000},
+		{"scrollback-capped-0", "flood\n", "flood-done", 0},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			h := startWorkerWith(b, blastAgent)
@@ -145,9 +152,12 @@ func BenchmarkAttach(b *testing.B) {
 			var size int
 			for b.Loop() {
 				conn := h.dial()
-				if err := protocol.WriteRequest(conn, &protocol.Request{AttachSession: &protocol.AttachSession{
-					SessionID: h.sessionID, Kind: session.AttachmentAttach, Geometry: g,
-				}}); err != nil {
+				attach := &protocol.AttachSession{SessionID: h.sessionID, Kind: session.AttachmentAttach, Geometry: g}
+				if tc.scrollback >= 0 {
+					attach.Features = []string{protocol.CapAttachScrollback}
+					attach.ScrollbackRows = uint32(tc.scrollback)
+				}
+				if err := protocol.WriteRequest(conn, &protocol.Request{AttachSession: attach}); err != nil {
 					b.Fatal(err)
 				}
 				resp, err := protocol.ReadResponse(bufio.NewReader(conn))

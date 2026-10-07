@@ -14,6 +14,7 @@ type Config struct {
 	DefaultAgent string                 `toml:"default_agent"`
 	Agents       map[string]AgentConfig `toml:"agents"`
 	Remote       RemoteConfig           `toml:"remote"`
+	Attach       AttachConfig           `toml:"attach"`
 
 	// agentOrder lists the Agents keys in file order, which a map loses.
 	agentOrder []string
@@ -26,6 +27,28 @@ type RemoteConfig struct {
 	// Listen is the UDP host:port to accept QUIC connections on. Prefer a
 	// Tailscale or WireGuard address over a public one.
 	Listen string `toml:"listen"`
+}
+
+// AttachConfig is how `agent attach` fills the terminal.
+type AttachConfig struct {
+	// ScrollbackRows caps the rows of a session's scrollback an attach
+	// copies into the terminal, the most recent ones: -1 copies all of it,
+	// 0 only the screen. Unset means DefaultAttachScrollbackRows. `agent
+	// history` has the rest.
+	ScrollbackRows *int `toml:"scrollback_rows"`
+}
+
+// DefaultAttachScrollbackRows bounds what an attach sends: a session's full
+// scrollback can be hundreds of KiB (see BENCHMARKS.md).
+const DefaultAttachScrollbackRows = 1000
+
+// AttachScrollbackRows is ScrollbackRows with its default applied: -1 for
+// all of the scrollback, otherwise a number of rows.
+func (a AttachConfig) AttachScrollbackRows() int {
+	if a.ScrollbackRows == nil {
+		return DefaultAttachScrollbackRows
+	}
+	return *a.ScrollbackRows
 }
 
 type AgentConfig struct {
@@ -56,6 +79,12 @@ model_flag = "--model"
 command = "codex"
 args = []
 model_flag = "--model"
+
+# How much of a session's scrollback "agent attach" copies into the
+# terminal: the most recent rows (-1 for all of it, 0 for the screen only).
+# "agent history" has the rest.
+[attach]
+scrollback_rows = 1000
 `
 
 func defaultConfig() *Config {
@@ -94,6 +123,9 @@ func Load(path string) (*Config, error) {
 		if _, ok := cfg.Agents[preferredDefaultAgent]; !ok && len(cfg.agentOrder) > 0 {
 			cfg.DefaultAgent = cfg.agentOrder[0]
 		}
+	}
+	if n := cfg.Attach.ScrollbackRows; n != nil && *n < -1 {
+		return nil, fmt.Errorf("[attach] scrollback_rows must be -1 (all), 0 or more in %s", path)
 	}
 	if len(cfg.Agents) > 0 {
 		if _, ok := cfg.Agents[cfg.DefaultAgent]; !ok {

@@ -137,7 +137,14 @@ type AttachSession struct {
 	// only together with a matching ExpectUID, since attach ids are only
 	// unique within one incarnation.
 	Replaces string
+	// ScrollbackRows (CapAttachScrollback) caps the scrollback rows in
+	// Attached's snapshot (AllScrollbackRows for all of them).
+	ScrollbackRows uint32
 }
+
+// AllScrollbackRows in AttachSession.ScrollbackRows asks for every
+// retained row of scrollback.
+const AllScrollbackRows = ^uint32(0)
 
 // HasFeature reports whether the attach stream asked for capability c.
 func (a *AttachSession) HasFeature(c string) bool { return slices.Contains(a.Features, c) }
@@ -592,6 +599,9 @@ func encodeRequest(req *Request, f Features) (kind, []byte, error) {
 			if a.HasFeature(CapAttachReplace) {
 				e.str(a.Replaces)
 			}
+			if a.HasFeature(CapAttachScrollback) {
+				e.u32(a.ScrollbackRows)
+			}
 		}
 		return kAttachSessionRequest, e.buf, e.err
 	case req.AttachResize != nil:
@@ -713,6 +723,9 @@ func decodeRequest(k kind, payload []byte, f Features) (*Request, error) {
 			}
 			if a.HasFeature(CapAttachReplace) {
 				a.Replaces = d.str()
+			}
+			if a.HasFeature(CapAttachScrollback) {
+				a.ScrollbackRows = d.u32()
 			}
 		}
 		req.AttachSession = a

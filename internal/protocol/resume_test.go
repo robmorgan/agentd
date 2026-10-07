@@ -146,6 +146,22 @@ func TestAttachFeaturesGoldenFrames(t *testing.T) {
 	})
 	// A feature with no field of its own adds only its name.
 	roundTripRequest(t, &Request{AttachSession: &AttachSession{SessionID: "ab", Kind: session.AttachmentAttach, Features: []string{CapAttachResync}}})
+	// The scrollback cap follows the fields of the features before it.
+	assertRequestGolden(t, &Request{AttachSession: &AttachSession{
+		SessionID: "ab", Kind: session.AttachmentAttach, Geometry: Geometry{Cols: 80, Rows: 24},
+		Features: []string{CapAttachScrollback}, ScrollbackRows: 1000,
+	}}, []byte{
+		0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x2c, 0x00, 0x00, 0x00,
+		0x02, 0x00, 0x00, 0x00, 'a', 'b', // session id
+		0x01,                                           // attach
+		0x50, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, // geometry
+		0x01, 0x00, 0x00, 0x00, // features
+		0x11, 0x00, 0x00, 0x00, 'a', 't', 't', 'a', 'c', 'h', '-', 's', 'c', 'r', 'o', 'l', 'l', 'b', 'a', 'c', 'k',
+		0xe8, 0x03, 0x00, 0x00, // scrollback rows
+	})
+	roundTripRequest(t, &Request{AttachSession: &AttachSession{SessionID: "ab", Kind: session.AttachmentAttach,
+		Features: AttachCapabilities(), ExpectUID: "u", Replaces: "attach-1", ScrollbackRows: AllScrollbackRows}})
 }
 
 func TestAttachFeaturesFollowTheControlStream(t *testing.T) {

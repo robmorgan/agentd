@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/robmorgan/agentd/internal/config"
 	"github.com/robmorgan/agentd/internal/protocol"
 	"github.com/robmorgan/agentd/internal/session"
 	"github.com/robmorgan/agentd/internal/transport"
@@ -165,8 +166,9 @@ func (a *attachStream) stop() {
 //
 // The attach stream asks for the attach features the daemon's Welcome
 // offered (protocol.AttachFeatures): the session's UID, replacing prev's
-// attachment when prev knows the UID, and resyncs after lag.
-func (c *client) connectAttach(ctx context.Context, id string, prev attachIdentity) (*attachStream, *protocol.Attached, *protocol.SessionEnded, error) {
+// attachment when prev knows the UID, resyncs after lag, and at most
+// scrollback rows of scrollback in the snapshot (-1 for all).
+func (c *client) connectAttach(ctx context.Context, id string, prev attachIdentity, scrollback int) (*attachStream, *protocol.Attached, *protocol.SessionEnded, error) {
 	cs, err := c.controlStream(ctx)
 	if err != nil {
 		return nil, nil, nil, err
@@ -188,6 +190,12 @@ func (c *client) connectAttach(ctx context.Context, id string, prev attachIdenti
 		attach.ExpectUID = prev.uid
 		if attach.HasFeature(protocol.CapAttachReplace) {
 			attach.Replaces = prev.attachID
+		}
+	}
+	if attach.HasFeature(protocol.CapAttachScrollback) {
+		attach.ScrollbackRows = protocol.AllScrollbackRows
+		if scrollback >= 0 {
+			attach.ScrollbackRows = uint32(scrollback)
 		}
 	}
 	req := &protocol.Request{AttachSession: attach}
@@ -232,7 +240,7 @@ func (c *client) connectAttach(ctx context.Context, id string, prev attachIdenti
 // see reattach.
 func (c *client) attachOnce(id, uid string, titled *bool) (attachResult, error) {
 	ident := attachIdentity{uid: uid}
-	stream, attached, ended, err := c.connectAttach(context.Background(), id, ident)
+	stream, attached, ended, err := c.connectAttach(context.Background(), id, ident, c.attachScrollbackRows())
 	if err != nil {
 		return attachResult{}, err
 	}
@@ -283,6 +291,16 @@ func (c *client) attachOnce(id, uid string, titled *bool) (attachResult, error) 
 		// hidden the cursor.
 		writeOut([]byte("\x1b[?25h"))
 	}
+}
+
+// attachScrollbackRows is the configured cap on the scrollback an attach
+// copies into the terminal ([attach] scrollback_rows; -1 for all of it).
+func (c *client) attachScrollbackRows() int {
+	cfg, err := config.Load(c.paths.Config)
+	if err != nil {
+		return config.DefaultAttachScrollbackRows
+	}
+	return cfg.Attach.AttachScrollbackRows()
 }
 
 // runAttachment runs one attach stream until it ends, the user detaches or
@@ -431,7 +449,9 @@ func (c *client) reattach(id string, prev attachIdentity, keys <-chan []byte, pa
 		go func() {
 			defer close(done)
 			var a attempt
-			a.stream, a.attached, a.ended, a.err = c.connectAttach(ctx, id, prev)
+			// The terminal already holds the scrollback the first
+			// snapshot copied, so a reattach repaints only the screen.
+			a.stream, a.attached, a.ended, a.err = c.connectAttach(ctx, id, prev, 0)
 			result <- a
 		}()
 		finished := waitUnlessDetached(done, keys, parser)

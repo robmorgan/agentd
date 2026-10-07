@@ -243,26 +243,30 @@ func (s *terminalState) format(vt bool) ([]byte, error) {
 	// at the next quiet tick.
 	s.compressed = false
 	if !vt {
-		return formatScreen(s.term, libghostty.FormatterFormatPlain, true)
+		return formatScreen(s.term, libghostty.FormatterFormatPlain, true, allScrollback)
 	}
 	colors, err := changedColors(s.term)
 	if err != nil {
 		return nil, err
 	}
-	screen, err := formatScreen(s.term, libghostty.FormatterFormatVT, true)
+	screen, err := formatScreen(s.term, libghostty.FormatterFormatVT, true, allScrollback)
 	if err != nil {
 		return nil, err
 	}
 	return append(colors, screen...), nil
 }
 
+// allScrollback asks for every retained row of scrollback.
+const allScrollback = -1
+
 // snapshot returns the VT bytes that repaint a client's terminal, already
 // cleared and of the same size, as this terminal is now: the primary screen
-// and its scrollback, the alternate screen when it is active, the cursor
-// (position, visibility, pen style), terminal modes, scrolling region, tab
-// stops, keyboard modes, charsets and any colors the program changed.
+// and up to scrollback rows of its scrollback (allScrollback for all of
+// it), the alternate screen when it is active, the cursor (position,
+// visibility, pen style), terminal modes, scrolling region, tab stops,
+// keyboard modes, charsets and any colors the program changed.
 // ARCHITECTURE.md lists what a VT stream cannot restore.
-func (s *terminalState) snapshot() ([]byte, error) {
+func (s *terminalState) snapshot(scrollback int) ([]byte, error) {
 	out, err := changedColors(s.term)
 	if err != nil {
 		return nil, err
@@ -276,13 +280,13 @@ func (s *terminalState) snapshot() ([]byte, error) {
 	// is set, the alternate one's is set too, block included.
 	primaryShape := false
 	if screen == libghostty.ScreenAlternate {
-		primary, shape, err := s.primaryUnderAlternate()
+		primary, shape, err := s.primaryUnderAlternate(scrollback)
 		if err != nil {
 			return nil, err
 		}
 		out, primaryShape = append(out, primary...), shape
 	}
-	active, err := formatScreen(s.term, libghostty.FormatterFormatVT, true)
+	active, err := formatScreen(s.term, libghostty.FormatterFormatVT, true, scrollback)
 	if err != nil {
 		return nil, err
 	}
@@ -368,7 +372,7 @@ func appendCursorShape(out []byte, term *libghostty.Terminal, block bool) ([]byt
 // This costs a copy of the whole terminal, scrollback included, on each
 // snapshot taken while the alternate screen is up; BENCHMARKS.md has the
 // numbers.
-func (s *terminalState) primaryUnderAlternate() (out []byte, shape bool, err error) {
+func (s *terminalState) primaryUnderAlternate(scrollback int) (out []byte, shape bool, err error) {
 	data, err := s.term.Snapshot()
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to copy terminal state: %w", err)
@@ -408,7 +412,7 @@ func (s *terminalState) primaryUnderAlternate() (out []byte, shape bool, err err
 	// the alternate screen's formatting sets it. Set here as well, it
 	// would already be in force while the alternate screen's contents are
 	// written from the top, and scroll them.
-	out, err = formatScreen(cp, libghostty.FormatterFormatVT, false)
+	out, err = formatScreen(cp, libghostty.FormatterFormatVT, false, scrollback)
 	if err != nil {
 		return nil, false, err
 	}
@@ -433,22 +437,25 @@ func (s *terminalState) primaryUnderAlternate() (out []byte, shape bool, err err
 // exactly as far as this terminal has. The formatter separates rows with
 // CRLF and emits no other CRLF, so the count of rows it emitted is the
 // count of CRLFs plus one.
-func formatScreen(term *libghostty.Terminal, format libghostty.FormatterFormat, region bool) ([]byte, error) {
-	out, err := runFormatter(term, format, true, region)
-	if err != nil || format != libghostty.FormatterFormatVT {
-		return out, err
-	}
-	total, err := term.TotalRows()
+//
+// With scrollback other than allScrollback, only the last scrollback rows
+// of scrollback are formatted, followed by the screen.
+func formatScreen(term *libghostty.Terminal, format libghostty.FormatterFormat, region bool, scrollback int) ([]byte, error) {
+	sel, rows, err := scrollbackSelection(term, scrollback)
 	if err != nil {
 		return nil, err
 	}
-	missing := int(total) - 1 - bytes.Count(out, crlf)
+	out, err := runFormatter(term, format, true, region, sel)
+	if err != nil || format != libghostty.FormatterFormatVT {
+		return out, err
+	}
+	missing := int(rows) - 1 - bytes.Count(out, crlf)
 	if missing <= 0 {
 		return out, nil
 	}
 	// The same formatting without the trailing extras is the prefix of
 	// out that ends with the screen contents.
-	contents, err := runFormatter(term, format, false, false)
+	contents, err := runFormatter(term, format, false, false, sel)
 	if err != nil {
 		return nil, err
 	}
@@ -463,13 +470,50 @@ func formatScreen(term *libghostty.Terminal, format libghostty.FormatterFormat, 
 
 var crlf = []byte("\r\n")
 
+// scrollbackSelection selects the last scrollback rows of term's
+// scrollback and the whole screen, and returns the number of rows selected.
+// It returns a nil selection, for the whole of both, when scrollback is
+// allScrollback or covers all of it.
+func scrollbackSelection(term *libghostty.Terminal, scrollback int) (*libghostty.Selection, uint, error) {
+	total, err := term.TotalRows()
+	if err != nil {
+		return nil, 0, err
+	}
+	history, err := term.ScrollbackRows()
+	if err != nil {
+		return nil, 0, err
+	}
+	if scrollback < 0 || uint(scrollback) >= history {
+		return nil, total, nil
+	}
+	cols, err := term.Cols()
+	if err != nil {
+		return nil, 0, err
+	}
+	screenRows := total - history
+	start := libghostty.Point{Tag: libghostty.PointTagActive}
+	if scrollback > 0 {
+		start = libghostty.Point{Tag: libghostty.PointTagHistory, Y: uint32(history - uint(scrollback))}
+	}
+	first, err := term.GridRef(start)
+	if err != nil {
+		return nil, 0, err
+	}
+	last, err := term.GridRef(libghostty.Point{Tag: libghostty.PointTagActive, X: cols - 1, Y: uint32(screenRows - 1)})
+	if err != nil {
+		return nil, 0, err
+	}
+	return &libghostty.Selection{Start: *first, End: *last}, uint(scrollback) + screenRows, nil
+}
+
 // runFormatter formats term's active screen. The modes and tab stops come
 // before the screen contents; with trailing set, the state emitted after
 // them (the scrolling region if region is also set, keyboard modes, then
 // cursor, pen, hyperlink, protection, kitty keyboard flags and charsets)
 // follows.
-func runFormatter(term *libghostty.Terminal, format libghostty.FormatterFormat, trailing, region bool) ([]byte, error) {
+func runFormatter(term *libghostty.Terminal, format libghostty.FormatterFormat, trailing, region bool, sel *libghostty.Selection) ([]byte, error) {
 	f, err := libghostty.NewFormatter(term,
+		libghostty.WithFormatterSelection(sel),
 		libghostty.WithFormatterFormat(format),
 		libghostty.WithFormatterTrim(false),
 		libghostty.WithFormatterUnwrap(false),

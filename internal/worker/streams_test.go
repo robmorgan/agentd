@@ -112,7 +112,7 @@ func checkReplay(data []byte, cut int) error {
 		n, _, _ := ts.feedUntilGround(data[cut:])
 		cut += n
 	}
-	snap, err := ts.snapshot()
+	snap, err := ts.snapshot(allScrollback)
 	if err != nil {
 		return err
 	}
