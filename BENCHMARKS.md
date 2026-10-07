@@ -412,6 +412,36 @@ under it is formatted from a copy of the terminal, which doubles the cost; at th
 limit that is about 40 ms per attach, against 20 ms. The snapshot no longer carries the 256-entry
 palette (about 6 KiB) unless a program changed colors.
 
+### VT and binary snapshots
+
+`BenchmarkSnapshotFormat` compares the VT snapshot a client gets today with libghostty's binary
+snapshot (`Terminal.Snapshot`), which only a client that embeds libghostty could load. VT is
+formatted by the worker and replayed into a fresh terminal by the client; binary is encoded by the
+worker and decoded into a terminal by the client. Sizes are as sent, with gzip in parentheses
+(neither is compressed today). Same sessions as above, median of three runs (load average 3-4):
+
+| Session | VT size | VT format + restore | Binary size | Binary encode + decode |
+| --- | --- | --- | --- | --- |
+| Idle | 252 B (110 B) | 16 + 16 µs | 1.2 KiB (627 B) | 3 + 21 µs |
+| Full scrollback | 289 KiB (3.9 KiB) | 1.81 + 1.05 ms | 297 KiB (4.5 KiB) | 0.29 + 1.26 ms |
+| Full scrollback, alternate screen up | 289 KiB (4.0 KiB) | 3.47 + 1.06 ms | 297 KiB (4.6 KiB) | 0.29 + 1.28 ms |
+| clang, 500 KB of diagnostics | 539 KiB (22 KiB) | 7.04 + 2.36 ms | 1,383 KiB (44 KiB) | 0.46 + 2.22 ms |
+| Neovim | 11 KiB (667 B) | 117 + 53 µs | 20 KiB (1.4 KiB) | 10 + 52 µs |
+| Vim | 4.0 KiB (461 B) | 108 + 37 µs | 10 KiB (1.3 KiB) | 8 + 43 µs |
+| Claude Code | 2.1 KiB (519 B) | 71 + 28 µs | 4.1 KiB (1.2 KiB) | 5 + 39 µs |
+| Codex | 483 B (146 B) | 61 + 24 µs | 1.4 KiB (666 B) | 4 + 34 µs |
+| bash | 2.3 KiB (716 B) | 37 + 23 µs | 5.1 KiB (1.8 KiB) | 6 + 30 µs |
+| `go test -v` | 2.0 KiB (715 B) | 29 + 17 µs | 3.0 KiB (1.4 KiB) | 4 + 22 µs |
+
+Encoding is 6-15x cheaper than formatting, and decoding costs about what replaying VT does, so
+binary takes 1.8-3.5x less CPU in all. It is also 1.03-2.6x larger: it carries cell
+structure that VT leaves out (styled output such as clang's grows the most). For the agents and
+editors either costs well under a millisecond, below any network round trip. Only full scrollback
+is large, and there the bytes on the wire outweigh the CPU: 290 KiB is about 23 ms at 100 Mbit/s,
+against a 1.3 ms difference in CPU. Compression (24x for clang's real output; the flood lines
+compress unrealistically well) or sending the screen first and the scrollback after would cut
+that further than a change of format.
+
 ### Attach
 
 `BenchmarkAttach`: connect to the worker's socket, send `AttachSession`, receive `Attached` with
