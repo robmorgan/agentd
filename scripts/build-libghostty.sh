@@ -2,13 +2,15 @@
 # Builds the libghostty-vt static library the Go bindings link against.
 #
 # go.mitchellh.com/libghostty tracks a specific ghostty commit; this pin must
-# match the GIT_TAG in that module's CMakeLists.txt. Requires Zig 0.16+.
+# match the GIT_TAG in that module's CMakeLists.txt, or be a later commit with
+# the same C API (include/ghostty). It is currently one commit ahead, for the
+# single shift fix (ghostty #14576). Requires Zig 0.16+.
 #
 # Usage: scripts/build-libghostty.sh            # builds into .build
 #        eval "$(scripts/build-libghostty.sh --env)"   # only print exports
 set -euo pipefail
 
-GHOSTTY_COMMIT="33da6848d63b3bba2b4f31ab1531d618f2795192"
+GHOSTTY_COMMIT="b699ea79f4b881421b4b3055abc16a0957d76beb"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD="${HERE}/../.build"
 SRC="${BUILD}/ghostty"

@@ -1,4 +1,4 @@
-.PHONY: libghostty build agent agentd test test-linux vet dev-run install
+.PHONY: libghostty build agent agentd test test-cgocheck test-linux vet dev-run install
 
 ZIG ?= zig
 VERSION ?= 0.1.0
@@ -25,6 +25,11 @@ agent:
 
 test: libghostty
 	go test -race ./...
+
+# The worker's tests with cgo's full pointer checks, which catch Go pointers
+# stored in C memory (libghostty's bindings, or our calls into them).
+test-cgocheck: libghostty
+	GOEXPERIMENT=cgocheck2 go test ./internal/worker/
 
 # The same suite on Linux, in Docker (scripts/test-linux.sh).
 test-linux:
