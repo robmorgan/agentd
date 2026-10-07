@@ -1,7 +1,6 @@
 package session
 
 import (
-	"fmt"
 	"time"
 )
 
@@ -58,6 +57,17 @@ const (
 	// EventStalled: no output for a long time while a command other than
 	// the agent holds the terminal's foreground (notice).
 	EventStalled EventKind = "stalled"
+	// EventBlocked: the program reported it cannot proceed without the
+	// user (OSC 7501 state=blocked); the summary carries the kind of
+	// block (permission, question, auth) and the program's message
+	// (action).
+	EventBlocked EventKind = "blocked"
+	// EventDone: the program reported it finished and the result has not
+	// been looked at (OSC 7501 state=done) (notice).
+	EventDone EventKind = "done"
+	// EventError: the program reported it failed and stopped
+	// (OSC 7501 state=error) (action).
+	EventError EventKind = "error"
 	// EventAcknowledged: the user looked at the session, clearing its
 	// attention (info).
 	EventAcknowledged EventKind = "acknowledged"
@@ -67,9 +77,9 @@ const (
 // with, unless the producer has a reason to differ (see EventIdle).
 func (k EventKind) DefaultAttention() AttentionLevel {
 	switch k {
-	case EventFailed, EventWorkerLost, EventBell, EventNotification:
+	case EventFailed, EventWorkerLost, EventBell, EventNotification, EventBlocked, EventError:
 		return AttentionAction
-	case EventExited, EventIdle, EventStalled:
+	case EventExited, EventIdle, EventStalled, EventDone:
 		return AttentionNotice
 	}
 	return AttentionInfo
@@ -102,7 +112,9 @@ func (a AttentionLevel) Rank() int {
 
 // Activity is what a live session's agent appears to be doing, judged by
 // its worker from the PTY stream. The worker records it only when it
-// changes.
+// changes. Activities are free strings in state.db and on the wire: a
+// daemon or client older than a session's worker shows an activity it
+// does not know rather than failing to read the session.
 type Activity string
 
 const (
@@ -116,14 +128,16 @@ const (
 	// ActivityWaiting: the program rang the bell or sent a notification
 	// and nobody has typed into the session since.
 	ActivityWaiting Activity = "waiting"
+	// ActivityBlocked: the program reported it cannot proceed without the
+	// user (OSC 7501 state=blocked).
+	ActivityBlocked Activity = "blocked"
+	// ActivityDone: the program reported it finished (OSC 7501
+	// state=done).
+	ActivityDone Activity = "done"
+	// ActivityError: the program reported it failed and stopped
+	// (OSC 7501 state=error).
+	ActivityError Activity = "error"
 	// ActivityExited: the agent is no longer running.
 	ActivityExited Activity = "exited"
 )
 
-func ParseActivity(v string) (Activity, error) {
-	switch Activity(v) {
-	case ActivityUnknown, ActivityWorking, ActivityIdle, ActivityWaiting, ActivityExited:
-		return Activity(v), nil
-	}
-	return "", fmt.Errorf("unknown session activity %q", v)
-}

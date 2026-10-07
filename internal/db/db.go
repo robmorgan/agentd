@@ -681,9 +681,9 @@ func scanSession(row scanner) (*session.Record, error) {
 		return nil, err
 	}
 	var err error
-	if rec.Activity, err = session.ParseActivity(activity.String); err != nil {
-		return nil, err
-	}
+	// Any activity string is accepted: a newer worker may record values
+	// this build does not know.
+	rec.Activity = session.Activity(activity.String)
 	rec.Foreground = nullStr(foreground)
 	rec.Title = nullStr(title)
 	if rec.LastOutputAt, err = nullTime(lastOutputAt); err != nil {
