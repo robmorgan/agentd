@@ -108,3 +108,44 @@ func TestSessionActivityIsNegotiated(t *testing.T) {
 		t.Fatal("this build does not advertise its event capabilities")
 	}
 }
+
+// The program status fields (OSC 7501) are appended after the activity
+// fields, under their own capability: a peer with neither, or only
+// CapSessionActivity, decodes the record it always did.
+func TestSessionStatusIsNegotiated(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	progress := 47
+	rec := session.Record{SessionID: "a", Agent: "claude", Mode: session.ModeExecute, Cwd: "/w",
+		Status: session.StatusRunning, Attention: session.AttentionAction, AttentionSummary: strp("permission: Run tests?"),
+		CreatedAt: now, UpdatedAt: now, Activity: session.ActivityBlocked, Foreground: strp("claude"),
+		LastOutputAt: &now, AttentionAt: &now,
+		StatusApp: strp("claude-code"), StatusKind: strp("permission"), StatusMsg: strp("Run tests?"), StatusProgress: &progress}
+	resp := &Response{Session: &rec}
+	activityOnly := NegotiateFeatures(Capabilities(), []string{CapSessionActivity})
+	both := NegotiateFeatures(Capabilities(), []string{CapSessionActivity, CapSessionStatus})
+
+	var partial, full bytes.Buffer
+	if err := WriteResponseWith(&partial, activityOnly, resp); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteResponseWith(&full, both, resp); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadResponseWith(bytes.NewReader(full.Bytes()), both)
+	if err != nil || !reflect.DeepEqual(got, resp) {
+		t.Fatalf("with the capability: %#v, %v", got, err)
+	}
+	got, err = ReadResponseWith(bytes.NewReader(partial.Bytes()), activityOnly)
+	partialRec := rec
+	partialRec.StatusApp, partialRec.StatusKind, partialRec.StatusMsg, partialRec.StatusProgress = nil, nil, nil, nil
+	if err != nil || !reflect.DeepEqual(got, &Response{Session: &partialRec}) {
+		t.Fatalf("without it: %#v, %v", got, err)
+	}
+	// Neither side can misread the other: the lengths no longer line up.
+	if _, err := ReadResponseWith(bytes.NewReader(full.Bytes()), activityOnly); err == nil {
+		t.Fatal("a decoder without the capability accepted the appended fields")
+	}
+	if !HasCapability(Capabilities(), CapSessionStatus) {
+		t.Fatal("this build does not advertise CapSessionStatus")
+	}
+}
