@@ -271,12 +271,16 @@ func (s *terminalState) snapshot() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Each screen has its own cursor shape, and entering the alternate
+	// screen can copy the primary one's: once the primary screen's shape
+	// is set, the alternate one's is set too, block included.
+	primaryShape := false
 	if screen == libghostty.ScreenAlternate {
-		primary, err := s.primaryUnderAlternate()
+		primary, shape, err := s.primaryUnderAlternate()
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, primary...)
+		out, primaryShape = append(out, primary...), shape
 	}
 	active, err := formatScreen(s.term, libghostty.FormatterFormatVT, true)
 	if err != nil {
@@ -286,7 +290,8 @@ func (s *terminalState) snapshot() ([]byte, error) {
 		active = resetPenAfterSwitch(active)
 	}
 	out = append(out, active...)
-	return appendCursorShape(out, s.term)
+	out, _, err = appendCursorShape(out, s.term, primaryShape)
+	return out, err
 }
 
 // penReset puts the pen back to its defaults: SGR, hyperlink, charsets
@@ -311,23 +316,24 @@ func resetPenAfterSwitch(formatted []byte) []byte {
 	return append(out, formatted[i:]...)
 }
 
-// appendCursorShape appends DECSCUSR for a bar or underline cursor, which
-// the formatter does not emit. A block cursor is left alone: it is also
-// what a terminal shows when no program has asked for a shape, so the
-// client keeps its own default. The shape is only exposed through a render
-// state, which copies the visible screen once.
-func appendCursorShape(out []byte, term *libghostty.Terminal) ([]byte, error) {
+// appendCursorShape appends DECSCUSR for the active screen's cursor shape,
+// which the formatter does not emit, and reports whether it did. A block
+// cursor is left alone unless block is set: it is also what a terminal
+// shows when no program has asked for a shape, so the client keeps its own
+// default. The shape is only exposed through a render state, which copies
+// the visible screen once.
+func appendCursorShape(out []byte, term *libghostty.Terminal, block bool) ([]byte, bool, error) {
 	rs, err := libghostty.NewRenderState()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer rs.Close()
 	if err := rs.Update(term); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	shape, err := rs.CursorVisualStyle()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var n int
 	switch shape {
@@ -336,12 +342,15 @@ func appendCursorShape(out []byte, term *libghostty.Terminal) ([]byte, error) {
 	case libghostty.CursorVisualStyleUnderline:
 		n = 4
 	default:
-		return out, nil
+		if !block {
+			return out, false, nil
+		}
+		n = 2
 	}
 	if blinking, _ := term.Mode(libghostty.ModeCursorBlinking); blinking {
 		n-- // the blinking variant of each shape
 	}
-	return fmt.Appendf(out, "\x1b[%d q", n), nil
+	return fmt.Appendf(out, "\x1b[%d q", n), true, nil
 }
 
 // primaryUnderAlternate formats the primary screen while a program (an
@@ -353,37 +362,57 @@ func appendCursorShape(out []byte, term *libghostty.Terminal) ([]byte, error) {
 // switches it over with the same mode the program used, so the primary
 // screen and its scrollback are there again when the program exits.
 //
+// The primary screen's cursor shape is included, and shape reports whether
+// it was set (see snapshot).
+//
 // This costs a copy of the whole terminal, scrollback included, on each
 // snapshot taken while the alternate screen is up; BENCHMARKS.md has the
 // numbers.
-func (s *terminalState) primaryUnderAlternate() ([]byte, error) {
+func (s *terminalState) primaryUnderAlternate() (out []byte, shape bool, err error) {
 	data, err := s.term.Snapshot()
 	if err != nil {
-		return nil, fmt.Errorf("failed to copy terminal state: %w", err)
+		return nil, false, fmt.Errorf("failed to copy terminal state: %w", err)
 	}
 	dec, err := libghostty.NewSnapshotDecoderBytes(data)
 	if err != nil {
-		return nil, fmt.Errorf("failed to copy terminal state: %w", err)
+		return nil, false, fmt.Errorf("failed to copy terminal state: %w", err)
 	}
 	defer dec.Close()
 	cp, err := dec.Decode()
 	if err != nil {
-		return nil, fmt.Errorf("failed to copy terminal state: %w", err)
+		return nil, false, fmt.Errorf("failed to copy terminal state: %w", err)
 	}
 	defer cp.Close()
 
-	exit := "\x1b[?47l"
-	if on, _ := s.term.Mode(libghostty.ModeAltScreenSave); on {
-		exit = "\x1b[?1049l"
-	} else if on, _ := s.term.Mode(libghostty.ModeAltScreen); on {
-		exit = "\x1b[?1047l"
+	// Leave the alternate screen with 1049, which switches screens without
+	// copying the alternate screen's cursor (47 and 1047 copy it, shape
+	// included, over the primary screen's own), then clear the other
+	// alternate screen modes: a program can set more than one, and one left
+	// set would make this primary screen's formatting enter the alternate
+	// screen again. 1049 restores the saved cursor, which a client restores
+	// the same way when the program leaves with 1049.
+	cp.VTWrite([]byte("\x1b[?1049l\x1b[?1047l\x1b[?47l"))
+	// Restoring the saved cursor also restores origin mode, which belongs
+	// to the terminal rather than a screen: put it back as it is now, or
+	// this formatting would set it and the alternate screen's (which only
+	// sets modes that differ from the defaults) would leave it set.
+	on, _ := s.term.Mode(libghostty.ModeOrigin)
+	if copied, _ := cp.Mode(libghostty.ModeOrigin); copied != on {
+		if on {
+			cp.VTWrite([]byte("\x1b[?6h"))
+		} else {
+			cp.VTWrite([]byte("\x1b[?6l"))
+		}
 	}
-	cp.VTWrite([]byte(exit))
 	// The scrolling region belongs to the terminal, not to a screen, and
 	// the alternate screen's formatting sets it. Set here as well, it
 	// would already be in force while the alternate screen's contents are
 	// written from the top, and scroll them.
-	return formatScreen(cp, libghostty.FormatterFormatVT, false)
+	out, err = formatScreen(cp, libghostty.FormatterFormatVT, false)
+	if err != nil {
+		return nil, false, err
+	}
+	return appendCursorShape(out, cp, false)
 }
 
 // formatScreen formats term's active screen. In VT form it also emits the

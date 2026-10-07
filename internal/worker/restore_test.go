@@ -318,6 +318,10 @@ func TestSnapshotRestores(t *testing.T) {
 		{"alternate screen (1049)", scrollback.String() + "$ vim\x1b[?1049h\x1b[H\x1b[2Jalt content\x1b[3;4H"},
 		{"alternate screen (1047)", "primary\x1b[?1047h\x1b[2Jalt content"},
 		{"alternate screen (47)", "primary\x1b[?47halt content"},
+		{"alternate screen entered with two modes", "primary\x1b[?1047h\x1b[?47h alt"},
+		{"cursor shape under the alternate screen", "\x1b[6 q\x1b[?47h"},
+		{"cursor shapes of both screens", "\x1b[4 q\x1b[?1049h\x1b[2 q"},
+		{"cursor shape set on the alternate screen", "\x1b[?47h\x1b[6 q0"},
 		{"primary pen under the alternate screen (1049)", "\x1b[41;1mred\x1b[?1049h\x1b[0m\x1b[2J\x1b[1;5Hx\x1b[3;3H"},
 		{"primary pen under the alternate screen (1047)", "\x1b[41;1mred\x1b[?1047h\x1b[0m\x1b[2J\x1b[1;5Hx\x1b[3;3H"},
 		{"primary pen under the alternate screen (47)", "\x1b[41;1mred\x1b[?47h\x1b[0m\x1b[2J\x1b[1;5Hx\x1b[3;3H"},
@@ -343,6 +347,37 @@ func TestSnapshotRestores(t *testing.T) {
 func withoutKnownLimits(img terminalImage) terminalImage {
 	img.Blanks, img.RowFlags = "", ""
 	return img
+}
+
+// TestSnapshotOriginModeUnderAlternateScreen checks that the copy the
+// primary screen is formatted from, which leaves the alternate screen with
+// 1049 and so restores the saved cursor, does not hand the saved cursor's
+// origin mode to the client: origin mode belongs to the terminal, and the
+// alternate screen's formatting would not clear it. Only the current screen
+// is compared, since the saved cursor itself is a known limit.
+func TestSnapshotOriginModeUnderAlternateScreen(t *testing.T) {
+	for _, stream := range []string{
+		"\x1b[5;20r\x1b[?6h\x1b7\x1b[?6l\x1b[?47hx",
+		"\x1b[?6h\x1b7\x1b[?6l\x1b[?1047hx",
+		"\x1b7\x1b[?6h\x1b[?47hx",
+	} {
+		ts := newTestTerminal(t, 80, 24)
+		ts.feed([]byte(stream))
+		snap, err := ts.snapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		client, err := newClientTerminal(80, 24)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client.VTWrite([]byte("\x1b[2J\x1b[H"))
+		client.VTWrite(snap)
+		if d := diffRestored(ts.term, client); d != "" {
+			t.Errorf("%q: restored terminal differs:\n%s\nsnapshot: %q", stream, d, snap)
+		}
+		client.Close()
+	}
 }
 
 // TestSnapshotKnownLimits pins what the snapshot does not restore, so a
@@ -403,6 +438,20 @@ func TestSnapshotKnownLimits(t *testing.T) {
 			// cell (here the wrap comes back with a restored cursor).
 			name: "pending wrap over a blank cell", stream: "\x1b[1;80Hx\x1b7\x1b[2K\x1b8",
 			differs: []string{"PendingWrap"},
+		},
+		{
+			// Without grapheme clustering a zero-width codepoint joins the
+			// cell before it; with it, U+061C (a control) starts its own
+			// grapheme and is dropped. Cells do not record which mode
+			// made them, and the snapshot sets the current one first.
+			name: "text printed before grapheme clustering was enabled", stream: "0\u061c\x1b[?2027h",
+			differs: []string{"Text", "Styled", "Cells"},
+		},
+		{
+			// Only CSI 22 J (scroll the screen into scrollback) gives the
+			// alternate screen scrollback, and nothing a client is sent can.
+			name: "scrollback on the alternate screen", stream: "\x1b[?1047h0\x1b[22J0",
+			differs: []string{"ScrollbackRows", "Text", "Styled"},
 		},
 		{
 			// The cursor saved with DECSC (or 1048) is not formatted.

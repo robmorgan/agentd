@@ -1024,6 +1024,12 @@ formatter's):
 * **A wide character printed in the DEC line-drawing charset**: libghostty maps it but keeps it
   two columns wide, and the formatter writes the mapped character in one, so the rest of the row
   lands a column to the left.
+* **Text printed before grapheme clustering (mode 2027) was switched.** The mode decides how
+  codepoints join into cells, cells do not record which mode made them, and the snapshot sets
+  the current mode before the contents, so text printed under the other mode can split or join
+  differently.
+* **Scrollback on the alternate screen**, which only CSI 22 J (scroll the screen into
+  scrollback) can make.
 * **The saved cursor** (DECSC, mode 1048), the kitty keyboard flag stack (only the current flags
   are set), kitty graphics and sixel images.
 * **The window title and working directory** (OSC 0/2 and 7), deliberately: the CLI sets its own
