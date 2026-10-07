@@ -31,6 +31,9 @@ type ownerState struct {
 	// activity tracks what the agent is doing; nil in tests that build
 	// an ownerState without a session.
 	activity *activityTracker
+	// status keeps the program's own status records (OSC 7501), the
+	// primary source of activity; see status.go.
+	status *statusTracker
 	// owner is the goroutine this state belongs to, for timers that need
 	// to get back onto it.
 	owner *owner
@@ -160,8 +163,18 @@ func (s *ownerState) writeInput(data []byte) error {
 	if err := s.input.enqueue(data); err != nil {
 		return err
 	}
+	now := time.Now()
+	// Typing answers whatever the session was waiting for, for both
+	// sources: a blocked status record counts as answered until the
+	// program reports again (silently, like the heuristic waiting flag).
+	if s.status != nil {
+		s.status.noteInput(now)
+		if s.activity != nil {
+			s.activity.setNative(now, s.status.derive(), s.watched(), false)
+		}
+	}
 	if s.activity != nil {
-		s.activity.input(time.Now(), s.watched())
+		s.activity.input(now, s.watched())
 	}
 	return nil
 }
@@ -230,12 +243,33 @@ func (s *ownerState) publishOutput(data []byte) error {
 // position, device attributes and so on) to the PTY when no client terminal
 // is attached to answer them itself.
 func (s *ownerState) afterFeed(writes [][]byte, effects terminalEffects) {
+	now := time.Now()
+	// The program status detection query is answered whether or not a
+	// client terminal is attached: the worker consumes the reports itself,
+	// and the client's terminal may not speak the protocol. A client
+	// terminal that does answers too; the replies are identical bytes.
+	for _, reply := range effects.statusReplies {
+		if err := s.input.enqueue(reply); err != nil {
+			fmt.Fprintf(os.Stderr, "session worker: dropped program status reply: %v\n", err)
+		}
+	}
+	if s.status != nil {
+		for _, r := range effects.statusReports {
+			s.status.apply(now, r)
+		}
+		if effects.promptStart {
+			s.status.promptSeen()
+		}
+	}
 	if s.activity != nil {
 		title := ""
 		if effects.titleChanged {
 			title = s.terminal.title()
 		}
-		s.activity.output(time.Now(), effects, title, s.watched())
+		if s.status != nil {
+			s.activity.setNative(now, s.status.derive(), s.watched(), true)
+		}
+		s.activity.output(now, effects, title, s.watched())
 	}
 	if s.hasLiveAttachTerminal() {
 		return

@@ -65,6 +65,40 @@ type terminalEffects struct {
 	bells         int
 	notifications []libghostty.TerminalDesktopNotification
 	titleChanged  bool
+	// statusReports are the program status reports (OSC 7501) of the feed,
+	// already validated by libghostty, in order. Unlike notifications they
+	// are not capped: replaying them into the record store needs them all
+	// (dropping a clear, say, leaves stale records), and a report costs
+	// the program at least its own sequence bytes of PTY output, so the
+	// feed bounds them.
+	statusReports []libghostty.ProgramStatus
+	// statusReplies are the terminal's answers to the program status
+	// protocol's detection query. They are kept apart from the other
+	// terminal replies (pending) because the worker answers this query
+	// even while a client terminal is attached: the worker consumes the
+	// reports itself, and the client's terminal may not support the
+	// protocol. See ownerState.afterFeed.
+	statusReplies [][]byte
+	// promptStart reports a new primary shell prompt (OSC 133 A), which
+	// ends the command any working or blocked status records came from.
+	promptStart bool
+}
+
+// statusDetectionReplies are the exact replies libghostty writes to the
+// program status detection query (the query echoed back, with whichever
+// terminator it used).
+var statusDetectionReplies = [][]byte{
+	[]byte("\x1b]7501;?\x1b\\"),
+	[]byte("\x1b]7501;?\x07"),
+}
+
+func isStatusDetectionReply(data []byte) bool {
+	for _, reply := range statusDetectionReplies {
+		if bytes.Equal(data, reply) {
+			return true
+		}
+	}
+	return false
 }
 
 func newTerminalState(cols, rows uint16, maxScrollbackBytes uint) (*terminalState, error) {
@@ -86,6 +120,10 @@ func newTerminalState(cols, rows uint16, maxScrollbackBytes uint) (*terminalStat
 // changes.
 func (s *terminalState) adopt(term *libghostty.Terminal) {
 	term.SetEffectWritePty(func(_ *libghostty.Terminal, data []byte) {
+		if isStatusDetectionReply(data) {
+			s.effects.statusReplies = append(s.effects.statusReplies, append([]byte(nil), data...))
+			return
+		}
 		s.pending = append(s.pending, append([]byte(nil), data...))
 	})
 	term.SetEffectSize(func(_ *libghostty.Terminal) (libghostty.SizeReportSize, bool) {
@@ -98,6 +136,16 @@ func (s *terminalState) adopt(term *libghostty.Terminal) {
 		}
 	})
 	term.SetEffectTitleChanged(func(_ *libghostty.Terminal) { s.effects.titleChanged = true })
+	// Setting a program status handler also makes the terminal answer the
+	// protocol's detection query, so programs know they can report.
+	term.SetEffectProgramStatus(func(_ *libghostty.Terminal, r libghostty.ProgramStatus) {
+		s.effects.statusReports = append(s.effects.statusReports, r)
+	})
+	term.SetEffectSemanticPrompt(func(_ *libghostty.Terminal, p libghostty.TerminalSemanticPrompt) {
+		if p.Kind == libghostty.SemanticPromptStart && p.PromptKind == libghostty.PromptPrimary {
+			s.effects.promptStart = true
+		}
+	})
 	s.term = term
 }
 

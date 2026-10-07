@@ -64,6 +64,24 @@ type nativeStatus struct {
 	progress int
 }
 
+// eventSummary is the one-line summary for an event about this status:
+// the program's message (cleaned, it is untrusted), prefixed with why it
+// is blocked, falling back to the bare state.
+func (n *nativeStatus) eventSummary() string {
+	s := clean(n.message)
+	if n.activity == session.ActivityBlocked && n.kind != "" {
+		if s == "" {
+			s = n.kind
+		} else {
+			s = n.kind + ": " + s
+		}
+	}
+	if s == "" {
+		s = string(n.activity)
+	}
+	return s
+}
+
 // statusTracker keeps a session's program status records.
 type statusTracker struct {
 	records map[string]*statusRecord
@@ -76,6 +94,10 @@ type statusTracker struct {
 	// session can say the program speaks the protocol even after its
 	// records are cleared.
 	reported bool
+	// derived caches derive's last reading until the records (or the
+	// input time) change, since derive is consulted on every PTY feed.
+	derived *nativeStatus
+	dirty   bool
 }
 
 func newStatusTracker() *statusTracker {
@@ -86,6 +108,7 @@ func newStatusTracker() *statusTracker {
 // own (root) record.
 func (t *statusTracker) apply(now time.Time, r libghostty.ProgramStatus) {
 	t.reported = true
+	t.dirty = true
 	if r.State == libghostty.ProgramStatusStateClear {
 		if r.ID == "" {
 			clear(t.records)
@@ -132,6 +155,7 @@ func (t *statusTracker) evict() {
 // idle ones (which the spec lets either way) stay too, so an interactive
 // tool sitting at its own prompt remains visible.
 func (t *statusTracker) promptSeen() {
+	t.dirty = true
 	for id, rec := range t.records {
 		switch rec.State {
 		case libghostty.ProgramStatusStateWorking, libghostty.ProgramStatusStateBlocked:
@@ -143,6 +167,7 @@ func (t *statusTracker) promptSeen() {
 // noteInput notes that someone typed into the session.
 func (t *statusTracker) noteInput(now time.Time) {
 	t.lastInput = now
+	t.dirty = true
 }
 
 // seen reports whether any report arrived this incarnation.
@@ -172,6 +197,15 @@ func statusRank(s libghostty.ProgramStatusState) int {
 // blocked shard of a parallel program blocks the session, and one still
 // working keeps it working however many are done.
 func (t *statusTracker) derive() *nativeStatus {
+	if !t.dirty {
+		return t.derived
+	}
+	t.dirty = false
+	t.derived = t.deriveNow()
+	return t.derived
+}
+
+func (t *statusTracker) deriveNow() *nativeStatus {
 	var top *statusRecord
 	var topID string
 	var topState libghostty.ProgramStatusState

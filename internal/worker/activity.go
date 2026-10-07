@@ -17,20 +17,35 @@ import (
 // Activity and attention detection.
 //
 // The worker sees everything the agent writes, so it is where "which agent
-// needs me?" is answered. It reads four signals, none of which needs the
-// agent's cooperation beyond what terminals already understand:
+// needs me?" is answered. The primary signal is the program's own word:
+// program status reports (OSC 7501), which statusTracker keeps and reads
+// (status.go). While any records exist, they decide the session's activity
+// (working with progress, blocked on the user and why, done, error) and
+// raise its attention.
+//
+// For programs that do not report, the worker falls back to heuristics,
+// none of which needs the agent's cooperation beyond what terminals
+// already understand:
 //
 //   - the bell (BEL), and desktop notifications (OSC 9, OSC 777;notify),
 //     which libghostty's parser reports while it shadows the PTY. Claude
 //     Code and Codex emit them when they wait for the user, if configured
 //     to (see the README). Either makes the session `waiting` and raises
-//     action-level attention until someone types into it.
+//     action-level attention until someone types into it. While the
+//     program reports status, these are recorded as info-level context
+//     instead: the reports say what the program needs.
 //   - output timing: output within idleAfter means `working`, none means
 //     `idle`; going idle after working records an idle event.
+//
+// Two more signals stay on regardless, since no report carries them:
+//
 //   - the PTY's foreground process group (tcgetpgrp on the master), whose
 //     leader's name is the session's foreground command; sampled every
 //     activityTick.
 //   - the terminal title (OSC 0/2), kept as context.
+//
+// The "7501:" comments mark the seams between the two sources; if the
+// heuristics are ever dropped, they list what goes.
 //
 // Cost on the PTY hot path: the effects come out of the VTWrite the worker
 // already makes, and each output chunk adds a clock read. Database writes
@@ -89,6 +104,15 @@ type activityTracker struct {
 	fgPGID     int
 	foreground string
 	title      string
+
+	// 7501: native is the program's own status (nil while it has no
+	// records, which lets the heuristics apply). The last event recorded
+	// for it dedups repeats: a program flipping between the same states,
+	// or re-reporting the same block, gains nothing within noticeQuiet.
+	native            *nativeStatus
+	lastNativeKind    session.EventKind
+	lastNativeSummary string
+	lastNativeAt      time.Time
 }
 
 func newActivityTracker(rec *recorder, agentPGID int, now time.Time) *activityTracker {
@@ -115,24 +139,105 @@ func (a *activityTracker) output(now time.Time, fx terminalEffects, title string
 			text = "notification"
 		}
 		if text != a.lastNotice || now.Sub(a.lastNoticeAt) >= noticeQuiet {
-			a.rec.event(db.NewEvent{Kind: session.EventNotification, Summary: text, At: now})
+			e := db.NewEvent{Kind: session.EventNotification, Summary: text, At: now}
+			// 7501: while the program reports its own status, a
+			// notification is context, not the attention signal.
+			if a.native != nil {
+				e.Attention = session.AttentionInfo
+			}
+			a.rec.event(e)
 		}
 		a.lastNotice, a.lastNoticeAt = text, now
-		a.waiting = true
+		if a.native == nil {
+			a.waiting = true
+		}
 	}
 	if fx.bells > 0 {
 		quiet := a.lastBell.IsZero() || now.Sub(a.lastBell) >= bellQuiet
 		if quiet && now.Sub(a.lastNoticeAt) >= bellAfterNotice {
-			summary := "bell"
+			e := db.NewEvent{Kind: session.EventBell, At: now, Summary: "bell"}
 			if a.title != "" {
-				summary = "bell: " + a.title
+				e.Summary = "bell: " + a.title
 			}
-			a.rec.event(db.NewEvent{Kind: session.EventBell, Summary: summary, At: now})
+			// 7501: as above.
+			if a.native != nil {
+				e.Attention = session.AttentionInfo
+			}
+			a.rec.event(e)
 		}
 		a.lastBell = now
-		a.waiting = true
+		if a.native == nil {
+			a.waiting = true
+		}
 	}
 	a.update(now, watched, false)
+}
+
+// 7501: setNative gives the tracker the program's own reading of its
+// status, from the session's status records: the primary source of the
+// activity, overriding the heuristics while it is non-nil. emit also
+// records the event a change implies; input-driven calls pass false, since
+// typing answers a block silently (as input does for the heuristics).
+func (a *activityTracker) setNative(now time.Time, n *nativeStatus, watched, emit bool) {
+	prev := a.native
+	a.native = n
+	if n == nil {
+		if prev != nil {
+			// The records are gone (cleared, or dropped at a shell
+			// prompt): the heuristics resume from a fresh working period.
+			a.workingSince = now
+			a.idleRecorded = false
+			a.update(now, watched, true)
+		}
+		return
+	}
+	if emit {
+		a.recordNative(prev, n, now, watched)
+	}
+	// Force the write-through when anything in the status changed, so a
+	// progress update reaches the session record without a state change.
+	a.update(now, watched, prev == nil || *prev != *n)
+}
+
+// 7501: recordNative records the event a change in the program's status
+// implies. A blocked program asking something new re-raises attention even
+// without a state change; repeats of the same event within noticeQuiet are
+// dropped.
+func (a *activityTracker) recordNative(prev, n *nativeStatus, now time.Time, watched bool) {
+	changed := prev == nil || prev.activity != n.activity
+	var kind session.EventKind
+	switch n.activity {
+	case session.ActivityBlocked:
+		kind = session.EventBlocked
+		if !changed && (prev.kind != n.kind || prev.message != n.message) {
+			changed = true
+		}
+	case session.ActivityError:
+		kind = session.EventError
+	case session.ActivityDone:
+		kind = session.EventDone
+	case session.ActivityIdle:
+		kind = session.EventIdle
+	case session.ActivityWorking:
+		kind = session.EventWorking
+	default:
+		return
+	}
+	if !changed {
+		return
+	}
+	summary := n.eventSummary()
+	if kind == a.lastNativeKind && summary == a.lastNativeSummary && now.Sub(a.lastNativeAt) < noticeQuiet {
+		return
+	}
+	e := db.NewEvent{Kind: kind, Summary: summary, At: now}
+	if kind == session.EventIdle && watched {
+		// Someone attached is watching it; it only needs noticing when
+		// nobody is (the same rule as the heuristic idle event).
+		e.Attention = session.AttentionInfo
+	}
+	a.rec.event(e)
+	a.lastNativeKind, a.lastNativeSummary, a.lastNativeAt = kind, summary, now
 }
 
 // input notes that someone typed into the session (an attached client or
@@ -173,6 +278,10 @@ func (a *activityTracker) tick(now time.Time, fgPGID int, watched bool) {
 func (a *activityTracker) update(now time.Time, watched, force bool) {
 	next := session.ActivityWorking
 	switch {
+	// 7501: while the program reports its own status, it decides; the
+	// waiting flag and the idle timer only judge programs that do not.
+	case a.native != nil:
+		next = a.native.activity
 	case a.waiting:
 		next = session.ActivityWaiting
 	case now.Sub(a.lastOutput) >= idleAfter:
@@ -184,6 +293,9 @@ func (a *activityTracker) update(now time.Time, watched, force bool) {
 	prev := a.state
 	a.state = next
 	switch {
+	// 7501: native transitions record their own events (recordNative);
+	// the cases below are the heuristic idle/working events.
+	case a.native != nil:
 	case next == session.ActivityIdle && prev == session.ActivityWorking:
 		if a.lastIdleEvent.IsZero() || now.Sub(a.lastIdleEvent) >= idleEventGap {
 			// Someone attached is watching it go quiet; it only needs

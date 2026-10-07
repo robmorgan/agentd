@@ -1,7 +1,9 @@
 package worker
 
 import (
+	"bytes"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +18,65 @@ func report(id string, state libghostty.ProgramStatusState, mod ...func(*libghos
 		m(&r)
 	}
 	return r
+}
+
+// The shadow terminal reports program status (OSC 7501) from the same
+// VTWrite that keeps the screen. This also pins what the worker expects of
+// libghostty: parsed reports, a detection reply through the write-pty
+// effect, and primary prompt starts. A libghostty bump that changes any of
+// it fails here rather than silently muting the primary activity source.
+func TestTerminalReportsProgramStatus(t *testing.T) {
+	ts, err := newTerminalState(80, 24, maxScrollbackBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ts.close()
+
+	// An ST-terminated report, fully parsed and validated by libghostty.
+	_, fx := ts.feed([]byte("\x1b]7501;state=working:progress=47:app=cargo\x1b\\"))
+	if len(fx.statusReports) != 1 {
+		t.Fatalf("working report: %+v", fx)
+	}
+	if r := fx.statusReports[0]; r.State != libghostty.ProgramStatusStateWorking || r.Progress != 47 || r.App != "cargo" {
+		t.Fatalf("working report = %+v", r)
+	}
+
+	// A BEL-terminated blocked report with base64 text.
+	_, fx = ts.feed([]byte("\x1b]7501;state=blocked:kind=permission:msg=UnVuIHRlc3RzPw==\x07"))
+	if len(fx.statusReports) != 1 {
+		t.Fatalf("blocked report: %+v", fx)
+	}
+	if r := fx.statusReports[0]; r.Kind != libghostty.ProgramStatusKindPermission || r.Message != "Run tests?" {
+		t.Fatalf("blocked report = %+v", r)
+	}
+
+	// A report split across reads arrives once complete.
+	if _, fx = ts.feed([]byte("\x1b]7501;state=do")); len(fx.statusReports) != 0 {
+		t.Fatalf("partial report: %+v", fx)
+	}
+	_, fx = ts.feed([]byte("ne\x1b\\"))
+	if len(fx.statusReports) != 1 || fx.statusReports[0].State != libghostty.ProgramStatusStateDone {
+		t.Fatalf("completed report: %+v", fx)
+	}
+
+	// The detection query is answered (the query echoed back, with its
+	// own terminator) and kept apart from the other terminal replies, so
+	// the worker can send it even while a client terminal is attached.
+	for _, query := range []string{"\x1b]7501;?\x1b\\", "\x1b]7501;?\x07"} {
+		writes, fx := ts.feed([]byte(query))
+		if len(writes) != 0 {
+			t.Fatalf("query %q: reply in the pending writes: %q", query, writes)
+		}
+		if len(fx.statusReplies) != 1 || !bytes.Equal(fx.statusReplies[0], []byte(query)) {
+			t.Fatalf("query %q: replies = %q", query, fx.statusReplies)
+		}
+	}
+
+	// A new primary shell prompt (OSC 133 A) is reported, which drops
+	// working and blocked records.
+	if _, fx = ts.feed([]byte("\x1b]133;A\x07")); !fx.promptStart {
+		t.Fatalf("prompt: %+v", fx)
+	}
 }
 
 func TestStatusTrackerDerivation(t *testing.T) {
@@ -188,6 +249,93 @@ func TestStatusTrackerPromptDropsWorkingAndBlocked(t *testing.T) {
 	if !tr.seen() {
 		t.Error("seen() = false after reports")
 	}
+}
+
+// statusAgent reports program status on command; "Run tests?" and "All
+// tests passed" in base64. -icanon so the query branch can read the
+// detection reply, which no newline follows. "blocked" also rings the bell
+// after the report: typing at the session would count the block as
+// answered, so the two must ride one command.
+const statusAgent = `stty -echo -icanon; echo ready
+while IFS= read -r l; do
+  case "$l" in
+    blocked) printf '\033]7501;state=blocked:kind=permission:app=claude-code:msg=UnVuIHRlc3RzPw==\033\\'; sleep 0.2; printf '\a'; echo bell-rung;;
+    done) printf '\033]7501;state=done:msg=QWxsIHRlc3RzIHBhc3NlZA==\033\\';;
+    clear) printf '\033]7501;state=clear\033\\';;
+    query) printf '\033]7501;?\033\\'; head -c 10 | cat -v; echo; echo query-done;;
+    quit) exit 0;;
+    *) echo "got:$l";;
+  esac
+done`
+
+// A program that reports its own status is the primary source: its reports
+// decide the activity and the events, bells are demoted to information,
+// typing answers a block, and clearing the records hands the session back
+// to the heuristics.
+func TestProgramStatusFromThePTY(t *testing.T) {
+	fastActivity(t)
+	h := startWorkerWith(t, statusAgent)
+
+	// The program reports it is blocked on a permission, then rings the
+	// bell (as agents configured for both would).
+	h.sendInput("blocked\n")
+	blocked := h.waitEvent(0, session.EventBlocked)
+	if blocked.Summary != "permission: Run tests?" || blocked.Attention != session.AttentionAction {
+		t.Fatalf("blocked = %#v", blocked)
+	}
+	h.eventually("blocked activity", func() bool { return h.record().Activity == session.ActivityBlocked })
+	if rec := h.record(); *rec.AttentionSummary != "permission: Run tests?" {
+		t.Fatalf("attention summary = %q", *rec.AttentionSummary)
+	}
+
+	// The bell while the program reports status is context, not the
+	// signal: information, and the session stays blocked.
+	bell := h.waitEvent(blocked.ID, session.EventBell)
+	if bell.Attention != session.AttentionInfo {
+		t.Fatalf("bell while native = %#v", bell)
+	}
+	h.eventually("still blocked", func() bool { return h.record().Activity == session.ActivityBlocked })
+
+	// Typing answers the block until the program reports again.
+	h.sendInput("answered\n")
+	h.eventually("blocked answered", func() bool { return h.record().Activity == session.ActivityWorking })
+
+	// The program finishes.
+	h.sendInput("done\n")
+	done := h.waitEvent(bell.ID, session.EventDone)
+	if done.Summary != "All tests passed" || done.Attention != session.AttentionNotice {
+		t.Fatalf("done = %#v", done)
+	}
+	h.eventually("done activity", func() bool { return h.record().Activity == session.ActivityDone })
+
+	// Clearing the records hands the activity back to the heuristics,
+	// which judge the quiet session idle.
+	h.sendInput("clear\n")
+	h.eventually("heuristics resumed", func() bool { return h.record().Activity == session.ActivityIdle })
+
+	h.sendInput("quit\n")
+	h.waitExit()
+}
+
+// The worker answers the program status detection query itself, whether or
+// not a client is attached: it consumes the reports either way.
+func TestProgramStatusDetectionReply(t *testing.T) {
+	fastActivity(t)
+	h := startWorkerWith(t, statusAgent)
+
+	// Nobody attached.
+	h.sendInput("query\n")
+	h.eventually("the detection reply", func() bool { return strings.Contains(h.history(), "7501;?") })
+
+	// Attached: other terminal replies are left to the client's terminal,
+	// but this one the worker still answers (the client here answers no
+	// queries at all).
+	h.attach(defaultGeometry)
+	h.eventually("the first query to finish", func() bool { return strings.Contains(h.history(), "query-done") })
+	h.sendInput("query\n")
+	h.eventually("the detection reply while attached", func() bool {
+		return strings.Count(h.history(), "7501;?") >= 2
+	})
 }
 
 func TestStatusTrackerEvictsLeastRecentlyUpdated(t *testing.T) {
