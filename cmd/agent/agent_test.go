@@ -716,6 +716,48 @@ func TestEventsEndToEnd(t *testing.T) {
 	}
 }
 
+// A program that reports its own status (OSC 7501) drives the activity,
+// events, listings and status end to end: "Deploy?" and "Deployed" ride
+// the reports in base64.
+func TestProgramStatusEndToEnd(t *testing.T) {
+	e := newEnv(t, "")
+	e.startAndDetach("demo")
+
+	follow := e.start("events", "demo", "--follow")
+	m := follow.expect(0, "started")
+
+	// The shell echoes the command as typed, which is harmless text; the
+	// report reaches the terminal when printf runs.
+	e.mustRun("agent", "send-input", "demo",
+		`printf '\033]7501;state=blocked:kind=permission:app=claude-code:progress=40:msg=RGVwbG95Pw==\033\\'`+"\r")
+	m = follow.expect(m, "action  blocked")
+	m = follow.expect(m, "permission: Deploy?")
+
+	ls := e.mustRun("agent", "ls")
+	if !strings.Contains(ls, "⚠") || !strings.Contains(ls, "blocked") {
+		t.Fatalf("ls:\n%s", ls)
+	}
+	status := e.mustRun("agent", "status", "demo")
+	for _, want := range []string{"activity: blocked", "status_app: claude-code", "status_kind: permission",
+		"status_progress: 40%", "status_msg: Deploy?", "attention_summary: permission: Deploy?"} {
+		if !strings.Contains(status, want) {
+			t.Fatalf("status lacks %q:\n%s", want, status)
+		}
+	}
+	if out := e.mustRun("agent", "ls", "--json"); !strings.Contains(out, `"status_kind":"permission"`) ||
+		!strings.Contains(out, `"status_progress":40`) {
+		t.Fatalf("ls --json:\n%s", out)
+	}
+
+	// The program finishes; the record replaces the blocked one.
+	e.mustRun("agent", "send-input", "demo", `printf '\033]7501;state=done:msg=RGVwbG95ZWQ=\033\\'`+"\r")
+	m = follow.expect(m, "notice  done")
+	follow.expect(m, "Deployed")
+	if status := e.mustRun("agent", "status", "demo"); !strings.Contains(status, "activity: done") {
+		t.Fatalf("status after done:\n%s", status)
+	}
+}
+
 // A local attachment survives `agent daemon upgrade`, which replaces the
 // daemon and hands the session's worker over to the new binary while the
 // shell keeps running, and `agent daemon restart`: both times the CLI

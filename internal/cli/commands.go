@@ -699,6 +699,20 @@ func printSession(w io.Writer, s *session.Record, now time.Time) {
 	if s.LastOutputAt != nil {
 		p("last_output: %s ago\n", formatElapsed(int64(now.Sub(*s.LastOutputAt)/time.Second)))
 	}
+	// What the program itself reported through the program status
+	// protocol (OSC 7501), when it does.
+	if s.StatusApp != nil {
+		p("status_app: %s\n", escapeControls(*s.StatusApp))
+	}
+	if s.StatusKind != nil {
+		p("status_kind: %s\n", escapeControls(*s.StatusKind))
+	}
+	if s.StatusProgress != nil {
+		p("status_progress: %d%%\n", *s.StatusProgress)
+	}
+	if s.StatusMsg != nil {
+		p("status_msg: %s\n", escapeControls(*s.StatusMsg))
+	}
 	p("attention: %s\n", s.Attention)
 	if s.AttentionSummary != nil {
 		p("attention_summary: %s\n", escapeControls(*s.AttentionSummary))

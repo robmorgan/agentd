@@ -196,6 +196,22 @@ func TestActivityText(t *testing.T) {
 	if got := activityText(&s, now); got != "waiting 3m" {
 		t.Fatalf("waiting: %q", got)
 	}
+	s.Activity = session.ActivityBlocked
+	if got := activityText(&s, now); got != "blocked 3m" {
+		t.Fatalf("blocked: %q", got)
+	}
+	s.Activity = session.ActivityWorking
+	progress := 47
+	s.StatusProgress = &progress
+	if got := activityText(&s, now); got != "working 47%" {
+		t.Fatalf("working with progress: %q", got)
+	}
+	// 100% would overflow the column and ends at once anyway.
+	progress = 100
+	if got := activityText(&s, now); got != "working" {
+		t.Fatalf("working at 100%%: %q", got)
+	}
+	s.StatusProgress = nil
 	s.Activity = "something-new"
 	if got := activityText(&s, now); got != "something-new" {
 		t.Fatalf("unknown: %q", got)
