@@ -319,7 +319,13 @@ func (a *activityTracker) update(now time.Time, watched, force bool) {
 			a.rec.event(db.NewEvent{Kind: session.EventWorking, Summary: "output resumed", At: now})
 		}
 	}
-	a.rec.setActivity(db.Activity{Activity: a.state, Foreground: a.foreground, Title: a.title, LastOutputAt: a.lastOutput})
+	act := db.Activity{Activity: a.state, Foreground: a.foreground, Title: a.title,
+		LastOutputAt: a.lastOutput, StatusProgress: -1}
+	if a.native != nil {
+		act.StatusApp, act.StatusKind = a.native.app, a.native.kind
+		act.StatusMsg, act.StatusProgress = clean(a.native.message), a.native.progress
+	}
+	a.rec.setActivity(act)
 }
 
 // clean makes program-supplied text safe and short for a one-line summary:

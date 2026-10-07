@@ -224,6 +224,30 @@ func TestSetActivityGuards(t *testing.T) {
 	}
 }
 
+// The program status fields (OSC 7501) ride SetActivity: set while the
+// program reports, NULL again when it stops.
+func TestSetActivityProgramStatus(t *testing.T) {
+	store := newStore(t)
+	createdAt, _ := store.InsertSession(NewSession{SessionID: "s", Agent: "sh", Mode: session.ModeExecute, Cwd: "/"})
+	store.MarkRunning("s", createdAt, 10, 11)
+	if err := store.SetActivity("s", 10, Activity{Activity: session.ActivityBlocked,
+		StatusApp: "claude-code", StatusKind: "permission", StatusMsg: "Run tests?", StatusProgress: 60}); err != nil {
+		t.Fatal(err)
+	}
+	rec := store.mustGet(t, "s")
+	if rec.Activity != session.ActivityBlocked || *rec.StatusApp != "claude-code" ||
+		*rec.StatusKind != "permission" || *rec.StatusMsg != "Run tests?" || *rec.StatusProgress != 60 {
+		t.Fatalf("record = %#v", rec)
+	}
+	if err := store.SetActivity("s", 10, Activity{Activity: session.ActivityIdle, StatusProgress: -1}); err != nil {
+		t.Fatal(err)
+	}
+	rec = store.mustGet(t, "s")
+	if rec.StatusApp != nil || rec.StatusKind != nil || rec.StatusMsg != nil || rec.StatusProgress != nil {
+		t.Fatalf("after the program stopped reporting: %#v", rec)
+	}
+}
+
 // A version 2 database gains the events table and activity columns, and
 // statements a version 2 worker still runs keep working against it.
 func TestMigrateFromVersion2(t *testing.T) {
