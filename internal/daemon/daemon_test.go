@@ -52,7 +52,8 @@ func TestMain(m *testing.M) {
 }
 
 // echoAgent echoes each line back as got:<line>. "where" prints the working
-// directory, "bigflood" writes about 67 MB of output, "done" exits 0, "quit"
+// directory, "bigflood" writes about 67 MB of output, "block" reports a
+// blocked program status ("Deploy?" in base64), "done" exits 0, "quit"
 // exits 3.
 const echoAgent = `stty -echo; echo ready
 while IFS= read -r l; do
@@ -60,6 +61,7 @@ while IFS= read -r l; do
     quit) exit 3;;
     done) exit 0;;
     where) echo "pwd:$(pwd -P)";;
+    block) printf '\033]7501;state=blocked:kind=permission:msg=RGVwbG95Pw==\033\\';;
     bigflood) seq -f "line %g padding padding padding padding" 1 1500000; echo flood-done;;
     *) echo "got:$l";;
   esac

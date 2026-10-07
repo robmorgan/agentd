@@ -2,6 +2,7 @@ package worker
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -336,6 +337,50 @@ func TestProgramStatusDetectionReply(t *testing.T) {
 	h.eventually("the detection reply while attached", func() bool {
 		return strings.Count(h.history(), "7501;?") >= 2
 	})
+}
+
+// The records cross a worker handoff (as JSON, like the rest of
+// handoffState): a blocked agent must stay blocked, since the program will
+// not re-report on its own. States travel as the specification's words, so
+// a record from a future state is dropped rather than misread.
+func TestStatusHandoffRoundTrip(t *testing.T) {
+	now := time.Now().Round(0)
+	tr := newStatusTracker()
+	tr.apply(now, report("", libghostty.ProgramStatusStateBlocked, func(r *libghostty.ProgramStatus) {
+		r.Kind = libghostty.ProgramStatusKindPermission
+		r.App = "claude-code"
+		r.Message = "Run tests?"
+		r.Progress = 60
+	}))
+	tr.apply(now, report("lint", libghostty.ProgramStatusStateDone))
+	tr.noteInput(now.Add(-time.Minute))
+
+	data, err := json.Marshal(tr.handoff())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var h statusHandoff
+	if err := json.Unmarshal(data, &h); err != nil {
+		t.Fatal(err)
+	}
+	h.Records["future"] = statusHandoffRecord{State: "pondering", UpdatedAt: now}
+
+	restored := restoreStatusTracker(&h)
+	if len(restored.records) != 2 {
+		t.Fatalf("restored %d records, want 2 (the future state dropped)", len(restored.records))
+	}
+	if !restored.seen() {
+		t.Error("seen() lost across the handoff")
+	}
+	want := tr.derive()
+	if got := restored.derive(); got == nil || *got != *want {
+		t.Fatalf("derive() = %+v, want %+v", got, want)
+	}
+
+	// An image older than the records hands over nothing.
+	if empty := restoreStatusTracker(nil); empty.derive() != nil || empty.seen() {
+		t.Fatalf("restore from nil: %+v", empty)
+	}
 }
 
 func TestStatusTrackerEvictsLeastRecentlyUpdated(t *testing.T) {

@@ -264,6 +264,65 @@ func (t *statusTracker) app(id string, rec *statusRecord) string {
 	return ""
 }
 
+// statusHandoff is the tracker's state carried across a worker handoff.
+// States and kinds travel as the specification's words rather than
+// libghostty's numeric values, which are not pinned across versions; a
+// record whose state the next image does not know is dropped (the program
+// re-reports, as it would to a fresh terminal).
+type statusHandoff struct {
+	Records   map[string]statusHandoffRecord
+	LastInput time.Time
+	Reported  bool
+}
+
+type statusHandoffRecord struct {
+	State     string
+	Kind      string `json:",omitempty"`
+	Progress  int8
+	App       string `json:",omitempty"`
+	Title     string `json:",omitempty"`
+	Message   string `json:",omitempty"`
+	UpdatedAt time.Time
+}
+
+func (t *statusTracker) handoff() *statusHandoff {
+	if t == nil {
+		return nil
+	}
+	h := &statusHandoff{Records: make(map[string]statusHandoffRecord, len(t.records)),
+		LastInput: t.lastInput, Reported: t.reported}
+	for id, rec := range t.records {
+		h.Records[id] = statusHandoffRecord{
+			State: statusStateName(rec.State), Kind: statusKindName(rec.Kind),
+			Progress: rec.Progress, App: rec.App, Title: rec.Title, Message: rec.Message,
+			UpdatedAt: rec.UpdatedAt,
+		}
+	}
+	return h
+}
+
+// restoreStatusTracker rebuilds the tracker from a handoff; h may be nil
+// (an image older than the records, or a session that never reported).
+func restoreStatusTracker(h *statusHandoff) *statusTracker {
+	t := newStatusTracker()
+	if h == nil {
+		return t
+	}
+	t.lastInput, t.reported, t.dirty = h.LastInput, h.Reported, true
+	for id, rec := range h.Records {
+		state, ok := statusStateFromName(rec.State)
+		if !ok {
+			continue
+		}
+		t.records[id] = &statusRecord{
+			State: state, Kind: statusKindFromName(rec.Kind),
+			Progress: rec.Progress, App: rec.App, Title: rec.Title, Message: rec.Message,
+			UpdatedAt: rec.UpdatedAt,
+		}
+	}
+	return t
+}
+
 func statusActivity(s libghostty.ProgramStatusState) session.Activity {
 	switch s {
 	case libghostty.ProgramStatusStateBlocked:
@@ -290,4 +349,48 @@ func statusKindName(k libghostty.ProgramStatusKind) string {
 		return "auth"
 	}
 	return ""
+}
+
+func statusKindFromName(name string) libghostty.ProgramStatusKind {
+	switch name {
+	case "permission":
+		return libghostty.ProgramStatusKindPermission
+	case "question":
+		return libghostty.ProgramStatusKindQuestion
+	case "auth":
+		return libghostty.ProgramStatusKindAuth
+	}
+	return libghostty.ProgramStatusKindNone
+}
+
+// statusStateName is the specification's word for a record's state. clear
+// never makes a record.
+func statusStateName(s libghostty.ProgramStatusState) string {
+	switch s {
+	case libghostty.ProgramStatusStateWorking:
+		return "working"
+	case libghostty.ProgramStatusStateDone:
+		return "done"
+	case libghostty.ProgramStatusStateBlocked:
+		return "blocked"
+	case libghostty.ProgramStatusStateError:
+		return "error"
+	}
+	return "idle"
+}
+
+func statusStateFromName(name string) (libghostty.ProgramStatusState, bool) {
+	switch name {
+	case "idle":
+		return libghostty.ProgramStatusStateIdle, true
+	case "working":
+		return libghostty.ProgramStatusStateWorking, true
+	case "done":
+		return libghostty.ProgramStatusStateDone, true
+	case "blocked":
+		return libghostty.ProgramStatusStateBlocked, true
+	case "error":
+		return libghostty.ProgramStatusStateError, true
+	}
+	return 0, false
 }
