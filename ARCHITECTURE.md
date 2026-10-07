@@ -544,9 +544,38 @@ happened to a session: an id, the session, a time, a kind, an attention level (`
 | `idle` | notice (info while a client is attached) | the worker, when output stops for 10s after activity |
 | `working` | info | the worker, when output resumes after an idle event |
 | `stalled` | notice | the worker, after 30 minutes without output while a command other than the agent holds the PTY's foreground |
+| `blocked` | action | the worker, when the program reports it cannot proceed without the user (OSC 7501); the summary is the kind of block and the program's message |
+| `done` | notice | the worker, when the program reports it finished (OSC 7501) |
+| `error` | action | the worker, when the program reports it failed and stopped (OSC 7501) |
 | `acknowledged` | info | the daemon, when the user looked at the session (below) |
 
 Kinds travel as strings, so a client shows kinds newer than itself instead of failing to decode them.
+
+**Program status (OSC 7501) is the primary source.** A program that speaks the [program status
+protocol](https://www.superlogical.com/rex/docs/build/program-status) reports what it is doing
+directly: `idle`, `working` (with progress), `blocked` (with why: `permission`, `question`,
+`auth`), `done` or `error`, with an `app` name, a one-line message, and hierarchical record ids
+for programs doing several things at once. libghostty validates and parses the reports; the worker
+keeps the records (`internal/worker/status.go`) under the specification's rules: a report replaces
+its record whole, `clear` removes a record and its descendants (or everything), a new shell prompt
+(OSC 133 A) drops `working` and `blocked` records, a full reset removes all, and at most 256 are
+kept, evicting the least recently updated. The records survive a live worker handoff (they travel
+in `handoffState`, states as the specification's words): a blocked agent must stay blocked across
+an upgrade, since the program will not re-report on its own.
+
+While any records exist, they decide the session's activity: the state that needs the user most
+wins (`blocked` > `error` > `working` > `done` > `idle`), so one blocked shard of a parallel
+program blocks the session and one still working keeps it working however many are done.
+Transitions record the events above (repeats within 10 seconds are dropped; a blocked program
+asking something new re-raises). Typing into the session counts a blocked record as answered —
+silently, like the heuristic waiting flag — until the program reports again. Meanwhile the
+heuristics below are demoted, not disabled: bells and notifications from a reporting program are
+recorded as info-level context, and the idle timer no longer decides the activity. A session whose
+program never reports keeps the heuristic behavior exactly; the `// 7501:` comments in
+`internal/worker/activity.go` mark every seam. The worker answers the protocol's detection query
+(`ESC ] 7501 ; ?`, echoed back) whether or not a client is attached, since it consumes the reports
+itself; a client terminal that also supports the protocol replies identically, and the program
+reads the two replies as one answer.
 
 **Persistence.** Events are rows of the `events` table in `state.db`, written by the daemon and
 the workers. Ids come from `AUTOINCREMENT`, so they increase per runtime root and are never reused;
@@ -571,24 +600,33 @@ attention. An attachment that ends because the session ended does not, and outpu
 an attached client does not either, since an attached terminal may be a background tab. An ended
 session's attention stays until it is removed.
 
-**Activity.** The worker also keeps the session's `activity` (`working`; `idle` after 10 seconds
-without output; `waiting` after a bell or notification, until someone types; `exited`), the name of
-the process in the PTY's foreground (`tcgetpgrp` on the master, sampled every second: the agent
-itself, or a command a shell runs there under job control), the terminal title, and when the program
-last wrote output. It writes them on transitions only, never per output chunk, and never bumps
-`updated_at`, so lists do not reshuffle as agents go idle and back. Elapsed time is derived from
-`created_at` and `exited_at`.
+**Activity.** The worker also keeps the session's `activity`: what the program reports (`working`,
+`blocked`, `done`, `error`, `idle`), or for one that does not report, `working`, `idle` after 10
+seconds without output, or `waiting` after a bell or notification until someone types (`exited`
+either way once the agent is gone). Alongside it: the program's reported app name, kind of block,
+message and progress (`status_app`, `status_kind`, `status_msg`, `status_progress`, NULL for a
+program that does not report), the name of the process in the PTY's foreground (`tcgetpgrp` on the
+master, sampled every second: the agent itself, or a command a shell runs there under job
+control), the terminal title, and when the program last wrote output. It writes them on
+transitions only, never per output chunk, and never bumps `updated_at`, so lists do not reshuffle
+as agents go idle and back. Elapsed time is derived from `created_at` and `exited_at`. The status
+fields travel to clients under their own capability (`CapSessionStatus`), appended after the
+`CapSessionActivity` fields in session records.
 
-**Detection.** Bells, desktop notifications (OSC 9 and OSC 777) and title changes come from
-libghostty's parser, through its effect callbacks, out of the `VTWrite` the worker already makes
-for each PTY read; the added cost per chunk is a clock read. The owner goroutine never touches the
-database for this: events and activity go to a recorder goroutine through a queue of at most 64
-events (dropped, and logged, while it is full) and a single activity slot (a newer snapshot
-replaces an unwritten one). Noise is bounded: a bell is recorded unless another was seen in the
-last 10 seconds with no input since, so a program ringing in a loop records one event; a repeated
-notification text likewise; a bell within 2 seconds of a notification is the same request; and
-idle events are at most one per 30 seconds. OSC 99 (kitty's notification protocol) is not parsed
-by libghostty and is not detected.
+**Detection.** Program status reports, bells, desktop notifications (OSC 9 and OSC 777), shell
+prompts (OSC 133) and title changes come from libghostty's parser, through its effect callbacks,
+out of the `VTWrite` the worker already makes for each PTY read; the added cost per chunk is a
+clock read. The owner goroutine never touches the database for this: events and activity go to a
+recorder goroutine through a queue of at most 64 events (dropped, and logged, while it is full)
+and a single activity slot (a newer snapshot replaces an unwritten one). Noise is bounded: a bell
+is recorded unless another was seen in the last 10 seconds with no input since, so a program
+ringing in a loop records one event; a repeated notification text likewise; a bell within 2
+seconds of a notification is the same request; idle events are at most one per 30 seconds; and a
+program flipping between the same reported states gains nothing within 10 seconds. The status
+reports of one feed are not capped (replaying them into the record store needs them all, and a
+report costs the program at least its own sequence bytes of output), while notifications are kept
+to 4 per feed. OSC 99 (kitty's notification protocol) is not parsed by libghostty and is not
+detected.
 
 **Events streams.** `SubscribeEvents{AfterID, SessionID, Tail}` opens an events stream: the daemon
 sends every retained event after `AfterID` (or, without it, the newest `Tail` events), then new

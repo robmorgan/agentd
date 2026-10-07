@@ -531,6 +531,7 @@ Done:
 - Resource usage: workers and the daemon report their own (`GetSessionStats`/`GetDaemonStats`, `agent status --stats`, `agent daemon stats`), and `agentd bench sessions` measures sessions at scale (BENCHMARKS.md, "Sessions at scale").
 
 - Cross-host discovery (`agent ls --all`, `agent events --all`) and global session ids (daemon id + session UID).
+- Program status (OSC 7501) as the primary attention source: libghostty parses the reports, the worker keeps the records (`internal/worker/status.go`) and answers the detection query, the program's word decides activity/attention (blocked/done/error activities and events; progress, app, kind and message in `state.db` v6 and under `CapSessionStatus`), bells/notifications/idle-timing are the demoted fallback (the `// 7501:` seams in activity.go), and records survive handoffs.
 
 Next:
 1. Per-client permissions and audit, if remote peers need to be limited.

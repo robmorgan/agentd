@@ -157,19 +157,23 @@ notice    something meaningful happened (an agent went quiet, a session finished
 action    user intervention required (a bell, a permission prompt, a failure)
 ```
 
-Clients surface sessions based on attention instead of raw output. `agentd` reads the signals from
-each session's terminal output, without any cooperation from the agent beyond what terminals
-already understand: the bell, desktop notifications (OSC 9 and OSC 777), output stopping and
-starting, and the process in the foreground. They are recorded as events, and a session needs
-attention until you look at it: attaching to it (or detaching from it) acknowledges it.
+Clients surface sessions based on attention instead of raw output. The primary signal is the
+program's own word: [program status reports](https://mitchellh.com/writing/program-status-osc7501)
+(OSC 7501), through which a program says it is `working` (with progress), `blocked` on the user
+(and why: a permission, a question, a login), `done` or `error`, with a one-line message. While a
+program reports, its word decides the session's activity and attention. For programs that do not,
+`agentd` falls back to what terminals already understand: the bell, desktop notifications (OSC 9
+and OSC 777), output stopping and starting, and the process in the foreground. Either way the
+signals are recorded as events, and a session needs attention until you look at it: attaching to
+it (or detaching from it) acknowledges it.
 
 ```sh
 agent ls
 
   RUN  AGE    NAME            ACTIVITY     CWD                 ATTENTION
-  ⚠    12m    fix-tests       waiting 2m   ~/src/app           Claude needs your permission to use Bash
-  ●    40m    dep-bump        idle 5m      ~/src/app           idle after 4m of output
-  ●    3m     docs            working      ~/src/docs
+  ⚠    12m    fix-tests       blocked 2m   ~/src/app           permission: Run the tests?
+  ●    40m    dep-bump        working 47%  ~/src/app
+  ●    3m     docs            idle 5m      ~/src/docs          idle after 4m of output
   ○    1h     refactor        exited       ~/src/app           finished (exit 0)
 ```
 
@@ -196,8 +200,22 @@ connection to a remote host) and resumes after the last event it printed.
 
 ### Making agents ask out loud
 
-A bell or a desktop notification is the clearest signal that an agent is waiting for you. Without
-one, `agentd` still notices an agent going quiet (`idle`), but cannot tell finishing from asking.
+The clearest signal is a program status report (OSC 7501): one escape sequence that says what the
+program is doing and what it needs. `agentd` answers the protocol's detection query (`ESC ] 7501 ;
+? ST`) for every session, attached or not, so a program that checks before reporting finds the
+protocol supported. Any program can report:
+
+```sh
+printf '\e]7501;state=blocked:kind=permission:msg=%s\e\\' "$(printf 'Deploy?' | base64)"
+```
+
+While a program reports, bells and notifications from it are recorded as information rather than
+treated as the attention signal, and typing into the session counts a `blocked` report as
+answered until the program reports again.
+
+For agents that do not report status yet, a bell or a desktop notification is the next best
+signal that one is waiting for you. Without either, `agentd` still notices an agent going quiet
+(`idle`), but cannot tell finishing from asking.
 
 - **Claude Code** sends a notification when it needs permission and when it has been waiting for
   input for a minute. Its default channel depends on the terminal it thinks it runs in, which
