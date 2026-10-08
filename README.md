@@ -242,6 +242,7 @@ the `agentd` daemon.
 make build    # builds libghostty-vt if needed, then bin/agentd and bin/agent
 make agent    # just the CLI: pure Go, no cgo or Zig needed
 make test     # Go tests, with -race
+make test-cgocheck  # the worker's tests with cgo's pointer checks (libghostty)
 make test-linux  # the same suite on Linux, in Docker
 ```
 

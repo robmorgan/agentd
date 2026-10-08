@@ -61,7 +61,7 @@ func FuzzSnapshotRestore(f *testing.F) {
 		client.VTWrite([]byte("\x1b[2J\x1b[H"))
 		client.VTWrite(snap)
 		if d := diffRestored(ts.term, client); d != "" {
-			if hasWideNarrowCell(ts.term) || pendingWrapOverBlank(ts.term) || alternateScrollback(ts.term) || graphemeModeChanged(ts.term, data) {
+			if pendingWrapOverBlank(ts.term) || alternateScrollback(ts.term) || graphemeModeChanged(ts.term, data) {
 				return // a known limit; see TestSnapshotKnownLimits
 			}
 			t.Fatalf("restored terminal differs:\n%s\nsnapshot: %q", d, snap)
@@ -74,23 +74,6 @@ func FuzzSnapshotRestore(f *testing.F) {
 			}
 		}
 	})
-}
-
-// hasWideNarrowCell reports whether the screen has a two-column cell holding
-// an ASCII character. libghostty makes one when a wide character is printed
-// while the DEC line-drawing charset is in use (it maps the character but
-// keeps its width), and the formatter writes it as one column.
-func hasWideNarrowCell(term *libghostty.Terminal) bool {
-	cols, rows := must(term.Cols()), must(term.Rows())
-	for y := range uint32(rows) {
-		for x := range cols {
-			cell := must(must(term.GridRef(libghostty.Point{Tag: libghostty.PointTagActive, X: x, Y: y})).Cell())
-			if must(cell.Wide()) == libghostty.CellWideWide && must(cell.Codepoint()) < 0x80 {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // graphemeModeChanged reports whether the stream may have switched

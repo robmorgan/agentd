@@ -1031,9 +1031,6 @@ formatter's):
 * **A pending wrap over a blank cell** (possible after restoring a saved cursor): the formatter
   restores a pending wrap by printing the cell under the cursor again, which does nothing when
   that cell is blank, so the next character lands on the same row instead of the next.
-* **A wide character printed in the DEC line-drawing charset**: libghostty maps it but keeps it
-  two columns wide, and the formatter writes the mapped character in one, so the rest of the row
-  lands a column to the left.
 * **Text printed before grapheme clustering (mode 2027) was switched.** The mode decides how
   codepoints join into cells, cells do not record which mode made them, and the snapshot sets
   the current mode before the contents, so text printed under the other mode can split or join
