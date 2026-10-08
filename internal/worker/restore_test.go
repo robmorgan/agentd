@@ -311,6 +311,7 @@ func TestSnapshotRestores(t *testing.T) {
 		{"kitty keyboard", "\x1b[>3u"},
 		{"charset", "\x1b(0lqk\x1b(B"},
 		{"wide character in the line-drawing charset", "\x1b(0危00\x1b(B"},
+		{"wide character with the line-drawing charset still in use", "\x1b(0危00"},
 		{"tabstops", "\x1b[3g\x1b[5G\x1bH\x1b[1G\tx"},
 		{"palette", "\x1b]4;1;rgb:12/34/56\x1b\\\x1b[31mred"},
 		{"default colors", "\x1b]10;rgb:aa/bb/cc\x1b\\\x1b]11;rgb:01/02/03\x07\x1b]12;rgb:ff/00/00\x07"},
