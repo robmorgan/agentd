@@ -109,10 +109,15 @@ type activityTracker struct {
 	// records, which lets the heuristics apply). The last event recorded
 	// for it dedups repeats: a program flipping between the same states,
 	// or re-reporting the same block, gains nothing within noticeQuiet.
-	native            *nativeStatus
-	lastNativeKind    session.EventKind
-	lastNativeSummary string
-	lastNativeAt      time.Time
+	// Action-level events additionally keep a rate floor of one per
+	// noticeQuiet (lastNativeActionAt), like the bell's quiet rule: a
+	// program churning blocked messages must not drive notifications at
+	// report rate.
+	native             *nativeStatus
+	lastNativeKind     session.EventKind
+	lastNativeSummary  string
+	lastNativeAt       time.Time
+	lastNativeActionAt time.Time
 }
 
 func newActivityTracker(rec *recorder, agentPGID int, now time.Time) *activityTracker {
@@ -191,6 +196,13 @@ func (a *activityTracker) setNative(now time.Time, n *nativeStatus, watched, emi
 		}
 		return
 	}
+	if prev == nil {
+		// The program's reports supersede whatever heuristic wait was
+		// pending: without this, a bell from before the first report
+		// would resurface, hours stale, when the records are cleared.
+		a.waiting = false
+		a.lastBell, a.lastNotice, a.lastNoticeAt = time.Time{}, "", time.Time{}
+	}
 	if emit {
 		a.recordNative(prev, n, now, watched)
 	}
@@ -202,16 +214,15 @@ func (a *activityTracker) setNative(now time.Time, n *nativeStatus, watched, emi
 // 7501: recordNative records the event a change in the program's status
 // implies. A blocked program asking something new re-raises attention even
 // without a state change; repeats of the same event within noticeQuiet are
-// dropped.
+// dropped, and action-level events keep a floor of one per noticeQuiet.
+// An action event the floor defers is retried on later calls (it still
+// differs from the last recorded one) until it records, so a new question
+// alerts at most noticeQuiet late, never not at all.
 func (a *activityTracker) recordNative(prev, n *nativeStatus, now time.Time, watched bool) {
-	changed := prev == nil || prev.activity != n.activity
 	var kind session.EventKind
 	switch n.activity {
 	case session.ActivityBlocked:
 		kind = session.EventBlocked
-		if !changed && (prev.kind != n.kind || prev.message != n.message) {
-			changed = true
-		}
 	case session.ActivityError:
 		kind = session.EventError
 	case session.ActivityDone:
@@ -223,11 +234,24 @@ func (a *activityTracker) recordNative(prev, n *nativeStatus, now time.Time, wat
 	default:
 		return
 	}
+	summary := n.eventSummary()
+	action := kind.DefaultAttention() == session.AttentionAction
+	changed := prev == nil || prev.activity != n.activity
+	if !changed && action && (kind != a.lastNativeKind || summary != a.lastNativeSummary) {
+		// Still blocked (or failing), but on something not recorded yet:
+		// a new question, or an event the floor deferred.
+		changed = true
+	}
 	if !changed {
 		return
 	}
-	summary := n.eventSummary()
 	if kind == a.lastNativeKind && summary == a.lastNativeSummary && now.Sub(a.lastNativeAt) < noticeQuiet {
+		return
+	}
+	// The rate floor: the session record already carries every new
+	// message (setActivity), but notifications and --exec fire at most
+	// once per noticeQuiet.
+	if action && now.Sub(a.lastNativeActionAt) < noticeQuiet {
 		return
 	}
 	e := db.NewEvent{Kind: kind, Summary: summary, At: now}
@@ -238,6 +262,9 @@ func (a *activityTracker) recordNative(prev, n *nativeStatus, now time.Time, wat
 	}
 	a.rec.event(e)
 	a.lastNativeKind, a.lastNativeSummary, a.lastNativeAt = kind, summary, now
+	if action {
+		a.lastNativeActionAt = now
+	}
 }
 
 // input notes that someone typed into the session (an attached client or
@@ -322,8 +349,9 @@ func (a *activityTracker) update(now time.Time, watched, force bool) {
 	act := db.Activity{Activity: a.state, Foreground: a.foreground, Title: a.title,
 		LastOutputAt: a.lastOutput, StatusProgress: -1}
 	if a.native != nil {
+		// The message was cleaned when the status was derived.
 		act.StatusApp, act.StatusKind = a.native.app, a.native.kind
-		act.StatusMsg, act.StatusProgress = clean(a.native.message), a.native.progress
+		act.StatusMsg, act.StatusProgress = a.native.message, a.native.progress
 	}
 	a.rec.setActivity(act)
 }
@@ -332,7 +360,13 @@ func (a *activityTracker) update(now time.Time, watched, force bool) {
 // control characters become spaces, runs of space collapse, and it is cut
 // to maxSummary runes.
 func clean(s string) string {
-	s = strings.Join(strings.FieldsFunc(s, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }), " ")
+	// Format characters (unicode.Cf: bidirectional overrides, zero-width
+	// characters) are invisible but reorder or hide what a summary shows,
+	// exactly where the user decides what to approve; unicode.IsControl
+	// does not cover them.
+	s = strings.Join(strings.FieldsFunc(s, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r)
+	}), " ")
 	if r := []rune(s); len(r) > maxSummary {
 		s = string(r[:maxSummary-1]) + "…"
 	}

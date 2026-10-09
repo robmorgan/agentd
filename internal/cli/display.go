@@ -148,7 +148,11 @@ func displayCwd(cwd, home string) string {
 // rather than letting a terminal act on them. Anything shown from a path
 // goes through it first.
 func escapeControls(text string) string {
-	if !strings.ContainsFunc(text, unicode.IsControl) {
+	// Format characters (unicode.Cf: bidirectional overrides, zero-width
+	// characters) are escaped like controls: invisible, they can reorder
+	// or hide what the line appears to say.
+	suspect := func(r rune) bool { return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) }
+	if !strings.ContainsFunc(text, suspect) {
 		return text
 	}
 	var b strings.Builder
@@ -160,7 +164,7 @@ func escapeControls(text string) string {
 			b.WriteString(`\n`)
 		case r == '\r':
 			b.WriteString(`\r`)
-		case unicode.IsControl(r):
+		case suspect(r):
 			fmt.Fprintf(&b, `\u{%x}`, r)
 		default:
 			b.WriteRune(r)

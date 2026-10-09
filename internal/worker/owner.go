@@ -160,6 +160,15 @@ func (s *ownerState) hasLiveAttachTerminal() bool {
 
 // writeInput queues client input for the PTY; see ptyInput.
 func (s *ownerState) writeInput(data []byte) error {
+	// A client terminal that also speaks the program status protocol
+	// echoes the detection query back as input. The worker has already
+	// answered it (afterFeed), so the copy is dropped: forwarded, it
+	// would reach the program as a stray escape sequence after its
+	// detection window, and it is a terminal's reflex, not the user
+	// typing, so it must not count as answering a blocked record.
+	if isStatusDetectionReply(data) {
+		return nil
+	}
 	if err := s.input.enqueue(data); err != nil {
 		return err
 	}
@@ -254,11 +263,15 @@ func (s *ownerState) afterFeed(writes [][]byte, effects terminalEffects) {
 		}
 	}
 	if s.status != nil {
-		for _, r := range effects.statusReports {
-			s.status.apply(now, r)
-		}
-		if effects.promptStart {
-			s.status.promptSeen()
+		// In stream order: a prompt ends the records of the program
+		// before it, never of one that reported after it in the same
+		// read.
+		for _, ev := range effects.statusEvents {
+			if ev.report != nil {
+				s.status.apply(now, *ev.report)
+			} else {
+				s.status.promptSeen()
+			}
 		}
 	}
 	if s.activity != nil {
@@ -372,6 +385,13 @@ func (s *ownerState) attach(attachID string, kind session.AttachmentKind, g prot
 
 	a := &ownerAttachment{kind: kind, connectedAt: connectedAt, sub: s.output.subscribe(), detach: make(chan struct{})}
 	s.attachments[attachID] = a
+	// An interactive attach shows the user the screen: done and error
+	// records have been seen (the same moment the daemon acknowledges
+	// attention), so they no longer decide the session's activity.
+	if kind == session.AttachmentAttach && s.status != nil && s.activity != nil {
+		s.status.userSaw()
+		s.activity.setNative(connectedAt, s.status.derive(), s.watched(), false)
+	}
 	return &attachResult{
 		attachID: attachID,
 		snapshot: snapshot,

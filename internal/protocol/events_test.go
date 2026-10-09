@@ -141,11 +141,30 @@ func TestSessionStatusIsNegotiated(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(got, &Response{Session: &partialRec}) {
 		t.Fatalf("without it: %#v, %v", got, err)
 	}
+	// The appended bytes are pinned: app, kind and msg as optional strings
+	// (presence byte + u32 length + bytes), progress as an optional u32
+	// (presence byte + u32). Different builds negotiate this capability
+	// with each other, so the layout must not drift.
+	appended := 1 + 4 + len("claude-code") + 1 + 4 + len("permission") + 1 + 4 + len("Run tests?") + 1 + 4
+	if full.Len()-partial.Len() != appended {
+		t.Fatalf("status fields grew the record by %d bytes, want %d", full.Len()-partial.Len(), appended)
+	}
 	// Neither side can misread the other: the lengths no longer line up.
 	if _, err := ReadResponseWith(bytes.NewReader(full.Bytes()), activityOnly); err == nil {
 		t.Fatal("a decoder without the capability accepted the appended fields")
 	}
 	if !HasCapability(Capabilities(), CapSessionStatus) {
 		t.Fatal("this build does not advertise CapSessionStatus")
+	}
+	// Out-of-contract progress never reaches the wire or the reader.
+	bad := -1
+	rec.StatusProgress = &bad
+	var clamped bytes.Buffer
+	if err := WriteResponseWith(&clamped, both, &Response{Session: &rec}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = ReadResponseWith(bytes.NewReader(clamped.Bytes()), both)
+	if err != nil || got.Session.StatusProgress != nil {
+		t.Fatalf("negative progress crossed the wire: %#v, %v", got.Session.StatusProgress, err)
 	}
 }

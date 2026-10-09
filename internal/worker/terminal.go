@@ -65,13 +65,16 @@ type terminalEffects struct {
 	bells         int
 	notifications []libghostty.TerminalDesktopNotification
 	titleChanged  bool
-	// statusReports are the program status reports (OSC 7501) of the feed,
-	// already validated by libghostty, in order. Unlike notifications they
-	// are not capped: replaying them into the record store needs them all
-	// (dropping a clear, say, leaves stale records), and a report costs
-	// the program at least its own sequence bytes of PTY output, so the
-	// feed bounds them.
-	statusReports []libghostty.ProgramStatus
+	// statusEvents are the program status reports (OSC 7501, already
+	// validated by libghostty) and primary shell prompt starts (OSC 133 A)
+	// of the feed, in stream order: a prompt ends the records of the
+	// program before it but not of one that reported after it, so the
+	// order must survive a coalesced read. Unlike notifications they are
+	// not capped: replaying them into the record store needs them all
+	// (dropping a clear, say, leaves stale records), and each costs the
+	// program its own sequence bytes of PTY output, so the feed bounds
+	// them.
+	statusEvents []statusEvent
 	// statusReplies are the terminal's answers to the program status
 	// protocol's detection query. They are kept apart from the other
 	// terminal replies (pending) because the worker answers this query
@@ -79,9 +82,12 @@ type terminalEffects struct {
 	// reports itself, and the client's terminal may not support the
 	// protocol. See ownerState.afterFeed.
 	statusReplies [][]byte
-	// promptStart reports a new primary shell prompt (OSC 133 A), which
-	// ends the command any working or blocked status records came from.
-	promptStart bool
+}
+
+// statusEvent is one entry of a feed's program status stream: a report,
+// or (report nil) a primary shell prompt start.
+type statusEvent struct {
+	report *libghostty.ProgramStatus
 }
 
 // statusDetectionReplies are the exact replies libghostty writes to the
@@ -139,11 +145,11 @@ func (s *terminalState) adopt(term *libghostty.Terminal) {
 	// Setting a program status handler also makes the terminal answer the
 	// protocol's detection query, so programs know they can report.
 	term.SetEffectProgramStatus(func(_ *libghostty.Terminal, r libghostty.ProgramStatus) {
-		s.effects.statusReports = append(s.effects.statusReports, r)
+		s.effects.statusEvents = append(s.effects.statusEvents, statusEvent{report: &r})
 	})
 	term.SetEffectSemanticPrompt(func(_ *libghostty.Terminal, p libghostty.TerminalSemanticPrompt) {
 		if p.Kind == libghostty.SemanticPromptStart && p.PromptKind == libghostty.PromptPrimary {
-			s.effects.promptStart = true
+			s.effects.statusEvents = append(s.effects.statusEvents, statusEvent{})
 		}
 	})
 	s.term = term

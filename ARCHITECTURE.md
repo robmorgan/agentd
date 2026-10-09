@@ -164,6 +164,17 @@ state, attention); the live PTY, agent process and terminal state live in the se
 | Worker crash (SIGKILL) | Metadata | The session: its PTY is hung up, so the kernel sends the agent SIGHUP; terminal history not yet written to `logs/` (it is written when a session ends) | Recorded `failed` by the daemon that spawned the worker, or `unknown_recovered` when a probe finds its socket refusing. An agent that ignores SIGHUP survives, orphaned, with a dead terminal: agentd does not signal recorded pids, which may have been reused |
 | Agent exits or crashes | Metadata, history (written to `logs/`) | The live session | The worker records `exited` (exit 0, or a kill) or `failed` with the reason, and sends `SessionEnded` to attached clients |
 | Machine reboot | Metadata, history of ended sessions, keys, config | Every live session (processes and PTYs), and the unsaved history of those sessions | Sessions recorded running are `unknown_recovered` once the next daemon finds their sockets refusing or gone |
+
+**Downgrades are one-way past a schema bump.** A binary older than `state.db`'s version refuses
+to open it (remove the runtime root to start fresh), and whichever process opens the database
+first — the daemon, a worker, even `agentd bench` — migrates it. Two subtler costs of rolling
+back a binary across the program status release (schema v6): a pre-v6 daemon still parses
+activities strictly, so running workers writing the new words (`blocked`, `done`, `error`) make
+it fail to read those sessions at all, not just miss their status fields; and a live handoff to
+a pre-status image silently drops the program status records (the old image ignores the unknown
+handoff field), so a blocked agent reads as merely idle until it reports again — the heuristics
+resume, nothing is corrupted, but the program's word is lost. Roll workers and daemon back
+together, or not at all.
 | Upgrade with live handoff (`agent daemon upgrade`, `agentd upgrade`) | Everything a daemon restart keeps, and the worker itself moves to the new binary: same pid, same agent (still its child), same PTY, socket path, exact terminal state, attach numbering; queued input reaches the agent first, and output written during the handoff waits in the PTY | Attachments end with `SessionRestarting` (clients that do not know it are detached instead); a connection arriving during the exec just waits for the new image | The new image restores the state and touches the session's row (`MarkResumed`); nothing else changes in `state.db` |
 | Upgrade without handoff (the handoff was refused or failed before the exec) | The session, unchanged, on its previous binary | Attachments, if the failure came after clients were told to restart (they reattach to the same worker) | Nothing to reconcile; `agentd upgrade` names the session and the reason |
 | New image dies after the exec | Metadata | The session, as for a worker crash | As for a worker crash; `agentd upgrade` reports the session as lost |
@@ -558,8 +569,12 @@ directly: `idle`, `working` (with progress), `blocked` (with why: `permission`, 
 for programs doing several things at once. libghostty validates and parses the reports; the worker
 keeps the records (`internal/worker/status.go`) under the specification's rules: a report replaces
 its record whole, `clear` removes a record and its descendants (or everything), a new shell prompt
-(OSC 133 A) drops `working` and `blocked` records, a full reset removes all, and at most 256 are
-kept, evicting the least recently updated. The records survive a live worker handoff (they travel
+(OSC 133 A) drops `working`, `blocked` and `idle` records (that program is over; an idle record
+left behind would pin the session while the next, possibly non-reporting, command runs), `done`
+and `error` records stay until the user has seen them — typing into the session or attaching to
+look at it — a full reset removes all, and at most 256 are kept, evicting the least recently
+updated. Reports and prompt starts are applied in stream order, so a report arriving after a
+prompt in the same coalesced PTY read belongs to the next command and survives it. The records survive a live worker handoff (they travel
 in `handoffState`, states as the specification's words): a blocked agent must stay blocked across
 an upgrade, since the program will not re-report on its own.
 

@@ -504,9 +504,12 @@ type ending struct {
 func (d *Database) end(sessionID string, e ending) error {
 	at := now()
 	level := e.kind.DefaultAttention()
+	// The program status columns go with the agent: an ended session
+	// carries no live program status, however it ended.
 	query := `UPDATE sessions SET status = ?2, worker_pid = NULL, agent_pid = NULL,
                  attention = ?3, attention_summary = ?4, attention_at = ?5, updated_at = ?5,
-                 activity = 'exited'` + e.set + " WHERE session_id = ?1" + e.where
+                 activity = 'exited',
+                 status_app = NULL, status_kind = NULL, status_msg = NULL, status_progress = NULL` + e.set + " WHERE session_id = ?1" + e.where
 	_, err := d.transition(NewEvent{SessionID: sessionID, Kind: e.kind, Attention: level, Summary: e.summary},
 		query, append([]any{sessionID, string(e.status), string(level), e.summary, at}, e.args...)...)
 	return err

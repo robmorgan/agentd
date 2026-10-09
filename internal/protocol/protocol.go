@@ -1238,8 +1238,10 @@ func (e *encoder) sessionRecord(s *session.Record) {
 		e.optStr(s.StatusApp)
 		e.optStr(s.StatusKind)
 		e.optStr(s.StatusMsg)
+		// Progress is 0-100 by contract; anything else is absent rather
+		// than wrapped into a huge unsigned value on the wire.
 		var progress *uint32
-		if s.StatusProgress != nil {
+		if s.StatusProgress != nil && *s.StatusProgress >= 0 && *s.StatusProgress <= 100 {
 			v := uint32(*s.StatusProgress)
 			progress = &v
 		}
@@ -1554,7 +1556,9 @@ func (d *decoder) sessionRecord() session.Record {
 		rec.StatusApp = d.optStr()
 		rec.StatusKind = d.optStr()
 		rec.StatusMsg = d.optStr()
-		if v := d.optU32(); v != nil {
+		// A peer's progress outside the 0-100 contract is dropped, not
+		// displayed (and not wrapped negative on 32-bit ints).
+		if v := d.optU32(); v != nil && *v <= 100 {
 			p := int(*v)
 			rec.StatusProgress = &p
 		}

@@ -65,10 +65,10 @@ type nativeStatus struct {
 }
 
 // eventSummary is the one-line summary for an event about this status:
-// the program's message (cleaned, it is untrusted), prefixed with why it
-// is blocked, falling back to the bare state.
+// the program's message (already cleaned by deriveNow), prefixed with why
+// it is blocked, falling back to the bare state.
 func (n *nativeStatus) eventSummary() string {
-	s := clean(n.message)
+	s := n.message
 	if n.activity == session.ActivityBlocked && n.kind != "" {
 		if s == "" {
 			s = n.kind
@@ -90,10 +90,6 @@ type statusTracker struct {
 	// program reports again; the next report replaces the record and the
 	// suppression dissolves.
 	lastInput time.Time
-	// reported is set once any report arrives this incarnation, so the
-	// session can say the program speaks the protocol even after its
-	// records are cleared.
-	reported bool
 	// derived caches derive's last reading until the records (or the
 	// input time) change, since derive is consulted on every PTY feed.
 	derived *nativeStatus
@@ -105,9 +101,13 @@ func newStatusTracker() *statusTracker {
 }
 
 // apply folds one report into the records. The empty id is the program's
-// own (root) record.
+// own (root) record. A state this build does not know is ignored, as the
+// libghostty binding asks: coercing it to a known one could demote an
+// urgent future state to a quiet record.
 func (t *statusTracker) apply(now time.Time, r libghostty.ProgramStatus) {
-	t.reported = true
+	if _, ok := statusStateName(r.State); !ok && r.State != libghostty.ProgramStatusStateClear {
+		return
+	}
 	t.dirty = true
 	if r.State == libghostty.ProgramStatusStateClear {
 		if r.ID == "" {
@@ -115,8 +115,9 @@ func (t *statusTracker) apply(now time.Time, r libghostty.ProgramStatus) {
 			return
 		}
 		delete(t.records, r.ID)
+		prefix := r.ID + "/"
 		for id := range t.records {
-			if strings.HasPrefix(id, r.ID+"/") {
+			if strings.HasPrefix(id, prefix) {
 				delete(t.records, id)
 			}
 		}
@@ -149,30 +150,44 @@ func (t *statusTracker) evict() {
 	}
 }
 
-// promptSeen notes a new shell prompt (OSC 133 A): the command the records
-// came from is over, so working and blocked records are dropped. Done and
-// error records stay until the user sees them or the program clears them;
-// idle ones (which the spec lets either way) stay too, so an interactive
-// tool sitting at its own prompt remains visible.
+// promptSeen notes a new shell prompt (OSC 133 A): the program the records
+// came from is over, so its working, blocked and idle records are dropped
+// (keeping an idle record would pin the session to it while the next,
+// possibly non-reporting, command runs). Done and error records stay until
+// the user sees them (userSaw) or the program clears them.
 func (t *statusTracker) promptSeen() {
 	t.dirty = true
 	for id, rec := range t.records {
 		switch rec.State {
-		case libghostty.ProgramStatusStateWorking, libghostty.ProgramStatusStateBlocked:
+		case libghostty.ProgramStatusStateWorking, libghostty.ProgramStatusStateBlocked,
+			libghostty.ProgramStatusStateIdle:
 			delete(t.records, id)
 		}
 	}
 }
 
-// noteInput notes that someone typed into the session.
+// noteInput notes that someone typed into the session: whatever finished
+// has been seen, and whatever was blocked counts as answered until the
+// program reports again.
 func (t *statusTracker) noteInput(now time.Time) {
 	t.lastInput = now
 	t.dirty = true
+	t.userSaw()
 }
 
-// seen reports whether any report arrived this incarnation.
-func (t *statusTracker) seen() bool {
-	return t.reported
+// userSaw drops the done and error records: the specification keeps them
+// only "until the user has seen them", which here is typing into the
+// session or attaching to look at it. Without this, one finished tool's
+// record would pin the session's activity (and demote its heuristics) for
+// every later program that does not report.
+func (t *statusTracker) userSaw() {
+	t.dirty = true
+	for id, rec := range t.records {
+		switch rec.State {
+		case libghostty.ProgramStatusStateDone, libghostty.ProgramStatusStateError:
+			delete(t.records, id)
+		}
+	}
 }
 
 // statusRank orders states by how much they need the user: blocked first,
@@ -211,8 +226,14 @@ func (t *statusTracker) deriveNow() *nativeStatus {
 	var topState libghostty.ProgramStatusState
 	for id, rec := range t.records {
 		state := t.effectiveState(rec)
-		if top == nil || statusRank(state) > statusRank(topState) ||
-			(statusRank(state) == statusRank(topState) && rec.UpdatedAt.After(top.UpdatedAt)) {
+		switch {
+		case top == nil,
+			statusRank(state) > statusRank(topState),
+			// Among equal ranks the latest report wins; reports from one
+			// feed share a time, so the id breaks the remaining tie (map
+			// order must not decide whose message the session shows).
+			statusRank(state) == statusRank(topState) && rec.UpdatedAt.After(top.UpdatedAt),
+			statusRank(state) == statusRank(topState) && rec.UpdatedAt.Equal(top.UpdatedAt) && id < topID:
 			top, topID, topState = rec, id, state
 		}
 	}
@@ -222,11 +243,14 @@ func (t *statusTracker) deriveNow() *nativeStatus {
 	n := &nativeStatus{
 		activity: statusActivity(topState),
 		app:      t.app(topID, top),
-		message:  top.Message,
+		// The message is cleaned here once (it is untrusted program
+		// text), so the summary, the session record and the change
+		// comparison in setNative all see the same canonical form.
+		message:  clean(top.Message),
 		progress: int(top.Progress),
 	}
 	if n.message == "" {
-		n.message = top.Title
+		n.message = clean(top.Title)
 	}
 	if topState == libghostty.ProgramStatusStateBlocked {
 		n.kind = statusKindName(top.Kind)
@@ -268,11 +292,12 @@ func (t *statusTracker) app(id string, rec *statusRecord) string {
 // States and kinds travel as the specification's words rather than
 // libghostty's numeric values, which are not pinned across versions; a
 // record whose state the next image does not know is dropped (the program
-// re-reports, as it would to a fresh terminal).
+// re-reports, as it would to a fresh terminal). An unknown kind degrades
+// to none instead: the record keeps its blocked state and only loses the
+// word for why, which the next report restores.
 type statusHandoff struct {
 	Records   map[string]statusHandoffRecord
 	LastInput time.Time
-	Reported  bool
 }
 
 type statusHandoffRecord struct {
@@ -290,10 +315,16 @@ func (t *statusTracker) handoff() *statusHandoff {
 		return nil
 	}
 	h := &statusHandoff{Records: make(map[string]statusHandoffRecord, len(t.records)),
-		LastInput: t.lastInput, Reported: t.reported}
+		LastInput: t.lastInput}
 	for id, rec := range t.records {
+		state, ok := statusStateName(rec.State)
+		if !ok {
+			// apply never stores an unknown state; a record from a future
+			// build is dropped rather than misnamed.
+			continue
+		}
 		h.Records[id] = statusHandoffRecord{
-			State: statusStateName(rec.State), Kind: statusKindName(rec.Kind),
+			State: state, Kind: statusKindName(rec.Kind),
 			Progress: rec.Progress, App: rec.App, Title: rec.Title, Message: rec.Message,
 			UpdatedAt: rec.UpdatedAt,
 		}
@@ -308,7 +339,7 @@ func restoreStatusTracker(h *statusHandoff) *statusTracker {
 	if h == nil {
 		return t
 	}
-	t.lastInput, t.reported, t.dirty = h.LastInput, h.Reported, true
+	t.lastInput, t.dirty = h.LastInput, true
 	for id, rec := range h.Records {
 		state, ok := statusStateFromName(rec.State)
 		if !ok {
@@ -363,20 +394,22 @@ func statusKindFromName(name string) libghostty.ProgramStatusKind {
 	return libghostty.ProgramStatusKindNone
 }
 
-// statusStateName is the specification's word for a record's state. clear
-// never makes a record.
-func statusStateName(s libghostty.ProgramStatusState) string {
+// statusStateName is the specification's word for a record's state, and
+// whether this build knows the state at all. clear never makes a record.
+func statusStateName(s libghostty.ProgramStatusState) (string, bool) {
 	switch s {
+	case libghostty.ProgramStatusStateIdle:
+		return "idle", true
 	case libghostty.ProgramStatusStateWorking:
-		return "working"
+		return "working", true
 	case libghostty.ProgramStatusStateDone:
-		return "done"
+		return "done", true
 	case libghostty.ProgramStatusStateBlocked:
-		return "blocked"
+		return "blocked", true
 	case libghostty.ProgramStatusStateError:
-		return "error"
+		return "error", true
 	}
-	return "idle"
+	return "", false
 }
 
 func statusStateFromName(name string) (libghostty.ProgramStatusState, bool) {

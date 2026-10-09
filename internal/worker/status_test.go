@@ -35,28 +35,28 @@ func TestTerminalReportsProgramStatus(t *testing.T) {
 
 	// An ST-terminated report, fully parsed and validated by libghostty.
 	_, fx := ts.feed([]byte("\x1b]7501;state=working:progress=47:app=cargo\x1b\\"))
-	if len(fx.statusReports) != 1 {
+	if len(fx.statusEvents) != 1 || fx.statusEvents[0].report == nil {
 		t.Fatalf("working report: %+v", fx)
 	}
-	if r := fx.statusReports[0]; r.State != libghostty.ProgramStatusStateWorking || r.Progress != 47 || r.App != "cargo" {
+	if r := fx.statusEvents[0].report; r.State != libghostty.ProgramStatusStateWorking || r.Progress != 47 || r.App != "cargo" {
 		t.Fatalf("working report = %+v", r)
 	}
 
 	// A BEL-terminated blocked report with base64 text.
 	_, fx = ts.feed([]byte("\x1b]7501;state=blocked:kind=permission:msg=UnVuIHRlc3RzPw==\x07"))
-	if len(fx.statusReports) != 1 {
+	if len(fx.statusEvents) != 1 || fx.statusEvents[0].report == nil {
 		t.Fatalf("blocked report: %+v", fx)
 	}
-	if r := fx.statusReports[0]; r.Kind != libghostty.ProgramStatusKindPermission || r.Message != "Run tests?" {
+	if r := fx.statusEvents[0].report; r.Kind != libghostty.ProgramStatusKindPermission || r.Message != "Run tests?" {
 		t.Fatalf("blocked report = %+v", r)
 	}
 
 	// A report split across reads arrives once complete.
-	if _, fx = ts.feed([]byte("\x1b]7501;state=do")); len(fx.statusReports) != 0 {
+	if _, fx = ts.feed([]byte("\x1b]7501;state=do")); len(fx.statusEvents) != 0 {
 		t.Fatalf("partial report: %+v", fx)
 	}
 	_, fx = ts.feed([]byte("ne\x1b\\"))
-	if len(fx.statusReports) != 1 || fx.statusReports[0].State != libghostty.ProgramStatusStateDone {
+	if len(fx.statusEvents) != 1 || fx.statusEvents[0].report == nil || fx.statusEvents[0].report.State != libghostty.ProgramStatusStateDone {
 		t.Fatalf("completed report: %+v", fx)
 	}
 
@@ -73,10 +73,61 @@ func TestTerminalReportsProgramStatus(t *testing.T) {
 		}
 	}
 
-	// A new primary shell prompt (OSC 133 A) is reported, which drops
-	// working and blocked records.
-	if _, fx = ts.feed([]byte("\x1b]133;A\x07")); !fx.promptStart {
-		t.Fatalf("prompt: %+v", fx)
+	// A new primary shell prompt (OSC 133 A) is reported in stream order
+	// with the reports: a report AFTER the prompt in the same read belongs
+	// to the next command and must survive the prompt's record drop.
+	_, fx = ts.feed([]byte("\x1b]133;A\x07\x1b]7501;state=blocked\x1b\\"))
+	if len(fx.statusEvents) != 2 || fx.statusEvents[0].report != nil || fx.statusEvents[1].report == nil {
+		t.Fatalf("prompt then report: %+v", fx.statusEvents)
+	}
+}
+
+// A coalesced read carrying a prompt and the next command's report applies
+// them in stream order: the record reported after the prompt survives.
+func TestPromptInSameFeedKeepsLaterReport(t *testing.T) {
+	now := time.Now()
+	tr := newStatusTracker()
+	apply := func(events []statusEvent) {
+		for _, ev := range events {
+			if ev.report != nil {
+				tr.apply(now, *ev.report)
+			} else {
+				tr.promptSeen()
+			}
+		}
+	}
+	// Report, then prompt: the old command's record is dropped.
+	apply([]statusEvent{
+		{report: &libghostty.ProgramStatus{State: libghostty.ProgramStatusStateBlocked, Progress: -1}},
+		{},
+	})
+	if tr.derive() != nil {
+		t.Fatalf("record survived the prompt that followed it: %+v", tr.derive())
+	}
+	// Prompt, then report: the new command's record survives.
+	apply([]statusEvent{
+		{},
+		{report: &libghostty.ProgramStatus{State: libghostty.ProgramStatusStateBlocked, Progress: -1}},
+	})
+	if got := tr.derive(); got == nil || got.activity != session.ActivityBlocked {
+		t.Fatalf("record reported after the prompt was dropped: %+v", got)
+	}
+}
+
+// Typing or attaching means the user saw the session: done and error
+// records drop (the spec keeps them only until seen), while a blocked
+// record stays for the input-suppression rule to govern.
+func TestUserSeenDropsDoneAndError(t *testing.T) {
+	now := time.Now()
+	tr := newStatusTracker()
+	tr.apply(now, report("a", libghostty.ProgramStatusStateDone))
+	tr.apply(now, report("b", libghostty.ProgramStatusStateError))
+	tr.apply(now, report("c", libghostty.ProgramStatusStateBlocked))
+	tr.noteInput(now.Add(time.Second))
+	for id, want := range map[string]bool{"a": false, "b": false, "c": true} {
+		if _, ok := tr.records[id]; ok != want {
+			t.Errorf("after input, record %q kept = %v, want %v", id, ok, want)
+		}
 	}
 }
 
@@ -202,6 +253,49 @@ func TestStatusTrackerDerivation(t *testing.T) {
 	}
 }
 
+// Clearing "build" removes its descendants but never a sibling that merely
+// shares the prefix text.
+func TestStatusClearKeepsPrefixSiblings(t *testing.T) {
+	now := time.Now()
+	tr := newStatusTracker()
+	tr.apply(now, report("build", libghostty.ProgramStatusStateWorking))
+	tr.apply(now.Add(time.Second), report("build/test", libghostty.ProgramStatusStateWorking))
+	tr.apply(now.Add(2*time.Second), report("builder", libghostty.ProgramStatusStateWorking))
+	tr.apply(now.Add(3*time.Second), report("build", libghostty.ProgramStatusStateClear))
+	if _, ok := tr.records["builder"]; !ok {
+		t.Error(`clearing "build" removed the sibling "builder"`)
+	}
+	if _, ok := tr.records["build/test"]; ok {
+		t.Error(`descendant "build/test" survived the clear`)
+	}
+}
+
+// Reports from one PTY feed share a timestamp; among equal ranks the id
+// breaks the tie, so map order never decides whose message the session
+// shows.
+func TestStatusTrackerTieBreakIsDeterministic(t *testing.T) {
+	now := time.Now()
+	for range 10 {
+		tr := newStatusTracker()
+		tr.apply(now, report("b", libghostty.ProgramStatusStateBlocked, func(r *libghostty.ProgramStatus) { r.Message = "from b" }))
+		tr.apply(now, report("a", libghostty.ProgramStatusStateBlocked, func(r *libghostty.ProgramStatus) { r.Message = "from a" }))
+		if got := tr.derive(); got.message != "from a" {
+			t.Fatalf("derive() picked %q, want the smallest id to win the tie", got.message)
+		}
+	}
+}
+
+// A report whose state this build does not know is ignored entirely, as
+// the libghostty binding asks: it must not pin the session to a bogus
+// idle record or suppress the heuristics.
+func TestStatusTrackerIgnoresUnknownStates(t *testing.T) {
+	tr := newStatusTracker()
+	tr.apply(time.Now(), report("x", libghostty.ProgramStatusState(99)))
+	if len(tr.records) != 0 || tr.derive() != nil {
+		t.Fatalf("unknown state stored: records=%d derive=%+v", len(tr.records), tr.derive())
+	}
+}
+
 func TestStatusTrackerInputSuppressesBlocked(t *testing.T) {
 	now := time.Now()
 	tr := newStatusTracker()
@@ -233,7 +327,7 @@ func TestStatusTrackerInputSuppressesBlocked(t *testing.T) {
 	}
 }
 
-func TestStatusTrackerPromptDropsWorkingAndBlocked(t *testing.T) {
+func TestStatusTrackerPromptDropsWorkingBlockedAndIdle(t *testing.T) {
 	now := time.Now()
 	tr := newStatusTracker()
 	tr.apply(now, report("a", libghostty.ProgramStatusStateWorking))
@@ -242,13 +336,12 @@ func TestStatusTrackerPromptDropsWorkingAndBlocked(t *testing.T) {
 	tr.apply(now, report("d", libghostty.ProgramStatusStateError))
 	tr.apply(now, report("e", libghostty.ProgramStatusStateIdle))
 	tr.promptSeen()
-	for id, want := range map[string]bool{"a": false, "b": false, "c": true, "d": true, "e": true} {
+	// The prompt means that program is over: working, blocked and idle
+	// go; done and error stay until the user sees them.
+	for id, want := range map[string]bool{"a": false, "b": false, "c": true, "d": true, "e": false} {
 		if _, ok := tr.records[id]; ok != want {
 			t.Errorf("after a prompt, record %q kept = %v, want %v", id, ok, want)
 		}
-	}
-	if !tr.seen() {
-		t.Error("seen() = false after reports")
 	}
 }
 
@@ -346,6 +439,9 @@ func TestProgramStatusDetectionReply(t *testing.T) {
 func TestStatusHandoffRoundTrip(t *testing.T) {
 	now := time.Now().Round(0)
 	tr := newStatusTracker()
+	// Input precedes the reports (noteInput after them would count the
+	// done record as seen and drop it).
+	tr.noteInput(now.Add(-time.Minute))
 	tr.apply(now, report("", libghostty.ProgramStatusStateBlocked, func(r *libghostty.ProgramStatus) {
 		r.Kind = libghostty.ProgramStatusKindPermission
 		r.App = "claude-code"
@@ -353,7 +449,6 @@ func TestStatusHandoffRoundTrip(t *testing.T) {
 		r.Progress = 60
 	}))
 	tr.apply(now, report("lint", libghostty.ProgramStatusStateDone))
-	tr.noteInput(now.Add(-time.Minute))
 
 	data, err := json.Marshal(tr.handoff())
 	if err != nil {
@@ -369,17 +464,110 @@ func TestStatusHandoffRoundTrip(t *testing.T) {
 	if len(restored.records) != 2 {
 		t.Fatalf("restored %d records, want 2 (the future state dropped)", len(restored.records))
 	}
-	if !restored.seen() {
-		t.Error("seen() lost across the handoff")
-	}
 	want := tr.derive()
 	if got := restored.derive(); got == nil || *got != *want {
 		t.Fatalf("derive() = %+v, want %+v", got, want)
 	}
 
 	// An image older than the records hands over nothing.
-	if empty := restoreStatusTracker(nil); empty.derive() != nil || empty.seen() {
+	if empty := restoreStatusTracker(nil); empty.derive() != nil {
 		t.Fatalf("restore from nil: %+v", empty)
+	}
+}
+
+// Value: protects=the events a native status change records (summaries
+// fall back to the kind or the bare state, a silently answered block
+// re-reported unchanged is not recorded again, a new question re-raises
+// only past the one-per-noticeQuiet action rate floor, notifications are
+// information while the program reports, error is action-level, native
+// idle while watched is information);
+// fails_when=recordNative's changed/dedup logic, the action rate floor,
+// eventSummary's fallbacks, or the notification demotion regress;
+// why_new=the PTY tests cover only the first block, the bell demotion and
+// done; seam=none
+func TestActivityTrackerNativeEvents(t *testing.T) {
+	_, h := newRoot(t)
+	rec := newRecorder(h.store, h.sessionID, 1)
+	a := newActivityTracker(rec, 0, time.Now())
+	at := func(s int) time.Time { return time.Now().Add(time.Duration(s) * time.Second) }
+	blocked := &nativeStatus{activity: session.ActivityBlocked, kind: "permission", progress: -1}
+
+	// A block with no message falls back to its kind.
+	a.setNative(at(0), blocked, false, true)
+	// Re-reporting the same block changes nothing.
+	a.setNative(at(1), blocked, false, true)
+	// Input answers it silently (writeInput passes emit=false)...
+	a.setNative(at(2), &nativeStatus{activity: session.ActivityWorking, kind: "permission", progress: -1}, false, false)
+	// ...and the program re-reporting the same block right after is the
+	// same event: deduped within noticeQuiet, not recorded again.
+	a.setNative(at(3), blocked, false, true)
+	// A new question within the action rate floor updates the record but
+	// records no event: notifications fire at most once per noticeQuiet.
+	reAsk := *blocked
+	reAsk.message = "Deploy to prod?"
+	a.setNative(at(4), &reAsk, false, true)
+	// Past the floor it re-raises, though the state is still blocked.
+	a.setNative(at(12), &reAsk, false, true)
+	// A notification while the program reports status is context, not the
+	// signal, and the session stays blocked.
+	fx := terminalEffects{notifications: []libghostty.TerminalDesktopNotification{{Title: "Codex", Body: "Approve?"}}}
+	a.output(at(13), fx, "", false)
+	if a.state != session.ActivityBlocked || a.waiting {
+		t.Fatalf("after a notification while native: state=%v waiting=%v", a.state, a.waiting)
+	}
+	// An error is action-level too, so it waits out the same floor; native
+	// idle while watched is information, with the bare state as summary.
+	a.setNative(at(25), &nativeStatus{activity: session.ActivityError, message: "build failed", progress: -1}, false, true)
+	a.setNative(at(26), &nativeStatus{activity: session.ActivityIdle, progress: -1}, true, true)
+	rec.close()
+
+	var got []session.Event
+	for _, ev := range h.eventsSince(0) {
+		if ev.Kind != session.EventCreated {
+			got = append(got, ev)
+		}
+	}
+	want := []struct {
+		kind      session.EventKind
+		summary   string
+		attention session.AttentionLevel
+	}{
+		{session.EventBlocked, "permission", session.AttentionAction},
+		{session.EventBlocked, "permission: Deploy to prod?", session.AttentionAction},
+		{session.EventNotification, "Codex: Approve?", session.AttentionInfo},
+		{session.EventError, "build failed", session.AttentionAction},
+		{session.EventIdle, "idle", session.AttentionInfo},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("recorded %d events, want %d: %#v", len(got), len(want), got)
+	}
+	for i, w := range want {
+		if got[i].Kind != w.kind || got[i].Summary != w.summary || got[i].Attention != w.attention {
+			t.Errorf("event %d = %v %q %v, want %v %q %v",
+				i, got[i].Kind, got[i].Summary, got[i].Attention, w.kind, w.summary, w.attention)
+		}
+	}
+}
+
+// Value: protects=a progress-only update (working 40% to 60%) reaching the
+// session record although the activity state did not change;
+// fails_when=setNative stops forcing the write-through on a changed status
+// (update early-returns on an unchanged state); why_new=the end-to-end test
+// reads one snapshot and never updates progress mid-state; seam=none
+func TestNativeProgressWriteThrough(t *testing.T) {
+	_, h := newRoot(t)
+	if err := h.store.MarkRunning(h.sessionID, h.createdAt, 1, 2); err != nil {
+		t.Fatal(err)
+	}
+	rec := newRecorder(h.store, h.sessionID, 1)
+	now := time.Now()
+	a := newActivityTracker(rec, 0, now)
+	a.setNative(now, &nativeStatus{activity: session.ActivityWorking, app: "cargo", progress: 40}, false, true)
+	a.setNative(now.Add(time.Second), &nativeStatus{activity: session.ActivityWorking, app: "cargo", progress: 60}, false, true)
+	rec.close()
+	r := h.record()
+	if r.Activity != session.ActivityWorking || r.StatusProgress == nil || *r.StatusProgress != 60 {
+		t.Fatalf("record = activity %v, progress %v, want working 60", r.Activity, r.StatusProgress)
 	}
 }
 
