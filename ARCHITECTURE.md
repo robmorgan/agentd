@@ -164,6 +164,9 @@ state, attention); the live PTY, agent process and terminal state live in the se
 | Worker crash (SIGKILL) | Metadata | The session: its PTY is hung up, so the kernel sends the agent SIGHUP; terminal history not yet written to `logs/` (it is written when a session ends) | Recorded `failed` by the daemon that spawned the worker, or `unknown_recovered` when a probe finds its socket refusing. An agent that ignores SIGHUP survives, orphaned, with a dead terminal: agentd does not signal recorded pids, which may have been reused |
 | Agent exits or crashes | Metadata, history (written to `logs/`) | The live session | The worker records `exited` (exit 0, or a kill) or `failed` with the reason, and sends `SessionEnded` to attached clients |
 | Machine reboot | Metadata, history of ended sessions, keys, config | Every live session (processes and PTYs), and the unsaved history of those sessions | Sessions recorded running are `unknown_recovered` once the next daemon finds their sockets refusing or gone |
+| Upgrade with live handoff (`agent daemon upgrade`, `agentd upgrade`) | Everything a daemon restart keeps, and the worker itself moves to the new binary: same pid, same agent (still its child), same PTY, socket path, exact terminal state, attach numbering; queued input reaches the agent first, and output written during the handoff waits in the PTY | Attachments end with `SessionRestarting` (clients that do not know it are detached instead); a connection arriving during the exec just waits for the new image | The new image restores the state and touches the session's row (`MarkResumed`); nothing else changes in `state.db` |
+| Upgrade without handoff (the handoff was refused or failed before the exec) | The session, unchanged, on its previous binary | Attachments, if the failure came after clients were told to restart (they reattach to the same worker) | Nothing to reconcile; `agentd upgrade` names the session and the reason |
+| New image dies after the exec | Metadata | The session, as for a worker crash | As for a worker crash; `agentd upgrade` reports the session as lost |
 
 **Downgrades are one-way past a schema bump.** A binary older than `state.db`'s version refuses
 to open it (remove the runtime root to start fresh), and whichever process opens the database
@@ -175,9 +178,6 @@ a pre-status image silently drops the program status records (the old image igno
 handoff field), so a blocked agent reads as merely idle until it reports again — the heuristics
 resume, nothing is corrupted, but the program's word is lost. Roll workers and daemon back
 together, or not at all.
-| Upgrade with live handoff (`agent daemon upgrade`, `agentd upgrade`) | Everything a daemon restart keeps, and the worker itself moves to the new binary: same pid, same agent (still its child), same PTY, socket path, exact terminal state, attach numbering; queued input reaches the agent first, and output written during the handoff waits in the PTY | Attachments end with `SessionRestarting` (clients that do not know it are detached instead); a connection arriving during the exec just waits for the new image | The new image restores the state and touches the session's row (`MarkResumed`); nothing else changes in `state.db` |
-| Upgrade without handoff (the handoff was refused or failed before the exec) | The session, unchanged, on its previous binary | Attachments, if the failure came after clients were told to restart (they reattach to the same worker) | Nothing to reconcile; `agentd upgrade` names the session and the reason |
-| New image dies after the exec | Metadata | The session, as for a worker crash | As for a worker crash; `agentd upgrade` reports the session as lost |
 
 Tests: `TestSessionSurvivesDaemonRestart`, `TestDaemonSIGKILLWithLiveSessions`,
 `TestCrashDuringCreate`, `TestWorkerSIGKILLHangsUpTheAgent`, `TestWorkerLostWhileDaemonDown`,

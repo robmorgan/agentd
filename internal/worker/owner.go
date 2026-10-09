@@ -279,6 +279,9 @@ func (s *ownerState) afterFeed(writes [][]byte, effects terminalEffects) {
 		if effects.titleChanged {
 			title = s.terminal.title()
 		}
+		// The feed's arrival is noted before its status effects, so
+		// setNative never judges them against a stale output clock.
+		s.activity.preOutput(now)
 		if s.status != nil {
 			s.activity.setNative(now, s.status.derive(), s.watched(), true)
 		}
@@ -387,8 +390,10 @@ func (s *ownerState) attach(attachID string, kind session.AttachmentKind, g prot
 	s.attachments[attachID] = a
 	// An interactive attach shows the user the screen: done and error
 	// records have been seen (the same moment the daemon acknowledges
-	// attention), so they no longer decide the session's activity.
-	if kind == session.AttachmentAttach && s.status != nil && s.activity != nil {
+	// attention), so they no longer decide the session's activity. A
+	// reattach that replaces a lost connection is the CLI reconnecting by
+	// itself — no human looked — so it does not count.
+	if kind == session.AttachmentAttach && replaces == "" && s.status != nil && s.activity != nil {
 		s.status.userSaw()
 		s.activity.setNative(connectedAt, s.status.derive(), s.watched(), false)
 	}

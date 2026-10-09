@@ -92,7 +92,11 @@ type statusEvent struct {
 
 // statusDetectionReplies are the exact replies libghostty writes to the
 // program status detection query (the query echoed back, with whichever
-// terminator it used).
+// terminator it used). writeInput matches them against whole input
+// chunks: a client terminal writes its reply as its own standalone write,
+// which arrives as its own chunk. A reply that ever coalesced with
+// keystrokes (or split across reads) would pass through as ordinary
+// input — the pre-existing behavior for every other terminal reply.
 var statusDetectionReplies = [][]byte{
 	[]byte("\x1b]7501;?\x1b\\"),
 	[]byte("\x1b]7501;?\x07"),
@@ -127,7 +131,12 @@ func newTerminalState(cols, rows uint16, maxScrollbackBytes uint) (*terminalStat
 func (s *terminalState) adopt(term *libghostty.Terminal) {
 	term.SetEffectWritePty(func(_ *libghostty.Terminal, data []byte) {
 		if isStatusDetectionReply(data) {
-			s.effects.statusReplies = append(s.effects.statusReplies, append([]byte(nil), data...))
+			// Bounded like notifications: a program spamming detection
+			// queries gains nothing past the first few per read (it can
+			// always query again), and the input queue is spared.
+			if len(s.effects.statusReplies) < maxNotificationsPerFeed {
+				s.effects.statusReplies = append(s.effects.statusReplies, append([]byte(nil), data...))
+			}
 			return
 		}
 		s.pending = append(s.pending, append([]byte(nil), data...))

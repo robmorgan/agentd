@@ -13,6 +13,12 @@ import (
 	"github.com/robmorgan/agentd/internal/session"
 )
 
+// native builds a nativeStatus as deriveNow would, summary included.
+func native(n nativeStatus) *nativeStatus {
+	n.summary = eventSummary(&n)
+	return &n
+}
+
 func report(id string, state libghostty.ProgramStatusState, mod ...func(*libghostty.ProgramStatus)) libghostty.ProgramStatus {
 	r := libghostty.ProgramStatus{ID: id, State: state, Progress: -1}
 	for _, m := range mod {
@@ -185,6 +191,20 @@ func TestStatusTrackerDerivation(t *testing.T) {
 			&nativeStatus{activity: session.ActivityDone, message: "All tests passed", progress: -1},
 		},
 		{
+			// Value: protects=the untrusted message cleaned once at
+			// derivation (controls become separators, invisible format
+			// characters are stripped) before the summary, the session
+			// record and setNative's comparison see it;
+			// fails_when=deriveNow stops calling clean (nothing else
+			// cleans any more), or clean stops stripping unicode.Cf;
+			// why_new=every other case uses already-clean text; seam=none
+			"message cleaned at derivation",
+			[]libghostty.ProgramStatus{report("", libghostty.ProgramStatusStateWorking, func(r *libghostty.ProgramStatus) {
+				r.Message = "Run‮ ​tests?\tnow"
+			})},
+			&nativeStatus{activity: session.ActivityWorking, message: "Run tests? now", progress: -1},
+		},
+		{
 			"title stands in for a missing message",
 			[]libghostty.ProgramStatus{report("", libghostty.ProgramStatusStateWorking, func(r *libghostty.ProgramStatus) {
 				r.Title = "deploy us-east"
@@ -246,6 +266,7 @@ func TestStatusTrackerDerivation(t *testing.T) {
 				}
 				return
 			}
+			tc.want.summary = eventSummary(tc.want)
 			if got == nil || *got != *tc.want {
 				t.Fatalf("derive() = %+v, want %+v", got, tc.want)
 			}
@@ -432,6 +453,64 @@ func TestProgramStatusDetectionReply(t *testing.T) {
 	})
 }
 
+// Value: protects=an interactive attach counting as the user seeing the
+// session, so a done record stops deciding the activity the moment
+// someone attaches to look (owner.attach calls userSaw and re-derives);
+// fails_when=attach stops calling userSaw/setNative, or userSaw stops
+// dropping done records; why_new=TestUserSeenDropsDoneAndError covers
+// only the typing trigger, nothing proved the attach one end to end;
+// seam=none
+func TestInteractiveAttachDropsDoneRecord(t *testing.T) {
+	fastActivity(t)
+	h := startWorkerWith(t, statusAgent)
+	h.sendInput("done\n")
+	h.eventually("done activity", func() bool { return h.record().Activity == session.ActivityDone })
+	// Attaching shows the user the screen: the done record has been seen
+	// and the heuristics take the activity back.
+	h.attach(defaultGeometry)
+	h.eventually("the done record seen on attach", func() bool {
+		return h.record().Activity != session.ActivityDone
+	})
+}
+
+// ghostInputAgent makes forwarded input visible: any line it reads comes
+// back between brackets with escapes rendered by cat -v, so a detection
+// reply leaking through writeInput would pollute the next line.
+const ghostInputAgent = `stty -echo -icanon; echo ready
+while IFS= read -r l; do
+  case "$l" in
+    quit) exit 0;;
+    *) printf 'got[%s]\n' "$l" | cat -v;;
+  esac
+done`
+
+// Value: protects=a client terminal's echoed copy of the status detection
+// reply being dropped in writeInput rather than forwarded: forwarded, it
+// reaches the program as a stray escape sequence (ghost input) and, worse,
+// counts as the user typing, silently answering a blocked record;
+// fails_when=writeInput loses its isStatusDetectionReply early return, or
+// the pinned reply bytes drift from what libghostty emits;
+// why_new=TestProgramStatusDetectionReply covers the worker answering the
+// query, not a client's reflex arriving as input; seam=none
+func TestWriteInputDropsDetectionReply(t *testing.T) {
+	fastActivity(t)
+	h := startWorkerWith(t, ghostInputAgent)
+	h.eventually("the agent", func() bool { return strings.Contains(h.history(), "ready") })
+
+	// The client terminal's reflex: the exact reply bytes, one chunk, no
+	// newline. Forwarded, they would prefix the next line the agent reads.
+	h.sendInput("\x1b]7501;?\x1b\\")
+	h.sendInput("ping\n")
+	h.eventually("a clean line after the dropped reply", func() bool {
+		return strings.Contains(h.history(), "got[ping]")
+	})
+	if strings.Contains(h.history(), "7501") {
+		t.Fatalf("the detection reply reached the agent: %q", h.history())
+	}
+	h.sendInput("quit\n")
+	h.waitExit()
+}
+
 // The records cross a worker handoff (as JSON, like the rest of
 // handoffState): a blocked agent must stay blocked, since the program will
 // not re-report on its own. States travel as the specification's words, so
@@ -459,10 +538,17 @@ func TestStatusHandoffRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.Records["future"] = statusHandoffRecord{State: "pondering", UpdatedAt: now}
+	h.Records["oddkind"] = statusHandoffRecord{State: "blocked", Kind: "telepathy", UpdatedAt: now.Add(-time.Hour)}
 
 	restored := restoreStatusTracker(&h)
-	if len(restored.records) != 2 {
-		t.Fatalf("restored %d records, want 2 (the future state dropped)", len(restored.records))
+	if len(restored.records) != 3 {
+		t.Fatalf("restored %d records, want 3 (the future state dropped, the unknown kind kept)", len(restored.records))
+	}
+	// An unknown kind degrades to none: the record keeps its blocked
+	// state and only loses the word for why.
+	if rec := restored.records["oddkind"]; rec == nil ||
+		rec.State != libghostty.ProgramStatusStateBlocked || rec.Kind != libghostty.ProgramStatusKindNone {
+		t.Fatalf("unknown kind restored as %+v", restored.records["oddkind"])
 	}
 	want := tr.derive()
 	if got := restored.derive(); got == nil || *got != *want {
@@ -490,14 +576,14 @@ func TestActivityTrackerNativeEvents(t *testing.T) {
 	rec := newRecorder(h.store, h.sessionID, 1)
 	a := newActivityTracker(rec, 0, time.Now())
 	at := func(s int) time.Time { return time.Now().Add(time.Duration(s) * time.Second) }
-	blocked := &nativeStatus{activity: session.ActivityBlocked, kind: "permission", progress: -1}
+	blocked := native(nativeStatus{activity: session.ActivityBlocked, kind: "permission", progress: -1})
 
 	// A block with no message falls back to its kind.
 	a.setNative(at(0), blocked, false, true)
 	// Re-reporting the same block changes nothing.
 	a.setNative(at(1), blocked, false, true)
 	// Input answers it silently (writeInput passes emit=false)...
-	a.setNative(at(2), &nativeStatus{activity: session.ActivityWorking, kind: "permission", progress: -1}, false, false)
+	a.setNative(at(2), native(nativeStatus{activity: session.ActivityWorking, kind: "permission", progress: -1}), false, false)
 	// ...and the program re-reporting the same block right after is the
 	// same event: deduped within noticeQuiet, not recorded again.
 	a.setNative(at(3), blocked, false, true)
@@ -505,9 +591,9 @@ func TestActivityTrackerNativeEvents(t *testing.T) {
 	// records no event: notifications fire at most once per noticeQuiet.
 	reAsk := *blocked
 	reAsk.message = "Deploy to prod?"
-	a.setNative(at(4), &reAsk, false, true)
+	a.setNative(at(4), native(reAsk), false, true)
 	// Past the floor it re-raises, though the state is still blocked.
-	a.setNative(at(12), &reAsk, false, true)
+	a.setNative(at(12), native(reAsk), false, true)
 	// A notification while the program reports status is context, not the
 	// signal, and the session stays blocked.
 	fx := terminalEffects{notifications: []libghostty.TerminalDesktopNotification{{Title: "Codex", Body: "Approve?"}}}
@@ -517,8 +603,8 @@ func TestActivityTrackerNativeEvents(t *testing.T) {
 	}
 	// An error is action-level too, so it waits out the same floor; native
 	// idle while watched is information, with the bare state as summary.
-	a.setNative(at(25), &nativeStatus{activity: session.ActivityError, message: "build failed", progress: -1}, false, true)
-	a.setNative(at(26), &nativeStatus{activity: session.ActivityIdle, progress: -1}, true, true)
+	a.setNative(at(25), native(nativeStatus{activity: session.ActivityError, message: "build failed", progress: -1}), false, true)
+	a.setNative(at(26), native(nativeStatus{activity: session.ActivityIdle, progress: -1}), true, true)
 	rec.close()
 
 	var got []session.Event
@@ -549,6 +635,94 @@ func TestActivityTrackerNativeEvents(t *testing.T) {
 	}
 }
 
+// Value: protects=a floor-deferred blocked event recording from the
+// activity tick once noticeQuiet passes, with no further PTY output (a
+// program that re-asks and then waits silently must still alert);
+// fails_when=tick stops retrying recordNative, or the retry re-arms on
+// the wrong comparison; why_new=TestActivityTrackerNativeEvents drives
+// the retry with explicit output-path calls, never the tick; seam=none
+func TestDeferredActionEventRetriesFromTick(t *testing.T) {
+	_, h := newRoot(t)
+	rec := newRecorder(h.store, h.sessionID, 1)
+	start := time.Now()
+	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
+	a := newActivityTracker(rec, 0, start)
+	a.setNative(at(0), native(nativeStatus{activity: session.ActivityBlocked, kind: "permission", message: "Run tests?", progress: -1}), false, true)
+	// A new question lands inside the floor and the program goes silent.
+	a.setNative(at(3), native(nativeStatus{activity: session.ActivityBlocked, kind: "permission", message: "Deploy?", progress: -1}), false, true)
+	a.tick(at(5), 0, false)  // still floored: nothing records
+	a.tick(at(11), 0, false) // floor cleared: the deferred question records
+	a.tick(at(12), 0, false) // and only once
+	rec.close()
+	var blocked []session.Event
+	for _, ev := range h.eventsSince(0) {
+		if ev.Kind == session.EventBlocked {
+			blocked = append(blocked, ev)
+		}
+	}
+	if len(blocked) != 2 || blocked[1].Summary != "permission: Deploy?" {
+		t.Fatalf("blocked events = %#v, want the deferred question recorded once by the tick", blocked)
+	}
+}
+
+// Value: protects=the handoff-restore seeding (seedNativeAlert): a
+// still-blocked program's first output after an upgrade must not re-alert
+// the question the user already saw, while a new question still records;
+// fails_when=resumeRuntime stops seeding, or seeding stops covering the
+// action floor and dedup fields; why_new=the daemon handoff test answers
+// the block by typing, so the no-re-alert path is never exercised there;
+// seam=none
+func TestSeededAlertMemorySkipsUnchangedQuestion(t *testing.T) {
+	_, h := newRoot(t)
+	rec := newRecorder(h.store, h.sessionID, 1)
+	start := time.Now()
+	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
+	a := newActivityTracker(rec, 0, start)
+	blocked := native(nativeStatus{activity: session.ActivityBlocked, kind: "permission", message: "Run tests?", progress: -1})
+	// As resumeRuntime does: restore silently, then seed.
+	a.setNative(start, blocked, false, false)
+	a.seedNativeAlert(start)
+	// The program's first output re-derives the unchanged question.
+	a.setNative(at(2), blocked, false, true)
+	// A genuinely new question past the floor still records.
+	a.setNative(at(12), native(nativeStatus{activity: session.ActivityBlocked, kind: "permission", message: "Deploy?", progress: -1}), false, true)
+	rec.close()
+	var blockedEvents []session.Event
+	for _, ev := range h.eventsSince(0) {
+		if ev.Kind == session.EventBlocked {
+			blockedEvents = append(blockedEvents, ev)
+		}
+	}
+	if len(blockedEvents) != 1 || blockedEvents[0].Summary != "permission: Deploy?" {
+		t.Fatalf("blocked events after restore = %#v, want only the new question", blockedEvents)
+	}
+}
+
+// Value: protects=afterFeed noting a feed's arrival (preOutput) before
+// setNative, so records ending after an idleAfter-long quiet spell do not
+// record a bogus idle event with a negative duration; fails_when=the
+// preOutput call is removed or ordered after setNative; why_new=no other
+// test ends the records after a quiet gap in afterFeed's order; seam=none
+func TestRecordsEndingAfterQuietDoNotFakeIdle(t *testing.T) {
+	_, h := newRoot(t)
+	rec := newRecorder(h.store, h.sessionID, 1)
+	start := time.Now()
+	a := newActivityTracker(rec, 0, start)
+	a.setNative(start, native(nativeStatus{activity: session.ActivityWorking, progress: -1}), false, true)
+	// The next feed arrives after a long quiet and its only content ends
+	// the records (a prompt or a clear), in afterFeed's order.
+	later := start.Add(idleAfter + 5*time.Second)
+	a.preOutput(later)
+	a.setNative(later, nil, false, true)
+	a.output(later, terminalEffects{}, "", false)
+	rec.close()
+	for _, ev := range h.eventsSince(0) {
+		if ev.Kind == session.EventIdle {
+			t.Fatalf("bogus idle event recorded: %#v", ev)
+		}
+	}
+}
+
 // Value: protects=a progress-only update (working 40% to 60%) reaching the
 // session record although the activity state did not change;
 // fails_when=setNative stops forcing the write-through on a changed status
@@ -562,8 +736,8 @@ func TestNativeProgressWriteThrough(t *testing.T) {
 	rec := newRecorder(h.store, h.sessionID, 1)
 	now := time.Now()
 	a := newActivityTracker(rec, 0, now)
-	a.setNative(now, &nativeStatus{activity: session.ActivityWorking, app: "cargo", progress: 40}, false, true)
-	a.setNative(now.Add(time.Second), &nativeStatus{activity: session.ActivityWorking, app: "cargo", progress: 60}, false, true)
+	a.setNative(now, native(nativeStatus{activity: session.ActivityWorking, app: "cargo", progress: 40}), false, true)
+	a.setNative(now.Add(time.Second), native(nativeStatus{activity: session.ActivityWorking, app: "cargo", progress: 60}), false, true)
 	rec.close()
 	r := h.record()
 	if r.Activity != session.ActivityWorking || r.StatusProgress == nil || *r.StatusProgress != 60 {

@@ -58,16 +58,20 @@ type nativeStatus struct {
 	// dominating record or its nearest ancestor.
 	app string
 	// message is the dominating record's message, falling back to its
-	// title: one line of untrusted program text.
+	// title: one line of untrusted program text, cleaned at derivation.
 	message string
 	// progress is 0-100, or -1 when not reported.
 	progress int
+	// summary is the one-line event summary for this status, computed
+	// once here because recordNative consults it on every feed and tick.
+	summary string
 }
 
 // eventSummary is the one-line summary for an event about this status:
 // the program's message (already cleaned by deriveNow), prefixed with why
-// it is blocked, falling back to the bare state.
-func (n *nativeStatus) eventSummary() string {
+// it is blocked, falling back to the bare state, and held to maxSummary
+// like every other summary (the prefix could push a cut message past it).
+func eventSummary(n *nativeStatus) string {
 	s := n.message
 	if n.activity == session.ActivityBlocked && n.kind != "" {
 		if s == "" {
@@ -78,6 +82,9 @@ func (n *nativeStatus) eventSummary() string {
 	}
 	if s == "" {
 		s = string(n.activity)
+	}
+	if r := []rune(s); len(r) > maxSummary {
+		s = string(r[:maxSummary-1]) + "…"
 	}
 	return s
 }
@@ -155,6 +162,11 @@ func (t *statusTracker) evict() {
 // (keeping an idle record would pin the session to it while the next,
 // possibly non-reporting, command runs). Done and error records stay until
 // the user sees them (userSaw) or the program clears them.
+//
+// Assumed: a program marks prompts with OSC 133 A or reports status over
+// OSC 7501, not both for the same prompt — one that did both would drop
+// its own blocked record the moment it asks. Shells integrate 133; the
+// agents that report 7501 do not mark their internal prompts with it.
 func (t *statusTracker) promptSeen() {
 	t.dirty = true
 	for id, rec := range t.records {
@@ -255,6 +267,7 @@ func (t *statusTracker) deriveNow() *nativeStatus {
 	if topState == libghostty.ProgramStatusStateBlocked {
 		n.kind = statusKindName(top.Kind)
 	}
+	n.summary = eventSummary(n)
 	return n
 }
 

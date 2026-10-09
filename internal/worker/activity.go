@@ -113,16 +113,31 @@ type activityTracker struct {
 	// noticeQuiet (lastNativeActionAt), like the bell's quiet rule: a
 	// program churning blocked messages must not drive notifications at
 	// report rate.
+	// Non-action kinds additionally keep a per-kind gap
+	// (lastNativeKindAt), like the heuristic idleEventGap: alternating
+	// states or churning text record at most one event per kind per
+	// noticeQuiet.
 	native             *nativeStatus
 	lastNativeKind     session.EventKind
 	lastNativeSummary  string
 	lastNativeAt       time.Time
 	lastNativeActionAt time.Time
+	lastNativeKindAt   map[session.EventKind]time.Time
 }
 
 func newActivityTracker(rec *recorder, agentPGID int, now time.Time) *activityTracker {
 	return &activityTracker{rec: rec, agentPGID: agentPGID, state: session.ActivityWorking,
-		lastOutput: now, workingSince: now}
+		lastOutput: now, workingSince: now,
+		lastNativeKindAt: make(map[session.EventKind]time.Time)}
+}
+
+// preOutput notes a feed's arrival before its status effects are applied:
+// setNative runs first (afterFeed), and judging it against a stale output
+// clock would turn "the records ended after a quiet spell" into a bogus
+// idle event with a negative duration.
+func (a *activityTracker) preOutput(now time.Time) {
+	a.lastOutput = now
+	a.stalled = false
 }
 
 // output notes PTY output and its effects. watched reports an interactive
@@ -219,22 +234,11 @@ func (a *activityTracker) setNative(now time.Time, n *nativeStatus, watched, emi
 // differs from the last recorded one) until it records, so a new question
 // alerts at most noticeQuiet late, never not at all.
 func (a *activityTracker) recordNative(prev, n *nativeStatus, now time.Time, watched bool) {
-	var kind session.EventKind
-	switch n.activity {
-	case session.ActivityBlocked:
-		kind = session.EventBlocked
-	case session.ActivityError:
-		kind = session.EventError
-	case session.ActivityDone:
-		kind = session.EventDone
-	case session.ActivityIdle:
-		kind = session.EventIdle
-	case session.ActivityWorking:
-		kind = session.EventWorking
-	default:
+	kind, ok := nativeEventKind(n.activity)
+	if !ok {
 		return
 	}
-	summary := n.eventSummary()
+	summary := n.summary
 	action := kind.DefaultAttention() == session.AttentionAction
 	changed := prev == nil || prev.activity != n.activity
 	if !changed && action && (kind != a.lastNativeKind || summary != a.lastNativeSummary) {
@@ -243,6 +247,11 @@ func (a *activityTracker) recordNative(prev, n *nativeStatus, now time.Time, wat
 		changed = true
 	}
 	if !changed {
+		return
+	}
+	// Non-action kinds wait out a per-kind gap however their text churns;
+	// the session record still carries every latest message.
+	if !action && now.Sub(a.lastNativeKindAt[kind]) < noticeQuiet {
 		return
 	}
 	if kind == a.lastNativeKind && summary == a.lastNativeSummary && now.Sub(a.lastNativeAt) < noticeQuiet {
@@ -262,7 +271,46 @@ func (a *activityTracker) recordNative(prev, n *nativeStatus, now time.Time, wat
 	}
 	a.rec.event(e)
 	a.lastNativeKind, a.lastNativeSummary, a.lastNativeAt = kind, summary, now
+	a.lastNativeKindAt[kind] = now
 	if action {
+		a.lastNativeActionAt = now
+	}
+}
+
+// nativeEventKind is the event kind a native activity records.
+func nativeEventKind(act session.Activity) (session.EventKind, bool) {
+	switch act {
+	case session.ActivityBlocked:
+		return session.EventBlocked, true
+	case session.ActivityError:
+		return session.EventError, true
+	case session.ActivityDone:
+		return session.EventDone, true
+	case session.ActivityIdle:
+		return session.EventIdle, true
+	case session.ActivityWorking:
+		return session.EventWorking, true
+	}
+	return "", false
+}
+
+// 7501: seedNativeAlert primes the dedup memory with the current native
+// status, as if it had just been recorded. A handoff restore uses it so
+// the next output of a still-blocked program does not re-alert the
+// question the user already saw; anything that differs still records,
+// at most noticeQuiet late.
+func (a *activityTracker) seedNativeAlert(now time.Time) {
+	n := a.native
+	if n == nil {
+		return
+	}
+	kind, ok := nativeEventKind(n.activity)
+	if !ok {
+		return
+	}
+	a.lastNativeKind, a.lastNativeSummary, a.lastNativeAt = kind, n.summary, now
+	a.lastNativeKindAt[kind] = now
+	if kind.DefaultAttention() == session.AttentionAction {
 		a.lastNativeActionAt = now
 	}
 }
@@ -275,9 +323,16 @@ func (a *activityTracker) input(now time.Time, watched bool) {
 	a.update(now, watched, false)
 }
 
-// tick checks for idleness and stalls and samples the foreground process.
-// fgPGID is the PTY's foreground process group (0 if unknown).
+// tick checks for idleness and stalls, samples the foreground process,
+// and retries a floor-deferred native action event: without this, a
+// program that re-asked within the floor and then went silent (waiting
+// for its answer) would never alert. Deriving fresh from a.native means a
+// block that input answered, or a clear removed, cancels the retry
+// naturally; the changed/dedup/floor checks make it a no-op otherwise.
 func (a *activityTracker) tick(now time.Time, fgPGID int, watched bool) {
+	if a.native != nil {
+		a.recordNative(a.native, a.native, now, watched)
+	}
 	fgChanged := false
 	if fgPGID > 0 && fgPGID != a.fgPGID {
 		// The group is remembered only once its name is known: a process

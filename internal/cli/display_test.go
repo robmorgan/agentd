@@ -77,6 +77,14 @@ func TestPathsWithControlCharactersAreEscaped(t *testing.T) {
 	if got := escapeControls("/tmp/plain"); got != "/tmp/plain" {
 		t.Fatalf("got %q", got)
 	}
+	// Value: protects=invisible format characters (unicode.Cf: bidi
+	// overrides, zero-width) escaped like controls, so a path cannot
+	// reorder or hide what the line appears to say; fails_when=
+	// escapeControls narrows back to unicode.IsControl only; why_new=the
+	// existing cases cover only control characters; seam=none
+	if got := escapeControls("/tmp/a‮b​c"); got != `/tmp/a\u{202e}b\u{200b}c` {
+		t.Fatalf("format characters: got %q", got)
+	}
 }
 
 func TestDisplayCwdAbbreviatesHome(t *testing.T) {

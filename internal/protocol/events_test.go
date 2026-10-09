@@ -168,3 +168,55 @@ func TestSessionStatusIsNegotiated(t *testing.T) {
 		t.Fatalf("negative progress crossed the wire: %#v, %v", got.Session.StatusProgress, err)
 	}
 }
+
+// The appended status fields' exact bytes, pinned like the shared golden
+// frames: CLIs and daemons of different builds negotiate CapSessionStatus
+// with each other, and a length-preserving reorder of the three strings
+// would pass a round trip. The values have distinct lengths on purpose.
+func TestSessionStatusGoldenFrame(t *testing.T) {
+	f := NegotiateFeatures(Capabilities(), []string{CapSessionActivity, CapSessionStatus})
+	now := time.Unix(1_700_000_000, 0).UTC()
+	progress := 47
+	rec := session.Record{
+		SessionID: "ab", Agent: "sh", Mode: session.ModeExecute, Cwd: "/w",
+		Status: session.StatusRunning, Attention: session.AttentionAction,
+		CreatedAt: now, UpdatedAt: now, Activity: session.ActivityBlocked,
+		StatusApp: strp("claude-code"), StatusKind: strp("permission"),
+		StatusMsg: strp("Run the tests?"), StatusProgress: &progress,
+	}
+	var buf bytes.Buffer
+	if err := WriteResponseWith(&buf, f, &Response{Session: &rec}); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{
+		0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x6c, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x7b, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x61, 0x62, 0x02, 0x00,
+		0x00, 0x00, 0x73, 0x68, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x2f, 0x77,
+		0x02, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0xf1, 0x53, 0x65, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf1, 0x53, 0x65, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00,
+		0x00, 0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x65, 0x64, 0x00, 0x00, 0x00, 0x00,
+		0x01, 0x0b, 0x00, 0x00, 0x00, 0x63, 0x6c, 0x61, 0x75, 0x64, 0x65, 0x2d,
+		0x63, 0x6f, 0x64, 0x65, 0x01, 0x0a, 0x00, 0x00, 0x00, 0x70, 0x65, 0x72,
+		0x6d, 0x69, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x01, 0x0e, 0x00, 0x00, 0x00,
+		0x52, 0x75, 0x6e, 0x20, 0x74, 0x68, 0x65, 0x20, 0x74, 0x65, 0x73, 0x74,
+		0x73, 0x3f, 0x01, 0x2f, 0x00, 0x00, 0x00,
+	}
+	if !bytes.Equal(buf.Bytes(), want) {
+		t.Fatalf("encoding changed:\n got %#v", buf.Bytes())
+	}
+	got, err := ReadResponseWith(bytes.NewReader(want), f)
+	if err != nil || !reflect.DeepEqual(got, &Response{Session: &rec}) {
+		t.Fatalf("decode = %#v, %v", got, err)
+	}
+
+	// A non-conforming peer's out-of-range progress is dropped at decode:
+	// the same frame with the progress u32 patched to 101 reads back with
+	// no progress at all.
+	patched := append([]byte(nil), want...)
+	patched[len(patched)-4] = 101
+	got, err = ReadResponseWith(bytes.NewReader(patched), f)
+	if err != nil || got.Session == nil || got.Session.StatusProgress != nil {
+		t.Fatalf("progress 101 crossed the decoder: %#v, %v", got, err)
+	}
+}

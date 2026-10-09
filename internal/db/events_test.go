@@ -246,6 +246,36 @@ func TestSetActivityProgramStatus(t *testing.T) {
 	if rec.StatusApp != nil || rec.StatusKind != nil || rec.StatusMsg != nil || rec.StatusProgress != nil {
 		t.Fatalf("after the program stopped reporting: %#v", rec)
 	}
+	// Value: protects=GetSession reads records whose activity string this
+	// build does not know (a newer worker recorded it); fails_when=strict
+	// activity parsing returns to scanSession (ParseActivity was removed
+	// for this); why_new=nothing asserted the tolerance on the database
+	// side, only in display; seam=none
+	if err := store.SetActivity("s", 10, Activity{Activity: "pondering", StatusProgress: -1}); err != nil {
+		t.Fatal(err)
+	}
+	if rec = store.mustGet(t, "s"); rec.Activity != "pondering" {
+		t.Fatalf("unknown activity read back as %q, want it kept verbatim", rec.Activity)
+	}
+	// Value: protects=end() clearing the status columns with the agent:
+	// an ended session carries no live program status, however it ended;
+	// fails_when=end()'s UPDATE loses the status_* = NULL assignments (a
+	// dead session then keeps showing a stale "blocked: Run tests?");
+	// why_new=the SetActivity path above NULLs via the activity write,
+	// nothing exercised the ending path; seam=none
+	if err := store.SetActivity("s", 10, Activity{Activity: session.ActivityBlocked,
+		StatusApp: "claude-code", StatusKind: "permission", StatusMsg: "Run tests?", StatusProgress: 60}); err != nil {
+		t.Fatal(err)
+	}
+	code := int32(0)
+	if err := store.MarkExited("s", &code); err != nil {
+		t.Fatal(err)
+	}
+	rec = store.mustGet(t, "s")
+	if rec.Activity != session.ActivityExited ||
+		rec.StatusApp != nil || rec.StatusKind != nil || rec.StatusMsg != nil || rec.StatusProgress != nil {
+		t.Fatalf("ended session kept program status: %#v", rec)
+	}
 }
 
 // A version 2 database gains the events table and activity columns, and

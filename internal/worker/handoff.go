@@ -486,6 +486,10 @@ func resumeRuntime(st *handoffState) (*runtime, *ownerState, error) {
 	state.activity = newActivityTracker(rt.recorder, st.AgentPID, time.Now())
 	state.status = restoreStatusTracker(st.Status)
 	state.activity.setNative(time.Now(), state.status.derive(), false, false)
+	// The restored status was already alerted by the previous image; seed
+	// the dedup memory so the next output of a still-blocked program does
+	// not re-raise the question the user already saw.
+	state.activity.seedNativeAlert(time.Now())
 	state.owner = rt.owner
 	state.geometry = st.Geometry
 	return rt, state, nil
