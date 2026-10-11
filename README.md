@@ -293,13 +293,29 @@ make dev-run ARGS="list"
 
 ## Install
 
+On macOS, Debian/Ubuntu or Arch (Omarchy included):
+
 ```sh
-make install
+curl -fsSL https://raw.githubusercontent.com/robmorgan/agentd/main/install.sh | bash
 ```
 
-This installs `agent` and `agentd` side by side in `$GOBIN` (or `$(go env GOPATH)/bin`); set
-`BINDIR` to choose another directory. If an older `agent` from `cargo install` is still in
-`~/.cargo/bin`, remove it (`cargo uninstall agent-cli`) so the new one is found first.
+or `./install.sh` from a checkout, which builds that checkout. The script installs `agent` and
+`agentd` side by side in `~/.local/bin` (`AGENTD_PREFIX` changes the prefix) and can be run again
+at any time:
+
+- Missing base packages (git, make, a C compiler, pkg-config, curl, xz) come from apt or pacman,
+  through `sudo` when you are not root. On macOS it asks for the Xcode command line tools.
+- Go and Zig are used from `PATH` when new enough. Otherwise pinned releases are downloaded into
+  `~/.local/share/agentd/toolchain` and used for the build only.
+- Without a checkout it clones `AGENTD_REF` (default `main`) into `~/.local/share/agentd/src`; a
+  rerun fetches and rebuilds only what changed.
+- If a daemon is running, it runs `agentd upgrade`, so sessions are handed over to the new binary
+  without stopping (`AGENTD_NO_UPGRADE=1` leaves the daemon alone).
+
+It never turns on remote access; see `agentd remote enable` below.
+
+For development, `make install` installs the binaries from the current tree into `$GOBIN` (or
+`$(go env GOPATH)/bin`); set `BINDIR` to choose another directory.
 
 ## Working Directories And Worktrees
 
