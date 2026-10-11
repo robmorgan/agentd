@@ -23,7 +23,7 @@ Both binaries are one Go module at the repository root.
 
 | Package | What it does |
 |---|---|
-| `cmd/agentd` | `serve [--daemonize]`, `upgrade`, `remote enable\|disable\|status` (set `[remote] listen` and restart the daemon), `remote id\|list\|authorize\|revoke`, `bench sessions` (`internal/bench`: measures sessions on a private daemon), `session-worker` (also `--handoff-probe` and `--resume-fd`, for live handoff). `upgrade` replaces the daemon, then hands running sessions' workers over to the new binary. The agent CLI runs `serve --daemonize`. |
+| `cmd/agentd` | `serve [--daemonize]`, `upgrade`, `remote enable\|disable\|status` (set `[remote] listen` and restart the daemon), `remote pair\|id\|list\|authorize\|revoke`, `bench sessions` (`internal/bench`: measures sessions on a private daemon), `session-worker` (also `--handoff-probe` and `--resume-fd`, for live handoff). `upgrade` replaces the daemon, then hands running sessions' workers over to the new binary. The agent CLI runs `serve --daemonize`. |
 | `cmd/agent`, `internal/cli` | The `agent` CLI: commands, the session picker, attach and the Ctrl-Y overlay (plain ANSI), and `hosts.toml` for remote hosts. Pure Go: it never imports `worker`, `daemon` or `db`, and `cmd/agent`'s tests check that, then drive both real binaries through PTYs. |
 | `internal/daemon` | `agentd serve`: lock/socket/pid file lifecycle, create/kill/rm/ls/get, attach and request proxies to workers, history, daemon management, worker supervision and startup reconciliation. Tests run the daemon in-process against real worker processes. |
 | `internal/worker` | One session: PTY via `creack/pty`, shadow terminal via `go.mitchellh.com/libghostty`, per-session Unix socket, activity and attention detection from the PTY stream, and live handoff to a new binary (`handoff.go`; OS-specific waits in `sys_linux.go`, `sys_darwin.go`). Real-PTY tests run under `-race`. |
@@ -302,6 +302,36 @@ SSH uses host keys and `authorized_keys`, with no certificate authority:
   client may stop the daemon: a remote one could not start it again.
 * Keys are created without ever replacing one that exists (written to a temporary file, then
   linked into place), so processes creating a key at the same moment all end up using the same one.
+
+Pairing (`internal/transport/pair.go`) sets up both halves of that trust from a short code instead
+of copying fingerprints between machines. `agentd remote pair` asks the daemon (a management
+request on the local socket only) to open a pairing window. The daemon shows a 9-digit code, and
+`agent host add NAME ADDRESS --code CODE` proves it knows the code:
+
+* A pairing client connects with ALPN `agentd-pair` instead of `agentd`. The daemon completes that
+  handshake for any client key, but only while a window is open, and serves such a connection
+  nothing but the pairing exchange (protocol/pairing.go, framed like the management protocol so it
+  works across main-protocol versions, with frames capped at 4 KiB since the peer is not
+  authenticated). The connection is then closed, and the client reconnects normally under its
+  now-authorized key. At most 4 pairing connections are served at once, each for at most 30
+  seconds.
+* The two ends run CPace, a balanced PAKE (`filippo.io/cpace`, over ristretto255), with the code as
+  its password. Its context holds both keys' fingerprints and a value exported from this TLS
+  connection, so a machine in the middle, which must terminate TLS under its own key with each end,
+  gets a different shared secret from each. An attacker learns nothing from the exchange that would
+  let it test codes offline: each attempt is one online guess.
+* The client confirms the shared key first (an HMAC over it). Only then does the daemon authorize
+  the client's key under the name it sent (`authorized_clients`, as `remote authorize` would) and
+  send its own confirmation. The client pins the daemon's key only after checking that confirmation.
+* There is one window at a time. It closes when a client pairs, after 3 wrong codes, after 5 minutes,
+  or when the `remote pair` command goes away, since the window belongs to its stream. With 30 bits
+  of code and 3 guesses per window, a guess succeeds about 3 times in a billion.
+
+`filippo.io/cpace` is small (about 200 lines) and pinned at its only release, which its author
+calls experimental. Its construction is the one in draft-haase-cpace with HKDF and ristretto255,
+and our protocol adds the key confirmation it leaves to callers. If a maintained, standardized
+CPace for Go appears, it can replace this one: only `pair.go` uses it, and pairing is not
+persisted, so changing it affects only CLIs and daemons that pair across that change.
 
 The `agent` CLI is the client (`internal/cli/client.go`, over the same `internal/transport`
 QUIC code as the daemon). Its key is

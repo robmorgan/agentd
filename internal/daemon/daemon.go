@@ -92,6 +92,9 @@ type Server struct {
 	remoteErr atomic.Pointer[string]
 	// remoteListener is the bound QUIC listener, for connection status.
 	remoteListener atomic.Pointer[transport.QUICListener]
+	// pairing is the pairing window `agentd remote pair` opens; every QUIC
+	// listener the daemon binds serves it.
+	pairing *transport.Pairing
 
 	// supervised holds the pids of the workers this daemon spawned and has
 	// not yet reaped (int -> struct{}); see refresh.
@@ -142,7 +145,9 @@ func New(p *paths.AppPaths, workerBin string) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to load the daemon's key: %w", err)
 	}
+	host, _ := os.Hostname()
 	return &Server{
+		pairing:   transport.NewPairing(host),
 		daemonID:  id.Fingerprint,
 		paths:     p,
 		db:        store,
@@ -284,6 +289,7 @@ func (s *Server) startRemote() {
 		OnConnect: func(fp string, remote net.Addr) {
 			fmt.Fprintf(os.Stderr, "agentd: remote client %s connected from %s\n", fp, remote)
 		},
+		Pairing: s.pairing,
 	}
 	listen := func() *transport.QUICListener {
 		l, err := transport.ListenQUIC(addr, id, opts)
@@ -517,6 +523,8 @@ func (s *Server) handleManagement(conn transport.Stream, req *protocol.Managemen
 			OpenStreams:     s.openStreams(),
 			Connections:     s.remoteConnections(),
 		}})
+	case req.Pair != nil:
+		return s.servePair(conn)
 	case req.Shutdown != nil:
 		// A remote client can stop the daemon but not start it again, so
 		// only a local one may stop it.

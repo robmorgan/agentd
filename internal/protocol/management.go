@@ -14,8 +14,11 @@ import (
 const (
 	kDaemonStatusRequest    uint16 = 20_001
 	kDaemonShutdownRequest  uint16 = 20_002
+	kDaemonPairRequest      uint16 = 20_003
 	kDaemonStatusResponse   uint16 = 21_001
 	kDaemonShutdownResponse uint16 = 21_002
+	kDaemonPairingResponse  uint16 = 21_003
+	kDaemonPairedResponse   uint16 = 21_004
 	kDaemonErrorResponse    uint16 = 21_099
 )
 
@@ -23,6 +26,11 @@ const (
 type ManagementRequest struct {
 	Status   *struct{}
 	Shutdown *ManagementShutdown
+	// Pair opens the daemon's pairing window (see pairing.go). The daemon
+	// answers with ManagementPairing, then, on the same stream, with
+	// ManagementPaired or an error once a client has paired or the window
+	// has closed. Closing the stream closes the window.
+	Pair *struct{}
 }
 
 type ManagementShutdown struct {
@@ -33,7 +41,27 @@ type ManagementShutdown struct {
 type ManagementResponse struct {
 	Status   *ManagementStatus
 	Shutdown *ManagementShutdownResult
+	Pairing  *ManagementPairing
+	Paired   *ManagementPaired
 	Error    *ErrorResponse
+}
+
+// ManagementPairing announces an open pairing window.
+type ManagementPairing struct {
+	// Code is what the client must enter, formatted for reading aloud.
+	Code      string    `json:"code"`
+	ExpiresAt time.Time `json:"expires_at"`
+	// Remote is where the QUIC listener is bound, and Fingerprint the
+	// daemon's key, for the command the user is told to run.
+	Remote      string `json:"remote"`
+	Fingerprint string `json:"fingerprint"`
+}
+
+// ManagementPaired reports the client that paired, which is now authorized.
+type ManagementPaired struct {
+	Fingerprint string `json:"fingerprint"`
+	Name        string `json:"name,omitempty"`
+	Remote      string `json:"remote"`
 }
 
 type ManagementStatus struct {
@@ -130,6 +158,11 @@ func decodeManagementRequest(k uint16, payload []byte) (*ManagementRequest, erro
 			return nil, err
 		}
 		return &ManagementRequest{Shutdown: &s}, nil
+	case kDaemonPairRequest:
+		if len(payload) != 0 {
+			return nil, fmt.Errorf("unexpected pair request payload")
+		}
+		return &ManagementRequest{Pair: Empty}, nil
 	}
 	return nil, fmt.Errorf("unknown daemon management request kind `%d`", k)
 }
@@ -144,6 +177,8 @@ func WriteManagementRequest(w io.Writer, req *ManagementRequest) error {
 			return err
 		}
 		return writeFrame(w, DaemonManagementVersion, kDaemonShutdownRequest, payload)
+	case req.Pair != nil:
+		return writeFrame(w, DaemonManagementVersion, kDaemonPairRequest, nil)
 	}
 	return fmt.Errorf("empty management request")
 }
@@ -161,6 +196,12 @@ func WriteManagementResponse(w io.Writer, resp *ManagementResponse) error {
 	case resp.Shutdown != nil:
 		k = kDaemonShutdownResponse
 		payload, err = json.Marshal(resp.Shutdown)
+	case resp.Pairing != nil:
+		k = kDaemonPairingResponse
+		payload, err = json.Marshal(resp.Pairing)
+	case resp.Paired != nil:
+		k = kDaemonPairedResponse
+		payload, err = json.Marshal(resp.Paired)
 	case resp.Error != nil:
 		k = kDaemonErrorResponse
 		payload, err = json.Marshal(map[string]string{"message": resp.Error.Message})
@@ -195,6 +236,18 @@ func ReadManagementResponse(r io.Reader) (*ManagementResponse, error) {
 			return nil, err
 		}
 		return &ManagementResponse{Shutdown: &s}, nil
+	case kDaemonPairingResponse:
+		var p ManagementPairing
+		if err := json.Unmarshal(payload, &p); err != nil {
+			return nil, err
+		}
+		return &ManagementResponse{Pairing: &p}, nil
+	case kDaemonPairedResponse:
+		var p ManagementPaired
+		if err := json.Unmarshal(payload, &p); err != nil {
+			return nil, err
+		}
+		return &ManagementResponse{Paired: &p}, nil
 	case kDaemonErrorResponse:
 		var e struct {
 			Message string `json:"message"`

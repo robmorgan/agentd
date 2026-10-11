@@ -469,7 +469,33 @@ If the address does not exist yet when the daemon starts (say, Tailscale is stil
 boot), the daemon keeps retrying every few seconds. `agentd remote status` and `agent daemon info`
 show why it is not listening.
 
-**On the laptop**, run the command `enable` printed:
+**Pair the laptop** with a short code, so neither machine's key has to be copied. On the
+devbox:
+
+```sh
+agentd remote pair
+```
+
+```text
+Pairing code: 482-193-675
+
+On the machine you connect from, run:
+  agent host add devbox 100.64.0.5:7433 --code 482-193-675
+
+Waiting until 14:05:12 (Ctrl-C to cancel)...
+```
+
+**On the laptop**, run that command. The laptop pins the devbox's key, the devbox authorizes the
+laptop's key, and `agentd remote pair` reports which machine paired. The code works once, expires
+after 5 minutes, and closes after 3 wrong attempts. Neither end can be fooled into trusting a
+machine that does not know the code: the two run a password-authenticated key exchange (CPace),
+so someone on the network gets one guess per attempt and cannot test codes offline. No service
+outside the two machines is involved.
+
+A host you already added without pairing (one `agent hosts` shows as `unauthorized`) can be paired
+the same way: run the `agent host add` command with the same name and address.
+
+**Or, without pairing**, compare fingerprints. On the laptop, run the command `enable` printed:
 
 ```sh
 agent host add devbox 100.64.0.5:7433 --fingerprint SHA256:...
@@ -477,8 +503,7 @@ agent host add devbox 100.64.0.5:7433 --fingerprint SHA256:...
 
 Without `--fingerprint`, `agent host add` shows the key the daemon presents and asks you to confirm
 it against `agentd remote id`. Either way it then prints the command that authorizes the laptop.
-
-**Back on the devbox**, run the command it printed:
+Back on the devbox, run that command:
 
 ```sh
 agentd remote authorize SHA256:... my-laptop
@@ -553,6 +578,7 @@ agent remote id                  # this machine's client key fingerprint
 agent host ls                    # with --no-probe: hosts.toml as is, with pinned keys
 agent host info devbox
 agent host rm devbox
+agentd remote pair               # on the devbox: authorize a machine with a one-time code
 agentd remote list               # on the devbox: authorized clients
 agentd remote revoke SHA256:...
 ```
@@ -564,8 +590,10 @@ manage the local daemon.
 
 Troubleshooting:
 
-- **"refused this machine's key"**: the laptop is not authorized; run the `agentd remote authorize`
-  command from the error on the devbox.
+- **"refused this machine's key"**: the laptop is not authorized; pair it (`agentd remote pair` on
+  the devbox), or run the `agentd remote authorize` command from the error there.
+- **"is not pairing"**: no `agentd remote pair` is waiting on the devbox, or its code expired or was
+  closed by wrong attempts; run it again and use the new code.
 - **"the key of host ... has changed"**: the devbox presented a different key from the pinned one.
   If you know why (for example `remote/daemon.key` was recreated), run `agent host rm` and
   `agent host add` again. Otherwise, treat it as a possible interception.

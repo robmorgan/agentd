@@ -412,6 +412,12 @@ func putFrameHeader(h []byte, version, k, flags uint16, payloadLen int) {
 
 // readRawFrame returns (nil, nil) on a clean EOF before any header byte.
 func readRawFrame(r io.Reader) (*frameHeader, []byte, error) {
+	return readRawFrameLimit(r, MaxFramePayload)
+}
+
+// readRawFrameLimit is readRawFrame refusing payloads over limit before
+// allocating them.
+func readRawFrameLimit(r io.Reader, limit uint32) (*frameHeader, []byte, error) {
 	var header [frameHeaderLen]byte
 	n, err := r.Read(header[:1])
 	if n == 0 {
@@ -435,8 +441,8 @@ func readRawFrame(r io.Reader) (*frameHeader, []byte, error) {
 	}
 	flags := binary.LittleEndian.Uint16(header[8:10])
 	payloadLen := binary.LittleEndian.Uint32(header[12:16])
-	if payloadLen > MaxFramePayload {
-		return nil, nil, fmt.Errorf("frame payload too large: %d bytes (limit %d)", payloadLen, MaxFramePayload)
+	if payloadLen > limit {
+		return nil, nil, fmt.Errorf("frame payload too large: %d bytes (limit %d)", payloadLen, limit)
 	}
 	payload := make([]byte, payloadLen)
 	if _, err := io.ReadFull(r, payload); err != nil {

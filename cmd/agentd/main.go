@@ -26,6 +26,7 @@ import (
 	"github.com/robmorgan/agentd/internal/config"
 	"github.com/robmorgan/agentd/internal/daemon"
 	"github.com/robmorgan/agentd/internal/paths"
+	"github.com/robmorgan/agentd/internal/protocol"
 	"github.com/robmorgan/agentd/internal/transport"
 	"github.com/robmorgan/agentd/internal/worker"
 	"golang.org/x/term"
@@ -62,7 +63,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "usage: agentd serve [--daemonize]")
 	fmt.Fprintln(os.Stderr, "       agentd upgrade")
 	fmt.Fprintln(os.Stderr, "       agentd remote enable [ADDRESS] [--yes] | disable | status")
-	fmt.Fprintln(os.Stderr, "       agentd remote id | list | authorize FINGERPRINT [NAME] | revoke FINGERPRINT")
+	fmt.Fprintln(os.Stderr, "       agentd remote pair | id | list | authorize FINGERPRINT [NAME] | revoke FINGERPRINT")
 	fmt.Fprintln(os.Stderr, "       agentd bench sessions [--count N] [--output-heavy N] [--attach K] [--duration D] [--fill-lines L] [--json] [--json-file F]")
 	fmt.Fprintln(os.Stderr, "       agentd session-worker --session-id ID --cwd DIR --created-at TS --session-uid UID --agent-name NAME --command CMD [--model M] [--arg A]...")
 }
@@ -214,6 +215,8 @@ func runRemote(argv []string) int {
 		return runRemoteDisable(p)
 	case len(argv) == 1 && argv[0] == "status":
 		return runRemoteStatus(p)
+	case len(argv) == 1 && argv[0] == "pair":
+		return runRemotePair(p)
 	case len(argv) == 1 && argv[0] == "id":
 		id, err := transport.LoadOrCreateIdentity(p.RemoteKeyPath())
 		if err != nil {
@@ -362,10 +365,51 @@ func runRemoteEnable(p *paths.AppPaths, argv []string) int {
 	}
 	fmt.Printf("✓ Accepting remote clients over QUIC on %s\n", status.Remote)
 	fmt.Printf("  key %s\n\n", id.Fingerprint)
-	fmt.Println("On the machine you connect from, run:")
+	fmt.Println("To connect from another machine, pair it: run `agentd remote pair` here and")
+	fmt.Println("follow its instructions. Or, on that machine, run:")
 	fmt.Printf("  agent host add %s %s --fingerprint %s\n", shortHostname(), status.Remote, id.Fingerprint)
 	fmt.Println("and then authorize it here with the command it prints.")
 	return 0
+}
+
+// runRemotePair opens the daemon's pairing window and shows its code until
+// a client pairs with it, it expires, or the user interrupts.
+func runRemotePair(p *paths.AppPaths) int {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	paired, err := daemon.Pair(ctx, p, func(w *protocol.ManagementPairing) {
+		fmt.Printf("Pairing code: %s\n\n", w.Code)
+		fmt.Println("On the machine you connect from, run:")
+		fmt.Printf("  agent host add %s %s --code %s\n\n", shortHostname(), displayAddress(w.Remote), w.Code)
+		fmt.Printf("Waiting until %s (Ctrl-C to cancel)...\n", w.ExpiresAt.Local().Format("15:04:05"))
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			fmt.Println("Pairing cancelled")
+			return 1
+		}
+		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+		return 1
+	}
+	name := paired.Name
+	if name == "" {
+		name = "(unnamed)"
+	}
+	fmt.Printf("✓ Paired with %s from %s\n  key %s, now authorized\n", name, paired.Remote, paired.Fingerprint)
+	return 0
+}
+
+// displayAddress is a listen address as a client would dial it: one bound
+// to every interface has no single address to show.
+func displayAddress(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		return "ADDRESS:" + port
+	}
+	return addr
 }
 
 func runRemoteDisable(p *paths.AppPaths) int {
