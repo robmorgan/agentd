@@ -463,9 +463,11 @@ features both listed. Today there is one protocol version (1), and these capabil
 | `daemon-id` | the daemon's id appended to `Welcome` |
 | `events` | events streams (`SubscribeEvents`), `ListEvents` |
 | `session-activity` | the activity fields appended to session records (after the UID): activity, foreground command, title, last output and attention times |
+| `session-status` | the program status fields (OSC 7501) appended to session records after the `session-activity` fields: app, kind of block, message and progress |
 | `session-restart` | attach stream: the worker may end it with `SessionRestarting` when it restarts for a live handoff |
 | `worker-handoff` | `HandoffSession` and `HandedOff`, between agentd and a session worker only (a worker lists it in its answer to `Hello`) |
 | `terminal-memory` | the shadow terminal's memory appended to `SessionStats` |
+| `attach-scrollback` | attach stream: `AttachSession.ScrollbackRows` caps the scrollback in the attach snapshot (see "Bounded scrollback") |
 
 The protocol grows without breaking older peers this way: a new message kind, or a field appended
 to the end of an existing message or struct (a session record, even inside a list), comes with a
@@ -477,7 +479,8 @@ silently misread. Changing an existing encoding needs a new protocol version.
 
 Attach streams have no `Hello`, so `AttachSession` carries their handshake: when the daemon's
 `Welcome` listed `attach-features`, the CLI appends the attach-stream capabilities it wants that the
-daemon also listed (`session-uid`, `attach-replace`, `attach-resync`, `session-restart`), followed by the fields of the
+daemon also listed (`session-uid`, `attach-replace`, `attach-resync`, `session-restart`,
+`attach-scrollback`), followed by the fields of the
 ones listed. The daemon cuts the list down to what the session's worker supports (it asks the worker
 with a `Hello` on the worker socket; a worker started by an older daemon build may support fewer,
 and one from before attach features supports none), and the worker's `Attached` echoes the list in
@@ -572,11 +575,14 @@ its record whole, `clear` removes a record and its descendants (or everything), 
 (OSC 133 A) drops `working`, `blocked` and `idle` records (that program is over; an idle record
 left behind would pin the session while the next, possibly non-reporting, command runs), `done`
 and `error` records stay until the user has seen them — typing into the session or attaching to
-look at it — a full reset removes all, and at most 256 are kept, evicting the least recently
+look at it (a reattach that replaces a lost connection is the CLI reconnecting by itself, so it
+does not count) — a full reset removes all, and at most 256 are kept, evicting the least recently
 updated. Reports and prompt starts are applied in stream order, so a report arriving after a
 prompt in the same coalesced PTY read belongs to the next command and survives it. The records survive a live worker handoff (they travel
 in `handoffState`, states as the specification's words): a blocked agent must stay blocked across
-an upgrade, since the program will not re-report on its own.
+an upgrade, since the program will not re-report on its own. The event dedup memory rides along,
+so the new image neither re-alerts a question the user already saw nor loses one the rate limit
+had deferred at handoff time.
 
 While any records exist, they decide the session's activity: the state that needs the user most
 wins (`blocked` > `error` > `working` > `done` > `idle`), so one blocked shard of a parallel
@@ -589,8 +595,9 @@ recorded as info-level context, and the idle timer no longer decides the activit
 program never reports keeps the heuristic behavior exactly; the `// 7501:` comments in
 `internal/worker/activity.go` mark every seam. The worker answers the protocol's detection query
 (`ESC ] 7501 ; ?`, echoed back) whether or not a client is attached, since it consumes the reports
-itself; a client terminal that also supports the protocol replies identically, and the program
-reads the two replies as one answer.
+itself; the identical reply of a client terminal that also supports the protocol is dropped from
+the input, since the worker has already answered and a terminal's reflex must not count as the
+user typing.
 
 **Persistence.** Events are rows of the `events` table in `state.db`, written by the daemon and
 the workers. Ids come from `AUTOINCREMENT`, so they increase per runtime root and are never reused;
@@ -608,7 +615,9 @@ replace the attention instead, since an agent that has stopped is no longer wait
 asked. Acknowledging resets the attention to info and records an `acknowledged` event, if there was
 anything to clear. Attaching interactively (`attach`, or focusing a session in the picker)
 acknowledges, and so does detaching from a session that is still running: either way the user has
-seen its screen. The daemon writes an attach's acknowledgement beside the attach rather than
+seen its screen. A reattach that replaces a lost attachment is the exception: the CLI reconnected
+by itself, no one looked, so attention raised while the connection was down stays pending. The
+daemon writes an attach's acknowledgement beside the attach rather than
 before relaying it, so attaching never waits on the database; it only clears attention raised
 before the attach began (`db.AcknowledgeBefore`), so a session that fails at once keeps its
 attention. An attachment that ends because the session ended does not, and output reaching
@@ -973,7 +982,7 @@ The selected root contains:
 * `agentd.sock`
 * `agentd.lock` (held by the running daemon)
 * `agentd.pid` (informational)
-* `state.db` (schema v5; older versions are migrated forward, newer ones refused. Migrations
+* `state.db` (schema v6; older versions are migrated forward, newer ones refused. Migrations
   must be additive, because session workers keep writing to the file across daemon upgrades), and
   its `state.db-wal` and `state.db-shm`: the daemon and every worker share it, so it uses
   write-ahead logging, where reads never wait for writes, and each process keeps a connection open
