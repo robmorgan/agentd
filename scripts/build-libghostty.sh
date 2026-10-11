@@ -3,14 +3,16 @@
 #
 # go.mitchellh.com/libghostty tracks a specific ghostty commit; this pin must
 # match the GIT_TAG in that module's CMakeLists.txt, or be a later commit with
-# the same C API (include/ghostty). It is currently one commit ahead, for the
-# single shift fix (ghostty #14576). Requires Zig 0.16+.
+# the same C API (include/ghostty). It is currently ahead, on a Ghostty main
+# that keeps that API (only additions) and brings the formatter's origin mode
+# fix (ghostty #14588) and program status revision 0.4 (#14630). Requires
+# Zig 0.16+.
 #
 # Usage: scripts/build-libghostty.sh            # builds into .build
 #        eval "$(scripts/build-libghostty.sh --env)"   # only print exports
 set -euo pipefail
 
-GHOSTTY_COMMIT="b699ea79f4b881421b4b3055abc16a0957d76beb"
+GHOSTTY_COMMIT="24da727f6857b5350b4a502bdcb30ab942b36e81"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD="${HERE}/../.build"
 SRC="${BUILD}/ghostty"

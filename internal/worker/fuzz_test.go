@@ -2,6 +2,8 @@ package worker
 
 import (
 	"bytes"
+	"slices"
+	"strings"
 	"testing"
 
 	"go.mitchellh.com/libghostty"
@@ -44,11 +46,6 @@ func FuzzSnapshotRestore(f *testing.F) {
 		if !ts.atGround() {
 			return
 		}
-		// A cursor in origin mode is a known limit of the formatter (see
-		// TestSnapshotKnownLimits).
-		if origin, _ := ts.term.Mode(libghostty.ModeOrigin); origin {
-			return
-		}
 		snap, err := ts.snapshot(allScrollback)
 		if err != nil {
 			t.Fatalf("snapshot: %v", err)
@@ -69,11 +66,25 @@ func FuzzSnapshotRestore(f *testing.F) {
 		if screen, _ := ts.term.ActiveScreen(); screen == libghostty.ScreenAlternate {
 			ts.term.VTWrite([]byte(exitAltScreen))
 			client.VTWrite([]byte(exitAltScreen))
-			if d := diffRestored(ts.term, client); d != "" {
+			// Leaving with 1049 restores the saved cursor (its position
+			// and origin mode), and the saved cursor is a known limit (a
+			// snapshot does not carry it), so that state is left out here.
+			if d := diffImages(cursorless(imageOf(ts.term)), cursorless(imageOf(client))); d != "" {
 				t.Fatalf("primary screen under the alternate screen differs:\n%s\nsnapshot: %q", d, snap)
 			}
 		}
 	})
+}
+
+// cursorless leaves out of img the known limits and the state that
+// restoring a saved cursor sets: the cursor's position and pending wrap,
+// and origin mode.
+func cursorless(img terminalImage) terminalImage {
+	img = withoutKnownLimits(img)
+	img.CursorX, img.CursorY, img.PendingWrap = 0, 0, false
+	modes := strings.Split(img.Modes, ",")
+	img.Modes = strings.Join(slices.DeleteFunc(modes, func(m string) bool { return m == "DECOM" }), ",")
+	return img
 }
 
 // graphemeModeChanged reports whether the stream may have switched

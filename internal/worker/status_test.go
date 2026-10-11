@@ -66,16 +66,22 @@ func TestTerminalReportsProgramStatus(t *testing.T) {
 		t.Fatalf("completed report: %+v", fx)
 	}
 
-	// The detection query is answered (the query echoed back, with its
-	// own terminator) and kept apart from the other terminal replies, so
-	// the worker can send it even while a client terminal is attached.
-	for _, query := range []string{"\x1b]7501;?\x1b\\", "\x1b]7501;?\x07"} {
-		writes, fx := ts.feed([]byte(query))
+	// The detection query is answered (the query echoed back with the
+	// states and kinds libghostty accepts, and the query's own terminator)
+	// and kept apart from the other terminal replies, so the worker can
+	// send it even while a client terminal is attached.
+	for _, tc := range []struct{ query, end string }{
+		{"\x1b]7501;?\x1b\\", "\x1b\\"},
+		{"\x1b]7501;?\x07", "\x07"},
+	} {
+		writes, fx := ts.feed([]byte(tc.query))
 		if len(writes) != 0 {
-			t.Fatalf("query %q: reply in the pending writes: %q", query, writes)
+			t.Fatalf("query %q: reply in the pending writes: %q", tc.query, writes)
 		}
-		if len(fx.statusReplies) != 1 || !bytes.Equal(fx.statusReplies[0], []byte(query)) {
-			t.Fatalf("query %q: replies = %q", query, fx.statusReplies)
+		if len(fx.statusReplies) != 1 ||
+			!bytes.HasPrefix(fx.statusReplies[0], []byte("\x1b]7501;?:states=")) ||
+			!bytes.HasSuffix(fx.statusReplies[0], []byte(tc.end)) {
+			t.Fatalf("query %q: replies = %q", tc.query, fx.statusReplies)
 		}
 	}
 
@@ -368,7 +374,8 @@ func TestStatusTrackerPromptDropsWorkingBlockedAndIdle(t *testing.T) {
 
 // statusAgent reports program status on command; "Run tests?" and "All
 // tests passed" in base64. -icanon so the query branch can read the
-// detection reply, which no newline follows. "blocked" also rings the bell
+// detection reply, which no newline follows, a byte at a time up to the
+// backslash of its ST. "blocked" also rings the bell
 // after the report: typing at the session would count the block as
 // answered, so the two must ride one command.
 const statusAgent = `stty -echo -icanon; echo ready
@@ -377,7 +384,7 @@ while IFS= read -r l; do
     blocked) printf '\033]7501;state=blocked:kind=permission:app=claude-code:msg=UnVuIHRlc3RzPw==\033\\'; sleep 0.2; printf '\a'; echo bell-rung;;
     done) printf '\033]7501;state=done:msg=QWxsIHRlc3RzIHBhc3NlZA==\033\\';;
     clear) printf '\033]7501;state=clear\033\\';;
-    query) printf '\033]7501;?\033\\'; head -c 10 | cat -v; echo; echo query-done;;
+    query) printf '\033]7501;?\033\\'; r=; while c=$(dd bs=1 count=1 2>/dev/null) && [ "$c" != '\' ]; do r="$r$c"; done; printf '%s\\\n' "$r" | cat -v; echo query-done;;
     quit) exit 0;;
     *) echo "got:$l";;
   esac
@@ -435,6 +442,29 @@ func TestProgramStatusFromThePTY(t *testing.T) {
 	h.waitExit()
 }
 
+// isStatusDetectionReply accepts one detection reply, from any protocol
+// revision, and nothing that carries more than the reply.
+func TestIsStatusDetectionReply(t *testing.T) {
+	for _, tc := range []struct {
+		data string
+		want bool
+	}{
+		{"\x1b]7501;?\x1b\\", true},
+		{"\x1b]7501;?\x07", true},
+		{"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\", true},
+		{"\x1b]7501;?:states=idle\x07", true},
+		{"\x1b]7501;?", false},                        // no terminator
+		{"\x1b]7501;state=working\x1b\\", false},      // a report, not a reply
+		{"\x1b]7501;?\x1b\\y", false},                 // keystrokes after it
+		{"\x1b]7501;?\x1b\\\x1b]7501;?\x1b\\", false}, // two replies
+		{"x\x1b]7501;?\x07", false},                   // keystrokes before it
+	} {
+		if got := isStatusDetectionReply([]byte(tc.data)); got != tc.want {
+			t.Errorf("isStatusDetectionReply(%q) = %v, want %v", tc.data, got, tc.want)
+		}
+	}
+}
+
 // The worker answers the program status detection query itself, whether or
 // not a client is attached: it consumes the reports either way.
 func TestProgramStatusDetectionReply(t *testing.T) {
@@ -443,7 +473,9 @@ func TestProgramStatusDetectionReply(t *testing.T) {
 
 	// Nobody attached.
 	h.sendInput("query\n")
-	h.eventually("the detection reply", func() bool { return strings.Contains(h.history(), "7501;?") })
+	// The agent prints the reply through cat -v, so "^[" (not its own
+	// query's raw ESC) shows the reply arrived.
+	h.eventually("the detection reply", func() bool { return strings.Contains(h.history(), "^[]7501;?:states=") })
 
 	// Attached: other terminal replies are left to the client's terminal,
 	// but this one the worker still answers (the client here answers no
@@ -452,7 +484,7 @@ func TestProgramStatusDetectionReply(t *testing.T) {
 	h.eventually("the first query to finish", func() bool { return strings.Contains(h.history(), "query-done") })
 	h.sendInput("query\n")
 	h.eventually("the detection reply while attached", func() bool {
-		return strings.Count(h.history(), "7501;?") >= 2
+		return strings.Count(h.history(), "^[]7501;?:states=") >= 2
 	})
 }
 
@@ -501,8 +533,10 @@ func TestWriteInputDropsDetectionReply(t *testing.T) {
 	h.eventually("the agent", func() bool { return strings.Contains(h.history(), "ready") })
 
 	// The client terminal's reflex: the exact reply bytes, one chunk, no
-	// newline. Forwarded, they would prefix the next line the agent reads.
-	h.sendInput("\x1b]7501;?\x1b\\")
+	// newline, from a terminal on protocol revision 0.4 and from an older
+	// one. Forwarded, they would prefix the next line the agent reads.
+	h.sendInput("\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\")
+	h.sendInput("\x1b]7501;?\x07")
 	h.sendInput("ping\n")
 	h.eventually("a clean line after the dropped reply", func() bool {
 		return strings.Contains(h.history(), "got[ping]")

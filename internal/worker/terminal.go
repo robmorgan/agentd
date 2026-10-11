@@ -90,25 +90,33 @@ type statusEvent struct {
 	report *libghostty.ProgramStatus
 }
 
-// statusDetectionReplies are the exact replies libghostty writes to the
-// program status detection query (the query echoed back, with whichever
-// terminator it used). writeInput matches them against whole input
-// chunks: a client terminal writes its reply as its own standalone write,
-// which arrives as its own chunk. A reply that ever coalesced with
-// keystrokes (or split across reads) would pass through as ordinary
-// input — the pre-existing behavior for every other terminal reply.
-var statusDetectionReplies = [][]byte{
-	[]byte("\x1b]7501;?\x1b\\"),
-	[]byte("\x1b]7501;?\x07"),
-}
+// statusDetectionPrefix starts every reply to the program status detection
+// query: OSC 7501 ; ? and, since revision 0.4 of the protocol, the states
+// and kinds the terminal accepts (":states=idle,working,...:kinds=...").
+// Older terminals reply with the bare "?".
+const statusDetectionPrefix = "\x1b]7501;?"
 
+// isStatusDetectionReply reports whether data is exactly one detection
+// reply, ended by ST or BEL, as libghostty writes it and as a client
+// terminal sends it back. writeInput matches it against whole input chunks:
+// a client terminal writes its reply as its own standalone write, which
+// arrives as its own chunk. A reply that ever coalesced with keystrokes (or
+// split across reads) would pass through as ordinary input — the
+// pre-existing behavior for every other terminal reply.
 func isStatusDetectionReply(data []byte) bool {
-	for _, reply := range statusDetectionReplies {
-		if bytes.Equal(data, reply) {
-			return true
-		}
+	body, ok := bytes.CutPrefix(data, []byte(statusDetectionPrefix))
+	if !ok {
+		return false
 	}
-	return false
+	if b, ok := bytes.CutSuffix(body, []byte("\x1b\\")); ok {
+		body = b
+	} else if b, ok := bytes.CutSuffix(body, []byte("\x07")); ok {
+		body = b
+	} else {
+		return false
+	}
+	// Anything else that ends or starts a sequence means more than one.
+	return !bytes.ContainsAny(body, "\x1b\x07")
 }
 
 func newTerminalState(cols, rows uint16, maxScrollbackBytes uint) (*terminalState, error) {

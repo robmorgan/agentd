@@ -1117,8 +1117,6 @@ formatter's):
   It also writes the gap before later text on a row as spaces in the pen of the text before the
   gap. Both are fixable in libghostty's formatter (`PageFormatter`), which is where the fix
   belongs.
-* **The cursor in origin mode** (DECOM): the formatter enables the mode before an absolute cursor
-  position, which then lands relative to the top margin.
 * **Soft wraps and hyperlinks of text already on screen.** Every row is written with a line
   break after it, so a wrapped line comes back as separate lines that a later resize does not
   reflow; hyperlinks (OSC 8) are only emitted for the pen, not for text.
