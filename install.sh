@@ -236,14 +236,24 @@ source_dir() {
 }
 
 # upgrade_daemon hands a running daemon and its sessions over to the newly
-# installed agentd. With no daemon running it does nothing: `agentd upgrade`
-# would start one, and the CLI starts the daemon when it is first needed.
+# installed agentd, when there is one: the install changed agentd, or (Linux)
+# the daemon runs a binary that has since been replaced. With no daemon
+# running it does nothing, since `agentd upgrade` would start one and the CLI
+# starts the daemon when it is first needed.
 upgrade_daemon() {
-  local bindir="$1" running
-  running="$(pgrep -u "$(id -u)" -f 'agentd serve' 2>/dev/null || true)"
-  if [[ -z "${running}" ]]; then
+  local bindir="$1" changed="$2" pid
+  pid="$(pgrep -u "$(id -u)" -f 'agentd serve' 2>/dev/null | head -n 1 || true)"
+  if [[ -z "${pid}" ]]; then
     step "Daemon: not running (agent starts it when needed)"
     return
+  fi
+  if [[ "${changed}" != 1 ]]; then
+    local exe
+    exe="$(readlink "/proc/${pid}/exe" 2>/dev/null || true)"
+    if [[ "${exe}" != *" (deleted)" ]]; then
+      step "Daemon: running; agentd is unchanged, so it is left as is"
+      return
+    fi
   fi
   if [[ "${AGENTD_NO_UPGRADE:-}" == 1 ]]; then
     step "Daemon: running; left alone (AGENTD_NO_UPGRADE=1). Run \`agent daemon upgrade\` to switch to the new binary."
@@ -253,6 +263,12 @@ upgrade_daemon() {
   if ! "${bindir}/agentd" upgrade; then
     note "the upgrade failed; the old daemon may still be running. Retry with \`agent daemon upgrade\`."
   fi
+}
+
+# checksum prints a file's checksum, or nothing when it does not exist.
+checksum() {
+  [[ -f "$1" ]] && cksum <"$1"
+  return 0
 }
 
 finish() {
@@ -310,9 +326,12 @@ main() {
   ensure_zig
 
   step "Building and installing into ${bindir}"
+  local before changed=0
+  before="$(checksum "${bindir}/agentd")"
   make -C "${src}" install BINDIR="${bindir}" ZIG="${ZIG}" >&2
+  [[ "$(checksum "${bindir}/agentd")" == "${before}" ]] || changed=1
 
-  upgrade_daemon "${bindir}"
+  upgrade_daemon "${bindir}" "${changed}"
   finish "${bindir}"
 }
 
