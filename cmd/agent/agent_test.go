@@ -268,7 +268,7 @@ func (tm *term) wait() {
 // detachSequence clears the screen after Ctrl-\ detaches.
 const detachSequence = "\x1b[H\x1b[2J"
 
-const restoreSequence = "\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[?25h"
+const restoreSequence = "\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[>4m\x1b[?25h"
 
 func TestAttachEndToEnd(t *testing.T) {
 	e := newEnv(t, "")
