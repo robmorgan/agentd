@@ -265,7 +265,10 @@ func (tm *term) wait() {
 	}
 }
 
-const restoreSequence = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[?25h"
+// detachSequence clears the screen after Ctrl-\ detaches.
+const detachSequence = "\x1b[H\x1b[2J"
+
+const restoreSequence = "\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[?25h"
 
 func TestAttachEndToEnd(t *testing.T) {
 	e := newEnv(t, "")
@@ -286,7 +289,7 @@ func TestAttachEndToEnd(t *testing.T) {
 	// Ctrl-\ detaches and puts the terminal back.
 	tm.write("\x1c")
 	tm.wait()
-	if out := tm.output(); !strings.HasSuffix(out, restoreSequence+"\x1b]0;agentd\x07\x1b]2;agentd\x07") {
+	if out := tm.output(); !strings.HasSuffix(out, restoreSequence+detachSequence+"\x1b]0;agentd\x07\x1b]2;agentd\x07") {
 		t.Fatalf("detach did not restore the terminal:\n%q", out[max(len(out)-200, 0):])
 	}
 
