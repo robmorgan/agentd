@@ -242,8 +242,7 @@ daemon_pid() {
 }
 
 # daemon_stale reports whether the running daemon's binary has been replaced
-# since it started (Linux only). It must be asked before installing: install
-# replaces agentd even when the new build is identical.
+# since it started (Linux only), for example by `make install`.
 daemon_stale() {
   local pid exe
   pid="$(daemon_pid)"
@@ -253,7 +252,7 @@ daemon_stale() {
 }
 
 # upgrade_daemon hands a running daemon and its sessions over to the newly
-# installed agentd when needed is 1: the install changed agentd, or the
+# installed agentd when needed is 1: this run changed agentd, or the
 # daemon was already running a replaced binary. With no daemon running it
 # does nothing, since `agentd upgrade` would start one and the CLI starts the
 # daemon when it is first needed.
@@ -277,10 +276,18 @@ upgrade_daemon() {
   fi
 }
 
-# checksum prints a file's checksum, or nothing when it does not exist.
-checksum() {
-  [[ -f "$1" ]] && cksum <"$1"
-  return 0
+# install_binary copies src/bin/NAME into BINDIR unless the installed one is
+# identical, and reports whether it changed. Leaving an identical binary in
+# place matters for a running daemon: replacing it, even with the same bytes,
+# would make the daemon look stale (its executable deleted) to the next run.
+install_binary() {
+  local src="$1" bindir="$2" name="$3"
+  if cmp -s "${src}/bin/${name}" "${bindir}/${name}"; then
+    note "${name}: unchanged"
+    return 1
+  fi
+  install -m 0755 "${src}/bin/${name}" "${bindir}/${name}"
+  note "${name}: installed"
 }
 
 finish() {
@@ -338,11 +345,12 @@ main() {
   ensure_zig
 
   step "Building and installing into ${bindir}"
-  local before needed=0
-  before="$(checksum "${bindir}/agentd")"
+  local needed=0
   daemon_stale && needed=1
-  make -C "${src}" install BINDIR="${bindir}" ZIG="${ZIG}" >&2
-  [[ "$(checksum "${bindir}/agentd")" == "${before}" ]] || needed=1
+  make -C "${src}" build ZIG="${ZIG}" >&2
+  install -d "${bindir}"
+  install_binary "${src}" "${bindir}" agent || true
+  install_binary "${src}" "${bindir}" agentd && needed=1
 
   upgrade_daemon "${bindir}" "${needed}"
   finish "${bindir}"
