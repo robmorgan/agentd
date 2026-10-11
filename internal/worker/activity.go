@@ -107,7 +107,7 @@ type activityTracker struct {
 
 func newActivityTracker(rec *recorder, agentPGID int, now time.Time) *activityTracker {
 	return &activityTracker{rec: rec, agentPGID: agentPGID, state: session.ActivityWorking,
-		lastOutput: now,
+		lastOutput:       now,
 		lastNativeKindAt: make(map[session.EventKind]time.Time)}
 }
 

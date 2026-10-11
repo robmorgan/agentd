@@ -147,4 +147,3 @@ const (
 	// ActivityExited: the agent is no longer running.
 	ActivityExited Activity = "exited"
 )
-
