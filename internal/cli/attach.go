@@ -24,8 +24,10 @@ const (
 	attachEnterSequence = "\x1b[>1u"
 	// attachRestoreSequence undoes what an agent may have turned on: the
 	// alternate screen, mouse reporting, bracketed paste, focus events, the
-	// kitty keyboard flags (popped) and a hidden cursor.
-	attachRestoreSequence = "\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[?25h"
+	// kitty keyboard flags (popped), xterm's modifyOtherKeys (which
+	// Claude Code sets, and which leaves a shell reading Ctrl-R as
+	// "27;5;114~") and a hidden cursor.
+	attachRestoreSequence = "\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[>4m\x1b[?25h"
 	attachClearSequence   = "\x1b[2J\x1b[H"
 	// attachDetachSequence clears the session's screen after a detach, so
 	// the shell's prompt does not land in the middle of the agent's UI. The
