@@ -305,6 +305,10 @@ func TestSnapshotRestores(t *testing.T) {
 		{"hyperlink in progress", "before \x1b]8;;https://example.com\x1b\\"},
 		{"scrollback", scrollback.String() + "$ "},
 		{"scrolling region", "\x1b[3;10rinside\x1b[5;1H"},
+		{"cursor in origin mode", "\x1b[5;20r\x1b[?6h\x1b[3;3Hx"},
+		// No text: the gap before it would be written as spaces (see
+		// TestSnapshotKnownLimits), which the probe scrolls into view.
+		{"cursor in origin mode with left and right margins", "\x1b[?69h\x1b[5;20r\x1b[10;40s\x1b[?6h\x1b[3;3H"},
 		{"left and right margins", "\x1b[?69h\x1b[10;30s\x1b[2;12Hy"},
 		{"scrolling region under the alternate screen", "primary\x1b[2;30r\x1b[?1049h\x1b[2Jalt\x1b[5;5H"},
 		{"modes", "\x1b[?1h\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[?1004h\x1b[4h\x1b=\x1b[?7l"},
@@ -407,12 +411,6 @@ func TestSnapshotKnownLimits(t *testing.T) {
 			// spaces in the pen of the text before the gap.
 			name: "pen of the text before a gap", stream: "\x1b[41mred\x1b[0m\x1b[10Gplain",
 			differs: []string{"Blanks"},
-		},
-		{
-			// The cursor is restored with an absolute CUP after the
-			// origin mode is on, so it lands relative to the margin.
-			name: "cursor in origin mode", stream: "\x1b[5;20r\x1b[?6h\x1b[3;3Hx",
-			differs: []string{"CursorY"},
 		},
 		{
 			// Rows are written with a line break after each, so a
