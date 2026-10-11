@@ -435,12 +435,20 @@ _TIME. Following reconnects by itself and resumes after the last event shown.`}
 		}),
 	))
 
-	var fingerprint string
+	var fingerprint, pairCode string
 	hostAdd := a.command("add NAME ADDRESS", "Add a host and pin its daemon key", twoArgs, func(args []string) error {
+		if pairCode != "" {
+			if fingerprint != "" {
+				return usageError{errors.New("--code and --fingerprint cannot be used together")}
+			}
+			return a.hostPair(args[0], args[1], pairCode)
+		}
 		return a.hostAdd(args[0], args[1], fingerprint)
 	})
 	hostAdd.Flags().StringVar(&fingerprint, "fingerprint", "", "Expected daemon key (from `agentd remote id` on the host); skips the prompt")
 	withValue(hostAdd, "fingerprint", "FP")
+	hostAdd.Flags().StringVar(&pairCode, "code", "", "Pairing code from `agentd remote pair` on the host: pins its key and authorizes this machine there")
+	withValue(hostAdd, "code", "CODE")
 	var noProbe bool
 	listHosts := func([]string) error { return a.listHosts(noProbe) }
 	hostList := visibleAlias(a.command("list", "List hosts and whether they are reachable", noArgs, listHosts), "ls")
@@ -450,7 +458,7 @@ _TIME. Following reconnects by itself and resumes after the last event shown.`}
 	cmds = append(cmds, hosts)
 	cmds = append(cmds, group("host", "Manage remote hosts this machine can reach",
 		"Remote hosts running agentd with `[remote] listen` set.",
-		"Examples:\n  agent host add devbox 100.64.0.5:7433\n  agent host ls\n  agent --host devbox ls\n  agent attach devbox/auth-refactor\n  agent --host auto new --workspace mono fix-tests",
+		"Examples:\n  agent host add devbox 100.64.0.5:7433 --code 123-456-789\n  agent host add devbox 100.64.0.5:7433\n  agent host ls\n  agent --host devbox ls\n  agent attach devbox/auth-refactor\n  agent --host auto new --workspace mono fix-tests",
 		annotate(hostAdd, "[OPTIONS] <NAME> <ADDRESS>", "<NAME>     \n<ADDRESS>  HOST:PORT of the remote agentd's QUIC listener"),
 		hostList,
 		annotate(a.command("info NAME", "Show a host's machine, daemon, and capabilities", oneArg, func(args []string) error {
@@ -960,6 +968,54 @@ func (a *app) hostAdd(name, address, fingerprint string) error {
 	}
 	fmt.Printf("added host `%s` (%s)\n\nIf this machine is not authorized there yet, run on `%s`:\n  agentd remote authorize %s %s\n",
 		name, address, name, id.Fingerprint, localHostname())
+	fmt.Printf("or pair instead: run `agentd remote pair` there, then here:\n  agent host add %s %s --code CODE\n", name, address)
+	return nil
+}
+
+// hostPair adds a remote host by pairing with its daemon: proving the code
+// `agentd remote pair` shows there both pins the daemon's key here and
+// authorizes this machine's key there. A host that is already added (and
+// may not be authorized yet) can be paired again, as long as it presents
+// the key pinned for it.
+func (a *app) hostPair(name, address, code string) error {
+	path := a.paths.HostsPath()
+	if err := transport.ValidHostName(name); err != nil {
+		return err
+	}
+	existing, err := transport.LookupHost(path, name)
+	exists := err == nil
+	if exists && existing.Address != address {
+		return fmt.Errorf("host `%s` already exists at %s; remove it first with `agent host rm %s`", name, existing.Address, name)
+	}
+	if _, err := transport.NormalizePairingCode(code); err != nil {
+		return err
+	}
+	id, err := loadClientIdentity(a.paths)
+	if err != nil {
+		return err
+	}
+	paired, err := transport.Pair(context.Background(), address, id, code, localHostname())
+	var refused *transport.PairRefusedError
+	switch {
+	case errors.Is(err, transport.ErrNotPairing):
+		return fmt.Errorf("the agentd at %s is not pairing: run `agentd remote pair` there and use the code it shows (codes expire after %d minutes)", address, int(transport.PairingTTL.Minutes()))
+	case errors.As(err, &refused):
+		return fmt.Errorf("%s refused to pair: %s", address, refused.Message)
+	case err != nil:
+		return fmt.Errorf("could not pair with agentd at %s: %w", address, err)
+	}
+	if exists {
+		if existing.Fingerprint != paired.Fingerprint {
+			return fmt.Errorf("%s now presents key %s, not the key %s pinned for `%s`; it authorized this machine, but `%s` was not changed. If you know why the key changed, run `agent host rm %s` and pair again",
+				address, paired.Fingerprint, existing.Fingerprint, name, name, name)
+		}
+		fmt.Printf("✓ Paired with `%s` (%s); it has authorized this machine\n", name, address)
+		return nil
+	}
+	if err := transport.AddHost(path, transport.Host{Name: name, Address: address, Fingerprint: paired.Fingerprint}); err != nil {
+		return err
+	}
+	fmt.Printf("✓ Paired with `%s` (%s)\n  key %s\n  this machine is authorized there\n", name, address, paired.Fingerprint)
 	return nil
 }
 

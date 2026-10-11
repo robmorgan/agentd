@@ -146,3 +146,22 @@ func FuzzReadIncoming(f *testing.F) {
 		}
 	})
 }
+
+// Pairing frames come from peers that are not authenticated yet.
+func FuzzReadPairMessage(f *testing.F) {
+	for _, m := range []*PairMessage{
+		{Hello: &PairHello{Name: "laptop", Message: []byte("a")}},
+		{Proof: &PairProof{MAC: []byte("c")}},
+		{Error: &ErrorResponse{Message: "no"}},
+	} {
+		var buf bytes.Buffer
+		WritePairMessage(&buf, m)
+		f.Add(buf.Bytes())
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		m, err := ReadPairMessage(bytes.NewReader(data))
+		if err == nil && m.Hello == nil && m.Challenge == nil && m.Proof == nil && m.Accepted == nil && m.Error == nil {
+			t.Fatal("decoded an empty pairing message")
+		}
+	})
+}

@@ -32,7 +32,9 @@ const DeadPeerTimeout = 15 * time.Second
 // Both peers authenticate with pinned keys inside TLS 1.3: the daemon only
 // accepts client keys it has authorized, and a client only accepts the
 // daemon key it has pinned. Certificates are self-signed and never checked
-// against a CA.
+// against a CA. The one exception is pairing (pair.go): while a pairing
+// window is open, a client with any key may connect with PairALPN, and such
+// a connection carries the pairing exchange and nothing else.
 func quicConfig(idleTimeout time.Duration) *quic.Config {
 	return &quic.Config{
 		// Keep idle-but-open connections (for example a long attach with
@@ -89,6 +91,10 @@ type QUICOptions struct {
 	// IdleTimeout is how long a connection may go without hearing from
 	// its client before it is closed; zero means DeadPeerTimeout.
 	IdleTimeout time.Duration
+	// Pairing, if set, lets clients that are not authorized yet connect
+	// with PairALPN while a pairing window is open, to pair (pair.go).
+	// Such a connection only ever carries the pairing exchange.
+	Pairing *Pairing
 }
 
 // QUICListener yields the streams clients open on their QUIC connections.
@@ -97,11 +103,13 @@ type QUICOptions struct {
 // accepts its streams, and one that rechecks open connections against
 // Authorized. All of them end when the listener is closed.
 type QUICListener struct {
-	l       *quic.Listener
-	opts    QUICOptions
-	streams chan Stream
-	ctx     context.Context
-	cancel  context.CancelFunc
+	l    *quic.Listener
+	opts QUICOptions
+	// fingerprint is the listener's own key, which pairing binds to.
+	fingerprint string
+	streams     chan Stream
+	ctx         context.Context
+	cancel      context.CancelFunc
 
 	mu sync.Mutex
 	// conns maps each open connection to what is known about it.
@@ -112,6 +120,9 @@ type QUICListener struct {
 type connEntry struct {
 	fingerprint string
 	connectedAt time.Time
+	// pairing marks a pairing connection (pair.go): its client is not
+	// authorized, and it serves no agent protocol streams.
+	pairing bool
 	// opened counts the streams the client has opened; open is how many
 	// are open now. Each stream decrements open once, when it is closed.
 	opened atomic.Uint64
@@ -137,6 +148,9 @@ func (q *QUICListener) Connections() []ConnectionInfo {
 	defer q.mu.Unlock()
 	out := make([]ConnectionInfo, 0, len(q.conns))
 	for conn, e := range q.conns {
+		if e.pairing {
+			continue
+		}
 		stats := conn.ConnectionStats()
 		out = append(out, ConnectionInfo{
 			Fingerprint:   e.fingerprint,
@@ -167,10 +181,14 @@ func ListenQUIC(addr string, id *Identity, opts QUICOptions) (*QUICListener, err
 	if opts.IdleTimeout <= 0 {
 		opts.IdleTimeout = DeadPeerTimeout
 	}
+	protos := []string{ALPN}
+	if opts.Pairing != nil {
+		protos = append(protos, PairALPN)
+	}
 	tlsConf := &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{id.cert},
-		NextProtos:   []string{ALPN},
+		NextProtos:   protos,
 		// Any certificate is requested, and then judged by its key's
 		// fingerprint alone.
 		ClientAuth: tls.RequireAnyClientCert,
@@ -185,6 +203,13 @@ func ListenQUIC(addr string, id *Identity, opts QUICOptions) (*QUICListener, err
 				return errors.New("client sent no certificate")
 			}
 			fp := Fingerprint(cs.PeerCertificates[0])
+			if cs.NegotiatedProtocol == PairALPN {
+				// Any key may pair, but only while a window is open.
+				if !opts.Pairing.accepting() {
+					return errors.New("agentd is not pairing")
+				}
+				return nil
+			}
 			if !opts.Authorized(fp) {
 				return fmt.Errorf("client key %s is not authorized", fp)
 			}
@@ -197,12 +222,13 @@ func ListenQUIC(addr string, id *Identity, opts QUICOptions) (*QUICListener, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	q := &QUICListener{
-		l:       l,
-		opts:    opts,
-		streams: make(chan Stream),
-		ctx:     ctx,
-		cancel:  cancel,
-		conns:   make(map[*quic.Conn]*connEntry),
+		l:           l,
+		opts:        opts,
+		fingerprint: id.Fingerprint,
+		streams:     make(chan Stream),
+		ctx:         ctx,
+		cancel:      cancel,
+		conns:       make(map[*quic.Conn]*connEntry),
 	}
 	go q.acceptConns()
 	go q.recheck()
@@ -222,6 +248,14 @@ func (q *QUICListener) acceptConns() {
 		fp, err := leafFingerprintOf(conn)
 		if err != nil {
 			conn.CloseWithError(0, "no client certificate")
+			continue
+		}
+		if conn.ConnectionState().TLS.NegotiatedProtocol == PairALPN {
+			if !q.trackPairing(conn, fp) {
+				conn.CloseWithError(0, "too many pairing connections")
+				continue
+			}
+			go q.servePairing(conn, fp)
 			continue
 		}
 		entry := &connEntry{fingerprint: fp, connectedAt: time.Now()}
@@ -284,7 +318,9 @@ func (q *QUICListener) recheck() {
 		q.mu.Lock()
 		open := make(map[*quic.Conn]string, len(q.conns))
 		for conn, e := range q.conns {
-			open[conn] = e.fingerprint
+			if !e.pairing {
+				open[conn] = e.fingerprint
+			}
 		}
 		q.mu.Unlock()
 		// Authorized reads a file, so it is called outside the lock, once
@@ -310,6 +346,27 @@ func (q *QUICListener) track(conn *quic.Conn, e *connEntry) bool {
 		return false
 	}
 	q.conns[conn] = e
+	return true
+}
+
+// trackPairing records a pairing connection, so Close ends it too, unless
+// maxPairingConns are open already.
+func (q *QUICListener) trackPairing(conn *quic.Conn, fp string) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.ctx.Err() != nil {
+		return false
+	}
+	n := 0
+	for _, e := range q.conns {
+		if e.pairing {
+			n++
+		}
+	}
+	if n >= maxPairingConns {
+		return false
+	}
+	q.conns[conn] = &connEntry{fingerprint: fp, connectedAt: time.Now(), pairing: true}
 	return true
 }
 
@@ -369,7 +426,7 @@ func (e *KeyChangedError) Error() string {
 // (localhost is often ::1 and 127.0.0.1, only one of them listening), so
 // each is tried in turn, each with an equal share of the time left.
 func DialQUIC(ctx context.Context, addr string, id *Identity, pinned string) (*QUICClient, error) {
-	conn, _, err := dialEach(ctx, addr, id, pinned)
+	conn, _, err := dialEach(ctx, addr, id, pinned, ALPN)
 	if err != nil {
 		return nil, err
 	}
@@ -380,7 +437,7 @@ func DialQUIC(ctx context.Context, addr string, id *Identity, pinned string) (*Q
 // pinning one, for `agent host add`. It works before this client is
 // authorized: the daemon shows its certificate before judging the client's.
 func ProbeFingerprint(ctx context.Context, addr string, id *Identity) (string, error) {
-	conn, presented, err := dialEach(ctx, addr, id, "")
+	conn, presented, err := dialEach(ctx, addr, id, "", ALPN)
 	if conn != nil {
 		conn.CloseWithError(0, "")
 	}
@@ -429,8 +486,8 @@ func IsConnectionLost(err error) bool {
 // first connection, or at a daemon presenting another key; without one
 // (pinned == "") it stops at the first daemon that presents a key, whether
 // or not the handshake then completes. presented is the key the daemon
-// showed on the last attempt.
-func dialEach(ctx context.Context, addr string, id *Identity, pinned string) (conn *quic.Conn, presented string, err error) {
+// showed on the last attempt. alpn selects the protocol: ALPN, or PairALPN.
+func dialEach(ctx context.Context, addr string, id *Identity, pinned, alpn string) (conn *quic.Conn, presented string, err error) {
 	ctx, cancel := context.WithTimeout(ctx, DialTimeout)
 	defer cancel()
 	host, port, err := net.SplitHostPort(addr)
@@ -448,7 +505,7 @@ func dialEach(ctx context.Context, addr string, id *Identity, pinned string) (co
 			attemptCtx, attemptCancel = context.WithTimeout(ctx, time.Until(deadline)/time.Duration(len(ips)-i))
 			defer attemptCancel()
 		}
-		conn, presented, err = dialOne(attemptCtx, net.JoinHostPort(ip, port), id, pinned)
+		conn, presented, err = dialOne(attemptCtx, net.JoinHostPort(ip, port), id, pinned, alpn)
 		switch {
 		case err == nil:
 			return conn, presented, nil
@@ -463,12 +520,12 @@ func dialEach(ctx context.Context, addr string, id *Identity, pinned string) (co
 	return nil, presented, err
 }
 
-func dialOne(ctx context.Context, addr string, id *Identity, pinned string) (*quic.Conn, string, error) {
+func dialOne(ctx context.Context, addr string, id *Identity, pinned, alpn string) (*quic.Conn, string, error) {
 	var presented string
 	tlsConf := &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{id.cert},
-		NextProtos:   []string{ALPN},
+		NextProtos:   []string{alpn},
 		ServerName:   "agentd",
 		// The daemon's certificate is self-signed; it is trusted only by
 		// its pinned key fingerprint, checked below. TLS still checks the

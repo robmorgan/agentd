@@ -493,6 +493,7 @@ One slow session should not unnecessarily stall unrelated sessions.
 * [x] One-command setup (`agentd remote enable`, detecting a Tailscale address)
 * [x] Establish TLS identity model (self-signed Ed25519 keys, pinned by fingerprint)
 * [x] Authenticate machines/clients (mutual TLS: authorized client keys, pinned daemon key)
+* [x] Pair machines with a one-time code (`agentd remote pair`, `agent host add --code`: CPace over a pairing ALPN)
 * [x] Define stream roles (one bidirectional stream per request or attachment)
 * [x] Define stream negotiation (a stream's first frame sets its role)
 * [x] Support remote:
