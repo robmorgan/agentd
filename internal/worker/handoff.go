@@ -226,6 +226,9 @@ func (rt *runtime) tryHandoff(req *handoffRequest, state *ownerState) (err error
 			Geometry:  s.geometry,
 			Status:    s.status.handoff(),
 		}
+		if s.activity != nil {
+			s.activity.exportAlertMemory(st.Status)
+		}
 		return nil
 	}); err != nil {
 		return err
@@ -486,10 +489,10 @@ func resumeRuntime(st *handoffState) (*runtime, *ownerState, error) {
 	state.activity = newActivityTracker(rt.recorder, st.AgentPID, time.Now())
 	state.status = restoreStatusTracker(st.Status)
 	state.activity.setNative(time.Now(), state.status.derive(), false, false)
-	// The restored status was already alerted by the previous image; seed
-	// the dedup memory so the next output of a still-blocked program does
-	// not re-raise the question the user already saw.
-	state.activity.seedNativeAlert(time.Now())
+	// The previous image's alert memory comes along: an already-alerted
+	// question stays quiet, and one its rate floor had deferred still
+	// differs from the memory, so the tick retry records it here.
+	state.activity.restoreAlertMemory(st.Status)
 	state.owner = rt.owner
 	state.geometry = st.Geometry
 	return rt, state, nil

@@ -294,24 +294,36 @@ func nativeEventKind(act session.Activity) (session.EventKind, bool) {
 	return "", false
 }
 
-// 7501: seedNativeAlert primes the dedup memory with the current native
-// status, as if it had just been recorded. A handoff restore uses it so
-// the next output of a still-blocked program does not re-alert the
-// question the user already saw; anything that differs still records,
-// at most noticeQuiet late.
-func (a *activityTracker) seedNativeAlert(now time.Time) {
-	n := a.native
-	if n == nil {
+// 7501: exportAlertMemory copies the native-event dedup state into a
+// status handoff. Seeding the next image from its restored records would
+// mark a floor-deferred question as already alerted and lose it; the real
+// memory tells the two apart.
+func (a *activityTracker) exportAlertMemory(h *statusHandoff) {
+	if h == nil {
 		return
 	}
-	kind, ok := nativeEventKind(n.activity)
-	if !ok {
+	h.LastAlertKind = string(a.lastNativeKind)
+	h.LastAlertSummary = a.lastNativeSummary
+	h.LastAlertAt = a.lastNativeAt
+	h.LastActionAt = a.lastNativeActionAt
+	h.LastKindAt = make(map[string]time.Time, len(a.lastNativeKindAt))
+	for kind, at := range a.lastNativeKindAt {
+		h.LastKindAt[string(kind)] = at
+	}
+}
+
+// restoreAlertMemory is exportAlertMemory's inverse, for a handoff
+// restore.
+func (a *activityTracker) restoreAlertMemory(h *statusHandoff) {
+	if h == nil {
 		return
 	}
-	a.lastNativeKind, a.lastNativeSummary, a.lastNativeAt = kind, n.summary, now
-	a.lastNativeKindAt[kind] = now
-	if kind.DefaultAttention() == session.AttentionAction {
-		a.lastNativeActionAt = now
+	a.lastNativeKind = session.EventKind(h.LastAlertKind)
+	a.lastNativeSummary = h.LastAlertSummary
+	a.lastNativeAt = h.LastAlertAt
+	a.lastNativeActionAt = h.LastActionAt
+	for kind, at := range h.LastKindAt {
+		a.lastNativeKindAt[session.EventKind(kind)] = at
 	}
 }
 

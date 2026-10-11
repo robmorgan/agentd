@@ -97,9 +97,11 @@ func exchange(worker transport.Stream, req *protocol.Request) (*protocol.Respons
 //
 // Attaching acknowledges the session's attention, as does detaching from a
 // session that is still running: either way the user has seen its screen.
-// An attachment that ends because the session ended leaves the end's
-// attention in place, since a client may be attached in a terminal nobody
-// is looking at.
+// A reattach that replaces a lost connection is the exception: the CLI
+// reconnected by itself, no one looked, so attention raised while the
+// connection was down stays pending. An attachment that ends because the
+// session ended leaves the end's attention in place, since a client may be
+// attached in a terminal nobody is looking at.
 //
 // Termination: when the client stops sending (detach or disconnect) the
 // worker side is half-closed so the worker drops the attachment and ends its
@@ -129,7 +131,12 @@ func (s *Server) proxyAttach(client transport.Stream, clientReader *bufio.Reader
 	attachedAck := make(chan struct{})
 	go func() {
 		defer close(attachedAck)
-		s.acknowledgeBefore(req.SessionID, "seen: attached", attachedAt)
+		// Replaces survives negotiateAttach only when the worker will
+		// honor it, so a non-empty value is a self-reconnect: no human
+		// looked, nothing is acknowledged.
+		if req.Replaces == "" {
+			s.acknowledgeBefore(req.SessionID, "seen: attached", attachedAt)
+		}
 	}()
 	defer func() {
 		<-attachedAck

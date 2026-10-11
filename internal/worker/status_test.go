@@ -665,56 +665,98 @@ func TestDeferredActionEventRetriesFromTick(t *testing.T) {
 	}
 }
 
-// Value: protects=the handoff-restore seeding (seedNativeAlert): a
-// still-blocked program's first output after an upgrade must not re-alert
-// the question the user already saw, while a new question still records;
-// fails_when=resumeRuntime stops seeding, or seeding stops covering the
-// action floor and dedup fields; why_new=the daemon handoff test answers
-// the block by typing, so the no-re-alert path is never exercised there;
-// seam=none
-func TestSeededAlertMemorySkipsUnchangedQuestion(t *testing.T) {
+// Value: protects=the alert memory carried across a handoff: the restored
+// worker must not re-alert the question the user already saw (even when
+// its ticks run with no new output), and a question the rate floor had
+// deferred at handoff time must still record once the floor clears —
+// seeding from the restored records alone cannot tell the two apart;
+// fails_when=exportAlertMemory/restoreAlertMemory stop carrying the dedup
+// or floor fields, or resumeRuntime stops restoring them;
+// why_new=the daemon handoff test answers the block by typing, so neither
+// path is exercised there; seam=none
+func TestAlertMemoryCarriedAcrossHandoff(t *testing.T) {
 	_, h := newRoot(t)
-	rec := newRecorder(h.store, h.sessionID, 1)
 	start := time.Now()
 	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
-	a := newActivityTracker(rec, 0, start)
-	blocked := native(nativeStatus{activity: session.ActivityBlocked, kind: "permission", message: "Run tests?", progress: -1})
-	// As resumeRuntime does: restore silently, then seed.
-	a.setNative(start, blocked, false, false)
-	a.seedNativeAlert(start)
-	// The program's first output re-derives the unchanged question.
-	a.setNative(at(2), blocked, false, true)
-	// A genuinely new question past the floor still records.
-	a.setNative(at(12), native(nativeStatus{activity: session.ActivityBlocked, kind: "permission", message: "Deploy?", progress: -1}), false, true)
+	askedA := native(nativeStatus{activity: session.ActivityBlocked, kind: "permission", message: "Run tests?", progress: -1})
+	askedB := native(nativeStatus{activity: session.ActivityBlocked, kind: "permission", message: "Deploy?", progress: -1})
+
+	// The old image records question A, then B arrives inside the floor
+	// (deferred), then the handoff happens.
+	rec := newRecorder(h.store, h.sessionID, 1)
+	old := newActivityTracker(rec, 0, start)
+	old.setNative(at(0), askedA, false, true)
+	old.setNative(at(3), askedB, false, true)
+	carried := &statusHandoff{}
+	old.exportAlertMemory(carried)
 	rec.close()
-	var blockedEvents []session.Event
+
+	// The new image restores B as the live status with A's alert memory,
+	// as resumeRuntime does.
+	rec2 := newRecorder(h.store, h.sessionID, 1)
+	restored := newActivityTracker(rec2, 0, at(4))
+	restored.setNative(at(4), askedB, false, false)
+	restored.restoreAlertMemory(carried)
+	// Ticks with no new output: quiet while the floor holds, then the
+	// deferred question records, exactly once.
+	restored.tick(at(5), 0, false)
+	restored.tick(at(11), 0, false)
+	restored.tick(at(12), 0, false)
+	rec2.close()
+
+	var blocked []session.Event
 	for _, ev := range h.eventsSince(0) {
 		if ev.Kind == session.EventBlocked {
-			blockedEvents = append(blockedEvents, ev)
+			blocked = append(blocked, ev)
 		}
 	}
-	if len(blockedEvents) != 1 || blockedEvents[0].Summary != "permission: Deploy?" {
-		t.Fatalf("blocked events after restore = %#v, want only the new question", blockedEvents)
+	if len(blocked) != 2 || blocked[0].Summary != "permission: Run tests?" || blocked[1].Summary != "permission: Deploy?" {
+		t.Fatalf("blocked events = %#v, want A before the handoff and the deferred B once after it", blocked)
+	}
+
+	// And an unchanged, already-alerted question stays quiet across the
+	// restore: carry B's memory once it has recorded, restore, tick.
+	rec3 := newRecorder(h.store, h.sessionID, 1)
+	carried2 := &statusHandoff{}
+	restored.exportAlertMemory(carried2)
+	again := newActivityTracker(rec3, 0, at(13))
+	again.setNative(at(13), askedB, false, false)
+	again.restoreAlertMemory(carried2)
+	again.setNative(at(14), askedB, false, true) // first output re-derives it
+	again.tick(at(25), 0, false)                 // and ticks past the floor
+	rec3.close()
+	for _, ev := range h.eventsSince(blocked[1].ID) {
+		if ev.Kind == session.EventBlocked {
+			t.Fatalf("already-alerted question re-recorded after the handoff: %#v", ev)
+		}
 	}
 }
 
-// Value: protects=afterFeed noting a feed's arrival (preOutput) before
-// setNative, so records ending after an idleAfter-long quiet spell do not
-// record a bogus idle event with a negative duration; fails_when=the
-// preOutput call is removed or ordered after setNative; why_new=no other
-// test ends the records after a quiet gap in afterFeed's order; seam=none
+// Value: protects=afterFeed noting a feed's arrival before applying its
+// status effects, driven through the real publishOutput: records ending
+// (a clear) after an idleAfter-long quiet spell must not record an idle
+// event with a negative duration; fails_when=the preOutput call in
+// owner.go's afterFeed is removed or reordered after setNative;
+// why_new=an earlier form of this test replicated the call order itself,
+// so reordering owner.go could not fail it; seam=none
 func TestRecordsEndingAfterQuietDoNotFakeIdle(t *testing.T) {
+	fastActivity(t)
 	_, h := newRoot(t)
 	rec := newRecorder(h.store, h.sessionID, 1)
-	start := time.Now()
-	a := newActivityTracker(rec, 0, start)
-	a.setNative(start, native(nativeStatus{activity: session.ActivityWorking, progress: -1}), false, true)
-	// The next feed arrives after a long quiet and its only content ends
-	// the records (a prompt or a clear), in afterFeed's order.
-	later := start.Add(idleAfter + 5*time.Second)
-	a.preOutput(later)
-	a.setNative(later, nil, false, true)
-	a.output(later, terminalEffects{}, "", false)
+	ts, err := newTerminalState(80, 24, maxScrollbackBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ts.close()
+	s := &ownerState{terminal: ts, output: newBroadcaster(), attachments: map[string]*ownerAttachment{},
+		status: newStatusTracker(), activity: newActivityTracker(rec, 0, time.Now())}
+	if err := s.publishOutput([]byte("\x1b]7501;state=working\x1b\\")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(idleAfter + 100*time.Millisecond)
+	if err := s.publishOutput([]byte("\x1b]7501;state=clear\x1b\\")); err != nil {
+		t.Fatal(err)
+	}
 	rec.close()
 	for _, ev := range h.eventsSince(0) {
 		if ev.Kind == session.EventIdle {

@@ -311,6 +311,17 @@ func (t *statusTracker) app(id string, rec *statusRecord) string {
 type statusHandoff struct {
 	Records   map[string]statusHandoffRecord
 	LastInput time.Time
+	// The activity tracker's native alert memory rides along: restored
+	// as-is, the next image neither re-alerts the question the user
+	// already saw nor loses one the rate floor had deferred at handoff
+	// time (its tick retry still sees it differ from the last recorded
+	// alert). Zero values from an older image mean an empty memory: the
+	// first output then re-alerts once, as before the memory existed.
+	LastAlertKind    string
+	LastAlertSummary string
+	LastAlertAt      time.Time
+	LastActionAt     time.Time
+	LastKindAt       map[string]time.Time
 }
 
 type statusHandoffRecord struct {
