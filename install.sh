@@ -237,7 +237,8 @@ source_dir() {
 
 # daemon_pid prints the pid of this user's running daemon, if any.
 daemon_pid() {
-  pgrep -u "$(id -u)" -f 'agentd serve' 2>/dev/null | head -n 1 || true
+  # Anchored, so that a command line merely mentioning it does not match.
+  pgrep -u "$(id -u)" -f '^([^ ]*/)?agentd serve( |$)' 2>/dev/null | head -n 1 || true
 }
 
 # daemon_stale reports whether the running daemon's binary has been replaced
