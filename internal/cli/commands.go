@@ -437,13 +437,10 @@ _TIME. Following reconnects by itself and resumes after the last event shown.`}
 
 	var fingerprint, pairCode string
 	hostAdd := a.command("add NAME ADDRESS", "Add a host and pin its daemon key", twoArgs, func(args []string) error {
-		if pairCode != "" {
-			if fingerprint != "" {
-				return usageError{errors.New("--code and --fingerprint cannot be used together")}
-			}
-			return a.hostPair(args[0], args[1], pairCode)
+		if pairCode != "" && fingerprint != "" {
+			return usageError{errors.New("--code and --fingerprint cannot be used together")}
 		}
-		return a.hostAdd(args[0], args[1], fingerprint)
+		return a.hostAdd(args[0], args[1], fingerprint, pairCode)
 	})
 	hostAdd.Flags().StringVar(&fingerprint, "fingerprint", "", "Expected daemon key (from `agentd remote id` on the host); skips the prompt")
 	withValue(hostAdd, "fingerprint", "FP")
@@ -944,106 +941,161 @@ func parseSendInput(args []string) (sendInputArgs, error) {
 // arguments.
 var errHelp = errors.New("help requested")
 
-// hostAdd adds a remote host, pinning the key its daemon presents now.
-func (a *app) hostAdd(name, address, fingerprint string) error {
-	path := a.paths.HostsPath()
-	if err := transport.ValidHostName(name); err != nil {
-		return err
-	}
-	if _, err := transport.LookupHost(path, name); err == nil {
-		return fmt.Errorf("host `%s` already exists; remove it first with `agent host rm %s`", name, name)
-	}
-	if fingerprint != "" && !transport.ValidFingerprint(fingerprint) {
-		return fmt.Errorf("`%s` is not a key fingerprint (expected SHA256:...)", fingerprint)
-	}
-	id, err := loadClientIdentity(a.paths)
-	if err != nil {
-		return err
-	}
-	presented, err := transport.ProbeFingerprint(context.Background(), address, id)
-	if err != nil {
-		return fmt.Errorf("could not reach agentd at %s: %w", address, err)
-	}
-	switch {
-	case fingerprint != "" && fingerprint != presented:
-		return fmt.Errorf("%s presented key %s, not the expected %s; not adding `%s`", address, presented, fingerprint, name)
-	case fingerprint == "":
-		fmt.Printf("The agentd at %s presents this key:\n  %s\nCompare it with `agentd remote id` on that machine.\n", address, presented)
-		ok, err := confirm("Trust this key?")
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return fmt.Errorf("not adding `%s`", name)
-		}
-	}
-	if err := transport.AddHost(path, transport.Host{Name: name, Address: address, Fingerprint: presented}); err != nil {
-		return err
-	}
-	fmt.Printf("added host `%s` (%s)\n\nIf this machine is not authorized there yet, run on `%s`:\n  agentd remote authorize %s %s\n",
-		name, address, name, id.Fingerprint, localHostname())
-	fmt.Printf("or pair instead: run `agentd remote pair` there, then here:\n  agent host add %s %s --code CODE\n", name, address)
-	return nil
-}
-
-// hostPair adds a remote host by pairing with its daemon: proving the code
-// `agentd remote pair` shows there both pins the daemon's key here and
-// authorizes this machine's key there. A host that is already added (and
-// may not be authorized yet) can be paired again, as long as it presents
-// the key pinned for it.
-func (a *app) hostPair(name, address, code string) error {
+// hostAdd adds a remote host and pins its daemon's key. With a pairing
+// code (--code, or typed at the prompt) it pairs, which also authorizes this
+// machine there; with --fingerprint, or by confirming the key it shows, it
+// only pins the key and says how to authorize this machine. A host that is
+// already added (and may not be authorized yet) can be paired again at the
+// same address, as long as it presents the key pinned for it.
+func (a *app) hostAdd(name, address, fingerprint, code string) error {
 	path := a.paths.HostsPath()
 	if err := transport.ValidHostName(name); err != nil {
 		return err
 	}
 	existing, err := transport.LookupHost(path, name)
 	exists := err == nil
-	if exists && existing.Address != address {
-		return fmt.Errorf("host `%s` already exists at %s; remove it first with `agent host rm %s`", name, existing.Address, name)
+	alreadyExists := fmt.Errorf("host `%s` already exists; remove it first with `agent host rm %s`", name, name)
+	if exists && (fingerprint != "" || existing.Address != address) {
+		return alreadyExists
 	}
-	if _, err := transport.NormalizePairingCode(code); err != nil {
-		return err
+	if fingerprint != "" && !transport.ValidFingerprint(fingerprint) {
+		return fmt.Errorf("`%s` is not a key fingerprint (expected SHA256:...)", fingerprint)
+	}
+	if code != "" {
+		if _, err := transport.NormalizePairingCode(code); err != nil {
+			return err
+		}
+	} else if fingerprint == "" && !isTerminal(os.Stdin) {
+		return errors.New("no terminal to enter a pairing code on; pass --code CODE (from `agentd remote pair` on the host) or --fingerprint FP (from `agentd remote id` there)")
 	}
 	id, err := loadClientIdentity(a.paths)
 	if err != nil {
 		return err
 	}
+	if code != "" {
+		paired, err := a.pair(address, id, code)
+		if err != nil {
+			return err
+		}
+		return a.addPaired(name, address, paired.Fingerprint, existing, exists)
+	}
+
+	presented, err := transport.ProbeFingerprint(context.Background(), address, id)
+	if err != nil {
+		return fmt.Errorf("could not reach agentd at %s: %w", address, err)
+	}
+	if fingerprint != "" {
+		if fingerprint != presented {
+			return fmt.Errorf("%s presented key %s, not the expected %s; not adding `%s`", address, presented, fingerprint, name)
+		}
+		return a.addPinned(name, address, presented, id)
+	}
+	if exists && existing.Fingerprint != presented {
+		return keyChanged(name, address, presented, existing.Fingerprint)
+	}
+
+	fmt.Printf("The agentd at %s presents this key:\n  %s\n\n", address, presented)
+	fmt.Printf("To trust it, run `agentd remote pair` on `%s` and enter the code it shows.\n", name)
+	fmt.Println("(Or press Enter to compare the key with `agentd remote id` there instead.)")
+	in := bufio.NewReader(os.Stdin)
+	for attempt := 1; ; attempt++ {
+		code, err := prompt(in, "Pairing code: ")
+		if err != nil {
+			return err
+		}
+		if code == "" {
+			break
+		}
+		if _, err := transport.NormalizePairingCode(code); err != nil {
+			fmt.Println(err)
+			attempt--
+			continue
+		}
+		paired, err := a.pair(address, id, code)
+		var refused *transport.PairRefusedError
+		if errors.As(err, &refused) && attempt < transport.PairingAttempts {
+			fmt.Println(refused.Message + "; try again")
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if paired.Fingerprint != presented {
+			return fmt.Errorf("%s paired with key %s, not the %s it presented a moment ago; not adding `%s`", address, paired.Fingerprint, presented, name)
+		}
+		return a.addPaired(name, address, paired.Fingerprint, existing, exists)
+	}
+
+	if exists {
+		return alreadyExists
+	}
+	fmt.Println("Compare it with `agentd remote id` on that machine.")
+	answer, err := prompt(in, "Trust this key? [y/N] ")
+	if err != nil {
+		return err
+	}
+	switch answer {
+	case "y", "Y", "yes", "Yes":
+	default:
+		return fmt.Errorf("not adding `%s`", name)
+	}
+	return a.addPinned(name, address, presented, id)
+}
+
+// pair pairs with the daemon at address using code.
+func (a *app) pair(address string, id *transport.Identity, code string) (*transport.PairedHost, error) {
 	paired, err := transport.Pair(context.Background(), address, id, code, localHostname())
 	var refused *transport.PairRefusedError
 	switch {
 	case errors.Is(err, transport.ErrNotPairing):
-		return fmt.Errorf("the agentd at %s is not pairing: run `agentd remote pair` there and use the code it shows (codes expire after %d minutes)", address, int(transport.PairingTTL.Minutes()))
+		return nil, fmt.Errorf("the agentd at %s is not pairing: run `agentd remote pair` there and use the code it shows (codes expire after %d minutes)", address, int(transport.PairingTTL.Minutes()))
 	case errors.As(err, &refused):
-		return fmt.Errorf("%s refused to pair: %s", address, refused.Message)
+		return nil, err
 	case err != nil:
-		return fmt.Errorf("could not pair with agentd at %s: %w", address, err)
+		return nil, fmt.Errorf("could not pair with agentd at %s: %w", address, err)
 	}
+	return paired, nil
+}
+
+// addPaired records a host this machine just paired with.
+func (a *app) addPaired(name, address, fingerprint string, existing transport.Host, exists bool) error {
 	if exists {
-		if existing.Fingerprint != paired.Fingerprint {
-			return fmt.Errorf("%s now presents key %s, not the key %s pinned for `%s`; it authorized this machine, but `%s` was not changed. If you know why the key changed, run `agent host rm %s` and pair again",
-				address, paired.Fingerprint, existing.Fingerprint, name, name, name)
+		if existing.Fingerprint != fingerprint {
+			return keyChanged(name, address, fingerprint, existing.Fingerprint)
 		}
 		fmt.Printf("✓ Paired with `%s` (%s); it has authorized this machine\n", name, address)
 		return nil
 	}
-	if err := transport.AddHost(path, transport.Host{Name: name, Address: address, Fingerprint: paired.Fingerprint}); err != nil {
+	if err := transport.AddHost(a.paths.HostsPath(), transport.Host{Name: name, Address: address, Fingerprint: fingerprint}); err != nil {
 		return err
 	}
-	fmt.Printf("✓ Paired with `%s` (%s)\n  key %s\n  this machine is authorized there\n", name, address, paired.Fingerprint)
+	fmt.Printf("✓ Paired with `%s` (%s)\n  key %s\n  this machine is authorized there\n", name, address, fingerprint)
 	return nil
 }
 
-// confirm asks a yes/no question on the terminal. Without one it refuses,
-// since trust must never be granted by default.
-func confirm(question string) (bool, error) {
-	if !isTerminal(os.Stdin) {
-		return false, errors.New("no terminal to confirm on; pass --fingerprint (from `agentd remote id` on the host)")
+// addPinned records a host whose key was checked by hand; authorizing this
+// machine there is still to do.
+func (a *app) addPinned(name, address, fingerprint string, id *transport.Identity) error {
+	if err := transport.AddHost(a.paths.HostsPath(), transport.Host{Name: name, Address: address, Fingerprint: fingerprint}); err != nil {
+		return err
 	}
-	fmt.Printf("%s [y/N] ", question)
-	answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
-	switch strings.TrimSpace(answer) {
-	case "y", "Y", "yes", "Yes":
-		return true, nil
+	fmt.Printf("added host `%s` (%s)\n\nIf this machine is not authorized there yet, run on `%s`:\n  agentd remote authorize %s %s\n",
+		name, address, name, id.Fingerprint, localHostname())
+	return nil
+}
+
+func keyChanged(name, address, presented, pinned string) error {
+	return fmt.Errorf("%s presents key %s, not the key %s pinned for `%s`, which was not changed. If you know why the key changed, run `agent host rm %s` and add it again",
+		address, presented, pinned, name, name)
+}
+
+// prompt asks for one line on the terminal.
+func prompt(in *bufio.Reader, question string) (string, error) {
+	fmt.Print(question)
+	line, err := in.ReadString('\n')
+	if err != nil && line == "" {
+		fmt.Println()
+		return "", fmt.Errorf("no answer: %w", err)
 	}
-	return false, nil
+	return strings.TrimSpace(line), nil
 }

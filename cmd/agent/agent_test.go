@@ -799,3 +799,80 @@ func TestLocalAttachSurvivesUpgradeAndRestart(t *testing.T) {
 	tm.write("\x1c")
 	tm.wait()
 }
+
+// `agent host add` without flags shows the daemon's key and asks for the
+// code `agentd remote pair` shows there; pairing pins the key and
+// authorizes this machine in one step. A wrong code can be retried.
+func TestHostAddPairsAtThePrompt(t *testing.T) {
+	e := newEnv(t, "\n[remote]\nlisten = \"127.0.0.1:0\"\n")
+	e.mustRun("agent", "ls") // starts the daemon
+	addr := ""
+	for _, line := range strings.Split(e.mustRun("agent", "daemon", "info"), "\n") {
+		if v, ok := strings.CutPrefix(line, "remote: "); ok {
+			addr = v
+		}
+	}
+	if !strings.HasPrefix(addr, "127.0.0.1:") {
+		t.Fatalf("remote not listening at %q", addr)
+	}
+	daemonKey := strings.TrimSpace(e.mustRun("agentd", "remote", "id"))
+
+	pair := exec.Command(filepath.Join(binDir, "agentd"), "remote", "pair")
+	pair.Env = e.environ()
+	var pairOut syncBuffer
+	pair.Stdout, pair.Stderr = &pairOut, &pairOut
+	if err := pair.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pair.Process.Kill(); pair.Wait() })
+	codeRE := regexp.MustCompile(`Pairing code: (\d{3}-\d{3}-\d{3})`)
+	var code string
+	for deadline := time.Now().Add(10 * time.Second); code == ""; time.Sleep(20 * time.Millisecond) {
+		if m := codeRE.FindStringSubmatch(pairOut.String()); m != nil {
+			code = m[1]
+		} else if time.Now().After(deadline) {
+			t.Fatalf("no pairing code:\n%s", pairOut.String())
+		}
+	}
+	wrong := "000-000-000"
+	if code == wrong {
+		wrong = "000-000-001"
+	}
+
+	tm := e.start("host", "add", "dev", addr)
+	mark := tm.expect(0, daemonKey)
+	mark = tm.expect(mark, "Pairing code: ")
+	tm.write(wrong + "\n")
+	mark = tm.expect(mark, "wrong pairing code; try again")
+	mark = tm.expect(mark, "Pairing code: ")
+	tm.write(code + "\n")
+	tm.expect(mark, "✓ Paired with `dev`")
+	if err := tm.waitErr(); err != nil {
+		t.Fatalf("host add: %v\n%s", err, tm.output())
+	}
+	if err := pair.Wait(); err != nil || !strings.Contains(pairOut.String(), "now authorized") {
+		t.Fatalf("agentd remote pair: %v\n%s", err, pairOut.String())
+	}
+	if out := e.mustRun("agent", "host", "ls", "--no-probe"); !strings.Contains(out, "dev\t"+addr+"\t"+daemonKey) {
+		t.Fatalf("host ls --no-probe:\n%s", out)
+	}
+	e.mustRun("agent", "--host", "dev", "ls")
+}
+
+// syncBuffer is a bytes.Buffer that a command writes while a test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}

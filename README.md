@@ -485,8 +485,22 @@ On the machine you connect from, run:
 Waiting until 14:05:12 (Ctrl-C to cancel)...
 ```
 
-**On the laptop**, run that command. The laptop pins the devbox's key, the devbox authorizes the
-laptop's key, and `agentd remote pair` reports which machine paired. The code works once, expires
+**On the laptop**, run that command. Or leave out `--code`: `agent host add` then shows the key
+the devbox presents and asks for the code:
+
+```text
+$ agent host add devbox 100.64.0.5:7433
+The agentd at 100.64.0.5:7433 presents this key:
+  SHA256:...
+
+To trust it, run `agentd remote pair` on `devbox` and enter the code it shows.
+(Or press Enter to compare the key with `agentd remote id` there instead.)
+Pairing code: 482-193-675
+✓ Paired with `devbox` (100.64.0.5:7433)
+```
+
+The laptop pins the devbox's key, the devbox authorizes the laptop's key, and `agentd remote pair`
+reports which machine paired. A mistyped code can be entered again. The code works once, expires
 after 5 minutes, and closes after 3 wrong attempts. Neither end can be fooled into trusting a
 machine that does not know the code: the two run a password-authenticated key exchange (CPace),
 so someone on the network gets one guess per attempt and cannot test codes offline. No service
@@ -501,8 +515,9 @@ the same way: run the `agent host add` command with the same name and address.
 agent host add devbox 100.64.0.5:7433 --fingerprint SHA256:...
 ```
 
-Without `--fingerprint`, `agent host add` shows the key the daemon presents and asks you to confirm
-it against `agentd remote id`. Either way it then prints the command that authorizes the laptop.
+Or run it without `--fingerprint` and press Enter at the pairing code prompt: it then asks you to
+confirm the key against `agentd remote id`. Either way it then prints the command that authorizes
+the laptop.
 Back on the devbox, run that command:
 
 ```sh
