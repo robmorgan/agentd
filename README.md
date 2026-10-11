@@ -81,7 +81,8 @@ agent attach fix-tests
 Multiple clients can attach to the same running session at once, including the TUI and one or
 more `agent attach` processes.
 
-Detach the local `agent attach` client using `ctrl + \`. Switch to the previous attached session
+Detach the local `agent attach` client using `ctrl + \`; the screen is cleared, and the session's
+output stays in your terminal's scrollback. Switch to the previous attached session
 with `ctrl + [` and the next one with `ctrl + ]`. To inspect or manage other attached
 clients:
 

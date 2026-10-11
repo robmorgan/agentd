@@ -22,12 +22,16 @@ const (
 	// attachEnterSequence pushes the kitty keyboard protocol's
 	// "disambiguate" flag, so Ctrl-[ and Esc arrive as different keys.
 	attachEnterSequence = "\x1b[>1u"
-	// attachRestoreSequence undoes what an agent may have turned on: mouse
-	// reporting, bracketed paste, focus events, the kitty keyboard flags
-	// (popped) and a hidden cursor.
-	attachRestoreSequence = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[?25h"
+	// attachRestoreSequence undoes what an agent may have turned on: the
+	// alternate screen, mouse reporting, bracketed paste, focus events, the
+	// kitty keyboard flags (popped) and a hidden cursor.
+	attachRestoreSequence = "\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[<u\x1b[?25h"
 	attachClearSequence   = "\x1b[2J\x1b[H"
-	attachExitTitle       = "agentd"
+	// attachDetachSequence clears the session's screen after a detach, so
+	// the shell's prompt does not land in the middle of the agent's UI. The
+	// session's output stays in the terminal's scrollback.
+	attachDetachSequence = "\x1b[H\x1b[2J"
+	attachExitTitle      = "agentd"
 
 	// frameQueue bounds the daemon frames read ahead of the terminal.
 	frameQueue = 16
@@ -238,7 +242,7 @@ func (c *client) connectAttach(ctx context.Context, id string, prev attachIdenti
 // for an upgrade) the terminal stays in raw mode while attachOnce attaches
 // to the same session again, repainting the screen from the new snapshot;
 // see reattach.
-func (c *client) attachOnce(id, uid string, titled *bool) (attachResult, error) {
+func (c *client) attachOnce(id, uid string, titled *bool) (res attachResult, err error) {
 	ident := attachIdentity{uid: uid}
 	stream, attached, ended, err := c.connectAttach(context.Background(), id, ident, c.attachScrollbackRows())
 	if err != nil {
@@ -264,6 +268,9 @@ func (c *client) attachOnce(id, uid string, titled *bool) (attachResult, error) 
 	defer func() {
 		raw.restore()
 		writeOut([]byte(attachRestoreSequence))
+		if err == nil && res.outcome == outcomeDetached {
+			writeOut([]byte(attachDetachSequence))
+		}
 	}()
 	winch := make(chan os.Signal, 1)
 	signal.Notify(winch, syscall.SIGWINCH)
