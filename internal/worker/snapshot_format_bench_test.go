@@ -55,7 +55,7 @@ func BenchmarkSnapshotFormat(b *testing.B) {
 			b.Fatal(err)
 		}
 		ts.feed(s.data)
-		vt, err := ts.snapshot()
+		vt, err := ts.snapshot(allScrollback)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -67,7 +67,7 @@ func BenchmarkSnapshotFormat(b *testing.B) {
 		b.Run(s.name+"/vt-format", func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				if _, err := ts.snapshot(); err != nil {
+				if _, err := ts.snapshot(allScrollback); err != nil {
 					b.Fatal(err)
 				}
 			}

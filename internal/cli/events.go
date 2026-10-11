@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/robmorgan/agentd/internal/protocol"
 	"github.com/robmorgan/agentd/internal/session"
@@ -424,10 +425,12 @@ func alertBytes(ev session.Event, host string, getenv func(string) string) []byt
 	return []byte("\a" + seq)
 }
 
-// oscText strips what could end or confuse an OSC string.
+// oscText strips what could end or confuse an OSC string, and the
+// invisible format characters (unicode.Cf) that could reorder or hide
+// what a desktop notification appears to say.
 func oscText(s string) string {
 	return strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) || unicode.Is(unicode.Cf, r) {
 			return ' '
 		}
 		return r

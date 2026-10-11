@@ -31,6 +31,9 @@ type ownerState struct {
 	// activity tracks what the agent is doing; nil in tests that build
 	// an ownerState without a session.
 	activity *activityTracker
+	// status keeps the program's own status records (OSC 7501), the
+	// primary source of activity; see status.go.
+	status *statusTracker
 	// owner is the goroutine this state belongs to, for timers that need
 	// to get back onto it.
 	owner *owner
@@ -157,11 +160,30 @@ func (s *ownerState) hasLiveAttachTerminal() bool {
 
 // writeInput queues client input for the PTY; see ptyInput.
 func (s *ownerState) writeInput(data []byte) error {
+	// A client terminal that also speaks the program status protocol
+	// echoes the detection query back as input. The worker has already
+	// answered it (afterFeed), so the copy is dropped: forwarded, it
+	// would reach the program as a stray escape sequence after its
+	// detection window, and it is a terminal's reflex, not the user
+	// typing, so it must not count as answering a blocked record.
+	if isStatusDetectionReply(data) {
+		return nil
+	}
 	if err := s.input.enqueue(data); err != nil {
 		return err
 	}
+	now := time.Now()
+	// Typing answers whatever the session was waiting for, for both
+	// sources: a blocked status record counts as answered until the
+	// program reports again (silently, like the heuristic waiting flag).
+	if s.status != nil {
+		s.status.noteInput(now)
+		if s.activity != nil {
+			s.activity.setNative(now, s.status.derive(), s.watched(), false)
+		}
+	}
 	if s.activity != nil {
-		s.activity.input(time.Now(), s.watched())
+		s.activity.input(now, s.watched())
 	}
 	return nil
 }
@@ -230,12 +252,37 @@ func (s *ownerState) publishOutput(data []byte) error {
 // position, device attributes and so on) to the PTY when no client terminal
 // is attached to answer them itself.
 func (s *ownerState) afterFeed(writes [][]byte, effects terminalEffects) {
+	now := time.Now()
+	// The program status detection query is answered whether or not a
+	// client terminal is attached: the worker consumes the reports itself,
+	// and the client's terminal may not speak the protocol. A client
+	// terminal that does answers too; the replies are identical bytes.
+	for _, reply := range effects.statusReplies {
+		if err := s.input.enqueue(reply); err != nil {
+			fmt.Fprintf(os.Stderr, "session worker: dropped program status reply: %v\n", err)
+		}
+	}
+	if s.status != nil {
+		// In stream order: a prompt ends the records of the program
+		// before it, never of one that reported after it in the same
+		// read.
+		for _, ev := range effects.statusEvents {
+			if ev.report != nil {
+				s.status.apply(now, *ev.report)
+			} else {
+				s.status.promptSeen()
+			}
+		}
+	}
 	if s.activity != nil {
 		title := ""
 		if effects.titleChanged {
 			title = s.terminal.title()
 		}
-		s.activity.output(time.Now(), effects, title, s.watched())
+		if s.status != nil {
+			s.activity.setNative(now, s.status.derive(), s.watched(), true)
+		}
+		s.activity.output(now, effects, title, s.watched())
 	}
 	if s.hasLiveAttachTerminal() {
 		return
@@ -338,6 +385,15 @@ func (s *ownerState) attach(attachID string, kind session.AttachmentKind, g prot
 
 	a := &ownerAttachment{kind: kind, connectedAt: connectedAt, sub: s.output.subscribe(), detach: make(chan struct{})}
 	s.attachments[attachID] = a
+	// An interactive attach shows the user the screen: done and error
+	// records have been seen (the same moment the daemon acknowledges
+	// attention), so they no longer decide the session's activity. A
+	// reattach that replaces a lost connection is the CLI reconnecting by
+	// itself — no human looked — so it does not count.
+	if kind == session.AttachmentAttach && replaces == "" && s.status != nil && s.activity != nil {
+		s.status.userSaw()
+		s.activity.setNative(connectedAt, s.status.derive(), s.watched(), false)
+	}
 	return &attachResult{
 		attachID: attachID,
 		snapshot: snapshot,

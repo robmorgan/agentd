@@ -77,6 +77,14 @@ func TestPathsWithControlCharactersAreEscaped(t *testing.T) {
 	if got := escapeControls("/tmp/plain"); got != "/tmp/plain" {
 		t.Fatalf("got %q", got)
 	}
+	// Value: protects=invisible format characters (unicode.Cf: bidi
+	// overrides, zero-width) escaped like controls, so a path cannot
+	// reorder or hide what the line appears to say; fails_when=
+	// escapeControls narrows back to unicode.IsControl only; why_new=the
+	// existing cases cover only control characters; seam=none
+	if got := escapeControls("/tmp/a‮b​c"); got != `/tmp/a\u{202e}b\u{200b}c` {
+		t.Fatalf("format characters: got %q", got)
+	}
 }
 
 func TestDisplayCwdAbbreviatesHome(t *testing.T) {
@@ -196,6 +204,22 @@ func TestActivityText(t *testing.T) {
 	if got := activityText(&s, now); got != "waiting 3m" {
 		t.Fatalf("waiting: %q", got)
 	}
+	s.Activity = session.ActivityBlocked
+	if got := activityText(&s, now); got != "blocked 3m" {
+		t.Fatalf("blocked: %q", got)
+	}
+	s.Activity = session.ActivityWorking
+	progress := 47
+	s.StatusProgress = &progress
+	if got := activityText(&s, now); got != "working 47%" {
+		t.Fatalf("working with progress: %q", got)
+	}
+	// 100% would overflow the column and ends at once anyway.
+	progress = 100
+	if got := activityText(&s, now); got != "working" {
+		t.Fatalf("working at 100%%: %q", got)
+	}
+	s.StatusProgress = nil
 	s.Activity = "something-new"
 	if got := activityText(&s, now); got != "something-new" {
 		t.Fatalf("unknown: %q", got)

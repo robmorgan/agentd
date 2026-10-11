@@ -168,6 +168,10 @@ const (
 	// CapSessionActivity: session records carry the activity fields
 	// appended to them (session.Record.Activity onwards).
 	CapSessionActivity = "session-activity"
+	// CapSessionStatus: session records carry the program status fields
+	// (OSC 7501; session.Record.StatusApp onwards), appended after the
+	// CapSessionActivity fields.
+	CapSessionStatus = "session-status"
 	// CapDaemonID: Welcome ends with the daemon's id, the fingerprint of
 	// its key (remote/daemon.key), which is stable for the life of its
 	// runtime root. With a session's UID it forms the session's global
@@ -205,7 +209,7 @@ const MinProtocolVersion uint16 = 1
 // Capabilities is what this build supports.
 func Capabilities() []string {
 	return []string{CapControlStream, CapGitState, CapArtifacts, CapSessionUID, CapRequestTokens, CapAttachFeatures, CapAttachReplace, CapAttachResync, CapRuntimeStats,
-		CapEvents, CapSessionActivity, CapDaemonID, CapSessionRestart, CapWorkerHandoff, CapTerminalMemory, CapAttachScrollback}
+		CapEvents, CapSessionActivity, CapSessionStatus, CapDaemonID, CapSessionRestart, CapWorkerHandoff, CapTerminalMemory, CapAttachScrollback}
 }
 
 // AttachCapabilities are the capabilities that apply to an attach stream,
