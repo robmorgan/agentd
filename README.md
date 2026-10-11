@@ -309,8 +309,9 @@ at any time:
   `~/.local/share/agentd/toolchain` and used for the build only.
 - Without a checkout it clones `AGENTD_REF` (default `main`) into `~/.local/share/agentd/src`; a
   rerun fetches and rebuilds only what changed.
-- If a daemon is running, it runs `agentd upgrade`, so sessions are handed over to the new binary
-  without stopping (`AGENTD_NO_UPGRADE=1` leaves the daemon alone).
+- Binaries are only replaced when the build differs. If a daemon is running and `agentd` changed
+  (or the daemon still runs a binary replaced earlier), it runs `agentd upgrade`, so sessions are
+  handed over to the new binary without stopping (`AGENTD_NO_UPGRADE=1` leaves the daemon alone).
 
 It never turns on remote access; see `agentd remote enable` below.
 
