@@ -474,8 +474,9 @@ func TestRemoteAttachEndToEnd(t *testing.T) {
 		t.Fatalf("remote events:\n%s", out)
 	}
 	follow := e.start("--host", "dev", "events", "--follow", "--lines", "0")
-	e.mustRun("agent", "--host", "dev", "send-input", "demo", `printf '\a'`+"\r")
-	follow.expect(0, "dev/demo  action  bell")
+	e.mustRun("agent", "--host", "dev", "send-input", "demo",
+		`printf '\033]7501;state=blocked:kind=permission:msg=RGVwbG95Pw==\033\\'`+"\r")
+	follow.expect(0, "dev/demo  action  blocked")
 
 	// Attach over QUIC with a host/session address.
 	tm = e.start("attach", "dev/demo")
@@ -667,9 +668,10 @@ func TestRemoteReattachRefusesARecreatedSession(t *testing.T) {
 	}
 }
 
-// A bell in a session reaches `agent events --follow --notify` (and the
-// user's terminal as a notification), shows in `agent ls` and `status`,
-// and attaching acknowledges it. Following survives a daemon restart.
+// A blocked status report reaches `agent events --follow --notify` (and
+// the user's terminal as a notification), shows in `agent ls` and
+// `status`, and attaching acknowledges it; a bell is information only.
+// Following survives a daemon restart.
 func TestEventsEndToEnd(t *testing.T) {
 	e := newEnv(t, "")
 	e.startAndDetach("demo")
@@ -678,22 +680,27 @@ func TestEventsEndToEnd(t *testing.T) {
 	m := follow.expect(0, "created")
 	m = follow.expect(m, "started")
 
-	// The shell echoes the command as typed; only running it rings.
+	// A bell is recorded as information: no notification, no attention.
 	e.mustRun("agent", "send-input", "demo", `printf '\a'`+"\r")
-	m = follow.expect(m, "action  bell          bell")
-	m = follow.expect(m, "\a\x1b]9;agentd: demo: bell")
+	m = follow.expect(m, "info    bell          bell")
+
+	// The program's own word carries the attention.
+	e.mustRun("agent", "send-input", "demo",
+		`printf '\033]7501;state=blocked:kind=permission:msg=RGVwbG95Pw==\033\\'`+"\r")
+	m = follow.expect(m, "action  blocked       permission: Deploy?")
+	m = follow.expect(m, "\a\x1b]9;agentd: demo: permission: Deploy?")
 
 	ls := e.mustRun("agent", "ls")
-	if !strings.Contains(ls, "⚠") || !strings.Contains(ls, "waiting") || !strings.Contains(ls, "ATTENTION") {
+	if !strings.Contains(ls, "⚠") || !strings.Contains(ls, "blocked") || !strings.Contains(ls, "ATTENTION") {
 		t.Fatalf("ls:\n%s", ls)
 	}
 	status := e.mustRun("agent", "status", "demo")
-	for _, want := range []string{"attention: action", "attention_summary: bell", "activity: waiting", "elapsed: "} {
+	for _, want := range []string{"attention: action", "attention_summary: permission: Deploy?", "activity: blocked", "elapsed: "} {
 		if !strings.Contains(status, want) {
 			t.Fatalf("status lacks %q:\n%s", want, status)
 		}
 	}
-	if out := e.mustRun("agent", "events", "--json", "--level", "action"); !strings.Contains(out, `"kind":"bell"`) || strings.Contains(out, `"kind":"created"`) {
+	if out := e.mustRun("agent", "events", "--json", "--level", "action"); !strings.Contains(out, `"kind":"blocked"`) || strings.Contains(out, `"kind":"bell"`) {
 		t.Fatalf("events --json:\n%s", out)
 	}
 
@@ -711,8 +718,8 @@ func TestEventsEndToEnd(t *testing.T) {
 	e.mustRun("agent", "daemon", "restart")
 	m = follow.expect(m, "reconnecting")
 	m = follow.expect(m, "recovered")
-	if n := strings.Count(follow.output(), "  bell   "); n != 1 {
-		t.Fatalf("bell shown %d times:\n%s", n, follow.output())
+	if n := strings.Count(follow.output(), "action  blocked"); n != 1 {
+		t.Fatalf("blocked shown %d times:\n%s", n, follow.output())
 	}
 }
 

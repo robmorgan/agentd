@@ -423,10 +423,13 @@ func TestProgramStatusFromThePTY(t *testing.T) {
 	}
 	h.eventually("done activity", func() bool { return h.record().Activity == session.ActivityDone })
 
-	// Clearing the records hands the activity back to the heuristics,
-	// which judge the quiet session idle.
+	// Clearing the records leaves a session agentd attaches no judgment
+	// to: plainly working, status fields gone.
 	h.sendInput("clear\n")
-	h.eventually("heuristics resumed", func() bool { return h.record().Activity == session.ActivityIdle })
+	h.eventually("back to plain working", func() bool {
+		rec := h.record()
+		return rec.Activity == session.ActivityWorking && rec.StatusApp == nil
+	})
 
 	h.sendInput("quit\n")
 	h.waitExit()
@@ -594,12 +597,12 @@ func TestActivityTrackerNativeEvents(t *testing.T) {
 	a.setNative(at(4), native(reAsk), false, true)
 	// Past the floor it re-raises, though the state is still blocked.
 	a.setNative(at(12), native(reAsk), false, true)
-	// A notification while the program reports status is context, not the
-	// signal, and the session stays blocked.
+	// A notification is observability, never the signal: the session
+	// stays blocked, untouched by it.
 	fx := terminalEffects{notifications: []libghostty.TerminalDesktopNotification{{Title: "Codex", Body: "Approve?"}}}
 	a.output(at(13), fx, "", false)
-	if a.state != session.ActivityBlocked || a.waiting {
-		t.Fatalf("after a notification while native: state=%v waiting=%v", a.state, a.waiting)
+	if a.state != session.ActivityBlocked {
+		t.Fatalf("after a notification: state=%v", a.state)
 	}
 	// An error is action-level too, so it waits out the same floor; native
 	// idle while watched is information, with the bare state as summary.
@@ -732,15 +735,12 @@ func TestAlertMemoryCarriedAcrossHandoff(t *testing.T) {
 	}
 }
 
-// Value: protects=afterFeed noting a feed's arrival before applying its
-// status effects, driven through the real publishOutput: records ending
-// (a clear) after an idleAfter-long quiet spell must not record an idle
-// event with a negative duration; fails_when=the preOutput call in
-// owner.go's afterFeed is removed or reordered after setNative;
-// why_new=an earlier form of this test replicated the call order itself,
-// so reordering owner.go could not fail it; seam=none
-func TestRecordsEndingAfterQuietDoNotFakeIdle(t *testing.T) {
-	fastActivity(t)
+// Value: protects=records ending (a clear) through the real publishOutput
+// leaving the session at plain working with no inferred event — agentd
+// attaches no judgment to a program that stopped reporting;
+// fails_when=afterFeed resurrects inference around setNative(nil), or the
+// cleared status columns stop being written through; seam=none
+func TestRecordsEndingLeaveNoJudgment(t *testing.T) {
 	_, h := newRoot(t)
 	rec := newRecorder(h.store, h.sessionID, 1)
 	ts, err := newTerminalState(80, 24, maxScrollbackBytes)
@@ -753,15 +753,17 @@ func TestRecordsEndingAfterQuietDoNotFakeIdle(t *testing.T) {
 	if err := s.publishOutput([]byte("\x1b]7501;state=working\x1b\\")); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(idleAfter + 100*time.Millisecond)
 	if err := s.publishOutput([]byte("\x1b]7501;state=clear\x1b\\")); err != nil {
 		t.Fatal(err)
 	}
 	rec.close()
 	for _, ev := range h.eventsSince(0) {
-		if ev.Kind == session.EventIdle {
-			t.Fatalf("bogus idle event recorded: %#v", ev)
+		if ev.Kind == session.EventIdle || ev.Kind == session.EventBlocked {
+			t.Fatalf("inferred event after the records ended: %#v", ev)
 		}
+	}
+	if s.activity.state != session.ActivityWorking || s.activity.native != nil {
+		t.Fatalf("after clear: state=%v native=%v", s.activity.state, s.activity.native)
 	}
 }
 

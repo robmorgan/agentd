@@ -279,9 +279,6 @@ func (s *ownerState) afterFeed(writes [][]byte, effects terminalEffects) {
 		if effects.titleChanged {
 			title = s.terminal.title()
 		}
-		// The feed's arrival is noted before its status effects, so
-		// setNative never judges them against a stale output clock.
-		s.activity.preOutput(now)
 		if s.status != nil {
 			s.activity.setNative(now, s.status.derive(), s.watched(), true)
 		}

@@ -175,8 +175,8 @@ back a binary across the program status release (schema v6): a pre-v6 daemon sti
 activities strictly, so running workers writing the new words (`blocked`, `done`, `error`) make
 it fail to read those sessions at all, not just miss their status fields; and a live handoff to
 a pre-status image silently drops the program status records (the old image ignores the unknown
-handoff field), so a blocked agent reads as merely idle until it reports again — the heuristics
-resume, nothing is corrupted, but the program's word is lost. Roll workers and daemon back
+handoff field), so a blocked agent reads as whatever the old image's heuristics make of it until
+it reports again — nothing is corrupted, but the program's word is lost. Roll workers and daemon back
 together, or not at all.
 
 Tests: `TestSessionSurvivesDaemonRestart`, `TestDaemonSIGKILLWithLiveSessions`,
@@ -553,11 +553,11 @@ happened to a session: an id, the session, a time, a kind, an attention level (`
 | `failed` | action | the worker or daemon, when the session fails to start or the agent exits non-zero |
 | `worker_lost` | action | the daemon, when a worker died without recording an outcome |
 | `recovered` | info | a starting daemon, for each session whose worker kept running |
-| `bell` | action | the worker, when the program rings the bell |
-| `notification` | action | the worker, for a desktop notification (OSC 9, OSC 777); the summary is its text |
-| `idle` | notice (info while a client is attached) | the worker, when output stops for 10s after activity |
-| `working` | info | the worker, when output resumes after an idle event |
-| `stalled` | notice | the worker, after 30 minutes without output while a command other than the agent holds the PTY's foreground |
+| `bell` | info | the worker, when the program rings the bell (observability only; never raises attention) |
+| `notification` | info | the worker, for a desktop notification (OSC 9, OSC 777); the summary is its text (observability only) |
+| `idle` | notice (info while a client is attached) | the worker, when the program reports it awaits the user's direction (OSC 7501) |
+| `working` | info | the worker, when the program reports it is busy again (OSC 7501) |
+| `stalled` | notice | the worker, after 30 minutes without output while a command other than the agent holds the PTY's foreground and nothing reports status |
 | `blocked` | action | the worker, when the program reports it cannot proceed without the user (OSC 7501); the summary is the kind of block and the program's message |
 | `done` | notice | the worker, when the program reports it finished (OSC 7501) |
 | `error` | action | the worker, when the program reports it failed and stopped (OSC 7501) |
@@ -589,11 +589,12 @@ wins (`blocked` > `error` > `working` > `done` > `idle`), so one blocked shard o
 program blocks the session and one still working keeps it working however many are done.
 Transitions record the events above (repeats within 10 seconds are dropped; a blocked program
 asking something new re-raises). Typing into the session counts a blocked record as answered —
-silently, like the heuristic waiting flag — until the program reports again. Meanwhile the
-heuristics below are demoted, not disabled: bells and notifications from a reporting program are
-recorded as info-level context, and the idle timer no longer decides the activity. A session whose
-program never reports keeps the heuristic behavior exactly; the `// 7501:` comments in
-`internal/worker/activity.go` mark every seam. The worker answers the protocol's detection query
+silently — until the program reports again. There is no inferred state: a session whose program
+never reports shows as plainly `working` while it runs, with no judgment attached. Bells and
+desktop notifications are recorded as info-level events for observability only (facts about what
+the terminal emitted, useful when a reporter misbehaves), and never raise attention; the bell/
+notification-to-waiting and output-timing-to-idle heuristics that predated the protocol were
+removed once Claude Code adopted it. The worker answers the protocol's detection query
 (`ESC ] 7501 ; ?`, echoed back) whether or not a client is attached, since it consumes the reports
 itself; the identical reply of a client terminal that also supports the protocol is dropped from
 the input, since the worker has already answered and a terminal's reflex must not count as the
@@ -625,17 +626,18 @@ an attached client does not either, since an attached terminal may be a backgrou
 session's attention stays until it is removed.
 
 **Activity.** The worker also keeps the session's `activity`: what the program reports (`working`,
-`blocked`, `done`, `error`, `idle`), or for one that does not report, `working`, `idle` after 10
-seconds without output, or `waiting` after a bell or notification until someone types (`exited`
-either way once the agent is gone). Alongside it: the program's reported app name, kind of block,
-message and progress (`status_app`, `status_kind`, `status_msg`, `status_progress`, NULL for a
-program that does not report), the name of the process in the PTY's foreground (`tcgetpgrp` on the
-master, sampled every second: the agent itself, or a command a shell runs there under job
-control), the terminal title, and when the program last wrote output. It writes them on
-transitions only, never per output chunk, and never bumps `updated_at`, so lists do not reshuffle
-as agents go idle and back. Elapsed time is derived from `created_at` and `exited_at`. The status
-fields travel to clients under their own capability (`CapSessionStatus`), appended after the
-`CapSessionActivity` fields in session records.
+`blocked`, `done`, `error`, `idle`), plain `working` for one that does not report (no judgment is
+attached), and `exited` once the agent is gone (`waiting` appears only in rows written by older
+workers that still inferred it from bells). Alongside it: the program's reported app name, kind of
+block, message and progress (`status_app`, `status_kind`, `status_msg`, `status_progress`, NULL
+for a program that does not report), the name of the process in the PTY's foreground (`tcgetpgrp`
+on the master, sampled every second: the agent itself, or a command a shell runs there under job
+control), the terminal title, and when the program last wrote output. It writes them on report
+transitions, title and foreground changes only, never per output chunk, and never bumps
+`updated_at`, so lists do not reshuffle as agents report and resume. (`last_output_at` is as
+fresh as the latest such write.) Elapsed time is derived from `created_at` and `exited_at`. The
+status fields travel to clients under their own capability (`CapSessionStatus`), appended after
+the `CapSessionActivity` fields in session records.
 
 **Detection.** Program status reports, bells, desktop notifications (OSC 9 and OSC 777), shell
 prompts (OSC 133) and title changes come from libghostty's parser, through its effect callbacks,
@@ -645,8 +647,8 @@ recorder goroutine through a queue of at most 64 events (dropped, and logged, wh
 and a single activity slot (a newer snapshot replaces an unwritten one). Noise is bounded: a bell
 is recorded unless another was seen in the last 10 seconds with no input since, so a program
 ringing in a loop records one event; a repeated notification text likewise; a bell within 2
-seconds of a notification is the same request; idle events are at most one per 30 seconds; and a
-program flipping between the same reported states gains nothing within 10 seconds. The status
+seconds of a notification is the same request; and a program flipping between the same reported
+states gains nothing within 10 seconds. The status
 reports of one feed are not capped (replaying them into the record store needs them all, and a
 report costs the program at least its own sequence bytes of output), while notifications are kept
 to 4 per feed. OSC 99 (kitty's notification protocol) is not parsed by libghostty and is not

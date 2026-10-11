@@ -100,16 +100,16 @@ func TestAttentionRaisesAndAcknowledges(t *testing.T) {
 		t.Fatalf("info event changed attention: %s %q", a, s)
 	}
 	record(session.EventIdle, session.AttentionNotice, "idle")
-	record(session.EventBell, "", "bell")
-	if a, s := attention(); a != session.AttentionAction || s != "bell" {
-		t.Fatalf("after bell: %s %q", a, s)
+	record(session.EventBlocked, "", "permission: Run tests?")
+	if a, s := attention(); a != session.AttentionAction || s != "permission: Run tests?" {
+		t.Fatalf("after blocked: %s %q", a, s)
 	}
 	record(session.EventIdle, session.AttentionNotice, "idle again")
-	if a, s := attention(); a != session.AttentionAction || s != "bell" {
+	if a, s := attention(); a != session.AttentionAction || s != "permission: Run tests?" {
 		t.Fatalf("notice lowered action: %s %q", a, s)
 	}
-	record(session.EventNotification, "", "Approve?")
-	if a, s := attention(); a != session.AttentionAction || s != "Approve?" {
+	record(session.EventError, "", "build failed")
+	if a, s := attention(); a != session.AttentionAction || s != "build failed" {
 		t.Fatalf("same level did not replace: %s %q", a, s)
 	}
 
@@ -123,7 +123,7 @@ func TestAttentionRaisesAndAcknowledges(t *testing.T) {
 		t.Fatal("acknowledging nothing recorded an event")
 	}
 	events, _ := store.LatestEvents(0, "s", 2)
-	if got := kindsOf(events); got != "notification acknowledged" {
+	if got := kindsOf(events); got != "error acknowledged" {
 		t.Fatalf("latest = %s", got)
 	}
 
@@ -358,17 +358,17 @@ func TestAcknowledgeBefore(t *testing.T) {
 	if _, err := store.InsertSession(NewSession{SessionID: "s", Agent: "sh", Mode: session.ModeExecute, Cwd: "/w"}); err != nil {
 		t.Fatal(err)
 	}
-	bell := func(at time.Time) {
+	asked := func(at time.Time) {
 		t.Helper()
-		if _, err := store.RecordEvent(NewEvent{SessionID: "s", Kind: session.EventBell, Summary: "bell", At: at}); err != nil {
+		if _, err := store.RecordEvent(NewEvent{SessionID: "s", Kind: session.EventBlocked, Summary: "asked", At: at}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// Times that only differ in their fractional seconds, which the
 	// stored text drops trailing zeros from, still order correctly.
 	looked := time.Date(2026, 10, 4, 2, 0, 5, 500_000_000, time.UTC)
-	bell(looked.Add(-400 * time.Millisecond)) // 05.1
-	bell(looked.Add(10 * time.Microsecond))   // 05.50001, after the client looked
+	asked(looked.Add(-400 * time.Millisecond)) // 05.1
+	asked(looked.Add(10 * time.Microsecond))   // 05.50001, after the client looked
 	if changed, err := store.AcknowledgeBefore("s", "seen", looked); err != nil || changed {
 		t.Fatalf("acknowledged attention raised later: %v %v", changed, err)
 	}

@@ -62,6 +62,7 @@ while IFS= read -r l; do
     done) exit 0;;
     where) echo "pwd:$(pwd -P)";;
     block) printf '\033]7501;state=blocked:kind=permission:msg=RGVwbG95Pw==\033\\';;
+    finish) printf '\033]7501;state=done:msg=RmluaXNoZWQ=\033\\';;
     bigflood) seq -f "line %g padding padding padding padding" 1 1500000; echo flood-done;;
     *) echo "got:$l";;
   esac

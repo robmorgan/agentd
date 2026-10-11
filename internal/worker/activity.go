@@ -17,35 +17,26 @@ import (
 // Activity and attention detection.
 //
 // The worker sees everything the agent writes, so it is where "which agent
-// needs me?" is answered. The primary signal is the program's own word:
-// program status reports (OSC 7501), which statusTracker keeps and reads
-// (status.go). While any records exist, they decide the session's activity
-// (working with progress, blocked on the user and why, done, error) and
-// raise its attention.
+// needs me?" is answered — by the program's own word: program status
+// reports (OSC 7501), which statusTracker keeps and reads (status.go).
+// The records decide the session's activity (working with progress,
+// blocked on the user and why, done, error, idle) and raise its attention;
+// a program that does not report shows as plainly `working` while it runs,
+// with no judgment attached. There is no inferred state: agentd stopped
+// guessing from bells and output timing when the harnesses adopted the
+// protocol.
 //
-// For programs that do not report, the worker falls back to heuristics,
-// none of which needs the agent's cooperation beyond what terminals
-// already understand:
-//
-//   - the bell (BEL), and desktop notifications (OSC 9, OSC 777;notify),
-//     which libghostty's parser reports while it shadows the PTY. Claude
-//     Code and Codex emit them when they wait for the user, if configured
-//     to (see the README). Either makes the session `waiting` and raises
-//     action-level attention until someone types into it. While the
-//     program reports status, these are recorded as info-level context
-//     instead: the reports say what the program needs.
-//   - output timing: output within idleAfter means `working`, none means
-//     `idle`; going idle after working records an idle event.
-//
-// Two more signals stay on regardless, since no report carries them:
+// Three observed signals remain, since no report carries them:
 //
 //   - the PTY's foreground process group (tcgetpgrp on the master), whose
 //     leader's name is the session's foreground command; sampled every
-//     activityTick.
+//     activityTick. A non-reporting foreground command that is silent for
+//     stallAfter records a stalled event.
 //   - the terminal title (OSC 0/2), kept as context.
-//
-// The "7501:" comments mark the seams between the two sources; if the
-// heuristics are ever dropped, they list what goes.
+//   - bells and desktop notifications (OSC 9, OSC 777;notify), recorded as
+//     info-level events for observability only: they are facts about what
+//     the terminal emitted (useful when a reporter misbehaves), never an
+//     attention signal.
 //
 // Cost on the PTY hot path: the effects come out of the VTWrite the worker
 // already makes, and each output chunk adds a clock read. Database writes
@@ -53,23 +44,21 @@ import (
 //
 // Noise: a bell is recorded unless another was seen within bellQuiet with
 // no input since, so a program ringing in a loop records one event; a
-// repeated notification text likewise. Idle events are at most one per
-// idleEventGap, and a working event is recorded only to close an idle one.
+// repeated notification text likewise.
 
 var (
-	// idleAfter is how long without output makes a session idle.
-	idleAfter = 10 * time.Second
-	// stallAfter is how long a command other than the agent may hold the
-	// foreground without output before the session counts as stalled.
+	// stallAfter is how long a non-reporting command other than the agent
+	// may hold the foreground without output before the session counts as
+	// stalled.
 	stallAfter = 30 * time.Minute
-	// activityTick is how often idleness and the foreground are checked.
+	// activityTick is how often the foreground is sampled and a deferred
+	// native alert retried.
 	activityTick = time.Second
 	// bellQuiet and noticeQuiet suppress repeats of a bell or the same
-	// notification without input in between.
+	// notification without input in between; noticeQuiet also paces the
+	// native event dedup and rate floor.
 	bellQuiet   = 10 * time.Second
 	noticeQuiet = 10 * time.Second
-	// idleEventGap is the least time between two idle events.
-	idleEventGap = 30 * time.Second
 )
 
 // bellAfterNotice: a bell this soon after a notification is the same
@@ -87,15 +76,9 @@ type activityTracker struct {
 	rec       *recorder
 	agentPGID int
 
-	state        session.Activity
-	waiting      bool
-	lastOutput   time.Time
-	workingSince time.Time
-	// idleRecorded is set when an idle event was recorded for the current
-	// quiet period, so the working event that ends it is recorded too.
-	idleRecorded  bool
-	lastIdleEvent time.Time
-	stalled       bool
+	state      session.Activity
+	lastOutput time.Time
+	stalled    bool
 	// lastBell is the last bell seen since the last input, recorded or not.
 	lastBell     time.Time
 	lastNotice   string
@@ -105,18 +88,15 @@ type activityTracker struct {
 	foreground string
 	title      string
 
-	// 7501: native is the program's own status (nil while it has no
-	// records, which lets the heuristics apply). The last event recorded
-	// for it dedups repeats: a program flipping between the same states,
-	// or re-reporting the same block, gains nothing within noticeQuiet.
-	// Action-level events additionally keep a rate floor of one per
-	// noticeQuiet (lastNativeActionAt), like the bell's quiet rule: a
-	// program churning blocked messages must not drive notifications at
-	// report rate.
-	// Non-action kinds additionally keep a per-kind gap
-	// (lastNativeKindAt), like the heuristic idleEventGap: alternating
-	// states or churning text record at most one event per kind per
-	// noticeQuiet.
+	// native is the program's own status (nil while it has no records).
+	// The last event recorded for it dedups repeats: a program flipping
+	// between the same states, or re-reporting the same block, gains
+	// nothing within noticeQuiet. Action-level events additionally keep a
+	// rate floor of one per noticeQuiet (lastNativeActionAt): a program
+	// churning blocked messages must not drive notifications at report
+	// rate. Non-action kinds keep a per-kind gap (lastNativeKindAt):
+	// alternating states or churning text record at most one event per
+	// kind per noticeQuiet.
 	native             *nativeStatus
 	lastNativeKind     session.EventKind
 	lastNativeSummary  string
@@ -127,17 +107,8 @@ type activityTracker struct {
 
 func newActivityTracker(rec *recorder, agentPGID int, now time.Time) *activityTracker {
 	return &activityTracker{rec: rec, agentPGID: agentPGID, state: session.ActivityWorking,
-		lastOutput: now, workingSince: now,
+		lastOutput: now,
 		lastNativeKindAt: make(map[session.EventKind]time.Time)}
-}
-
-// preOutput notes a feed's arrival before its status effects are applied:
-// setNative runs first (afterFeed), and judging it against a stale output
-// clock would turn "the records ended after a quiet spell" into a bogus
-// idle event with a negative duration.
-func (a *activityTracker) preOutput(now time.Time) {
-	a.lastOutput = now
-	a.stalled = false
 }
 
 // output notes PTY output and its effects. watched reports an interactive
@@ -145,8 +116,14 @@ func (a *activityTracker) preOutput(now time.Time) {
 func (a *activityTracker) output(now time.Time, fx terminalEffects, title string, watched bool) {
 	a.lastOutput = now
 	a.stalled = false
+	// A changed title forces the write-through: with no inferred state
+	// transitions, nothing else would carry it to the session record.
+	forced := false
 	if fx.titleChanged {
-		a.title = clean(title)
+		if t := clean(title); t != a.title {
+			a.title = t
+			forced = true
+		}
 	}
 	for _, n := range fx.notifications {
 		text := clean(n.Body)
@@ -159,64 +136,42 @@ func (a *activityTracker) output(now time.Time, fx terminalEffects, title string
 			text = "notification"
 		}
 		if text != a.lastNotice || now.Sub(a.lastNoticeAt) >= noticeQuiet {
-			e := db.NewEvent{Kind: session.EventNotification, Summary: text, At: now}
-			// 7501: while the program reports its own status, a
-			// notification is context, not the attention signal.
-			if a.native != nil {
-				e.Attention = session.AttentionInfo
-			}
-			a.rec.event(e)
+			// Observability only: what the program asks for comes from
+			// its status reports, never inferred from a notification.
+			a.rec.event(db.NewEvent{Kind: session.EventNotification, Summary: text, At: now,
+				Attention: session.AttentionInfo})
 		}
 		a.lastNotice, a.lastNoticeAt = text, now
-		if a.native == nil {
-			a.waiting = true
-		}
 	}
 	if fx.bells > 0 {
 		quiet := a.lastBell.IsZero() || now.Sub(a.lastBell) >= bellQuiet
 		if quiet && now.Sub(a.lastNoticeAt) >= bellAfterNotice {
-			e := db.NewEvent{Kind: session.EventBell, At: now, Summary: "bell"}
+			e := db.NewEvent{Kind: session.EventBell, At: now, Summary: "bell",
+				Attention: session.AttentionInfo}
 			if a.title != "" {
 				e.Summary = "bell: " + a.title
-			}
-			// 7501: as above.
-			if a.native != nil {
-				e.Attention = session.AttentionInfo
 			}
 			a.rec.event(e)
 		}
 		a.lastBell = now
-		if a.native == nil {
-			a.waiting = true
-		}
 	}
-	a.update(now, watched, false)
+	a.update(now, watched, forced)
 }
 
-// 7501: setNative gives the tracker the program's own reading of its
-// status, from the session's status records: the primary source of the
-// activity, overriding the heuristics while it is non-nil. emit also
-// records the event a change implies; input-driven calls pass false, since
-// typing answers a block silently (as input does for the heuristics).
+// setNative gives the tracker the program's own reading of its status,
+// from the session's status records: the sole source of the activity.
+// emit also records the event a change implies; input-driven calls pass
+// false, since typing answers a block silently.
 func (a *activityTracker) setNative(now time.Time, n *nativeStatus, watched, emit bool) {
 	prev := a.native
 	a.native = n
 	if n == nil {
 		if prev != nil {
 			// The records are gone (cleared, or dropped at a shell
-			// prompt): the heuristics resume from a fresh working period.
-			a.workingSince = now
-			a.idleRecorded = false
+			// prompt): back to plain working, status columns cleared.
 			a.update(now, watched, true)
 		}
 		return
-	}
-	if prev == nil {
-		// The program's reports supersede whatever heuristic wait was
-		// pending: without this, a bell from before the first report
-		// would resurface, hours stale, when the records are cleared.
-		a.waiting = false
-		a.lastBell, a.lastNotice, a.lastNoticeAt = time.Time{}, "", time.Time{}
 	}
 	if emit {
 		a.recordNative(prev, n, now, watched)
@@ -328,19 +283,18 @@ func (a *activityTracker) restoreAlertMemory(h *statusHandoff) {
 }
 
 // input notes that someone typed into the session (an attached client or
-// send-input): whatever it was waiting for has been answered.
+// send-input): the bell and notification dedup starts over, so a program
+// asked again after input records again.
 func (a *activityTracker) input(now time.Time, watched bool) {
-	a.waiting = false
 	a.lastBell, a.lastNotice, a.lastNoticeAt = time.Time{}, "", time.Time{}
-	a.update(now, watched, false)
 }
 
-// tick checks for idleness and stalls, samples the foreground process,
-// and retries a floor-deferred native action event: without this, a
-// program that re-asked within the floor and then went silent (waiting
-// for its answer) would never alert. Deriving fresh from a.native means a
+// tick samples the foreground process, retries a floor-deferred native
+// action event (without this, a program that re-asked within the floor and
+// then went silent would never alert; deriving fresh from a.native means a
 // block that input answered, or a clear removed, cancels the retry
-// naturally; the changed/dedup/floor checks make it a no-op otherwise.
+// naturally), and checks for stalls: a non-reporting command other than
+// the agent holding the foreground in silence for stallAfter.
 func (a *activityTracker) tick(now time.Time, fgPGID int, watched bool) {
 	if a.native != nil {
 		a.recordNative(a.native, a.native, now, watched)
@@ -359,7 +313,7 @@ func (a *activityTracker) tick(now time.Time, fgPGID int, watched bool) {
 		}
 	}
 	a.update(now, watched, fgChanged)
-	if a.state == session.ActivityIdle && !a.stalled && now.Sub(a.lastOutput) >= stallAfter &&
+	if a.native == nil && !a.stalled && now.Sub(a.lastOutput) >= stallAfter &&
 		a.fgPGID > 0 && a.fgPGID != a.agentPGID {
 		a.stalled = true
 		a.rec.event(db.NewEvent{Kind: session.EventStalled, At: now,
@@ -367,52 +321,18 @@ func (a *activityTracker) tick(now time.Time, fgPGID int, watched bool) {
 	}
 }
 
-// update recomputes the activity, records the events its change implies,
-// and reports a change to the recorder.
+// update recomputes the activity (the program's reported status, or plain
+// working while it runs without reporting) and reports a change to the
+// recorder. Events come from recordNative; no state is inferred here.
 func (a *activityTracker) update(now time.Time, watched, force bool) {
 	next := session.ActivityWorking
-	switch {
-	// 7501: while the program reports its own status, it decides; the
-	// waiting flag and the idle timer only judge programs that do not.
-	case a.native != nil:
+	if a.native != nil {
 		next = a.native.activity
-	case a.waiting:
-		next = session.ActivityWaiting
-	case now.Sub(a.lastOutput) >= idleAfter:
-		next = session.ActivityIdle
 	}
 	if next == a.state && !force {
 		return
 	}
-	prev := a.state
 	a.state = next
-	switch {
-	// 7501: native transitions record their own events (recordNative);
-	// the cases below are the heuristic idle/working events.
-	case a.native != nil:
-	case next == session.ActivityIdle && prev == session.ActivityWorking:
-		if a.lastIdleEvent.IsZero() || now.Sub(a.lastIdleEvent) >= idleEventGap {
-			// Someone attached is watching it go quiet; it only needs
-			// noticing when nobody is.
-			level := session.AttentionNotice
-			if watched {
-				level = session.AttentionInfo
-			}
-			summary := fmt.Sprintf("idle after %s of output", roundDuration(a.lastOutput.Sub(a.workingSince)))
-			if a.title != "" {
-				summary += ": " + a.title
-			}
-			a.rec.event(db.NewEvent{Kind: session.EventIdle, Attention: level, Summary: summary, At: now})
-			a.idleRecorded = true
-			a.lastIdleEvent = now
-		}
-	case next == session.ActivityWorking && prev != session.ActivityWorking:
-		a.workingSince = now
-		if a.idleRecorded {
-			a.idleRecorded = false
-			a.rec.event(db.NewEvent{Kind: session.EventWorking, Summary: "output resumed", At: now})
-		}
-	}
 	act := db.Activity{Activity: a.state, Foreground: a.foreground, Title: a.title,
 		LastOutputAt: a.lastOutput, StatusProgress: -1}
 	if a.native != nil {

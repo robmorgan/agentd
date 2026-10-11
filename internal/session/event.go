@@ -42,20 +42,24 @@ const (
 	// EventRecovered: a starting daemon found the session's worker still
 	// running and took it over again (info).
 	EventRecovered EventKind = "recovered"
-	// EventBell: the program rang the terminal bell (BEL), which agents do
-	// when they wait for the user (action). Rate-limited.
+	// EventBell: the program rang the terminal bell (BEL). Recorded for
+	// observability only (info), rate-limited; what a program needs is
+	// said by its status reports.
 	EventBell EventKind = "bell"
 	// EventNotification: the program asked the terminal for a desktop
-	// notification (OSC 9 or OSC 777); the summary is its text (action).
+	// notification (OSC 9 or OSC 777); the summary is its text.
+	// Observability only (info), like the bell.
 	EventNotification EventKind = "notification"
-	// EventIdle: output stopped after a period of activity, typically an
-	// agent finishing its turn (notice; info while a client is attached,
-	// since someone is watching).
+	// EventIdle: the program reported it is waiting for the user to say
+	// what to do next (OSC 7501 state=idle) (notice; info while a client
+	// is attached, since someone is watching).
 	EventIdle EventKind = "idle"
-	// EventWorking: output resumed after an idle event (info).
+	// EventWorking: the program reported it is busy again (OSC 7501
+	// state=working) (info).
 	EventWorking EventKind = "working"
 	// EventStalled: no output for a long time while a command other than
-	// the agent holds the terminal's foreground (notice).
+	// the agent holds the terminal's foreground and nothing reports
+	// status (notice).
 	EventStalled EventKind = "stalled"
 	// EventBlocked: the program reported it cannot proceed without the
 	// user (OSC 7501 state=blocked); the summary carries the kind of
@@ -77,7 +81,7 @@ const (
 // with, unless the producer has a reason to differ (see EventIdle).
 func (k EventKind) DefaultAttention() AttentionLevel {
 	switch k {
-	case EventFailed, EventWorkerLost, EventBell, EventNotification, EventBlocked, EventError:
+	case EventFailed, EventWorkerLost, EventBlocked, EventError:
 		return AttentionAction
 	case EventExited, EventIdle, EventStalled, EventDone:
 		return AttentionNotice
@@ -121,12 +125,15 @@ const (
 	// ActivityUnknown: nothing reported (an older worker, or a session
 	// that never ran).
 	ActivityUnknown Activity = ""
-	// ActivityWorking: the program wrote output recently.
+	// ActivityWorking: the program reported it is busy, or runs without
+	// reporting status at all (agentd attaches no judgment to a program
+	// that does not speak OSC 7501).
 	ActivityWorking Activity = "working"
-	// ActivityIdle: no output for a while (10 seconds by default).
+	// ActivityIdle: the program reported it is waiting for the user to
+	// say what to do next (OSC 7501 state=idle).
 	ActivityIdle Activity = "idle"
-	// ActivityWaiting: the program rang the bell or sent a notification
-	// and nobody has typed into the session since.
+	// ActivityWaiting: historical (sessions written by workers that still
+	// inferred waiting from bells); kept so their rows read and display.
 	ActivityWaiting Activity = "waiting"
 	// ActivityBlocked: the program reported it cannot proceed without the
 	// user (OSC 7501 state=blocked).

@@ -65,7 +65,7 @@ List running tasks:
 agent ls
 
   RUN  AGE    NAME            ACTIVITY     CWD                 ATTENTION
-  ⚠    4m     dep-bump        waiting 1m   ~/src/app           Claude needs your permission to use Bash
+  ⚠    4m     dep-bump        blocked 1m   ~/src/app           permission: Use Bash?
   ●    12m    fix-tests       working      ~/src/app
   ○    6m     docs-readme     exited       ~/src/docs          finished (exit 0)
 ```
@@ -157,15 +157,17 @@ notice    something meaningful happened (an agent went quiet, a session finished
 action    user intervention required (a bell, a permission prompt, a failure)
 ```
 
-Clients surface sessions based on attention instead of raw output. The primary signal is the
-program's own word: [program status reports](https://mitchellh.com/writing/program-status-osc7501)
+Clients surface sessions based on attention instead of raw output. The signal is the program's
+own word: [program status reports](https://mitchellh.com/writing/program-status-osc7501)
 (OSC 7501), through which a program says it is `working` (with progress), `blocked` on the user
-(and why: a permission, a question, a login), `done` or `error`, with a one-line message. While a
-program reports, its word decides the session's activity and attention. For programs that do not,
-`agentd` falls back to what terminals already understand: the bell, desktop notifications (OSC 9
-and OSC 777), output stopping and starting, and the process in the foreground. Either way the
-signals are recorded as events, and a session needs attention until you look at it: attaching to
-it (or detaching from it) acknowledges it.
+(and why: a permission, a question, a login), `done` or `error`, with a one-line message. Claude
+Code reports since 2.1.295, and `agentd` does not guess: a program that does not report simply
+shows as running, with no inferred waiting or idleness. Bells and desktop notifications (OSC 9
+and OSC 777) are still recorded as info-level events for observability, and the foreground
+process is still sampled (a non-reporting foreground command that is silent for half an hour
+records a `stalled` notice), but neither raises attention. Report-driven signals are recorded as
+events, and a session needs attention until you look at it: attaching to it (or detaching from
+it) acknowledges it.
 
 ```sh
 agent ls
@@ -173,7 +175,7 @@ agent ls
   RUN  AGE    NAME            ACTIVITY     CWD                 ATTENTION
   ⚠    12m    fix-tests       blocked 2m   ~/src/app           permission: Run the tests?
   ●    40m    dep-bump        working 47%  ~/src/app
-  ●    3m     docs            idle 5m      ~/src/docs          idle after 4m of output
+  ●    3m     docs            idle 5m      ~/src/docs          Updated the README
   ○    1h     refactor        exited       ~/src/app           finished (exit 0)
 ```
 
@@ -209,33 +211,23 @@ protocol supported. Any program can report:
 printf '\e]7501;state=blocked:kind=permission:msg=%s\e\\' "$(printf 'Deploy?' | base64)"
 ```
 
-While a program reports, bells and notifications from it are recorded as information rather than
-treated as the attention signal, and typing into the session counts a `blocked` report as
-answered until the program reports again.
+Status reports are the only attention signal. Typing into the session counts a `blocked` report
+as answered until the program reports again. Bells and desktop notifications (OSC 9, OSC 777)
+are recorded as info-level events — visible in `agent events` as facts about what the terminal
+emitted — but raise no attention and trigger no `--notify`: `agentd` stopped inferring "needs
+you" from them when the agent harnesses began reporting status themselves.
 
-For agents that do not report status yet, a bell or a desktop notification is the next best
-signal that one is waiting for you. Without either, `agentd` still notices an agent going quiet
-(`idle`), but cannot tell finishing from asking.
+- **Claude Code** reports program status natively since 2.1.295: permission prompts, questions
+  and finished turns surface as `blocked`/`idle` with their message, with nothing to configure.
+- **Agents that do not report yet** (Codex, older Claude Code, plain tools) show as running,
+  with the foreground command and terminal title as context and a `stalled` notice if a
+  non-reporting foreground command is silent for half an hour. Attention arrives when their
+  harnesses adopt the protocol — or today, from anything you wrap:
 
-- **Claude Code** sends a notification when it needs permission and when it has been waiting for
-  input for a minute. Its default channel depends on the terminal it thinks it runs in, which
-  under `agentd` is whatever terminal the daemon was started from, and is often none. Choose one
-  explicitly: run `/config` in Claude Code and set **Notifications** to **iTerm2 (OSC 9)**,
-  **Ghostty (OSC 777)** or **Terminal Bell** (stored as `preferredNotifChannel` in
-  `~/.claude.json`). Do not choose Kitty (OSC 99): `agentd` cannot read it.
-- **Codex** sends notifications when a turn completes or it needs approval, once enabled in
-  `~/.codex/config.toml`. Codex only notifies when it thinks its terminal is unfocused, which
-  under `agentd` it cannot tell, so ask for always:
-
-  ```toml
-  [tui]
-  notifications = true
-  notification_method = "osc9"       # or "bel"
-  notification_condition = "always"
+  ```sh
+  mytool; printf '\e]7501;state=%s:msg=%s\e\\' \
+    "$([ $? -eq 0 ] && echo done || echo error)" "$(printf 'mytool finished' | base64)"
   ```
-
-- **Anything else** that rings the bell (`printf '\a'`) or prints `\e]9;message\e\\` is heard the
-  same way.
 
 ## Architecture
 
