@@ -100,16 +100,16 @@ func TestAttentionRaisesAndAcknowledges(t *testing.T) {
 		t.Fatalf("info event changed attention: %s %q", a, s)
 	}
 	record(session.EventIdle, session.AttentionNotice, "idle")
-	record(session.EventBell, "", "bell")
-	if a, s := attention(); a != session.AttentionAction || s != "bell" {
-		t.Fatalf("after bell: %s %q", a, s)
+	record(session.EventBlocked, "", "permission: Run tests?")
+	if a, s := attention(); a != session.AttentionAction || s != "permission: Run tests?" {
+		t.Fatalf("after blocked: %s %q", a, s)
 	}
 	record(session.EventIdle, session.AttentionNotice, "idle again")
-	if a, s := attention(); a != session.AttentionAction || s != "bell" {
+	if a, s := attention(); a != session.AttentionAction || s != "permission: Run tests?" {
 		t.Fatalf("notice lowered action: %s %q", a, s)
 	}
-	record(session.EventNotification, "", "Approve?")
-	if a, s := attention(); a != session.AttentionAction || s != "Approve?" {
+	record(session.EventError, "", "build failed")
+	if a, s := attention(); a != session.AttentionAction || s != "build failed" {
 		t.Fatalf("same level did not replace: %s %q", a, s)
 	}
 
@@ -123,7 +123,7 @@ func TestAttentionRaisesAndAcknowledges(t *testing.T) {
 		t.Fatal("acknowledging nothing recorded an event")
 	}
 	events, _ := store.LatestEvents(0, "s", 2)
-	if got := kindsOf(events); got != "notification acknowledged" {
+	if got := kindsOf(events); got != "error acknowledged" {
 		t.Fatalf("latest = %s", got)
 	}
 
@@ -224,6 +224,60 @@ func TestSetActivityGuards(t *testing.T) {
 	}
 }
 
+// The program status fields (OSC 7501) ride SetActivity: set while the
+// program reports, NULL again when it stops.
+func TestSetActivityProgramStatus(t *testing.T) {
+	store := newStore(t)
+	createdAt, _ := store.InsertSession(NewSession{SessionID: "s", Agent: "sh", Mode: session.ModeExecute, Cwd: "/"})
+	store.MarkRunning("s", createdAt, 10, 11)
+	if err := store.SetActivity("s", 10, Activity{Activity: session.ActivityBlocked,
+		StatusApp: "claude-code", StatusKind: "permission", StatusMsg: "Run tests?", StatusProgress: 60}); err != nil {
+		t.Fatal(err)
+	}
+	rec := store.mustGet(t, "s")
+	if rec.Activity != session.ActivityBlocked || *rec.StatusApp != "claude-code" ||
+		*rec.StatusKind != "permission" || *rec.StatusMsg != "Run tests?" || *rec.StatusProgress != 60 {
+		t.Fatalf("record = %#v", rec)
+	}
+	if err := store.SetActivity("s", 10, Activity{Activity: session.ActivityIdle, StatusProgress: -1}); err != nil {
+		t.Fatal(err)
+	}
+	rec = store.mustGet(t, "s")
+	if rec.StatusApp != nil || rec.StatusKind != nil || rec.StatusMsg != nil || rec.StatusProgress != nil {
+		t.Fatalf("after the program stopped reporting: %#v", rec)
+	}
+	// Value: protects=GetSession reads records whose activity string this
+	// build does not know (a newer worker recorded it); fails_when=strict
+	// activity parsing returns to scanSession (ParseActivity was removed
+	// for this); why_new=nothing asserted the tolerance on the database
+	// side, only in display; seam=none
+	if err := store.SetActivity("s", 10, Activity{Activity: "pondering", StatusProgress: -1}); err != nil {
+		t.Fatal(err)
+	}
+	if rec = store.mustGet(t, "s"); rec.Activity != "pondering" {
+		t.Fatalf("unknown activity read back as %q, want it kept verbatim", rec.Activity)
+	}
+	// Value: protects=end() clearing the status columns with the agent:
+	// an ended session carries no live program status, however it ended;
+	// fails_when=end()'s UPDATE loses the status_* = NULL assignments (a
+	// dead session then keeps showing a stale "blocked: Run tests?");
+	// why_new=the SetActivity path above NULLs via the activity write,
+	// nothing exercised the ending path; seam=none
+	if err := store.SetActivity("s", 10, Activity{Activity: session.ActivityBlocked,
+		StatusApp: "claude-code", StatusKind: "permission", StatusMsg: "Run tests?", StatusProgress: 60}); err != nil {
+		t.Fatal(err)
+	}
+	code := int32(0)
+	if err := store.MarkExited("s", &code); err != nil {
+		t.Fatal(err)
+	}
+	rec = store.mustGet(t, "s")
+	if rec.Activity != session.ActivityExited ||
+		rec.StatusApp != nil || rec.StatusKind != nil || rec.StatusMsg != nil || rec.StatusProgress != nil {
+		t.Fatalf("ended session kept program status: %#v", rec)
+	}
+}
+
 // A version 2 database gains the events table and activity columns, and
 // statements a version 2 worker still runs keep working against it.
 func TestMigrateFromVersion2(t *testing.T) {
@@ -304,17 +358,17 @@ func TestAcknowledgeBefore(t *testing.T) {
 	if _, err := store.InsertSession(NewSession{SessionID: "s", Agent: "sh", Mode: session.ModeExecute, Cwd: "/w"}); err != nil {
 		t.Fatal(err)
 	}
-	bell := func(at time.Time) {
+	asked := func(at time.Time) {
 		t.Helper()
-		if _, err := store.RecordEvent(NewEvent{SessionID: "s", Kind: session.EventBell, Summary: "bell", At: at}); err != nil {
+		if _, err := store.RecordEvent(NewEvent{SessionID: "s", Kind: session.EventBlocked, Summary: "asked", At: at}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// Times that only differ in their fractional seconds, which the
 	// stored text drops trailing zeros from, still order correctly.
 	looked := time.Date(2026, 10, 4, 2, 0, 5, 500_000_000, time.UTC)
-	bell(looked.Add(-400 * time.Millisecond)) // 05.1
-	bell(looked.Add(10 * time.Microsecond))   // 05.50001, after the client looked
+	asked(looked.Add(-400 * time.Millisecond)) // 05.1
+	asked(looked.Add(10 * time.Microsecond))   // 05.50001, after the client looked
 	if changed, err := store.AcknowledgeBefore("s", "seen", looked); err != nil || changed {
 		t.Fatalf("acknowledged attention raised later: %v %v", changed, err)
 	}

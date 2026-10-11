@@ -164,9 +164,10 @@ func TestDaemonRecordsWorkerLossAndRecovery(t *testing.T) {
 	}
 }
 
-// The worker reads attention signals from the PTY: a bell, and an OSC 9
-// notification whose BEL terminator is not a bell.
-func TestBellAndNotificationRaiseAttention(t *testing.T) {
+// The worker reads the program's word from the PTY: a status report raises
+// attention; a bell and an OSC 9 notification are recorded as information
+// only, raising nothing.
+func TestStatusReportsRaiseAttention(t *testing.T) {
 	h := newHarness(t)
 	id := h.mustCreate("asks")
 	sub := h.subscribe(&protocol.SubscribeEvents{SessionID: &id, Tail: 10})
@@ -176,16 +177,20 @@ func TestBellAndNotificationRaiseAttention(t *testing.T) {
 
 	h.sendInput(id, "\x1b]9;Claude needs your permission\x07\n")
 	ev := sub.next()
-	if ev.Kind != session.EventNotification || ev.Attention != session.AttentionAction || ev.Summary != "Claude needs your permission" {
+	if ev.Kind != session.EventNotification || ev.Attention != session.AttentionInfo || ev.Summary != "Claude needs your permission" {
 		t.Fatalf("notification = %#v", ev)
 	}
-	if rec := h.session(id); rec.Attention != session.AttentionAction || rec.AttentionSummary == nil || *rec.AttentionSummary != "Claude needs your permission" {
-		t.Fatalf("record = %s %v", rec.Attention, rec.AttentionSummary)
+	if rec := h.session(id); rec.Attention != session.AttentionInfo {
+		t.Fatalf("a notification raised attention: %s", rec.Attention)
 	}
 
-	h.sendInput(id, "\a\n")
-	if ev := sub.next(); ev.Kind != session.EventBell || ev.Attention != session.AttentionAction {
-		t.Fatalf("bell = %#v", ev)
+	h.sendInput(id, "block\n")
+	ev = sub.until(session.EventBlocked)[0]
+	if ev.Attention != session.AttentionAction || ev.Summary != "permission: Deploy?" {
+		t.Fatalf("blocked = %#v", ev)
+	}
+	if rec := h.session(id); rec.Attention != session.AttentionAction || rec.AttentionSummary == nil || *rec.AttentionSummary != "permission: Deploy?" {
+		t.Fatalf("record = %s %v", rec.Attention, rec.AttentionSummary)
 	}
 
 	// The control stream carries the session's activity to clients that
@@ -203,7 +208,7 @@ func TestBellAndNotificationRaiseAttention(t *testing.T) {
 	})
 	// /bin/sh is bash or dash on some systems.
 	fg := *rec.Foreground
-	if rec.Activity != session.ActivityWaiting || (fg != "sh" && fg != "bash" && fg != "dash") ||
+	if rec.Activity != session.ActivityBlocked || (fg != "sh" && fg != "bash" && fg != "dash") ||
 		rec.AttentionAt == nil || rec.LastOutputAt == nil {
 		t.Fatalf("session over control = %#v (foreground %q)", rec, fg)
 	}
@@ -212,8 +217,8 @@ func TestBellAndNotificationRaiseAttention(t *testing.T) {
 func TestAttachAcknowledgesAttention(t *testing.T) {
 	h := newHarness(t)
 	id := h.mustCreate("seen")
-	h.sendInput(id, "\a\n")
-	h.waitEvent(id, session.EventBell)
+	h.sendInput(id, "block\n")
+	h.waitEvent(id, session.EventBlocked)
 	if rec := h.session(id); rec.Attention != session.AttentionAction {
 		t.Fatalf("attention before attach = %s", rec.Attention)
 	}
@@ -228,10 +233,10 @@ func TestAttachAcknowledgesAttention(t *testing.T) {
 		t.Fatalf("ack = %#v", ack)
 	}
 
-	// While attached the bell still raises attention (the client may be in
-	// a background tab); detaching acknowledges it.
-	c.input("\a\n")
-	h.eventually("a second bell", func() bool { return h.session(id).Attention == session.AttentionAction })
+	// While attached the program finishing still raises attention (the
+	// client may be in a background tab); detaching acknowledges it.
+	c.input("finish\n")
+	h.eventually("the done report", func() bool { return h.session(id).Attention == session.AttentionNotice })
 	c.conn.Close()
 	h.eventually("detach to acknowledge", func() bool { return h.session(id).Attention == session.AttentionInfo })
 

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/robmorgan/agentd/internal/db"
 	"github.com/robmorgan/agentd/internal/protocol"
 	"github.com/robmorgan/agentd/internal/session"
 )
@@ -146,6 +147,52 @@ func TestLiveHandoffKeepsTheSession(t *testing.T) {
 	if hist := h.history(id); !strings.Contains(hist, "got:before") || !strings.Contains(hist, "got:after") {
 		t.Fatalf("history = %q", hist)
 	}
+}
+
+// A blocked program status record (OSC 7501) crosses the handoff: the
+// program will not re-report it to the new image, so losing it would
+// silently un-block the session. The harness's raw requests negotiate no
+// capabilities, so the activity is read from state.db, where the worker
+// records it.
+func TestHandoffKeepsProgramStatus(t *testing.T) {
+	h := newHarness(t)
+	store, err := db.Open(h.paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := h.mustCreate("status")
+	activity := func() session.Activity {
+		rec, err := store.GetSession(id)
+		if err != nil || rec == nil {
+			t.Fatalf("session: %v %v", rec, err)
+		}
+		return rec.Activity
+	}
+	c := h.attachRestartable(id)
+	c.input("block\n")
+	h.eventually("blocked activity", func() bool { return activity() == session.ActivityBlocked })
+
+	results := h.handoff(nextBinary(t))
+	if len(results) != 1 || results[0].HandedOff == nil {
+		t.Fatalf("handoff results = %+v", results)
+	}
+	c.expectRestarting()
+
+	rec := h.session(id)
+	if rec.Status != session.StatusRunning {
+		t.Fatalf("after handoff: %+v\n%s", rec, workerLog(h, id))
+	}
+	if got := activity(); got != session.ActivityBlocked {
+		t.Fatalf("activity after handoff = %q, want blocked\n%s", got, workerLog(h, id))
+	}
+	// (The attention raised by the block was acknowledged when the
+	// attachment ended with the handoff: the user was watching.)
+
+	// Typing still answers the restored record.
+	c2 := h.attachRestartable(id)
+	c2.input("answered\n")
+	c2.expectOutput("got:answered")
+	h.eventually("the block answered", func() bool { return activity() == session.ActivityWorking })
 }
 
 func deref(s *string) string {

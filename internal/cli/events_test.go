@@ -87,6 +87,14 @@ func TestAlertBytes(t *testing.T) {
 	if !strings.HasPrefix(got, "\a\x1bPtmux;\x1b\x1b]9;") || !strings.HasSuffix(got, "\x1b\x1b\\\x1b\\") {
 		t.Fatalf("tmux: %q", got)
 	}
+	// Value: protects=invisible format characters (unicode.Cf) becoming
+	// spaces in OSC notification text, so a summary cannot reorder or
+	// hide what the desktop notification appears to say; fails_when=
+	// oscText drops its unicode.Cf arm; why_new=the cases above cover
+	// only C0/C1 controls; seam=none
+	if got := oscText("a‮b​c"); got != "a b c" {
+		t.Fatalf("oscText kept format characters: %q", got)
+	}
 }
 
 func TestParseLevel(t *testing.T) {

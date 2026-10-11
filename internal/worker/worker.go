@@ -308,6 +308,7 @@ func newOwnerState(sessionID string, ptmx *os.File, terminal *terminalState) *ow
 		attachments: make(map[string]*ownerAttachment),
 		output:      newBroadcaster(),
 		input:       newPTYInput(ptmx),
+		status:      newStatusTracker(),
 		restart:     make(chan struct{}),
 	}
 }
@@ -348,8 +349,12 @@ func (rt *runtime) run(state *ownerState, ready func()) error {
 	}
 	go rt.watchAgent()
 	// Drives activity detection (idleness, stalls, the foreground
-	// process) until the session ends.
+	// process) until the session ends. run waits for it before returning,
+	// so nothing of the worker reads the tick settings afterwards (tests
+	// restore them between workers).
+	tickerDone := make(chan struct{})
 	go func() {
+		defer close(tickerDone)
 		ticker := time.NewTicker(activityTick)
 		defer ticker.Stop()
 		for {
@@ -398,6 +403,7 @@ func (rt *runtime) run(state *ownerState, ready func()) error {
 	rt.handlers.waitIdle(shutdownGrace)
 	rt.owner.stop()
 	<-ownerDone
+	<-tickerDone
 	if rt.pump != nil {
 		rt.pump.stop()
 	}

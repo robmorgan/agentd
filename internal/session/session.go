@@ -88,6 +88,21 @@ type Record struct {
 	// AttentionAt is when the current attention was raised; nil when
 	// nothing is pending.
 	AttentionAt *time.Time
+
+	// The fields below are what the program itself last reported through
+	// the program status protocol (OSC 7501); all nil for one that does
+	// not report. They travel only to clients that negotiated
+	// protocol.CapSessionStatus.
+
+	// StatusApp is the program's stable name for itself ("claude-code").
+	StatusApp *string
+	// StatusKind is why the program is blocked: "permission", "question"
+	// or "auth". Only with ActivityBlocked, and not always then.
+	StatusKind *string
+	// StatusMsg is the program's one-line message: untrusted program text.
+	StatusMsg *string
+	// StatusProgress is how much of the work is done, 0-100.
+	StatusProgress *int
 }
 
 // Workspace names a directory on the daemon's machine, so clients can start

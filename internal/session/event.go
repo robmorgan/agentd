@@ -1,7 +1,6 @@
 package session
 
 import (
-	"fmt"
 	"time"
 )
 
@@ -43,21 +42,36 @@ const (
 	// EventRecovered: a starting daemon found the session's worker still
 	// running and took it over again (info).
 	EventRecovered EventKind = "recovered"
-	// EventBell: the program rang the terminal bell (BEL), which agents do
-	// when they wait for the user (action). Rate-limited.
+	// EventBell: the program rang the terminal bell (BEL). Recorded for
+	// observability only (info), rate-limited; what a program needs is
+	// said by its status reports.
 	EventBell EventKind = "bell"
 	// EventNotification: the program asked the terminal for a desktop
-	// notification (OSC 9 or OSC 777); the summary is its text (action).
+	// notification (OSC 9 or OSC 777); the summary is its text.
+	// Observability only (info), like the bell.
 	EventNotification EventKind = "notification"
-	// EventIdle: output stopped after a period of activity, typically an
-	// agent finishing its turn (notice; info while a client is attached,
-	// since someone is watching).
+	// EventIdle: the program reported it is waiting for the user to say
+	// what to do next (OSC 7501 state=idle) (notice; info while a client
+	// is attached, since someone is watching).
 	EventIdle EventKind = "idle"
-	// EventWorking: output resumed after an idle event (info).
+	// EventWorking: the program reported it is busy again (OSC 7501
+	// state=working) (info).
 	EventWorking EventKind = "working"
 	// EventStalled: no output for a long time while a command other than
-	// the agent holds the terminal's foreground (notice).
+	// the agent holds the terminal's foreground and nothing reports
+	// status (notice).
 	EventStalled EventKind = "stalled"
+	// EventBlocked: the program reported it cannot proceed without the
+	// user (OSC 7501 state=blocked); the summary carries the kind of
+	// block (permission, question, auth) and the program's message
+	// (action).
+	EventBlocked EventKind = "blocked"
+	// EventDone: the program reported it finished and the result has not
+	// been looked at (OSC 7501 state=done) (notice).
+	EventDone EventKind = "done"
+	// EventError: the program reported it failed and stopped
+	// (OSC 7501 state=error) (action).
+	EventError EventKind = "error"
 	// EventAcknowledged: the user looked at the session, clearing its
 	// attention (info).
 	EventAcknowledged EventKind = "acknowledged"
@@ -67,9 +81,9 @@ const (
 // with, unless the producer has a reason to differ (see EventIdle).
 func (k EventKind) DefaultAttention() AttentionLevel {
 	switch k {
-	case EventFailed, EventWorkerLost, EventBell, EventNotification:
+	case EventFailed, EventWorkerLost, EventBlocked, EventError:
 		return AttentionAction
-	case EventExited, EventIdle, EventStalled:
+	case EventExited, EventIdle, EventStalled, EventDone:
 		return AttentionNotice
 	}
 	return AttentionInfo
@@ -102,28 +116,35 @@ func (a AttentionLevel) Rank() int {
 
 // Activity is what a live session's agent appears to be doing, judged by
 // its worker from the PTY stream. The worker records it only when it
-// changes.
+// changes. Activities are free strings in state.db and on the wire: a
+// daemon or client older than a session's worker shows an activity it
+// does not know rather than failing to read the session.
 type Activity string
 
 const (
 	// ActivityUnknown: nothing reported (an older worker, or a session
 	// that never ran).
 	ActivityUnknown Activity = ""
-	// ActivityWorking: the program wrote output recently.
+	// ActivityWorking: the program reported it is busy, or runs without
+	// reporting status at all (agentd attaches no judgment to a program
+	// that does not speak OSC 7501).
 	ActivityWorking Activity = "working"
-	// ActivityIdle: no output for a while (10 seconds by default).
+	// ActivityIdle: the program reported it is waiting for the user to
+	// say what to do next (OSC 7501 state=idle).
 	ActivityIdle Activity = "idle"
-	// ActivityWaiting: the program rang the bell or sent a notification
-	// and nobody has typed into the session since.
+	// ActivityWaiting: historical (sessions written by workers that still
+	// inferred waiting from bells); kept so their rows read and display.
 	ActivityWaiting Activity = "waiting"
+	// ActivityBlocked: the program reported it cannot proceed without the
+	// user (OSC 7501 state=blocked).
+	ActivityBlocked Activity = "blocked"
+	// ActivityDone: the program reported it finished (OSC 7501
+	// state=done).
+	ActivityDone Activity = "done"
+	// ActivityError: the program reported it failed and stopped
+	// (OSC 7501 state=error).
+	ActivityError Activity = "error"
 	// ActivityExited: the agent is no longer running.
 	ActivityExited Activity = "exited"
 )
 
-func ParseActivity(v string) (Activity, error) {
-	switch Activity(v) {
-	case ActivityUnknown, ActivityWorking, ActivityIdle, ActivityWaiting, ActivityExited:
-		return Activity(v), nil
-	}
-	return "", fmt.Errorf("unknown session activity %q", v)
-}

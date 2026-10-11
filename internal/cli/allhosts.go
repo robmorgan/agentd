@@ -105,6 +105,10 @@ type sessionJSON struct {
 	Agent     string     `json:"agent"`
 	Status    string     `json:"status"`
 	Activity  string     `json:"activity,omitempty"`
+	StatusApp string     `json:"status_app,omitempty"`
+	Kind      string     `json:"status_kind,omitempty"`
+	Msg       string     `json:"status_msg,omitempty"`
+	Progress  *int       `json:"status_progress,omitempty"`
 	Attention string     `json:"attention"`
 	Summary   string     `json:"attention_summary,omitempty"`
 	Cwd       string     `json:"cwd"`
@@ -131,6 +135,16 @@ func writeSessionsJSON(w io.Writer, sessions []hostSession) error {
 		if s.rec.AttentionSummary != nil && s.rec.Attention.Rank() > 0 {
 			v.Summary = *s.rec.AttentionSummary
 		}
+		if s.rec.StatusApp != nil {
+			v.StatusApp = *s.rec.StatusApp
+		}
+		if s.rec.StatusKind != nil {
+			v.Kind = *s.rec.StatusKind
+		}
+		if s.rec.StatusMsg != nil {
+			v.Msg = *s.rec.StatusMsg
+		}
+		v.Progress = s.rec.StatusProgress
 		if s.rec.Workspace != nil {
 			v.Workspace = *s.rec.Workspace
 		}

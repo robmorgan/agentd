@@ -847,6 +847,13 @@ agent appears stalled
 ## Deliverables
 
 * [x] Formalize attention events (`session.Event`: lifecycle, bell, notification, idle, stalled, acknowledged)
+* [x] Read program status reports (OSC 7501) as the primary activity source: the program's own
+      `working`/`blocked`/`done`/`error` (with kind, message and progress) decides activity and
+      attention, with the bell/notification/idle heuristics as the fallback for programs that do
+      not report; records survive worker handoffs, and the fields reach clients under
+      `CapSessionStatus` (`agent ls`, `agent status`, `agent ls --json`)
+    * Deferred: mapping ConEmu progress (OSC 9;4) to a synthetic record until a native report
+      arrives; listing a program's full record tree (ids) in `agent status`
 * [x] Add event persistence (`events` in `state.db`, newest 500 per session)
 * [x] Surface attention in CLI (`agent ls`, `agent status`, `agent events`)
 * [x] Surface attention in TUI (picker and `Ctrl-Y` switcher order and mark sessions needing action)

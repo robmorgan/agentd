@@ -144,12 +144,19 @@ func (d *Database) AcknowledgeBefore(sessionID, summary string, before time.Time
 		sessionID, before.UTC().Format(rfc3339))
 }
 
-// Activity is what a worker reports about its running session.
+// Activity is what a worker reports about its running session. The Status
+// fields are what the program itself reported through the program status
+// protocol (OSC 7501), empty (progress -1) for one that does not report.
 type Activity struct {
 	Activity     session.Activity
 	Foreground   string
 	Title        string
 	LastOutputAt time.Time
+
+	StatusApp      string
+	StatusKind     string
+	StatusMsg      string
+	StatusProgress int
 }
 
 // SetActivity records a running session's activity. Keyed on the worker's
@@ -167,9 +174,23 @@ func (d *Database) SetActivity(sessionID string, workerPID int, a Activity) erro
 	if a.Title != "" {
 		title = a.Title
 	}
-	return d.exec(`UPDATE sessions SET activity = ?3, foreground = ?4, title = ?5, last_output_at = ?6
+	var app, kind, msg, progress any
+	if a.StatusApp != "" {
+		app = a.StatusApp
+	}
+	if a.StatusKind != "" {
+		kind = a.StatusKind
+	}
+	if a.StatusMsg != "" {
+		msg = a.StatusMsg
+	}
+	if a.StatusProgress >= 0 {
+		progress = a.StatusProgress
+	}
+	return d.exec(`UPDATE sessions SET activity = ?3, foreground = ?4, title = ?5, last_output_at = ?6,
+                 status_app = ?7, status_kind = ?8, status_msg = ?9, status_progress = ?10
              WHERE session_id = ?1 AND worker_pid = ?2 AND status = 'running'`,
-		sessionID, workerPID, string(a.Activity), fg, title, lastOutput)
+		sessionID, workerPID, string(a.Activity), fg, title, lastOutput, app, kind, msg, progress)
 }
 
 // LastEventID is the id of the newest event ever recorded (0 if none). It

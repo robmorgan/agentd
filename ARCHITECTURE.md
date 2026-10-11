@@ -168,6 +168,17 @@ state, attention); the live PTY, agent process and terminal state live in the se
 | Upgrade without handoff (the handoff was refused or failed before the exec) | The session, unchanged, on its previous binary | Attachments, if the failure came after clients were told to restart (they reattach to the same worker) | Nothing to reconcile; `agentd upgrade` names the session and the reason |
 | New image dies after the exec | Metadata | The session, as for a worker crash | As for a worker crash; `agentd upgrade` reports the session as lost |
 
+**Downgrades are one-way past a schema bump.** A binary older than `state.db`'s version refuses
+to open it (remove the runtime root to start fresh), and whichever process opens the database
+first — the daemon, a worker, even `agentd bench` — migrates it. Two subtler costs of rolling
+back a binary across the program status release (schema v6): a pre-v6 daemon still parses
+activities strictly, so running workers writing the new words (`blocked`, `done`, `error`) make
+it fail to read those sessions at all, not just miss their status fields; and a live handoff to
+a pre-status image silently drops the program status records (the old image ignores the unknown
+handoff field), so a blocked agent reads as whatever the old image's heuristics make of it until
+it reports again — nothing is corrupted, but the program's word is lost. Roll workers and daemon back
+together, or not at all.
+
 Tests: `TestSessionSurvivesDaemonRestart`, `TestDaemonSIGKILLWithLiveSessions`,
 `TestCrashDuringCreate`, `TestWorkerSIGKILLHangsUpTheAgent`, `TestWorkerLostWhileDaemonDown`,
 `TestRecycledPidsAreNeverSignalled` and the handoff tests in `internal/daemon` (all against real
@@ -452,9 +463,11 @@ features both listed. Today there is one protocol version (1), and these capabil
 | `daemon-id` | the daemon's id appended to `Welcome` |
 | `events` | events streams (`SubscribeEvents`), `ListEvents` |
 | `session-activity` | the activity fields appended to session records (after the UID): activity, foreground command, title, last output and attention times |
+| `session-status` | the program status fields (OSC 7501) appended to session records after the `session-activity` fields: app, kind of block, message and progress |
 | `session-restart` | attach stream: the worker may end it with `SessionRestarting` when it restarts for a live handoff |
 | `worker-handoff` | `HandoffSession` and `HandedOff`, between agentd and a session worker only (a worker lists it in its answer to `Hello`) |
 | `terminal-memory` | the shadow terminal's memory appended to `SessionStats` |
+| `attach-scrollback` | attach stream: `AttachSession.ScrollbackRows` caps the scrollback in the attach snapshot (see "Bounded scrollback") |
 
 The protocol grows without breaking older peers this way: a new message kind, or a field appended
 to the end of an existing message or struct (a session record, even inside a list), comes with a
@@ -466,7 +479,8 @@ silently misread. Changing an existing encoding needs a new protocol version.
 
 Attach streams have no `Hello`, so `AttachSession` carries their handshake: when the daemon's
 `Welcome` listed `attach-features`, the CLI appends the attach-stream capabilities it wants that the
-daemon also listed (`session-uid`, `attach-replace`, `attach-resync`, `session-restart`), followed by the fields of the
+daemon also listed (`session-uid`, `attach-replace`, `attach-resync`, `session-restart`,
+`attach-scrollback`), followed by the fields of the
 ones listed. The daemon cuts the list down to what the session's worker supports (it asks the worker
 with a `Hello` on the worker socket; a worker started by an older daemon build may support fewer,
 and one from before attach features supports none), and the worker's `Attached` echoes the list in
@@ -539,14 +553,52 @@ happened to a session: an id, the session, a time, a kind, an attention level (`
 | `failed` | action | the worker or daemon, when the session fails to start or the agent exits non-zero |
 | `worker_lost` | action | the daemon, when a worker died without recording an outcome |
 | `recovered` | info | a starting daemon, for each session whose worker kept running |
-| `bell` | action | the worker, when the program rings the bell |
-| `notification` | action | the worker, for a desktop notification (OSC 9, OSC 777); the summary is its text |
-| `idle` | notice (info while a client is attached) | the worker, when output stops for 10s after activity |
-| `working` | info | the worker, when output resumes after an idle event |
-| `stalled` | notice | the worker, after 30 minutes without output while a command other than the agent holds the PTY's foreground |
+| `bell` | info | the worker, when the program rings the bell (observability only; never raises attention) |
+| `notification` | info | the worker, for a desktop notification (OSC 9, OSC 777); the summary is its text (observability only) |
+| `idle` | notice (info while a client is attached) | the worker, when the program reports it awaits the user's direction (OSC 7501) |
+| `working` | info | the worker, when the program reports it is busy again (OSC 7501) |
+| `stalled` | notice | the worker, after 30 minutes without output while a command other than the agent holds the PTY's foreground and nothing reports status |
+| `blocked` | action | the worker, when the program reports it cannot proceed without the user (OSC 7501); the summary is the kind of block and the program's message |
+| `done` | notice | the worker, when the program reports it finished (OSC 7501) |
+| `error` | action | the worker, when the program reports it failed and stopped (OSC 7501) |
 | `acknowledged` | info | the daemon, when the user looked at the session (below) |
 
 Kinds travel as strings, so a client shows kinds newer than itself instead of failing to decode them.
+
+**Program status (OSC 7501) is the primary source.** A program that speaks the [program status
+protocol](https://www.superlogical.com/rex/docs/build/program-status) reports what it is doing
+directly: `idle`, `working` (with progress), `blocked` (with why: `permission`, `question`,
+`auth`), `done` or `error`, with an `app` name, a one-line message, and hierarchical record ids
+for programs doing several things at once. libghostty validates and parses the reports; the worker
+keeps the records (`internal/worker/status.go`) under the specification's rules: a report replaces
+its record whole, `clear` removes a record and its descendants (or everything), a new shell prompt
+(OSC 133 A) drops `working`, `blocked` and `idle` records (that program is over; an idle record
+left behind would pin the session while the next, possibly non-reporting, command runs), `done`
+and `error` records stay until the user has seen them — typing into the session or attaching to
+look at it (a reattach that replaces a lost connection is the CLI reconnecting by itself, so it
+does not count) — a full reset removes all, and at most 256 are kept, evicting the least recently
+updated. Reports and prompt starts are applied in stream order, so a report arriving after a
+prompt in the same coalesced PTY read belongs to the next command and survives it. The records survive a live worker handoff (they travel
+in `handoffState`, states as the specification's words): a blocked agent must stay blocked across
+an upgrade, since the program will not re-report on its own. The event dedup memory rides along,
+so the new image neither re-alerts a question the user already saw nor loses one the rate limit
+had deferred at handoff time.
+
+While any records exist, they decide the session's activity: the state that needs the user most
+wins (`blocked` > `error` > `working` > `done` > `idle`), so one blocked shard of a parallel
+program blocks the session and one still working keeps it working however many are done.
+Transitions record the events above (repeats within 10 seconds are dropped; a blocked program
+asking something new re-raises). Typing into the session counts a blocked record as answered —
+silently — until the program reports again. There is no inferred state: a session whose program
+never reports shows as plainly `working` while it runs, with no judgment attached. Bells and
+desktop notifications are recorded as info-level events for observability only (facts about what
+the terminal emitted, useful when a reporter misbehaves), and never raise attention; the bell/
+notification-to-waiting and output-timing-to-idle heuristics that predated the protocol were
+removed once Claude Code adopted it. The worker answers the protocol's detection query
+(`ESC ] 7501 ; ?`, echoed back) whether or not a client is attached, since it consumes the reports
+itself; the identical reply of a client terminal that also supports the protocol is dropped from
+the input, since the worker has already answered and a terminal's reflex must not count as the
+user typing.
 
 **Persistence.** Events are rows of the `events` table in `state.db`, written by the daemon and
 the workers. Ids come from `AUTOINCREMENT`, so they increase per runtime root and are never reused;
@@ -564,31 +616,43 @@ replace the attention instead, since an agent that has stopped is no longer wait
 asked. Acknowledging resets the attention to info and records an `acknowledged` event, if there was
 anything to clear. Attaching interactively (`attach`, or focusing a session in the picker)
 acknowledges, and so does detaching from a session that is still running: either way the user has
-seen its screen. The daemon writes an attach's acknowledgement beside the attach rather than
+seen its screen. A reattach that replaces a lost attachment is the exception: the CLI reconnected
+by itself, no one looked, so attention raised while the connection was down stays pending. The
+daemon writes an attach's acknowledgement beside the attach rather than
 before relaying it, so attaching never waits on the database; it only clears attention raised
 before the attach began (`db.AcknowledgeBefore`), so a session that fails at once keeps its
 attention. An attachment that ends because the session ended does not, and output reaching
 an attached client does not either, since an attached terminal may be a background tab. An ended
 session's attention stays until it is removed.
 
-**Activity.** The worker also keeps the session's `activity` (`working`; `idle` after 10 seconds
-without output; `waiting` after a bell or notification, until someone types; `exited`), the name of
-the process in the PTY's foreground (`tcgetpgrp` on the master, sampled every second: the agent
-itself, or a command a shell runs there under job control), the terminal title, and when the program
-last wrote output. It writes them on transitions only, never per output chunk, and never bumps
-`updated_at`, so lists do not reshuffle as agents go idle and back. Elapsed time is derived from
-`created_at` and `exited_at`.
+**Activity.** The worker also keeps the session's `activity`: what the program reports (`working`,
+`blocked`, `done`, `error`, `idle`), plain `working` for one that does not report (no judgment is
+attached), and `exited` once the agent is gone (`waiting` appears only in rows written by older
+workers that still inferred it from bells). Alongside it: the program's reported app name, kind of
+block, message and progress (`status_app`, `status_kind`, `status_msg`, `status_progress`, NULL
+for a program that does not report), the name of the process in the PTY's foreground (`tcgetpgrp`
+on the master, sampled every second: the agent itself, or a command a shell runs there under job
+control), the terminal title, and when the program last wrote output. It writes them on report
+transitions, title and foreground changes only, never per output chunk, and never bumps
+`updated_at`, so lists do not reshuffle as agents report and resume. (`last_output_at` is as
+fresh as the latest such write.) Elapsed time is derived from `created_at` and `exited_at`. The
+status fields travel to clients under their own capability (`CapSessionStatus`), appended after
+the `CapSessionActivity` fields in session records.
 
-**Detection.** Bells, desktop notifications (OSC 9 and OSC 777) and title changes come from
-libghostty's parser, through its effect callbacks, out of the `VTWrite` the worker already makes
-for each PTY read; the added cost per chunk is a clock read. The owner goroutine never touches the
-database for this: events and activity go to a recorder goroutine through a queue of at most 64
-events (dropped, and logged, while it is full) and a single activity slot (a newer snapshot
-replaces an unwritten one). Noise is bounded: a bell is recorded unless another was seen in the
-last 10 seconds with no input since, so a program ringing in a loop records one event; a repeated
-notification text likewise; a bell within 2 seconds of a notification is the same request; and
-idle events are at most one per 30 seconds. OSC 99 (kitty's notification protocol) is not parsed
-by libghostty and is not detected.
+**Detection.** Program status reports, bells, desktop notifications (OSC 9 and OSC 777), shell
+prompts (OSC 133) and title changes come from libghostty's parser, through its effect callbacks,
+out of the `VTWrite` the worker already makes for each PTY read; the added cost per chunk is a
+clock read. The owner goroutine never touches the database for this: events and activity go to a
+recorder goroutine through a queue of at most 64 events (dropped, and logged, while it is full)
+and a single activity slot (a newer snapshot replaces an unwritten one). Noise is bounded: a bell
+is recorded unless another was seen in the last 10 seconds with no input since, so a program
+ringing in a loop records one event; a repeated notification text likewise; a bell within 2
+seconds of a notification is the same request; and a program flipping between the same reported
+states gains nothing within 10 seconds. The status
+reports of one feed are not capped (replaying them into the record store needs them all, and a
+report costs the program at least its own sequence bytes of output), while notifications are kept
+to 4 per feed. OSC 99 (kitty's notification protocol) is not parsed by libghostty and is not
+detected.
 
 **Events streams.** `SubscribeEvents{AfterID, SessionID, Tail}` opens an events stream: the daemon
 sends every retained event after `AfterID` (or, without it, the newest `Tail` events), then new
@@ -920,7 +984,7 @@ The selected root contains:
 * `agentd.sock`
 * `agentd.lock` (held by the running daemon)
 * `agentd.pid` (informational)
-* `state.db` (schema v5; older versions are migrated forward, newer ones refused. Migrations
+* `state.db` (schema v6; older versions are migrated forward, newer ones refused. Migrations
   must be additive, because session workers keep writing to the file across daemon upgrades), and
   its `state.db-wal` and `state.db-shm`: the daemon and every worker share it, so it uses
   write-ahead logging, where reads never wait for writes, and each process keeps a connection open

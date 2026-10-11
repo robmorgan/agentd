@@ -107,6 +107,10 @@ type handoffState struct {
 
 	Terminal terminalHandoff
 	Geometry protocol.Geometry
+	// Status carries the program status records (OSC 7501): a blocked
+	// agent must stay blocked across a handoff, since the program will
+	// not re-report on its own. Nil from an older image.
+	Status *statusHandoff
 
 	// Inherited descriptors.
 	PTYFD      int
@@ -220,6 +224,10 @@ func (rt *runtime) tryHandoff(req *handoffRequest, state *ownerState) (err error
 			StartedAt: rt.startedAt,
 			Terminal:  *term,
 			Geometry:  s.geometry,
+			Status:    s.status.handoff(),
+		}
+		if s.activity != nil {
+			s.activity.exportAlertMemory(st.Status)
 		}
 		return nil
 	}); err != nil {
@@ -475,9 +483,16 @@ func resumeRuntime(st *handoffState) (*runtime, *ownerState, error) {
 		rt.terminateAgent()
 	}
 	state := newOwnerState(st.Args.SessionID, ptmx, terminal)
-	// What the agent was doing (idle, stalled) is not carried over: the
-	// tracker starts afresh, as for a new attachment of interest.
+	// What the heuristics judged (idle, stalled) is not carried over: that
+	// tracker starts afresh, as for a new attachment of interest. The
+	// program status records are: the program will not re-report them.
 	state.activity = newActivityTracker(rt.recorder, st.AgentPID, time.Now())
+	state.status = restoreStatusTracker(st.Status)
+	state.activity.setNative(time.Now(), state.status.derive(), false, false)
+	// The previous image's alert memory comes along: an already-alerted
+	// question stays quiet, and one its rate floor had deferred still
+	// differs from the memory, so the tick retry records it here.
+	state.activity.restoreAlertMemory(st.Status)
 	state.owner = rt.owner
 	state.geometry = st.Geometry
 	return rt, state, nil

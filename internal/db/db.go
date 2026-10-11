@@ -22,10 +22,11 @@ import (
 // CurrentSchemaVersion 2 added workspaces (the table and sessions.workspace),
 // 3 the git base a session started from (sessions.git_base and
 // git_base_branch), 4 session UIDs, create tokens and attach sequence
-// numbers, 5 the events table and the sessions' live activity columns.
+// numbers, 5 the events table and the sessions' live activity columns, 6
+// the program status columns (OSC 7501).
 // Changes must be additive, applied by migrate: session workers open the
 // database once at startup and keep writing to it across daemon upgrades.
-const CurrentSchemaVersion = 5
+const CurrentSchemaVersion = 6
 
 // rfc3339 matches chrono's `to_rfc3339()` for UTC values (a `+00:00` offset,
 // fractional seconds only when non-zero), which is what the CLI parses.
@@ -100,8 +101,19 @@ CREATE TABLE events (
 );
 CREATE INDEX events_by_session ON events (session_id, id);`
 
+// Version 6: what the program itself last reported through the program
+// status protocol (OSC 7501), recorded along with activity changes: its
+// name, why it is blocked (permission, question, auth), its one-line
+// message, and its progress (0-100). All NULL for a program that does not
+// report.
+const migrateToV6 = `
+ALTER TABLE sessions ADD COLUMN status_app TEXT;
+ALTER TABLE sessions ADD COLUMN status_kind TEXT;
+ALTER TABLE sessions ADD COLUMN status_msg TEXT;
+ALTER TABLE sessions ADD COLUMN status_progress INTEGER;`
+
 // migrations[v] upgrades a database from version v+1 to v+2.
-var migrations = []string{migrateToV2, migrateToV3, migrateToV4, migrateToV5}
+var migrations = []string{migrateToV2, migrateToV3, migrateToV4, migrateToV5, migrateToV6}
 
 type Database struct {
 	path string
@@ -492,9 +504,12 @@ type ending struct {
 func (d *Database) end(sessionID string, e ending) error {
 	at := now()
 	level := e.kind.DefaultAttention()
+	// The program status columns go with the agent: an ended session
+	// carries no live program status, however it ended.
 	query := `UPDATE sessions SET status = ?2, worker_pid = NULL, agent_pid = NULL,
                  attention = ?3, attention_summary = ?4, attention_at = ?5, updated_at = ?5,
-                 activity = 'exited'` + e.set + " WHERE session_id = ?1" + e.where
+                 activity = 'exited',
+                 status_app = NULL, status_kind = NULL, status_msg = NULL, status_progress = NULL` + e.set + " WHERE session_id = ?1" + e.where
 	_, err := d.transition(NewEvent{SessionID: sessionID, Kind: e.kind, Attention: level, Summary: e.summary},
 		query, append([]any{sessionID, string(e.status), string(level), e.summary, at}, e.args...)...)
 	return err
@@ -620,7 +635,8 @@ func (d *Database) DeleteSession(sessionID string) error {
 
 const selectSession = `SELECT session_id, agent, model, mode, cwd, status, worker_pid, agent_pid, exit_code, error,
         attention, attention_summary, created_at, updated_at, exited_at, workspace, uid,
-        activity, foreground, title, last_output_at, attention_at
+        activity, foreground, title, last_output_at, attention_at,
+        status_app, status_kind, status_msg, status_progress
  FROM sessions`
 
 // GetSession returns nil, nil when the session does not exist.
@@ -674,15 +690,25 @@ func scanSession(row scanner) (*session.Record, error) {
 		createdAt, updatedAt              string
 		activity, foreground, title       sql.NullString
 		lastOutputAt, attentionAt         sql.NullString
+		statusApp, statusKind, statusMsg  sql.NullString
+		statusProgress                    sql.NullInt64
 	)
 	if err := row.Scan(&rec.SessionID, &rec.Agent, &model, &mode, &rec.Cwd, &status,
 		&workerPID, &agentPID, &exitCode, &errText, &attention, &summary, &createdAt, &updatedAt,
-		&exitedAt, &workspace, &uid, &activity, &foreground, &title, &lastOutputAt, &attentionAt); err != nil {
+		&exitedAt, &workspace, &uid, &activity, &foreground, &title, &lastOutputAt, &attentionAt,
+		&statusApp, &statusKind, &statusMsg, &statusProgress); err != nil {
 		return nil, err
 	}
 	var err error
-	if rec.Activity, err = session.ParseActivity(activity.String); err != nil {
-		return nil, err
+	// Any activity string is accepted: a newer worker may record values
+	// this build does not know.
+	rec.Activity = session.Activity(activity.String)
+	rec.StatusApp = nullStr(statusApp)
+	rec.StatusKind = nullStr(statusKind)
+	rec.StatusMsg = nullStr(statusMsg)
+	if statusProgress.Valid {
+		v := int(statusProgress.Int64)
+		rec.StatusProgress = &v
 	}
 	rec.Foreground = nullStr(foreground)
 	rec.Title = nullStr(title)

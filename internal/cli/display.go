@@ -77,9 +77,10 @@ func buildDisplayRow(s *session.Record, now time.Time) displayRow {
 	return row
 }
 
-// activityText is what a session is doing, for lists: "working", "idle 5m"
-// (since its last output), "waiting", or for one that is not running its
-// state.
+// activityText is what a session is doing, for lists: "working" (with the
+// progress the program reported, if any), "idle 5m" (since its last
+// output), "waiting" or "blocked" (since they asked), or for one that is
+// not running its state.
 func activityText(s *session.Record, now time.Time) string {
 	switch sessionRunState(s) {
 	case runStarting:
@@ -90,13 +91,17 @@ func activityText(s *session.Record, now time.Time) string {
 	switch s.Activity {
 	case session.ActivityUnknown:
 		return "running"
+	case session.ActivityWorking:
+		if p := s.StatusProgress; p != nil && *p > 0 && *p < 100 {
+			return fmt.Sprintf("working %d%%", *p)
+		}
 	case session.ActivityIdle:
 		if s.LastOutputAt != nil {
 			return "idle " + formatElapsed(max(int64(now.Sub(*s.LastOutputAt)/time.Second), 0))
 		}
-	case session.ActivityWaiting:
+	case session.ActivityWaiting, session.ActivityBlocked:
 		if s.AttentionAt != nil {
-			return "waiting " + formatElapsed(max(int64(now.Sub(*s.AttentionAt)/time.Second), 0))
+			return string(s.Activity) + " " + formatElapsed(max(int64(now.Sub(*s.AttentionAt)/time.Second), 0))
 		}
 	}
 	return escapeControls(string(s.Activity))
@@ -143,7 +148,11 @@ func displayCwd(cwd, home string) string {
 // rather than letting a terminal act on them. Anything shown from a path
 // goes through it first.
 func escapeControls(text string) string {
-	if !strings.ContainsFunc(text, unicode.IsControl) {
+	// Format characters (unicode.Cf: bidirectional overrides, zero-width
+	// characters) are escaped like controls: invisible, they can reorder
+	// or hide what the line appears to say.
+	suspect := func(r rune) bool { return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) }
+	if !strings.ContainsFunc(text, suspect) {
 		return text
 	}
 	var b strings.Builder
@@ -155,7 +164,7 @@ func escapeControls(text string) string {
 			b.WriteString(`\n`)
 		case r == '\r':
 			b.WriteString(`\r`)
-		case unicode.IsControl(r):
+		case suspect(r):
 			fmt.Fprintf(&b, `\u{%x}`, r)
 		default:
 			b.WriteRune(r)

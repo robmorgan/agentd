@@ -512,7 +512,7 @@ Document architectural decisions that would otherwise be difficult to infer from
 # Current state and next milestone
 
 Done:
-- The Go daemon and per-session workers, on protocol v1 and state schema v5.
+- The Go daemon and per-session workers, on protocol v1 and state schema v6.
 - Sessions survive client disconnects and daemon restarts.
 - Liveness is checked through the worker sockets, and a flock enforces a single daemon.
 - Attach fan-out and PTY input are bounded, and the runtime root is private to the user.
@@ -531,6 +531,7 @@ Done:
 - Resource usage: workers and the daemon report their own (`GetSessionStats`/`GetDaemonStats`, `agent status --stats`, `agent daemon stats`), and `agentd bench sessions` measures sessions at scale (BENCHMARKS.md, "Sessions at scale").
 
 - Cross-host discovery (`agent ls --all`, `agent events --all`) and global session ids (daemon id + session UID).
+- Program status (OSC 7501) as the sole attention source: libghostty parses the reports, the worker keeps the records (`internal/worker/status.go`) and answers the detection query, the program's word decides activity/attention (blocked/done/error activities and events; progress, app, kind and message in `state.db` v6 and under `CapSessionStatus`), and records survive handoffs. The bell/notification/idle heuristics were removed once Claude Code adopted the protocol: a non-reporting program shows as plainly running, bells/notifications are info-only observability events, and the stall watch (non-reporting foreground command silent for 30m) is the one remaining timing signal.
 
 Next:
 1. Per-client permissions and audit, if remote peers need to be limited.

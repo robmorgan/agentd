@@ -108,3 +108,115 @@ func TestSessionActivityIsNegotiated(t *testing.T) {
 		t.Fatal("this build does not advertise its event capabilities")
 	}
 }
+
+// The program status fields (OSC 7501) are appended after the activity
+// fields, under their own capability: a peer with neither, or only
+// CapSessionActivity, decodes the record it always did.
+func TestSessionStatusIsNegotiated(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	progress := 47
+	rec := session.Record{SessionID: "a", Agent: "claude", Mode: session.ModeExecute, Cwd: "/w",
+		Status: session.StatusRunning, Attention: session.AttentionAction, AttentionSummary: strp("permission: Run tests?"),
+		CreatedAt: now, UpdatedAt: now, Activity: session.ActivityBlocked, Foreground: strp("claude"),
+		LastOutputAt: &now, AttentionAt: &now,
+		StatusApp: strp("claude-code"), StatusKind: strp("permission"), StatusMsg: strp("Run tests?"), StatusProgress: &progress}
+	resp := &Response{Session: &rec}
+	activityOnly := NegotiateFeatures(Capabilities(), []string{CapSessionActivity})
+	both := NegotiateFeatures(Capabilities(), []string{CapSessionActivity, CapSessionStatus})
+
+	var partial, full bytes.Buffer
+	if err := WriteResponseWith(&partial, activityOnly, resp); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteResponseWith(&full, both, resp); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadResponseWith(bytes.NewReader(full.Bytes()), both)
+	if err != nil || !reflect.DeepEqual(got, resp) {
+		t.Fatalf("with the capability: %#v, %v", got, err)
+	}
+	got, err = ReadResponseWith(bytes.NewReader(partial.Bytes()), activityOnly)
+	partialRec := rec
+	partialRec.StatusApp, partialRec.StatusKind, partialRec.StatusMsg, partialRec.StatusProgress = nil, nil, nil, nil
+	if err != nil || !reflect.DeepEqual(got, &Response{Session: &partialRec}) {
+		t.Fatalf("without it: %#v, %v", got, err)
+	}
+	// The appended bytes are pinned: app, kind and msg as optional strings
+	// (presence byte + u32 length + bytes), progress as an optional u32
+	// (presence byte + u32). Different builds negotiate this capability
+	// with each other, so the layout must not drift.
+	appended := 1 + 4 + len("claude-code") + 1 + 4 + len("permission") + 1 + 4 + len("Run tests?") + 1 + 4
+	if full.Len()-partial.Len() != appended {
+		t.Fatalf("status fields grew the record by %d bytes, want %d", full.Len()-partial.Len(), appended)
+	}
+	// Neither side can misread the other: the lengths no longer line up.
+	if _, err := ReadResponseWith(bytes.NewReader(full.Bytes()), activityOnly); err == nil {
+		t.Fatal("a decoder without the capability accepted the appended fields")
+	}
+	if !HasCapability(Capabilities(), CapSessionStatus) {
+		t.Fatal("this build does not advertise CapSessionStatus")
+	}
+	// Out-of-contract progress never reaches the wire or the reader.
+	bad := -1
+	rec.StatusProgress = &bad
+	var clamped bytes.Buffer
+	if err := WriteResponseWith(&clamped, both, &Response{Session: &rec}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = ReadResponseWith(bytes.NewReader(clamped.Bytes()), both)
+	if err != nil || got.Session.StatusProgress != nil {
+		t.Fatalf("negative progress crossed the wire: %#v, %v", got.Session.StatusProgress, err)
+	}
+}
+
+// The appended status fields' exact bytes, pinned like the shared golden
+// frames: CLIs and daemons of different builds negotiate CapSessionStatus
+// with each other, and a length-preserving reorder of the three strings
+// would pass a round trip. The values have distinct lengths on purpose.
+func TestSessionStatusGoldenFrame(t *testing.T) {
+	f := NegotiateFeatures(Capabilities(), []string{CapSessionActivity, CapSessionStatus})
+	now := time.Unix(1_700_000_000, 0).UTC()
+	progress := 47
+	rec := session.Record{
+		SessionID: "ab", Agent: "sh", Mode: session.ModeExecute, Cwd: "/w",
+		Status: session.StatusRunning, Attention: session.AttentionAction,
+		CreatedAt: now, UpdatedAt: now, Activity: session.ActivityBlocked,
+		StatusApp: strp("claude-code"), StatusKind: strp("permission"),
+		StatusMsg: strp("Run the tests?"), StatusProgress: &progress,
+	}
+	var buf bytes.Buffer
+	if err := WriteResponseWith(&buf, f, &Response{Session: &rec}); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{
+		0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x6c, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x7b, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x61, 0x62, 0x02, 0x00,
+		0x00, 0x00, 0x73, 0x68, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x2f, 0x77,
+		0x02, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0xf1, 0x53, 0x65, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf1, 0x53, 0x65, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00,
+		0x00, 0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x65, 0x64, 0x00, 0x00, 0x00, 0x00,
+		0x01, 0x0b, 0x00, 0x00, 0x00, 0x63, 0x6c, 0x61, 0x75, 0x64, 0x65, 0x2d,
+		0x63, 0x6f, 0x64, 0x65, 0x01, 0x0a, 0x00, 0x00, 0x00, 0x70, 0x65, 0x72,
+		0x6d, 0x69, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x01, 0x0e, 0x00, 0x00, 0x00,
+		0x52, 0x75, 0x6e, 0x20, 0x74, 0x68, 0x65, 0x20, 0x74, 0x65, 0x73, 0x74,
+		0x73, 0x3f, 0x01, 0x2f, 0x00, 0x00, 0x00,
+	}
+	if !bytes.Equal(buf.Bytes(), want) {
+		t.Fatalf("encoding changed:\n got %#v", buf.Bytes())
+	}
+	got, err := ReadResponseWith(bytes.NewReader(want), f)
+	if err != nil || !reflect.DeepEqual(got, &Response{Session: &rec}) {
+		t.Fatalf("decode = %#v, %v", got, err)
+	}
+
+	// A non-conforming peer's out-of-range progress is dropped at decode:
+	// the same frame with the progress u32 patched to 101 reads back with
+	// no progress at all.
+	patched := append([]byte(nil), want...)
+	patched[len(patched)-4] = 101
+	got, err = ReadResponseWith(bytes.NewReader(patched), f)
+	if err != nil || got.Session == nil || got.Session.StatusProgress != nil {
+		t.Fatalf("progress 101 crossed the decoder: %#v, %v", got, err)
+	}
+}

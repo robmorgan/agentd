@@ -52,9 +52,9 @@ func TestTerminalReportsAttentionEffects(t *testing.T) {
 // fastActivity shortens the activity thresholds for a test. It must be
 // called before the worker starts, which then only reads them.
 func fastActivity(t *testing.T) {
-	saved := []time.Duration{idleAfter, stallAfter, activityTick, idleEventGap}
-	idleAfter, stallAfter, activityTick, idleEventGap = 300*time.Millisecond, time.Second, 50*time.Millisecond, 0
-	t.Cleanup(func() { idleAfter, stallAfter, activityTick, idleEventGap = saved[0], saved[1], saved[2], saved[3] })
+	saved := []time.Duration{stallAfter, activityTick}
+	stallAfter, activityTick = time.Second, 50*time.Millisecond
+	t.Cleanup(func() { stallAfter, activityTick = saved[0], saved[1] })
 }
 
 // signalAgent rings the bell, notifies, sets its title, writes bursts of
@@ -107,55 +107,48 @@ func (h *harness) record() *session.Record {
 	return rec
 }
 
-func TestActivityAndAttentionFromThePTY(t *testing.T) {
+// Bells, notifications and titles are observed facts, recorded as info
+// events: they raise no attention and change no activity (the program's
+// status reports alone decide those). The foreground sample and the stall
+// watch still work for programs that do not report.
+func TestObservedSignalsFromThePTY(t *testing.T) {
 	fastActivity(t)
 	h := startWorkerWith(t, signalAgent)
-
-	// Output stops: the session goes idle, which needs noticing since
-	// nobody is attached.
-	idle := h.waitEvent(0, session.EventIdle)
-	if idle.Attention != session.AttentionNotice {
-		t.Fatalf("idle = %#v", idle)
-	}
-	h.eventually("idle activity", func() bool { return h.record().Activity == session.ActivityIdle })
-	if rec := h.record(); rec.Attention != session.AttentionNotice || rec.LastOutputAt == nil {
-		t.Fatalf("record = %#v", rec)
-	}
 	h.eventually("the foreground process", func() bool { return h.record().Foreground != nil })
 
-	// Output resumes, then stops again.
-	h.sendInput("burst\n")
-	working := h.waitEvent(idle.ID, session.EventWorking)
-	idle = h.waitEvent(working.ID, session.EventIdle)
-
-	// A bell asks for the user; a program ringing it in a loop records it
-	// once.
+	// A bell is information, recorded once per quiet window however often
+	// it rings; the session stays plainly working with nothing pending.
 	h.sendInput("bells\n")
-	bell := h.waitEvent(idle.ID, session.EventBell)
-	h.eventually("waiting activity", func() bool { return h.record().Activity == session.ActivityWaiting })
-	if rec := h.record(); rec.Attention != session.AttentionAction || *rec.AttentionSummary != "bell" {
-		t.Fatalf("after bell: %s %v", rec.Attention, *rec.AttentionSummary)
+	bell := h.waitEvent(0, session.EventBell)
+	if bell.Attention != session.AttentionInfo {
+		t.Fatalf("bell = %#v", bell)
 	}
-	// The loop takes its own time (twenty sleeps); input sent while it
-	// still rings would be answered by the next bell, so wait it out.
 	h.eventually("the bell loop to finish", func() bool { return strings.Contains(h.history(), "bells-done") })
 	for _, ev := range h.eventsSince(bell.ID) {
 		if ev.Kind == session.EventBell {
 			t.Fatalf("a bell loop recorded a second event: %#v", ev)
 		}
 	}
+	rec := h.record()
+	if rec.Activity != session.ActivityWorking || rec.Attention != session.AttentionInfo || rec.LastOutputAt == nil {
+		t.Fatalf("after bell: %#v", rec)
+	}
 
-	// Typing answers it; a notification asks again, with its text.
+	// A notification records its text, as information, and the title is
+	// kept as context.
 	h.sendInput("title\n")
-	h.eventually("waiting to clear", func() bool { return h.record().Activity != session.ActivityWaiting })
 	h.sendInput("notify\n")
 	note := h.waitEvent(bell.ID, session.EventNotification)
-	if note.Summary != "Codex: Approve the command?" || note.Attention != session.AttentionAction {
+	if note.Summary != "Codex: Approve the command?" || note.Attention != session.AttentionInfo {
 		t.Fatalf("notification = %#v", note)
+	}
+	if rec := h.record(); rec.Title == nil || *rec.Title != "Fixing the tests" {
+		t.Fatalf("title = %v", rec.Title)
 	}
 
 	// A foreground job under job control is the session's foreground
-	// command, and long silence while it runs is a stall.
+	// command, and long silence while a non-reporting command runs is a
+	// stall.
 	h.sendInput("fg\n")
 	h.eventually("sleep in the foreground", func() bool {
 		rec := h.record()
@@ -165,35 +158,17 @@ func TestActivityAndAttentionFromThePTY(t *testing.T) {
 	if !strings.Contains(stalled.Summary, "`sleep`") || stalled.Attention != session.AttentionNotice {
 		t.Fatalf("stalled = %#v", stalled)
 	}
-	if rec := h.record(); rec.Title == nil || *rec.Title != "Fixing the tests" {
-		t.Fatalf("title = %v", rec.Title)
-	}
 
-	// Its end supersedes what it asked for.
+	// Its end supersedes earlier attention.
 	h.sendInput("quit\n")
 	h.waitExit()
-	rec := h.record()
+	rec = h.record()
 	if rec.Activity != session.ActivityExited || rec.Attention != session.AttentionAction || rec.Status != session.StatusFailed {
 		t.Fatalf("after exit: %#v", rec)
 	}
 	all := h.eventsSince(0)
 	if last := all[len(all)-1]; last.Kind != session.EventFailed {
 		t.Fatalf("last event = %#v", last)
-	}
-}
-
-// While a client is attached, going idle is only information: someone is
-// watching.
-func TestIdleWhileAttachedIsInformation(t *testing.T) {
-	fastActivity(t)
-	h := startWorkerWith(t, signalAgent)
-	first := h.waitEvent(0, session.EventIdle)
-	c := h.attach(defaultGeometry)
-	c.input("burst\n")
-	working := h.waitEvent(first.ID, session.EventWorking)
-	idle := h.waitEvent(working.ID, session.EventIdle)
-	if idle.Attention != session.AttentionInfo {
-		t.Fatalf("idle while attached = %#v", idle)
 	}
 }
 
