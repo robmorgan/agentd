@@ -45,6 +45,3 @@ dev-run: build
 install: build
 	install -d $(BINDIR)
 	install -m 0755 bin/agent bin/agentd $(BINDIR)/
-	@if [ -x "$(HOME)/.cargo/bin/agent" ]; then \
-		echo "note: $(HOME)/.cargo/bin/agent is the old Rust CLI; remove it (cargo uninstall agent-cli) so $(BINDIR)/agent is found"; \
-	fi
