@@ -235,25 +235,36 @@ source_dir() {
   echo "${src}"
 }
 
+# daemon_pid prints the pid of this user's running daemon, if any.
+daemon_pid() {
+  pgrep -u "$(id -u)" -f 'agentd serve' 2>/dev/null | head -n 1 || true
+}
+
+# daemon_stale reports whether the running daemon's binary has been replaced
+# since it started (Linux only). It must be asked before installing: install
+# replaces agentd even when the new build is identical.
+daemon_stale() {
+  local pid exe
+  pid="$(daemon_pid)"
+  [[ -n "${pid}" ]] || return 1
+  exe="$(readlink "/proc/${pid}/exe" 2>/dev/null || true)"
+  [[ "${exe}" == *" (deleted)" ]]
+}
+
 # upgrade_daemon hands a running daemon and its sessions over to the newly
-# installed agentd, when there is one: the install changed agentd, or (Linux)
-# the daemon runs a binary that has since been replaced. With no daemon
-# running it does nothing, since `agentd upgrade` would start one and the CLI
-# starts the daemon when it is first needed.
+# installed agentd when needed is 1: the install changed agentd, or the
+# daemon was already running a replaced binary. With no daemon running it
+# does nothing, since `agentd upgrade` would start one and the CLI starts the
+# daemon when it is first needed.
 upgrade_daemon() {
-  local bindir="$1" changed="$2" pid
-  pid="$(pgrep -u "$(id -u)" -f 'agentd serve' 2>/dev/null | head -n 1 || true)"
-  if [[ -z "${pid}" ]]; then
+  local bindir="$1" needed="$2"
+  if [[ -z "$(daemon_pid)" ]]; then
     step "Daemon: not running (agent starts it when needed)"
     return
   fi
-  if [[ "${changed}" != 1 ]]; then
-    local exe
-    exe="$(readlink "/proc/${pid}/exe" 2>/dev/null || true)"
-    if [[ "${exe}" != *" (deleted)" ]]; then
-      step "Daemon: running; agentd is unchanged, so it is left as is"
-      return
-    fi
+  if [[ "${needed}" != 1 ]]; then
+    step "Daemon: running; agentd is unchanged, so it is left as is"
+    return
   fi
   if [[ "${AGENTD_NO_UPGRADE:-}" == 1 ]]; then
     step "Daemon: running; left alone (AGENTD_NO_UPGRADE=1). Run \`agent daemon upgrade\` to switch to the new binary."
@@ -326,12 +337,13 @@ main() {
   ensure_zig
 
   step "Building and installing into ${bindir}"
-  local before changed=0
+  local before needed=0
   before="$(checksum "${bindir}/agentd")"
+  daemon_stale && needed=1
   make -C "${src}" install BINDIR="${bindir}" ZIG="${ZIG}" >&2
-  [[ "$(checksum "${bindir}/agentd")" == "${before}" ]] || changed=1
+  [[ "$(checksum "${bindir}/agentd")" == "${before}" ]] || needed=1
 
-  upgrade_daemon "${bindir}" "${changed}"
+  upgrade_daemon "${bindir}" "${needed}"
   finish "${bindir}"
 }
 
