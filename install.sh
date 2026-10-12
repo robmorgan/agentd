@@ -11,13 +11,15 @@
 # Go and Zig are used from PATH when new enough; otherwise pinned releases are
 # downloaded into ~/.local/share/agentd/toolchain and used for the build only.
 # Only the base packages (git, make, a C compiler, pkg-config, curl, xz) come
-# from the system package manager, through sudo when not root.
+# from the system package manager, through sudo when not root. On Linux with
+# systemd it also installs a user unit that starts the daemon at boot.
 #
 # Environment:
 #   AGENTD_PREFIX      install agent and agentd into $AGENTD_PREFIX/bin (default ~/.local)
 #   AGENTD_REF         branch, tag or commit to build when cloning (default main)
 #   AGENTD_SRC         where to clone the source (default ~/.local/share/agentd/src)
 #   AGENTD_NO_UPGRADE  set to 1 to leave a running daemon alone
+#   AGENTD_NO_SERVICE  set to 1 to skip the systemd unit that starts the daemon at boot (Linux)
 #   ZIG                a Zig 0.16+ to use instead of the one on PATH
 
 # Everything runs from main, called on the last line, so that bash has read
@@ -276,6 +278,84 @@ upgrade_daemon() {
   fi
 }
 
+# install_service makes the daemon start at boot on Linux with systemd, so a
+# devbox that reboots takes remote connections again without anyone logging
+# in: a systemd user unit, enabled, plus lingering for this user so their
+# systemd starts at boot. Anywhere else it does nothing; there the agent CLI
+# starts the daemon when it is first needed, as it always does.
+#
+# The unit only starts the daemon the way the CLI does (serve --daemonize)
+# and then leaves it alone. agentd replaces itself on `restart` and `upgrade`
+# without systemd, so systemd must not track the daemon as the service's
+# main process, and the unit must never kill anything: the daemon and every
+# session's worker live in its cgroup. Hence a oneshot that stays active,
+# with KillMode=process (its only process has exited long before any stop).
+# A daemon that crashes is not restarted by systemd.
+#
+# The daemon passes its environment on to every session, so it starts from
+# the user's login shell: the PATH an agent needs (~/.local/bin for claude,
+# for example) usually comes from the shell's profile, not from systemd.
+install_service() {
+  local bindir="$1"
+  [[ "${OS}" == Linux ]] || return 0
+  if [[ "${AGENTD_NO_SERVICE:-}" == 1 ]]; then
+    step "Service: skipped (AGENTD_NO_SERVICE=1)"
+    return
+  fi
+  if ! command -v systemctl >/dev/null 2>&1 || [[ ! -d /run/systemd/system ]]; then
+    step "Service: no systemd; the daemon starts when agent first needs it"
+    return
+  fi
+  if ! systemctl --user show-environment >/dev/null 2>&1; then
+    step "Service: skipped; this login has no systemd user manager (log in over ssh or a console and run this again)"
+    return
+  fi
+  local user shell unit_dir unit tmp
+  user="$(id -un)"
+  shell="$(getent passwd "${user}" 2>/dev/null | cut -d: -f7)"
+  [[ -x "${shell}" ]] || shell=/bin/sh
+  unit_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
+  unit="${unit_dir}/agentd.service"
+  tmp="$(mktemp)"
+  # $$0 is systemd's escape for the shell's $0, the agentd path.
+  cat >"${tmp}" <<EOF
+# Installed by agentd's install.sh, which rewrites it on every run.
+[Unit]
+Description=agentd, a daemon runtime for supervising coding agents
+Documentation=https://github.com/robmorgan/agentd
+
+[Service]
+# agentd restarts and upgrades itself without systemd, so this only starts it
+# at boot. KillMode=process: stopping the unit must not kill the daemon or the
+# sessions' workers, which live in its cgroup.
+Type=oneshot
+RemainAfterExit=yes
+KillMode=process
+ExecStart=${shell} -l -c 'exec "\$\$0" serve --daemonize' "${bindir}/agentd"
+
+[Install]
+WantedBy=default.target
+EOF
+  mkdir -p "${unit_dir}"
+  if cmp -s "${tmp}" "${unit}"; then
+    rm -f "${tmp}"
+  else
+    mv "${tmp}" "${unit}"
+    chmod 0644 "${unit}"
+    systemctl --user daemon-reload
+  fi
+  systemctl --user enable --quiet agentd.service
+  # Lingering starts the user's systemd at boot rather than at their first
+  # login. polkit lets a user turn it on for themselves; sudo otherwise.
+  if [[ "$(loginctl show-user "${user}" --property=Linger --value 2>/dev/null)" != yes ]] &&
+    ! loginctl enable-linger "${user}" 2>/dev/null &&
+    ! as_root loginctl enable-linger "${user}"; then
+    step "Service: enabled, but lingering is off, so it starts at ${user}'s first login rather than at boot"
+    return
+  fi
+  step "Service: the daemon starts at boot (systemd user unit ${unit})"
+}
+
 # install_binary copies src/bin/NAME into BINDIR unless the installed one is
 # identical, and reports whether it changed. Leaving an identical binary in
 # place matters for a running daemon: replacing it, even with the same bytes,
@@ -353,6 +433,7 @@ main() {
   install_binary "${src}" "${bindir}" agentd && needed=1
 
   upgrade_daemon "${bindir}" "${needed}"
+  install_service "${bindir}"
   finish "${bindir}"
 }
 

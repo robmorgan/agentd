@@ -312,6 +312,12 @@ at any time:
 - Binaries are only replaced when the build differs. If a daemon is running and `agentd` changed
   (or the daemon still runs a binary replaced earlier), it runs `agentd upgrade`, so sessions are
   handed over to the new binary without stopping (`AGENTD_NO_UPGRADE=1` leaves the daemon alone).
+- On Linux with systemd it installs and enables a user unit (`~/.config/systemd/user/agentd.service`)
+  and turns on lingering, so the daemon starts at boot without anyone logging in, and a rebooted
+  devbox takes remote connections again. The unit only starts the daemon, from your login shell so
+  sessions get your `PATH`; `agent daemon restart` and `upgrade` still manage it, and stopping the
+  unit never stops the daemon or a session. A daemon that crashes is not restarted by systemd.
+  `AGENTD_NO_SERVICE=1` skips this.
 
 It never turns on remote access; see `agentd remote enable` below.
 
