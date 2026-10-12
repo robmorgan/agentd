@@ -99,6 +99,15 @@ ensure_firewall() {
     >/dev/null
 }
 
+# remote_agentd runs agentd with ARGS on TARGET from a login shell. Commands
+# that start or restart the daemon pass their environment on to it, and so to
+# every session: a login shell's PATH has ~/.local/bin, where claude is.
+remote_agentd() {
+  local target="$1"
+  shift
+  ssh "${SSH_OPTS[@]}" "${target}" "bash -lc $(printf '%q' "~/.local/bin/agentd $*")"
+}
+
 wait_for_ssh() {
   local target="$1"
   for _ in $(seq 1 60); do
@@ -171,7 +180,7 @@ pair() {
   tmp="$(mktemp -d)"
   out="${tmp}/pair.out"
   step "Pairing this machine with ${name}"
-  ssh "${SSH_OPTS[@]}" "${target}" '~/.local/bin/agentd remote pair' >"${out}" 2>&1 &
+  remote_agentd "${target}" remote pair >"${out}" 2>&1 &
   pid=$!
   for _ in $(seq 1 150); do
     code="$(sed -n 's/^Pairing code: //p' "${out}")"
@@ -245,7 +254,7 @@ cmd_create() {
   [[ "${claude}" == 1 ]] && install_claude "${target}"
 
   step "Accepting remote clients on ${ip}:${PORT}"
-  ssh "${SSH_OPTS[@]}" "${target}" "~/.local/bin/agentd remote enable '${ip}:${PORT}' --yes" >/dev/null
+  remote_agentd "${target}" remote enable "${ip}:${PORT}" --yes >/dev/null
   pair "${target}" "${name}" "${ip}:${PORT}"
 
   step "Ready"
