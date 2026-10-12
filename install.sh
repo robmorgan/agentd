@@ -121,8 +121,10 @@ ensure_base_packages() {
   step "Base packages: installing ${missing[*]}"
   case "${PKG}" in
     apt)
-      as_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq </dev/null
-      as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+      # A fresh machine's unattended-upgrades holds the dpkg lock for a
+      # while after boot; wait for it rather than fail.
+      as_root env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 update -qq </dev/null
+      as_root env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y -qq \
         build-essential git pkg-config curl xz-utils </dev/null
       ;;
     pacman)
