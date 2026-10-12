@@ -638,6 +638,24 @@ Troubleshooting:
 - **"timed out connecting"**: check `[remote] listen` on the devbox, that the daemon was restarted,
   and that UDP reaches the port (firewalls often allow TCP only).
 
+### A Devbox On DigitalOcean
+
+`scripts/do-devbox.sh` does all of the above on a new droplet, with `doctl` (authenticated) on the
+laptop:
+
+```sh
+scripts/do-devbox.sh create devbox            # sgp1, s-2vcpu-4gb; --region, --size, --ref, --local
+agent --host devbox new --cwd ~ auth-refactor
+scripts/do-devbox.sh ls
+scripts/do-devbox.sh destroy devbox
+```
+
+`create` puts the droplet behind an `agentd` cloud firewall (SSH and UDP 7433 in), creates a sudo
+user named after you with your SSH keys, runs `install.sh` there (so the daemon starts at boot),
+installs Claude Code, listens on the droplet's public address, and pairs this machine with it.
+Sign in to Claude Code in the first session you start there. `destroy` deletes the droplet and
+removes the host; it only touches droplets tagged `agentd`.
+
 ## Troubleshooting
 
 Try restarting the daemon:
