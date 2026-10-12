@@ -316,7 +316,8 @@ at any time:
   and turns on lingering, so the daemon starts at boot without anyone logging in, and a rebooted
   devbox takes remote connections again. The unit only starts the daemon, from your login shell so
   sessions get your `PATH`; `agent daemon restart` and `upgrade` still manage it, and stopping the
-  unit never stops the daemon or a session. A daemon that crashes is not restarted by systemd.
+  unit never stops the daemon or a session. A daemon that crashes is not restarted by systemd. If
+  lingering cannot be turned on, the unit is left disabled.
   `AGENTD_NO_SERVICE=1` skips this.
 
 It never turns on remote access; see `agentd remote enable` below.
@@ -645,7 +646,7 @@ laptop:
 
 ```sh
 scripts/do-devbox.sh create devbox            # sgp1, s-2vcpu-4gb; --region, --size, --ref, --local
-agent --host devbox new --cwd ~ auth-refactor
+agent --host devbox new --cwd '~' auth-refactor
 scripts/do-devbox.sh ls
 scripts/do-devbox.sh destroy devbox
 ```

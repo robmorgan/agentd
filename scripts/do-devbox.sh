@@ -152,8 +152,11 @@ install_agentd() {
     local root
     root="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
     step "Installing agentd from this checkout (${root})"
-    # COPYFILE_DISABLE and --no-xattrs keep macOS metadata out of the archive.
+    # Tracked files deleted in the working tree are left out, or tar would
+    # fail on them. COPYFILE_DISABLE and --no-xattrs keep macOS metadata out
+    # of the archive.
     git -C "${root}" ls-files -z |
+      while IFS= read -r -d '' f; do [[ -e "${root}/${f}" ]] && printf '%s\0' "${f}"; done |
       COPYFILE_DISABLE=1 tar -C "${root}" --null -T - --no-xattrs -czf - |
       ssh "${SSH_OPTS[@]}" "${target}" 'rm -rf ~/src/agentd && mkdir -p ~/src/agentd && tar -xzf - -C ~/src/agentd'
     ssh "${SSH_OPTS[@]}" "${target}" '~/src/agentd/install.sh'
@@ -283,17 +286,19 @@ cmd_destroy() {
   id="$(droplet_field "${name}" ID)"
   ip="$(droplet_field "${name}" PublicIPv4)"
   if [[ -z "${id}" ]]; then
-    note "no droplet called ${name} is tagged ${TAG}"
-  else
-    if [[ "${yes}" != 1 ]]; then
-      local answer
-      read -r -p "Delete droplet ${name} (${ip}) and every session on it? [y/N] " answer
-      [[ "${answer}" == [yY]* ]] || die "not deleted"
-    fi
-    step "Deleting droplet ${name}"
-    doctl compute droplet delete "${id}" --force
-    [[ -n "${ip}" ]] && ssh-keygen -R "${ip}" >/dev/null 2>&1 || true
+    # The host may be one the user added by hand; leave it alone.
+    note "no droplet called ${name} is tagged ${TAG}; nothing deleted"
+    host_exists "${name}" && note "agent still has a host called ${name}; remove it with: agent host rm ${name}"
+    return 0
   fi
+  if [[ "${yes}" != 1 ]]; then
+    local answer
+    read -r -p "Delete droplet ${name} (${ip}) and every session on it? [y/N] " answer
+    [[ "${answer}" == [yY]* ]] || die "not deleted"
+  fi
+  step "Deleting droplet ${name}"
+  doctl compute droplet delete "${id}" --force
+  [[ -n "${ip}" ]] && ssh-keygen -R "${ip}" >/dev/null 2>&1 || true
   if host_exists "${name}"; then
     step "Removing host ${name} from agent"
     agent host rm "${name}" >/dev/null

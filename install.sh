@@ -346,15 +346,19 @@ EOF
     chmod 0644 "${unit}"
     systemctl --user daemon-reload
   fi
-  systemctl --user enable --quiet agentd.service
-  # Lingering starts the user's systemd at boot rather than at their first
-  # login. polkit lets a user turn it on for themselves; sudo otherwise.
+  # Lingering starts the user's systemd at boot and keeps it running with
+  # nobody logged in. polkit lets a user turn it on for themselves; sudo
+  # otherwise. Without it the unit is left disabled: a daemon it started
+  # would live in the user's systemd, which stops, killing the daemon and
+  # every session, when their last login ends.
   if [[ "$(loginctl show-user "${user}" --property=Linger --value 2>/dev/null)" != yes ]] &&
     ! loginctl enable-linger "${user}" 2>/dev/null &&
     ! as_root loginctl enable-linger "${user}"; then
-    step "Service: enabled, but lingering is off, so it starts at ${user}'s first login rather than at boot"
+    systemctl --user disable --quiet agentd.service 2>/dev/null || true
+    step "Service: not enabled, since lingering could not be turned on (loginctl enable-linger ${user}); the daemon starts when agent first needs it"
     return
   fi
+  systemctl --user enable --quiet agentd.service
   step "Service: the daemon starts at boot (systemd user unit ${unit})"
 }
 
