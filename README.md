@@ -1,6 +1,6 @@
 <h1>
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/fb16c2e0-fabb-4103-aed7-72e57ecc9659" alt="agentd logo" width="250" />
+  <img src="https://github.com/user-attachments/assets/d78e4746-d577-44be-97ee-3a0145bb9ce4" alt="agentd logo" width="250" />
 </h1>
   <p align="center">
     <strong>Run coding agents like processes. Supervise them like jobs.</strong>
@@ -312,6 +312,13 @@ at any time:
 - Binaries are only replaced when the build differs. If a daemon is running and `agentd` changed
   (or the daemon still runs a binary replaced earlier), it runs `agentd upgrade`, so sessions are
   handed over to the new binary without stopping (`AGENTD_NO_UPGRADE=1` leaves the daemon alone).
+- On Linux with systemd it installs and enables a user unit (`~/.config/systemd/user/agentd.service`)
+  and turns on lingering, so the daemon starts at boot without anyone logging in, and a rebooted
+  devbox takes remote connections again. The unit only starts the daemon, from your login shell so
+  sessions get your `PATH`; `agent daemon restart` and `upgrade` still manage it, and stopping the
+  unit never stops the daemon or a session. A daemon that crashes is not restarted by systemd. If
+  lingering cannot be turned on, the unit is left disabled.
+  `AGENTD_NO_SERVICE=1` skips this.
 
 It never turns on remote access; see `agentd remote enable` below.
 
@@ -631,6 +638,24 @@ Troubleshooting:
   `agent host add` again. Otherwise, treat it as a possible interception.
 - **"timed out connecting"**: check `[remote] listen` on the devbox, that the daemon was restarted,
   and that UDP reaches the port (firewalls often allow TCP only).
+
+### A Devbox On DigitalOcean
+
+`scripts/do-devbox.sh` does all of the above on a new droplet, with `doctl` (authenticated) on the
+laptop:
+
+```sh
+scripts/do-devbox.sh create devbox            # sgp1, s-2vcpu-4gb; --region, --size, --ref, --local
+agent --host devbox new --cwd '~' auth-refactor
+scripts/do-devbox.sh ls
+scripts/do-devbox.sh destroy devbox
+```
+
+`create` puts the droplet behind an `agentd` cloud firewall (SSH and UDP 7433 in), creates a sudo
+user named after you with your SSH keys, runs `install.sh` there (so the daemon starts at boot),
+installs Claude Code, listens on the droplet's public address, and pairs this machine with it.
+Sign in to Claude Code in the first session you start there. `destroy` deletes the droplet and
+removes the host; it only touches droplets tagged `agentd`.
 
 ## Troubleshooting
 
