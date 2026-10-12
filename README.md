@@ -1,6 +1,6 @@
 <h1>
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/fb16c2e0-fabb-4103-aed7-72e57ecc9659" alt="agentd logo" width="250" />
+  <img src="https://github.com/user-attachments/assets/d78e4746-d577-44be-97ee-3a0145bb9ce4" alt="agentd logo" width="250" />
 </h1>
   <p align="center">
     <strong>Run coding agents like processes. Supervise them like jobs.</strong>
