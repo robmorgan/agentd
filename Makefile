@@ -31,7 +31,8 @@ test: libghostty
 test-cgocheck: libghostty
 	GOEXPERIMENT=cgocheck2 go test ./internal/worker/
 
-# The same suite on Linux, in Docker (scripts/test-linux.sh).
+# The same suite on Linux: directly on a Linux host, otherwise in Docker
+# (scripts/test-linux.sh; AGENTD_TEST_DOCKER=1 forces Docker).
 test-linux:
 	./scripts/test-linux.sh
 
