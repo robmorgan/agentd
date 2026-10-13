@@ -163,6 +163,30 @@ type AuthorizedClient struct {
 	Name        string
 }
 
+// DescribeClient names a client key for people: "name (fingerprint)", or
+// the fingerprint alone when the client has no name.
+func DescribeClient(fingerprint, name string) string {
+	if name == "" {
+		return fingerprint
+	}
+	return name + " (" + fingerprint + ")"
+}
+
+// AuthorizedName is the name fingerprint is authorized under in the file
+// at path, or "" when it has none or is not authorized.
+func AuthorizedName(path, fingerprint string) string {
+	clients, err := ReadAuthorized(path)
+	if err != nil {
+		return ""
+	}
+	for _, c := range clients {
+		if c.Fingerprint == fingerprint {
+			return c.Name
+		}
+	}
+	return ""
+}
+
 // ReadAuthorized reads an authorized-clients file: one fingerprint per line,
 // optionally followed by a name; blank lines and lines starting with # are
 // ignored. A missing file authorizes nobody.

@@ -535,8 +535,10 @@ Done:
 - Program status (OSC 7501) as the sole attention source: libghostty parses the reports, the worker keeps the records (`internal/worker/status.go`) and answers the detection query, the program's word decides activity/attention (blocked/done/error activities and events; progress, app, kind and message in `state.db` v6 and under `CapSessionStatus`), and records survive handoffs. The bell/notification/idle heuristics were removed once Claude Code adopted the protocol: a non-reporting program shows as plainly running, bells/notifications are info-only observability events, and the stall watch (non-reporting foreground command silent for 30m) is the one remaining timing signal.
 - `install.sh`: an idempotent install from source for macOS, Debian/Ubuntu and Arch (private Go/Zig toolchains when the ones on PATH are too old; a rerun upgrades a running daemon with a live handoff).
 
+- Audit: pairings, failed pairings, manual authorizations and revocations, and remote connections are host events (empty session id) in `agent events` (`internal/daemon/audit.go`).
+
 Next:
-1. Per-client permissions and audit, if remote peers need to be limited.
+1. Per-client permissions, if remote peers need to be limited.
 
 Known gaps:
 - History is only saved when a session exits.

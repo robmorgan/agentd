@@ -184,7 +184,8 @@ Sessions that need you come first, in `agent ls`, in the picker (`agent`) and in
 switcher. `agent status NAME` shows the details: activity, foreground command, terminal title,
 elapsed time and what needs attention.
 
-Every session's history of events is kept (the newest 500 per session):
+Every session's history of events is kept (the newest 500 per session), along with a record of
+the machines that paired, were authorized or revoked, and connected remotely (shown as `host`):
 
 ```sh
 agent events                       # the latest events of every session
@@ -198,7 +199,7 @@ agent events --json --after 120    # for scripts: everything after event 120
 supports one (iTerm2, Ghostty, WezTerm, kitty and others use OSC 9; GNOME Terminal and other VTE
 terminals, foot and urxvt use OSC 777; inside tmux, `set -g allow-passthrough on`). `--exec` runs a
 command for each event with `AGENTD_EVENT_ID`, `_HOST`, `_SESSION`, `_KIND`, `_ATTENTION`,
-`_SUMMARY` and `_TIME` set. Following reconnects by itself (after a daemon restart, or a lost
+`_SUMMARY` and `_TIME` set (`_SESSION` is empty for a host event). Following reconnects by itself (after a daemon restart, or a lost
 connection to a remote host) and resumes after the last event it printed.
 
 ### Making agents ask out loud
@@ -525,7 +526,8 @@ Pairing code: 482-193-675
 
 The laptop pins the devbox's key, the devbox authorizes the laptop's key, and `agentd remote pair`
 reports which machine paired. A mistyped code can be entered again. The code works once, expires
-after 5 minutes, and closes after 3 wrong attempts. Neither end can be fooled into trusting a
+after 5 minutes, and closes after 3 wrong attempts. Both outcomes are recorded in `agent events`, with
+the address the attempt came from. Neither end can be fooled into trusting a
 machine that does not know the code: the two run a password-authenticated key exchange (CPace),
 so someone on the network gets one guess per attempt and cannot test codes offline. No service
 outside the two machines is involved.

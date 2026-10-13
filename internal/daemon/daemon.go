@@ -107,6 +107,8 @@ type Server struct {
 
 	// events wakes events-stream subscribers when events are recorded.
 	events *eventFeed
+	// connects limits how often remote connections are recorded (audit.go).
+	connects *connectAudit
 
 	shutdownOnce sync.Once
 	shutdown     chan struct{}
@@ -157,6 +159,7 @@ func New(p *paths.AppPaths, workerBin string) (*Server, error) {
 		startedAt: time.Now(),
 		replays:   newReplayCache(),
 		events:    newEventFeed(store),
+		connects:  newConnectAudit(),
 		shutdown:  make(chan struct{}),
 		conns:     make(map[transport.Stream]struct{}),
 	}, nil
@@ -288,6 +291,11 @@ func (s *Server) startRemote() {
 		},
 		OnConnect: func(fp string, remote net.Addr) {
 			fmt.Fprintf(os.Stderr, "agentd: remote client %s connected from %s\n", fp, remote)
+			s.remoteConnected(fp, remote)
+		},
+		OnRevoked: func(fp string, remote net.Addr) {
+			fmt.Fprintf(os.Stderr, "agentd: closed %s's connection from %s: key revoked\n", fp, remote)
+			s.remoteRevoked(fp, remote)
 		},
 		Pairing: s.pairing,
 	}

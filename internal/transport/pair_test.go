@@ -150,7 +150,8 @@ func TestPairingClosesAfterTooManyWrongCodes(t *testing.T) {
 		}
 	}
 	<-w.Done()
-	if r := w.Result(); r.Err == nil || !strings.Contains(r.Err.Error(), "wrong codes") {
+	// The result says who was guessing, for the daemon's audit record.
+	if r := w.Result(); !errors.Is(r.Err, ErrTooManyWrongCodes) || r.Remote == nil {
 		t.Fatalf("result = %+v", r)
 	}
 	// Even the right code is too late now.
