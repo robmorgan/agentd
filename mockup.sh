@@ -1,5 +1,5 @@
-#/bin/bash
-echo "
+#!/usr/bin/env bash
+echo -e "
 ❯ agent ls
 
   RUN   Δ   ↑   AGE   NAME            BRANCH
@@ -8,7 +8,7 @@ echo "
   \x1b[38;5;51m✓\x1b[0m     -   \x1b[38;5;213m2\x1b[0m   \x1b[2m9h\x1b[0m    \x1b[1mremove-create\x1b[0m   \x1b[2magent/remove-create\x1b[0m
   \x1b[38;5;196m✖\x1b[0m     \x1b[38;5;220m5\x1b[0m   -   \x1b[2m19m\x1b[0m   \x1b[1mswift-geckos\x1b[0m    \x1b[2magent/swift-geckos\x1b[0m"
 
-echo "
+echo -e "
 ❯ agent ls
 
   RUN   Δ   ↑   AGE   NAME            BRANCH
