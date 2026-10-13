@@ -40,7 +40,7 @@ func (s hostSession) globalID() string {
 	return protocol.GlobalSessionID(s.welcome.DaemonID, s.rec.UID)
 }
 
-// listAllSessions is `agent list --all`: this machine's sessions and every
+// listAllSessions is `agt list --all`: this machine's sessions and every
 // reachable host's, in one list ordered by what needs attention first.
 func (a *app) listAllSessions(asJSON bool) error {
 	// This machine's daemon is started as for any command; remote ones
@@ -58,7 +58,7 @@ func (a *app) listAllSessions(asJSON bool) error {
 	var listed []hostSession
 	for _, p := range probes {
 		if !p.online() {
-			fmt.Fprintf(os.Stderr, "agent list: %s is %s", p.name, p.status)
+			fmt.Fprintf(os.Stderr, "agt list: %s is %s", p.name, p.status)
 			if p.err != nil && p.status != hostOffline {
 				fmt.Fprintf(os.Stderr, ": %v", p.err)
 			}
@@ -95,7 +95,7 @@ func (a *app) listAllSessions(asJSON bool) error {
 	return nil
 }
 
-// sessionJSON is one line of `agent list --json`.
+// sessionJSON is one line of `agt list --json`.
 type sessionJSON struct {
 	Host      string     `json:"host"`
 	Address   string     `json:"address"`

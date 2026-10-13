@@ -61,7 +61,7 @@ func fakeDaemon(t *testing.T, reply []byte) *client {
 func TestRefusesDaemonThatHangsUp(t *testing.T) {
 	c := fakeDaemon(t, nil)
 	err := c.ensureCompatible()
-	if err == nil || !strings.Contains(err.Error(), "does not speak agent protocol 1") || !strings.Contains(err.Error(), "agent daemon upgrade") {
+	if err == nil || !strings.Contains(err.Error(), "does not speak agent protocol 1") || !strings.Contains(err.Error(), "agt daemon upgrade") {
 		t.Fatalf("got %v", err)
 	}
 }
@@ -89,11 +89,11 @@ func TestRefusesDaemonSpeakingAnotherProtocol(t *testing.T) {
 func TestSessionCommandsRefuseIncompatibleDaemon(t *testing.T) {
 	c := fakeDaemon(t, nil)
 	for range 4 {
-		if err := c.prepareDaemon(""); err == nil || !strings.Contains(err.Error(), "agent daemon upgrade") {
+		if err := c.prepareDaemon(""); err == nil || !strings.Contains(err.Error(), "agt daemon upgrade") {
 			t.Fatalf("got %v", err)
 		}
 	}
-	// `agent daemon info` still gets something to talk to.
+	// `agt daemon info` still gets something to talk to.
 	if err := c.prepareDaemon("info"); err != nil {
 		t.Fatalf("daemon info: %v", err)
 	}

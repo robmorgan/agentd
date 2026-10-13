@@ -22,7 +22,7 @@ func TestHostsRoundTripAndArePrivate(t *testing.T) {
 	if err := AddHost(path, host); err != nil {
 		t.Fatal(err)
 	}
-	if err := AddHost(path, host); err == nil || !strings.Contains(err.Error(), "agent host rm devbox") {
+	if err := AddHost(path, host); err == nil || !strings.Contains(err.Error(), "agt host rm devbox") {
 		t.Fatalf("duplicate: %v", err)
 	}
 	if err := AddHost(path, Host{Name: "Dev/Box", Address: host.Address, Fingerprint: testFingerprint}); err == nil {
@@ -43,7 +43,7 @@ func TestHostsRoundTripAndArePrivate(t *testing.T) {
 	if removed, err := RemoveHost(path, "devbox"); err != nil || removed {
 		t.Fatalf("second remove: %v %v", removed, err)
 	}
-	if _, err := LookupHost(path, "devbox"); err == nil || !strings.Contains(err.Error(), "agent host add devbox") {
+	if _, err := LookupHost(path, "devbox"); err == nil || !strings.Contains(err.Error(), "agt host add devbox") {
 		t.Fatalf("lookup after remove: %v", err)
 	}
 }

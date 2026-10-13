@@ -20,34 +20,34 @@ import (
 	"github.com/robmorgan/agentd/internal/transport"
 )
 
-// Version is the client version, reported by `agent --version` and
-// `agent daemon info`. Builds set it (and agentd's) from one place.
+// Version is the client version, reported by `agt --version` and
+// `agt daemon info`. Builds set it (and agentd's) from one place.
 var Version = "0.1.0"
 
 const rootIntro = `A local multi-session coding workflow for daemon-backed agents.
 
 Core flows:
-  Start a session      agent new fix-flaky-tests
-  Inspect sessions     agent list
-  Reconnect live PTY   agent attach <name>
-  Review its work      agent diff <name>
-  Hear who needs you   agent events --follow --notify
-  Run somewhere else   agent new --cwd ../wt/fix fix`
+  Start a session      agt new fix-flaky-tests
+  Inspect sessions     agt list
+  Reconnect live PTY   agt attach <name>
+  Review its work      agt diff <name>
+  Hear who needs you   agt events --follow --notify
+  Run somewhere else   agt new --cwd ../wt/fix fix`
 
 const rootExamples = `Examples:
-  agent new add-health-checks
-  agent list
-  agent status <name>
-  agent daemon info
+  agt new add-health-checks
+  agt list
+  agt status <name>
+  agt daemon info
 
-Use ` + "`agent <command> --help`" + ` for command-specific details.`
+Use ` + "`agt <command> --help`" + ` for command-specific details.`
 
 // usageError is a command line that does not parse. It exits with status 2.
 type usageError struct{ err error }
 
 func (e usageError) Error() string { return e.err.Error() }
 
-// Main runs the agent CLI with args (without the program name) and returns
+// Main runs the agt CLI with args (without the program name) and returns
 // the exit status.
 func Main(args []string) (status int) {
 	a := &app{}
@@ -103,7 +103,7 @@ func (a *app) setup() error {
 
 // connect chooses the daemon for a command and makes sure it is there.
 // sessionArgs may carry a host/ prefix, which is stripped. daemonCommand is
-// the `agent daemon` subcommand, if that is what runs. before runs once the
+// the `agt daemon` subcommand, if that is what runs. before runs once the
 // target is known but before a daemon is started, so a command can reject
 // bad arguments first.
 func (a *app) connect(sessionArgs []*string, daemonCommand string, before func(*client) error) (*client, error) {
@@ -122,7 +122,7 @@ func (a *app) connect(sessionArgs []*string, daemonCommand string, before func(*
 	case localHostName:
 		name = ""
 	case autoHostName:
-		return nil, errors.New("`--host auto` only chooses a host for `agent new`")
+		return nil, errors.New("`--host auto` only chooses a host for `agt new`")
 	}
 	c := &client{paths: a.paths}
 	if name != "" {
@@ -227,7 +227,7 @@ var (
 
 func (a *app) rootCommand() *cobra.Command {
 	root := &cobra.Command{
-		Use:           "agent",
+		Use:           "agt",
 		Short:         "Run, inspect, and review local coding sessions",
 		Version:       Version,
 		Args:          noArgs,
@@ -243,13 +243,13 @@ func (a *app) rootCommand() *cobra.Command {
 	}
 	root.Annotations = map[string]string{"intro": rootIntro, "after": rootExamples}
 	root.CompletionOptions.DisableDefaultCmd = true
-	root.PersistentFlags().StringVar(&a.host, "host", "", "Talk to the agentd on a remote host (see `agent host add`)")
+	root.PersistentFlags().StringVar(&a.host, "host", "", "Talk to the agentd on a remote host (see `agt host add`)")
 	root.PersistentFlags().Lookup("host").Annotations = map[string][]string{"value": {"NAME"}}
 	root.Flags().SortFlags = false
 	root.PersistentFlags().SortFlags = false
 	root.Flags().BoolP("help", "h", false, "Print help")
 	root.Flags().BoolP("version", "V", false, "Print version")
-	root.SetVersionTemplate("agent {{.Version}}\n")
+	root.SetVersionTemplate("agt {{.Version}}\n")
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError{err} })
 	root.SetHelpFunc(func(cmd *cobra.Command, _ []string) { writeHelp(os.Stdout, cmd) })
 	root.SetHelpCommand(&cobra.Command{Hidden: true})
@@ -257,7 +257,7 @@ func (a *app) rootCommand() *cobra.Command {
 	return root
 }
 
-// Help. It follows the agent CLI's long-standing layout: a header for the
+// Help. It follows the agt CLI's long-standing layout: a header for the
 // root, usage, commands (with visible aliases), options, then notes or
 // examples.
 
@@ -279,7 +279,7 @@ func writeHelp(w io.Writer, cmd *cobra.Command) {
 	switch {
 	case !cmd.HasParent():
 		b.WriteString(header() + "\n" + cmd.Annotations["intro"] + "\n\n")
-		fmt.Fprintf(&b, "agent %s\n\n%s\n\n", Version, cmd.Short)
+		fmt.Fprintf(&b, "agt %s\n\n%s\n\n", Version, cmd.Short)
 	case cmd.Annotations["intro"] != "":
 		fmt.Fprintf(&b, "%s\n%s\n\n", cmd.CommandPath(), cmd.Annotations["intro"])
 	default:

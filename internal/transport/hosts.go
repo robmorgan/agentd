@@ -39,7 +39,7 @@ func ValidHostName(name string) error {
 }
 
 // ReservedHostNames cannot name a remote host: "local" is this machine's own
-// daemon wherever hosts are listed, and "auto" asks `agent new` to pick one.
+// daemon wherever hosts are listed, and "auto" asks `agt new` to pick one.
 var ReservedHostNames = []string{"local", "auto"}
 
 // ReadHosts reads hosts.toml in file order. A missing file lists no hosts.
@@ -80,7 +80,7 @@ func LookupHost(path, name string) (Host, error) {
 			return host, nil
 		}
 	}
-	return Host{}, fmt.Errorf("unknown host `%s`; add it with `agent host add %s ADDRESS`", name, name)
+	return Host{}, fmt.Errorf("unknown host `%s`; add it with `agt host add %s ADDRESS`", name, name)
 }
 
 // AddHost adds a host to hosts.toml. A name that is already there is an
@@ -95,7 +95,7 @@ func AddHost(path string, host Host) error {
 	return editHosts(path, func(hosts []Host) ([]Host, error) {
 		for _, h := range hosts {
 			if h.Name == host.Name {
-				return nil, fmt.Errorf("host `%s` already exists; remove it first with `agent host rm %s`", host.Name, host.Name)
+				return nil, fmt.Errorf("host `%s` already exists; remove it first with `agt host rm %s`", host.Name, host.Name)
 			}
 		}
 		return append(hosts, host), nil
@@ -124,7 +124,7 @@ func RemoveHost(path, name string) (bool, error) {
 }
 
 // editHosts holds the hosts.toml lock across the read, change and write, so
-// concurrent `agent host` commands never lose each other's changes, and
+// concurrent `agt host` commands never lose each other's changes, and
 // replaces the file atomically. edit returning nil hosts and no error means
 // nothing changed.
 func editHosts(path string, edit func([]Host) ([]Host, error)) error {

@@ -259,7 +259,7 @@ func NegotiateVersion(clientMin, clientMax uint16) (uint16, error) {
 	}
 	v := min(clientMax, ProtocolVersion)
 	if v < max(clientMin, MinProtocolVersion) {
-		return 0, fmt.Errorf("agentd speaks protocol versions %d-%d but the client needs %d-%d; upgrade the agent CLI or the daemon",
+		return 0, fmt.Errorf("agentd speaks protocol versions %d-%d but the client needs %d-%d; upgrade the agt CLI or the daemon",
 			MinProtocolVersion, ProtocolVersion, clientMin, clientMax)
 	}
 	return v, nil

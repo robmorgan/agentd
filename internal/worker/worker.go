@@ -205,7 +205,7 @@ func Run(args Args) error {
 		return err
 	}
 	// Until the agent is running, record any failure on the session so the
-	// daemon (and `agent ls`) can report it rather than timing out.
+	// daemon (and `agt ls`) can report it rather than timing out.
 	fail := func(err error) error {
 		_ = store.MarkFailed(args.SessionID, err.Error())
 		return err
