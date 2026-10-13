@@ -1,5 +1,5 @@
 // Package session holds the session model shared by the daemon, its workers
-// and (through the wire protocol) the agent CLI. A session runs in a working
+// and (through the wire protocol) the agt CLI. A session runs in a working
 // directory (Cwd); agentd does not manage git state there.
 package session
 
@@ -107,7 +107,7 @@ type Record struct {
 
 // Workspace names a directory on the daemon's machine, so clients can start
 // sessions there without knowing its paths. Workspaces live in state.db and
-// are managed through the protocol (`agent workspace add|ls|rm`). agentd does
+// are managed through the protocol (`agt workspace add|ls|rm`). agentd does
 // not create, clone or sync the directory.
 type Workspace struct {
 	Name      string

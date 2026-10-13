@@ -1,4 +1,4 @@
-// Command agent is the client for agentd: it starts, lists, attaches to and
+// Command agt is the client for agentd: it starts, lists, attaches to and
 // manages coding-agent sessions on this machine or a remote one.
 package main
 

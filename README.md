@@ -36,7 +36,7 @@ This allows developers to supervise agent work without constantly switching betw
 `agentd` works WITH your terminal. Ghostty, iTerm2, Kitty, WezTerm... you chose your terminal for
 a reason. `agentd` doesn't replace it.
 
-To view an agent: open a new tab, run `agent attach my-agent`. Or use the built-in TUI (`agent`
+To view an agent: open a new tab, run `agt attach my-agent`. Or use the built-in TUI (`agt`
 with no args) for a quick overview of all sessions.
 
 What `agentd` manages that your terminal can't:
@@ -54,7 +54,7 @@ Native scrollback, native search, native copy/paste. For free.
 Start a task:
 
 ```sh
-agent new fix-tests
+agt new fix-tests
 ```
 
 This creates a session, and starts the agent in an attached PTY.
@@ -62,7 +62,7 @@ This creates a session, and starts the agent in an attached PTY.
 List running tasks:
 
 ```sh
-agent ls
+agt ls
 
   RUN  AGE    NAME            ACTIVITY     CWD                 ATTENTION
   ⚠    4m     dep-bump        blocked 1m   ~/src/app           permission: Use Bash?
@@ -75,68 +75,68 @@ Sessions that need you come first; see [Attention model](#attention-model).
 You can attach to a running agent to open the underlying PTY session:
 
 ```sh
-agent attach fix-tests
+agt attach fix-tests
 ```
 
 Multiple clients can attach to the same running session at once, including the TUI and one or
-more `agent attach` processes.
+more `agt attach` processes.
 
-Detach the local `agent attach` client using `ctrl + \`; the screen is cleared, and the session's
+Detach the local `agt attach` client using `ctrl + \`; the screen is cleared, and the session's
 output stays in your terminal's scrollback. Switch to the previous attached session
 with `ctrl + [` and the next one with `ctrl + ]`. To inspect or manage other attached
 clients:
 
 ```sh
-agent attachments fix-tests
-agent detach fix-tests --attach attach-1
-agent detach fix-tests --all
+agt attachments fix-tests
+agt detach fix-tests --attach attach-1
+agt detach fix-tests --all
 ```
 
 Inspect a session's scrollback (live from the session, or from its saved log once it has ended):
 
 ```sh
-agent history fix-tests
-agent history fix-tests --vt
+agt history fix-tests
+agt history fix-tests --vt
 ```
 
 Review what the agent produced in its git repository: commits, staged and unstaged edits, and
 new files, all since the session started:
 
 ```sh
-agent diff fix-tests                   # the whole diff, coloured in a terminal
-agent diff fix-tests --stat            # or a diffstat, or --name-only
-agent status fix-tests                 # includes branch, base, commits and changed files
-agent artifacts fix-tests              # what can be downloaded: diff, patch, history, history.vt
-agent artifact fix-tests patch -o fix-tests.mbox    # the commits, for `git am`
+agt diff fix-tests                   # the whole diff, coloured in a terminal
+agt diff fix-tests --stat            # or a diffstat, or --name-only
+agt status fix-tests                 # includes branch, base, commits and changed files
+agt artifacts fix-tests              # what can be downloaded: diff, patch, history, history.vt
+agt artifact fix-tests patch -o fix-tests.mbox    # the commits, for `git am`
 ```
 
 See what sessions cost: memory, CPU, threads and open files of a session's worker and agent, and
 its scrollback; or the daemon and every running session at once:
 
 ```sh
-agent status --stats fix-tests
-agent daemon stats
+agt status --stats fix-tests
+agt daemon stats
 ```
 
 Stop a task:
 
 ```sh
-agent kill fix-tests
+agt kill fix-tests
 ```
 
 Remove a session and clean up its artifacts:
 
 ```sh
-agent rm fix-tests
+agt rm fix-tests
 ```
 
 Or use the compatibility form:
 
 ```sh
-agent kill --rm fix-tests
+agt kill --rm fix-tests
 ```
 
-Run the `agent` command without any arguments to open the TUI.
+Run the `agt` command without any arguments to open the TUI.
 
 ## Core Concepts
 
@@ -171,7 +171,7 @@ events, and a session needs attention until you look at it: attaching to it (or 
 it) acknowledges it.
 
 ```sh
-agent ls
+agt ls
 
   RUN  AGE    NAME            ACTIVITY     CWD                 ATTENTION
   ⚠    12m    fix-tests       blocked 2m   ~/src/app           permission: Run the tests?
@@ -180,18 +180,18 @@ agent ls
   ○    1h     refactor        exited       ~/src/app           finished (exit 0)
 ```
 
-Sessions that need you come first, in `agent ls`, in the picker (`agent`) and in the `Ctrl-Y`
-switcher. `agent status NAME` shows the details: activity, foreground command, terminal title,
+Sessions that need you come first, in `agt ls`, in the picker (`agt`) and in the `Ctrl-Y`
+switcher. `agt status NAME` shows the details: activity, foreground command, terminal title,
 elapsed time and what needs attention.
 
 Every session's history of events is kept (the newest 500 per session):
 
 ```sh
-agent events                       # the latest events of every session
-agent events fix-tests --follow    # follow one session
-agent events --follow --notify     # ring the bell and post a desktop notification when a session needs you
-agent events --follow --level action --exec 'say "$AGENTD_EVENT_SESSION needs you"'
-agent events --json --after 120    # for scripts: everything after event 120
+agt events                       # the latest events of every session
+agt events fix-tests --follow    # follow one session
+agt events --follow --notify     # ring the bell and post a desktop notification when a session needs you
+agt events --follow --level action --exec 'say "$AGENTD_EVENT_SESSION needs you"'
+agt events --json --after 120    # for scripts: everything after event 120
 ```
 
 `--notify` writes to your terminal, so it pops a desktop notification wherever your terminal
@@ -214,7 +214,7 @@ printf '\e]7501;state=blocked:kind=permission:msg=%s\e\\' "$(printf 'Deploy?' | 
 
 Status reports are the only attention signal. Typing into the session counts a `blocked` report
 as answered until the program reports again. Bells and desktop notifications (OSC 9, OSC 777)
-are recorded as info-level events — visible in `agent events` as facts about what the terminal
+are recorded as info-level events — visible in `agt events` as facts about what the terminal
 emitted — but raise no attention and trigger no `--notify`: `agentd` stopped inferring "needs
 you" from them when the agent harnesses began reporting status themselves.
 
@@ -234,24 +234,24 @@ you" from them when the agent harnesses began reporting status themselves.
 
 ![](/.github/_docs/architecture.png)
 
-`agentd` focuses purely on agent runtime semantics:
+`agentd` focuses purely on agt runtime semantics:
 
 - durable PTY-backed agent sessions that outlive the client connection that started them
 - session metadata stored in `state.db` under the resolved runtime root
 - PTY scrollback held by each session's worker process and saved to `logs/` when the session ends
-- interactive reattach with `agent attach`
-- background PTY input with `agent send-input`
-- git state and artifacts (`agent diff`, `agent artifacts`), read from the session's directory and
+- interactive reattach with `agt attach`
+- background PTY input with `agt send-input`
+- git state and artifacts (`agt diff`, `agt artifacts`), read from the session's directory and
   streamed apart from terminal traffic
 
 ## Build
 
-`agentd` is two Go binaries, built from one module at the repository root: the `agent` CLI and
+`agentd` is two Go binaries, built from one module at the repository root: the `agt` CLI and
 the `agentd` daemon.
 
 ```sh
-make build    # builds libghostty-vt if needed, then bin/agentd and bin/agent
-make agent    # just the CLI: pure Go, no cgo or Zig needed
+make build    # builds libghostty-vt if needed, then bin/agentd and bin/agt
+make agt      # just the CLI: pure Go, no cgo or Zig needed
 make test     # Go tests, with -race
 make test-cgocheck  # the worker's tests with cgo's pointer checks (libghostty)
 make test-linux  # the same suite on Linux, in Docker
@@ -297,20 +297,21 @@ make dev-run ARGS="list"
 make install
 ```
 
-This installs `agent` and `agentd` side by side in `$GOBIN` (or `$(go env GOPATH)/bin`); set
-`BINDIR` to choose another directory. If an older `agent` from `cargo install` is still in
-`~/.cargo/bin`, remove it (`cargo uninstall agent-cli`) so the new one is found first.
+This installs `agt` and `agentd` side by side in `$GOBIN` (or `$(go env GOPATH)/bin`); set
+`BINDIR` to choose another directory. The CLI used to be called `agent`; it was renamed to `agt`
+so it no longer clashes with other tools' `agent` binaries (such as Cursor's). If an old
+`agent` from an earlier `make install` is still in `BINDIR`, remove it.
 
 ## Working Directories And Worktrees
 
-A session runs in the directory you give it. `agent new` defaults to the current directory;
+A session runs in the directory you give it. `agt new` defaults to the current directory;
 pass `--cwd DIR` to pick another (it must exist). `agentd` does not create git worktrees,
 branches, or merge anything back. If you want isolation between agents working on the same
 repository, create the worktree yourself and point the session at it:
 
 ```sh
 git worktree add -b agent/auth-refactor ../wt/auth-refactor main
-agent new --cwd ../wt/auth-refactor auth-refactor
+agt new --cwd ../wt/auth-refactor auth-refactor
 ```
 
 A skill or a wrapper script can package this recipe. Two agents started in the same checkout
@@ -321,13 +322,13 @@ will step on each other; that is your call, not the daemon's.
 When a session starts in a git repository, `agentd` records HEAD's commit and branch as the
 session's base. Everything is then measured from there:
 
-- `agent diff NAME` prints one unified diff of everything that differs from the base: commits made
+- `agt diff NAME` prints one unified diff of everything that differs from the base: commits made
   since, staged and unstaged changes, and untracked files (respecting `.gitignore`). `--stat` and
   `--name-only` summarise it. The diff applies to a checkout of the base with `git apply` (binary files are
   only named in it; the `patch` artifact carries them).
-- `agent status NAME` adds a git section: branch, HEAD, base, upstream with ahead/behind, the
+- `agt status NAME` adds a git section: branch, HEAD, base, upstream with ahead/behind, the
   commits since the base, and the changed files counted by kind with line totals.
-- `agent artifacts NAME` lists what can be downloaded, and `agent artifact NAME ARTIFACT [-o FILE]`
+- `agt artifacts NAME` lists what can be downloaded, and `agt artifact NAME ARTIFACT [-o FILE]`
   downloads it: `diff`, `patch` (the commits since the base as an mbox, for `git am`), `history` and
   `history.vt` (the terminal history, plain or with escape sequences). With `-o` the file only
   appears once the artifact has arrived whole.
@@ -346,11 +347,11 @@ Working directories are resolved on the machine running `agentd`, not the client
 directories you work in a name, then start sessions by name:
 
 ```sh
-agent workspace add mono '~/src/mono'                         # or: agent workspace add mono .
-agent workspace ls
-agent new --workspace mono auth-refactor                      # runs in ~/src/mono
-agent new --workspace mono --cwd services/api api-fix         # runs in ~/src/mono/services/api
-agent workspace rm mono
+agt workspace add mono '~/src/mono'                         # or: agt workspace add mono .
+agt workspace ls
+agt new --workspace mono auth-refactor                      # runs in ~/src/mono
+agt new --workspace mono --cwd services/api api-fix         # runs in ~/src/mono/services/api
+agt workspace rm mono
 ```
 
 Workspaces are stored by the daemon in `state.db`, so they take effect immediately and are
@@ -359,10 +360,10 @@ user's home; other paths are resolved by the CLI, which today always shares the 
 filesystem. The directory must exist: `agentd` does not clone, create, or sync workspaces.
 
 With `--workspace`, `--cwd` is relative to the workspace root and may not leave it. A session
-records the workspace it was started in (`agent status` shows it); removing or re-adding a
+records the workspace it was started in (`agt status` shows it); removing or re-adding a
 workspace does not move sessions that are already running.
 
-This is the addressing a remote client will use: once `agent --host` exists, a laptop can start
+This is the addressing a remote client will use: once `agt --host` exists, a laptop can start
 a session in a devbox's checkout without knowing the devbox's paths.
 
 ## Configure Agents
@@ -381,7 +382,7 @@ command = "codex"
 args = []
 ```
 
-`config.toml` also sets how much scrollback `agent attach` copies into your terminal (more
+`config.toml` also sets how much scrollback `agt attach` copies into your terminal (more
 below):
 
 ```toml
@@ -414,27 +415,27 @@ The root contains `config.toml`, `state.db`, `logs/`, `remote/` (keys for remote
 socket per live session). It is created private to your user (0700), and `agentd` refuses a root
 owned by someone else.
 
-Interactive PTY attach is available with `agent attach <name>`. Detach with `Ctrl-\`, switch to
+Interactive PTY attach is available with `agt attach <name>`. Detach with `Ctrl-\`, switch to
 the previous running session with `Ctrl-[`, or switch to the next running session with `Ctrl-]`, or
-`agent detach <name> --attach <attach_id>` for a specific client, or
-`agent detach <name> --all` to disconnect every attached client on the session.
-Use `agent attachments <name>` to inspect the current attachment ids.
+`agt detach <name> --attach <attach_id>` for a specific client, or
+`agt detach <name> --all` to disconnect every attached client on the session.
+Use `agt attachments <name>` to inspect the current attachment ids.
 Attach clears the visible screen and repaints from the daemon's retained terminal state; if the
 restored session was using the alternate screen, replay restores that state naturally. It also
 copies the session's most recent 1,000 rows of scrollback into your terminal, so you can scroll
-back through them natively; `agent history` has the rest. `[attach] scrollback_rows` in
+back through them natively; `agt history` has the rest. `[attach] scrollback_rows` in
 `config.toml` changes how many (`-1` for all of it, `0` for the screen only). When the client
 reconnects by itself, or repaints after the overlay closes or after falling behind, it sends only
 the screen, since your terminal already has the scrollback. A client
 that falls behind a fast agent (a slow link, a stalled terminal) never slows the agent down: it
 skips output it cannot keep up with and is repainted from the current screen once it catches up.
 
-Every session has a UID (`agent status` shows it) as well as its name. A name can be reused once
+Every session has a UID (`agt status` shows it) as well as its name. A name can be reused once
 its session is removed; the UID never is, so a reconnecting client can tell that the session under
 a name is no longer the one it was attached to.
 Multiple interactive attachers are allowed per session, and the TUI uses the same shared attach
 path when a worker is focused. Background PTY writes are still available with
-`agent send-input <name> -- <text>`.
+`agt send-input <name> -- <text>`.
 
 ## Remote Access (Preview)
 
@@ -450,7 +451,7 @@ agentd remote enable
 
 This finds the devbox's Tailscale address and listens on UDP port 7433 there. It sets
 `[remote] listen` in `config.toml`, restarts the daemon (sessions keep running), and prints the
-`agent host add` command to run on the laptop, with the daemon's key fingerprint included.
+`agt host add` command to run on the laptop, with the daemon's key fingerprint included.
 
 Without Tailscale, it offers the address of the interface holding the default route and asks first.
 A private LAN address is only reachable on that network and may change with DHCP; a public address
@@ -466,7 +467,7 @@ agentd remote disable
 ```
 
 If the address does not exist yet when the daemon starts (say, Tailscale is still coming up at
-boot), the daemon keeps retrying every few seconds. `agentd remote status` and `agent daemon info`
+boot), the daemon keeps retrying every few seconds. `agentd remote status` and `agt daemon info`
 show why it is not listening.
 
 **Pair the laptop** with a short code, so neither machine's key has to be copied. On the
@@ -480,7 +481,7 @@ agentd remote pair
 Pairing code: 482-193-675
 
 On the machine you connect from, run:
-  agent host add devbox 100.64.0.5:7433 --code 482-193-675
+  agt host add devbox 100.64.0.5:7433 --code 482-193-675
 
 Waiting until 14:05:12 (Ctrl-C to cancel)...
 ```
@@ -492,16 +493,16 @@ machine that does not know the code: the two run a password-authenticated key ex
 so someone on the network gets one guess per attempt and cannot test codes offline. No service
 outside the two machines is involved.
 
-A host you already added without pairing (one `agent hosts` shows as `unauthorized`) can be paired
-the same way: run the `agent host add` command with the same name and address.
+A host you already added without pairing (one `agt hosts` shows as `unauthorized`) can be paired
+the same way: run the `agt host add` command with the same name and address.
 
 **Or, without pairing**, compare fingerprints. On the laptop, run the command `enable` printed:
 
 ```sh
-agent host add devbox 100.64.0.5:7433 --fingerprint SHA256:...
+agt host add devbox 100.64.0.5:7433 --fingerprint SHA256:...
 ```
 
-Without `--fingerprint`, `agent host add` shows the key the daemon presents and asks you to confirm
+Without `--fingerprint`, `agt host add` shows the key the daemon presents and asks you to confirm
 it against `agentd remote id`. Either way it then prints the command that authorizes the laptop.
 Back on the devbox, run that command:
 
@@ -512,19 +513,19 @@ agentd remote authorize SHA256:... my-laptop
 Now any command can run on the devbox, with `--host` or a `host/session` address:
 
 ```sh
-agent --host devbox new --cwd ~/repo auth-refactor      # a path on the devbox (absolute or ~/...)
-agent --host devbox workspace add mono ~/src/mono       # name a directory on the devbox
-agent --host devbox new --workspace mono auth-tests      # and start sessions in it
-agent --host devbox ls
-agent attach devbox/auth-refactor
-agent send-input devbox/auth-refactor -- "run the tests"
-agent history devbox/auth-refactor
-agent diff devbox/auth-refactor --stat
-agent --host devbox events --follow --notify             # tell me when a devbox session needs me
-agent rm devbox/auth-refactor
+agt --host devbox new --cwd ~/repo auth-refactor      # a path on the devbox (absolute or ~/...)
+agt --host devbox workspace add mono ~/src/mono       # name a directory on the devbox
+agt --host devbox new --workspace mono auth-tests      # and start sessions in it
+agt --host devbox ls
+agt attach devbox/auth-refactor
+agt send-input devbox/auth-refactor -- "run the tests"
+agt history devbox/auth-refactor
+agt diff devbox/auth-refactor --stat
+agt --host devbox events --follow --notify             # tell me when a devbox session needs me
+agt rm devbox/auth-refactor
 ```
 
-Closing the laptop or losing the network leaves the session running; `agent attach` again, from any
+Closing the laptop or losing the network leaves the session running; `agt attach` again, from any
 authorized machine, restores the screen. An attachment that loses its connection (or whose daemon
 restarts or is upgraded, locally too) reconnects by itself: the bottom row says it is reconnecting, typing is ignored until it is back, and `Ctrl-\`
 gives up. It keeps trying (every 5 seconds at most) until the devbox answers, so a laptop that slept
@@ -536,7 +537,7 @@ devbox answers: lookups always, and `new`, `kill`, `rm` and `workspace add|rm` b
 token that lets the devbox do them only once and answer the retry with the first result.
 `send-input` is never sent twice. Without `--agent`, `new` uses the devbox's `default_agent`.
 
-With several hosts, `agent hosts` (or `agent host ls`) checks every one at once, this machine's
+With several hosts, `agt hosts` (or `agt host ls`) checks every one at once, this machine's
 daemon included as `local`:
 
 ```text
@@ -547,37 +548,37 @@ gpu-01  10.0.0.9:7433    offline  -        -         -     -             -
 ```
 
 `SESSIONS` is running/total. A host can also be `unauthorized` (it refuses this machine's key) or
-`key changed`. `agent host info devbox` shows its machine (OS, CPUs, memory), its agents, daemon
+`key changed`. `agt host info devbox` shows its machine (OS, CPUs, memory), its agents, daemon
 version, capabilities and pinned key. `--host local` (or `local/session`) is this machine.
 
 Across every host at once:
 
 ```sh
-agent ls --all             # one list, with a HOST column, what needs attention first
-agent ls --all --json      # one object per session, with its address and global id
-agent events --all -f      # follow every host's events (add --notify for alerts)
+agt ls --all             # one list, with a HOST column, what needs attention first
+agt ls --all --json      # one object per session, with its address and global id
+agt events --all -f      # follow every host's events (add --notify for alerts)
 ```
 
-A session's global id (`agent status` shows it) is its host's daemon key plus the session's UID.
+A session's global id (`agt status` shows it) is its host's daemon key plus the session's UID.
 Unlike `host/name`, it never changes when a host is renamed and never refers to a newer session
 that reused the name.
 
-`agent --host auto new` lets the CLI choose: among the hosts that are online, have the agent, and
+`agt --host auto new` lets the CLI choose: among the hosts that are online, have the agent, and
 (with `--workspace`) have that workspace, it picks the one with the fewest running sessions per
 CPU, and says which and why. It is a hint for spreading work, not a scheduler. It needs
 `--workspace` or an absolute or `~/` `--cwd`, which mean the same on every host:
 
 ```sh
-agent --host auto new --workspace mono fix-flaky-tests
+agt --host auto new --workspace mono fix-flaky-tests
 ```
 
 Managing keys and hosts:
 
 ```sh
-agent remote id                  # this machine's client key fingerprint
-agent host ls                    # with --no-probe: hosts.toml as is, with pinned keys
-agent host info devbox
-agent host rm devbox
+agt remote id                  # this machine's client key fingerprint
+agt host ls                    # with --no-probe: hosts.toml as is, with pinned keys
+agt host info devbox
+agt host rm devbox
 agentd remote pair               # on the devbox: authorize a machine with a one-time code
 agentd remote list               # on the devbox: authorized clients
 agentd remote revoke SHA256:...
@@ -585,7 +586,7 @@ agentd remote revoke SHA256:...
 
 An authorized client has the same access as you have locally, except that only the devbox itself
 can stop its daemon. Authorizing takes effect immediately; revoking a key also disconnects that
-client within a few seconds, ending any attachment it has open. `agent daemon info` works remotely; `restart` and `upgrade` only
+client within a few seconds, ending any attachment it has open. `agt daemon info` works remotely; `restart` and `upgrade` only
 manage the local daemon.
 
 Troubleshooting:
@@ -595,8 +596,8 @@ Troubleshooting:
 - **"is not pairing"**: no `agentd remote pair` is waiting on the devbox, or its code expired or was
   closed by wrong attempts; run it again and use the new code.
 - **"the key of host ... has changed"**: the devbox presented a different key from the pinned one.
-  If you know why (for example `remote/daemon.key` was recreated), run `agent host rm` and
-  `agent host add` again. Otherwise, treat it as a possible interception.
+  If you know why (for example `remote/daemon.key` was recreated), run `agt host rm` and
+  `agt host add` again. Otherwise, treat it as a possible interception.
 - **"timed out connecting"**: check `[remote] listen` on the devbox, that the daemon was restarted,
   and that UDP reaches the port (firewalls often allow TCP only).
 
@@ -605,13 +606,13 @@ Troubleshooting:
 Try restarting the daemon:
 
 ```sh
-agent daemon info
-agent daemon restart
-agent daemon upgrade
+agt daemon info
+agt daemon restart
+agt daemon upgrade
 ```
 
-`agent daemon restart` is safe while sessions run: they keep running and reattach to the new
-daemon. `agent daemon upgrade` (or `agentd upgrade`, run as the new binary) is too: it replaces the
+`agt daemon restart` is safe while sessions run: they keep running and reattach to the new
+daemon. `agt daemon upgrade` (or `agentd upgrade`, run as the new binary) is too: it replaces the
 daemon, then hands each running session's worker over to the new binary without stopping the agent
 (a live handoff), and lists what happened to each session:
 
@@ -626,12 +627,12 @@ run) keeps running on the binary it has. Attached clients, local or remote, reat
 after a daemon restart or a handoff and repaint the screen; output the agent writes meanwhile is
 kept. ARCHITECTURE.md lists exactly what survives each kind of restart and crash.
 
-`agent` starts the daemon on demand with `agentd serve --daemonize`, using the `agentd` binary
-installed next to `agent`. Set `AGENTD_BIN` to use a different daemon binary, for example a local
+`agt` starts the daemon on demand with `agentd serve --daemonize`, using the `agentd` binary
+installed next to `agt`. Set `AGENTD_BIN` to use a different daemon binary, for example a local
 build:
 
 ```sh
-AGENTD_BIN=$PWD/bin/agentd agent daemon restart
+AGENTD_BIN=$PWD/bin/agentd agt daemon restart
 ```
 
 ## Status And Limitations
@@ -639,16 +640,16 @@ AGENTD_BIN=$PWD/bin/agentd agent daemon restart
 Current capabilities include:
 
 - local `agentd` daemon over a Unix socket
-- remote sessions over QUIC with `agent --host` and pinned keys (preview)
+- remote sessions over QUIC with `agt --host` and pinned keys (preview)
 - PTY-backed agent processes that outlive client connections
 - sessions that survive the daemon stopping, crashing, restarting, or being upgraded: each runs
   in its own worker process, a new daemon picks it up again, and an upgrade hands the worker itself
   over to the new binary with the agent still running
 - SQLite-backed session metadata
 - per-session PTY history held by the session while it runs and saved to `logs/` when it ends
-- git state and artifacts of a session's repository (`agent diff`, `agent artifacts`), locally and
+- git state and artifacts of a session's repository (`agt diff`, `agt artifacts`), locally and
   remotely, with large transfers on their own streams so they never stall an attachment
 - attention and activity read from each session's terminal output, kept as events, followed with
-  `agent events --follow` and surfaced in `agent ls`, `agent status` and the TUI
+  `agt events --follow` and surfaced in `agt ls`, `agt status` and the TUI
 
 Sessions whose worker dies while no daemon is running are shown as `unknown_recovered`.

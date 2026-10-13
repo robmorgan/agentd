@@ -1,5 +1,5 @@
 // Package db is the SQLite state store (state.db) for the daemon and its
-// session workers. Only they open it: the agent CLI goes through the daemon
+// session workers. Only they open it: the agt CLI goes through the daemon
 // protocol for all session state.
 package db
 

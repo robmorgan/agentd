@@ -190,7 +190,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to bind agentd socket: %w", err)
 	}
-	// The pid file is informational (agent daemon info); the lock, not the
+	// The pid file is informational (agt daemon info); the lock, not the
 	// pid file, decides whether a daemon is running.
 	pid := strconv.Itoa(os.Getpid())
 	if err := os.WriteFile(s.paths.PIDFile, []byte(pid), 0o600); err != nil {
@@ -481,7 +481,7 @@ func (s *Server) handleConnection(conn transport.Stream) error {
 		// Answer in the client's own framing so it can say why it was
 		// refused instead of reporting a dropped connection.
 		return protocol.WriteErrorAtVersion(conn, versionErr.Version, fmt.Sprintf(
-			"agentd speaks protocol version %d but this client sent version %d; upgrade the agent CLI or the daemon so they match",
+			"agentd speaks protocol version %d but this client sent version %d; upgrade the agt CLI or the daemon so they match",
 			protocol.ProtocolVersion, versionErr.Version))
 	}
 	var decodeErr *protocol.DecodeError

@@ -8,7 +8,7 @@ import (
 )
 
 func TestHandshakeRoundTrips(t *testing.T) {
-	roundTripRequest(t, &Request{Hello: NewHello("agent 0.1.0")})
+	roundTripRequest(t, &Request{Hello: NewHello("agt 0.1.0")})
 	roundTripRequest(t, &Request{Hello: &Hello{MinVersion: 1, MaxVersion: 3, Client: "x"}})
 	roundTripResponse(t, &Response{Welcome: &Welcome{
 		Version: 1, DaemonVersion: "0.1.0", Capabilities: []string{CapControlStream, "future"},

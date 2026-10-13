@@ -16,8 +16,8 @@ import (
 	"github.com/robmorgan/agentd/internal/session"
 )
 
-// What a session produced: `agent diff`, `agent artifacts`, `agent
-// artifact`, and the git section of `agent status`. The daemon reads git
+// What a session produced: `agt diff`, `agt artifacts`, `agent
+// artifact`, and the git section of `agt status`. The daemon reads git
 // on its own machine; the CLI only shows what it sends.
 
 // requireCapability fails unless the daemon advertised c in its Welcome.
@@ -110,7 +110,7 @@ func (c *client) streamArtifact(id, name string, w io.Writer) error {
 	}
 }
 
-// diff runs `agent diff`.
+// diff runs `agt diff`.
 func (c *client) diff(id string, stat, nameOnly bool) error {
 	switch {
 	case stat && nameOnly:
@@ -160,7 +160,7 @@ func truncationNote(st *session.GitState) error {
 	return nil
 }
 
-// downloadArtifact runs `agent artifact`: to stdout, or to a file that only
+// downloadArtifact runs `agt artifact`: to stdout, or to a file that only
 // appears, complete, once the whole artifact has arrived.
 func (c *client) downloadArtifact(id, name, output string) error {
 	if output == "" || output == "-" {
@@ -202,10 +202,10 @@ func printArtifacts(w io.Writer, artifacts []session.Artifact) {
 // shortHash abbreviates a commit hash for display.
 func shortHash(h string) string { return h[:min(len(h), 12)] }
 
-// maxStatusCommits bounds the commits `agent status` lists.
+// maxStatusCommits bounds the commits `agt status` lists.
 const maxStatusCommits = 10
 
-// printGitState is the git section of `agent status`.
+// printGitState is the git section of `agt status`.
 func printGitState(w io.Writer, st *session.GitState, now time.Time) {
 	base := "none recorded"
 	if st.Base != "" {

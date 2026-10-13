@@ -72,7 +72,7 @@ func (a *app) commands() []*cobra.Command {
 	})
 	newCmd.Flags().StringVar(&cwd, "cwd", "", "Directory the agent runs in (default: the current directory, or the workspace root with --workspace, where DIR is relative to it)")
 	newCmd.Flags().StringVar(&agent, "agent", "", "")
-	newCmd.Flags().StringVar(&workspace, "workspace", "", "Run in a workspace (see `agent workspace`)")
+	newCmd.Flags().StringVar(&workspace, "workspace", "", "Run in a workspace (see `agt workspace`)")
 	withValue(newCmd, "cwd", "DIR")
 	withValue(newCmd, "agent", "AGENT")
 	withValue(newCmd, "workspace", "NAME")
@@ -210,7 +210,7 @@ func (a *app) commands() []*cobra.Command {
 		}
 		return nil
 	}), "ls", "sessions")
-	list.Flags().BoolVarP(&listAll, "all", "a", false, "List the sessions of this machine and every host (see `agent hosts`)")
+	list.Flags().BoolVarP(&listAll, "all", "a", false, "List the sessions of this machine and every host (see `agt hosts`)")
 	list.Flags().BoolVar(&listJSON, "json", false, "Print one JSON object per session, with its host and global id")
 	cmds = append(cmds, list)
 
@@ -315,7 +315,7 @@ func (a *app) commands() []*cobra.Command {
 	})
 	artifact.Flags().StringVarP(&artifactOutput, "output", "o", "", "Write to FILE instead of stdout (only once complete)")
 	withValue(artifact, "output", "FILE")
-	cmds = append(cmds, annotate(artifact, "[OPTIONS] <SESSION_ID> <NAME>", "<SESSION_ID>\n<NAME>        diff, patch, history or history.vt (see `agent artifacts`)"))
+	cmds = append(cmds, annotate(artifact, "[OPTIONS] <SESSION_ID> <NAME>", "<SESSION_ID>\n<NAME>        diff, patch, history or history.vt (see `agt artifacts`)"))
 
 	var ev eventsOptions
 	events := a.command("events [SESSION]", "Show session events: lifecycle and attention", optionalArg, func(args []string) error {
@@ -325,7 +325,7 @@ func (a *app) commands() []*cobra.Command {
 	events.Flags().IntVarP(&ev.lines, "lines", "n", 20, "How many past events to show first")
 	events.Flags().StringVar(&ev.level, "level", "", "Only events at or above this attention: info, notice or action")
 	events.Flags().BoolVar(&ev.json, "json", false, "Print one JSON object per event")
-	events.Flags().BoolVarP(&ev.all, "all", "a", false, "Show the events of this machine and every host (see `agent hosts`)")
+	events.Flags().BoolVarP(&ev.all, "all", "a", false, "Show the events of this machine and every host (see `agt hosts`)")
 	events.Flags().BoolVar(&ev.notify, "notify", false, "Ring the bell and post a desktop notification for action-level events")
 	events.Flags().StringVar(&ev.exec, "exec", "", "Run CMD with sh for each event, described in AGENTD_EVENT_* variables")
 	events.Flags().Func("after", "Start after event ID (from an earlier run) instead of with the newest events", func(v string) error {
@@ -338,18 +338,18 @@ func (a *app) commands() []*cobra.Command {
 	withValue(events, "exec", "CMD")
 	withValue(events, "after", "ID")
 	events.Annotations = map[string]string{"after": `Examples:
-  agent events                     the last 20 events of every session
-  agent events fix-tests -f        follow one session
-  agent --host devbox events -f --notify
+  agt events                     the last 20 events of every session
+  agt events fix-tests -f        follow one session
+  agt --host devbox events -f --notify
                                    alert when a session on devbox needs you
-  agent events -f --level action --exec 'say "$AGENTD_EVENT_SESSION needs you"'
+  agt events -f --level action --exec 'say "$AGENTD_EVENT_SESSION needs you"'
 
 --exec gets AGENTD_EVENT_ID, _HOST, _SESSION, _KIND, _ATTENTION, _SUMMARY and
 _TIME. Following reconnects by itself and resumes after the last event shown.`}
 	cmds = append(cmds, annotate(events, "[OPTIONS] [SESSION_ID]", "[SESSION_ID]"))
 
 	cmds = append(cmds, group("workspace", "Manage named working directories on the daemon's machine",
-		"Name directories on the daemon's machine, then start sessions in them\nwith `agent new --workspace NAME`.",
+		"Name directories on the daemon's machine, then start sessions in them\nwith `agt new --workspace NAME`.",
 		"Notes:\n  Paths are resolved by the daemon; `~/` is its user's home. The directory must\n  already exist: agentd does not clone, create, or sync workspaces.\n  Removing a workspace does not affect sessions already running in it.",
 		annotate(a.command("add NAME PATH", "Add a workspace", twoArgs, func(args []string) error {
 			c, err := a.connect(nil, "", nil)
@@ -453,17 +453,17 @@ _TIME. Following reconnects by itself and resumes after the last event shown.`}
 	listHosts := func([]string) error { return a.listHosts(noProbe) }
 	hostList := visibleAlias(a.command("list", "List hosts and whether they are reachable", noArgs, listHosts), "ls")
 	hostList.Flags().BoolVar(&noProbe, "no-probe", false, "List hosts.toml without contacting the hosts (shows their keys)")
-	hosts := a.command("hosts", "List hosts and whether they are reachable (same as `agent host ls`)", noArgs, listHosts)
+	hosts := a.command("hosts", "List hosts and whether they are reachable (same as `agt host ls`)", noArgs, listHosts)
 	hosts.Flags().BoolVar(&noProbe, "no-probe", false, "List hosts.toml without contacting the hosts (shows their keys)")
 	cmds = append(cmds, hosts)
 	cmds = append(cmds, group("host", "Manage remote hosts this machine can reach",
 		"Remote hosts running agentd with `[remote] listen` set.",
-		"Examples:\n  agent host add devbox 100.64.0.5:7433 --code 123-456-789\n  agent host add devbox 100.64.0.5:7433\n  agent host ls\n  agent --host devbox ls\n  agent attach devbox/auth-refactor\n  agent --host auto new --workspace mono fix-tests",
+		"Examples:\n  agt host add devbox 100.64.0.5:7433 --code 123-456-789\n  agt host add devbox 100.64.0.5:7433\n  agt host ls\n  agt --host devbox ls\n  agt attach devbox/auth-refactor\n  agt --host auto new --workspace mono fix-tests",
 		annotate(hostAdd, "[OPTIONS] <NAME> <ADDRESS>", "<NAME>     \n<ADDRESS>  HOST:PORT of the remote agentd's QUIC listener"),
 		hostList,
 		annotate(a.command("info NAME", "Show a host's machine, daemon, and capabilities", oneArg, func(args []string) error {
 			return a.hostInfo(args[0])
-		}), "<NAME>", "<NAME>  A host from `agent host ls`, or `local`"),
+		}), "<NAME>", "<NAME>  A host from `agt host ls`, or `local`"),
 		annotate(a.command("rm NAME", "Forget a host", oneArg, func(args []string) error {
 			removed, err := transport.RemoveHost(a.paths.HostsPath(), args[0])
 			if err != nil {
@@ -514,7 +514,7 @@ func (a *app) listHosts(noProbe bool) error {
 			return err
 		}
 		if len(hosts) == 0 {
-			fmt.Println("no hosts; add one with `agent host add NAME HOST:PORT`")
+			fmt.Println("no hosts; add one with `agt host add NAME HOST:PORT`")
 		}
 		for _, h := range hosts {
 			fmt.Printf("%s\t%s\t%s\n", h.Name, h.Address, h.Fingerprint)
@@ -527,7 +527,7 @@ func (a *app) listHosts(noProbe bool) error {
 	}
 	renderHosts(os.Stdout, probes)
 	if len(probes) == 1 {
-		fmt.Println("no remote hosts; add one with `agent host add NAME HOST:PORT`")
+		fmt.Println("no remote hosts; add one with `agt host add NAME HOST:PORT`")
 	}
 	return nil
 }
@@ -547,7 +547,7 @@ func (a *app) hostInfo(name string) error {
 	return nil
 }
 
-// placeSession resolves `agent new --host auto` to a host, telling the user
+// placeSession resolves `agt new --host auto` to a host, telling the user
 // which and why. A session placed on another machine needs a directory that
 // means the same there: a workspace, or an absolute or ~/ --cwd.
 func (a *app) placeSession(agent, workspace, cwd string) error {
@@ -746,7 +746,7 @@ func printSession(w io.Writer, s *session.Record, now time.Time) {
 	}
 }
 
-// newSessionRequest resolves `agent new`'s arguments.
+// newSessionRequest resolves `agt new`'s arguments.
 func (c *client) newSessionRequest(name, cwd, agent, workspace string) (*protocol.CreateSession, error) {
 	req := &protocol.CreateSession{}
 	if workspace = strings.TrimSpace(workspace); workspace != "" {
@@ -796,7 +796,7 @@ func normalizeRequestedName(name string) (string, error) {
 func remoteCwd(host, cwd string) (string, error) {
 	switch {
 	case cwd == "":
-		return "", fmt.Errorf("`agent new` on `%s` needs --workspace NAME or --cwd DIR (a directory on that machine)", host)
+		return "", fmt.Errorf("`agt new` on `%s` needs --workspace NAME or --cwd DIR (a directory on that machine)", host)
 	case !(strings.HasPrefix(cwd, "/") || cwd == "~" || strings.HasPrefix(cwd, "~/")):
 		return "", fmt.Errorf("--cwd `%s` must be absolute or start with `~/` on `%s`", cwd, host)
 	}
@@ -843,9 +843,9 @@ func resolveCwd(cwd string) (string, error) {
 	return canonical, nil
 }
 
-// workspacePath is the path sent for `agent workspace add`. A ~ path is sent
+// workspacePath is the path sent for `agt workspace add`. A ~ path is sent
 // as given, for the daemon to expand against its own home. Anything else is
-// resolved here, so `agent workspace add mono .` works; that relies on the
+// resolved here, so `agt workspace add mono .` works; that relies on the
 // CLI sharing the daemon's filesystem.
 func workspacePath(path string) (string, error) {
 	if path == "~" || strings.HasPrefix(path, "~/") {
@@ -870,7 +870,7 @@ func resolveDetachSessionID(id string) (string, error) {
 	if env := os.Getenv("AGENTD_SESSION_ID"); env != "" {
 		return env, nil
 	}
-	return "", errors.New("`agent detach` without a session id only works inside a managed session")
+	return "", errors.New("`agt detach` without a session id only works inside a managed session")
 }
 
 type sendInputArgs struct {
@@ -878,7 +878,7 @@ type sendInputArgs struct {
 	data                  []string
 }
 
-// parseSendInput parses `agent send-input`'s arguments by hand: DATA is
+// parseSendInput parses `agt send-input`'s arguments by hand: DATA is
 // everything after the session, flag-like words included.
 func parseSendInput(args []string) (sendInputArgs, error) {
 	var in sendInputArgs
@@ -951,7 +951,7 @@ func (a *app) hostAdd(name, address, fingerprint string) error {
 		return err
 	}
 	if _, err := transport.LookupHost(path, name); err == nil {
-		return fmt.Errorf("host `%s` already exists; remove it first with `agent host rm %s`", name, name)
+		return fmt.Errorf("host `%s` already exists; remove it first with `agt host rm %s`", name, name)
 	}
 	if fingerprint != "" && !transport.ValidFingerprint(fingerprint) {
 		return fmt.Errorf("`%s` is not a key fingerprint (expected SHA256:...)", fingerprint)
@@ -982,7 +982,7 @@ func (a *app) hostAdd(name, address, fingerprint string) error {
 	}
 	fmt.Printf("added host `%s` (%s)\n\nIf this machine is not authorized there yet, run on `%s`:\n  agentd remote authorize %s %s\n",
 		name, address, name, id.Fingerprint, localHostname())
-	fmt.Printf("or pair instead: run `agentd remote pair` there, then here:\n  agent host add %s %s --code CODE\n", name, address)
+	fmt.Printf("or pair instead: run `agentd remote pair` there, then here:\n  agt host add %s %s --code CODE\n", name, address)
 	return nil
 }
 
@@ -999,7 +999,7 @@ func (a *app) hostPair(name, address, code string) error {
 	existing, err := transport.LookupHost(path, name)
 	exists := err == nil
 	if exists && existing.Address != address {
-		return fmt.Errorf("host `%s` already exists at %s; remove it first with `agent host rm %s`", name, existing.Address, name)
+		return fmt.Errorf("host `%s` already exists at %s; remove it first with `agt host rm %s`", name, existing.Address, name)
 	}
 	if _, err := transport.NormalizePairingCode(code); err != nil {
 		return err
@@ -1020,7 +1020,7 @@ func (a *app) hostPair(name, address, code string) error {
 	}
 	if exists {
 		if existing.Fingerprint != paired.Fingerprint {
-			return fmt.Errorf("%s now presents key %s, not the key %s pinned for `%s`; it authorized this machine, but `%s` was not changed. If you know why the key changed, run `agent host rm %s` and pair again",
+			return fmt.Errorf("%s now presents key %s, not the key %s pinned for `%s`; it authorized this machine, but `%s` was not changed. If you know why the key changed, run `agt host rm %s` and pair again",
 				address, paired.Fingerprint, existing.Fingerprint, name, name, name)
 		}
 		fmt.Printf("✓ Paired with `%s` (%s); it has authorized this machine\n", name, address)

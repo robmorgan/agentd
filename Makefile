@@ -1,4 +1,4 @@
-.PHONY: libghostty build agent agentd test test-cgocheck test-linux vet dev-run install
+.PHONY: libghostty build agt agentd test test-cgocheck test-linux vet dev-run install
 
 ZIG ?= zig
 VERSION ?= 0.1.0
@@ -13,15 +13,15 @@ LDFLAGS := -X github.com/robmorgan/agentd/internal/cli.Version=$(VERSION) \
 libghostty:
 	ZIG=$(ZIG) ./scripts/build-libghostty.sh
 
-build: agentd agent
+build: agentd agt
 
 # agentd links libghostty-vt (cgo, built with Zig).
 agentd: libghostty
 	go build -ldflags '$(LDFLAGS)' -o bin/agentd ./cmd/agentd
 
-# agent is pure Go: it needs neither cgo nor Zig.
-agent:
-	CGO_ENABLED=0 go build -ldflags '$(LDFLAGS)' -o bin/agent ./cmd/agent
+# agt is pure Go: it needs neither cgo nor Zig.
+agt:
+	CGO_ENABLED=0 go build -ldflags '$(LDFLAGS)' -o bin/agt ./cmd/agt
 
 test: libghostty
 	go test -race ./...
@@ -40,11 +40,12 @@ vet: libghostty
 
 # The CLI looks for agentd next to its own executable, or at $AGENTD_BIN.
 dev-run: build
-	AGENTD_BIN=$(CURDIR)/bin/agentd ./bin/agent $(ARGS)
+	AGENTD_BIN=$(CURDIR)/bin/agentd ./bin/agt $(ARGS)
 
 install: build
 	install -d $(BINDIR)
-	install -m 0755 bin/agent bin/agentd $(BINDIR)/
-	@if [ -x "$(HOME)/.cargo/bin/agent" ]; then \
-		echo "note: $(HOME)/.cargo/bin/agent is the old Rust CLI; remove it (cargo uninstall agent-cli) so $(BINDIR)/agent is found"; \
+	install -m 0755 bin/agt bin/agentd $(BINDIR)/
+	@# The CLI was called agent before; point out a leftover copy.
+	@if [ -x "$(BINDIR)/agent" ] && "$(BINDIR)/agent" --version 2>/dev/null | grep -q '^agent '; then \
+		echo "note: $(BINDIR)/agent is the old name of agt; remove it (rm $(BINDIR)/agent)"; \
 	fi

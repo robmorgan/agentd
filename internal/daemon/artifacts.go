@@ -88,7 +88,7 @@ func (s *Server) listArtifacts(id string) *protocol.Response {
 	defer cancel()
 	out := []session.Artifact{}
 	// A directory that is not a repository (or where git fails) simply has
-	// no git artifacts; `agent diff` explains why if asked.
+	// no git artifacts; `agt diff` explains why if asked.
 	if sum, err := repo.Summarize(ctx, rec.Cwd, base); err == nil {
 		desc := "changes since HEAD (no base recorded), untracked files included"
 		if sum.Base != "" {
@@ -211,7 +211,7 @@ func (s *Server) openArtifact(ctx context.Context, req *protocol.GetArtifact) (i
 	case artifactHistory, artifactHistoryVT:
 		return s.historySource(id, req.Name == artifactHistoryVT)
 	}
-	return nil, fmt.Errorf("session `%s` has no artifact `%s`; see `agent artifacts %s`", id, req.Name, id)
+	return nil, fmt.Errorf("session `%s` has no artifact `%s`; see `agt artifacts %s`", id, req.Name, id)
 }
 
 // historySource is a session's history: live from its worker while it runs

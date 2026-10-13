@@ -1,4 +1,4 @@
-You are working in the `agentd` repository: a daemon runtime for supervising coding agents as durable tasks. It is one Go module: the daemon (`agentd serve` plus one `agentd session-worker` per session) and the `agent` CLI (`cmd/agent`, `internal/cli`), with QUIC as the remote transport.
+You are working in the `agentd` repository: a daemon runtime for supervising coding agents as durable tasks. It is one Go module: the daemon (`agentd serve` plus one `agentd session-worker` per session) and the `agt` CLI (`cmd/agt`, `internal/cli`), with QUIC as the remote transport.
 
 Before larger changes, read `README.md`, `ARCHITECTURE.md` and `ROADMAP.md`. The code is the source of truth for current behavior.
 
@@ -79,7 +79,7 @@ The eventual remote path should look like:
 ```text
 MacBook
 
-agent --host devbox attach foo
+agt --host devbox attach foo
 
         │
         │ QUIC
@@ -114,7 +114,7 @@ The daemon and its per-session workers are Go. Go owns:
 - PTY fan-out
 - task/agent lifecycle
 
-The `agent` CLI is Go too and uses the same protocol and transport packages. It must stay pure Go (no cgo, no Zig): it never imports `worker`, `daemon` or `db`, and a test in `cmd/agent` enforces that. It reaches session state only through the protocol. Golden-frame tests pin the protocol's bytes, since CLIs and daemons of different builds talk to each other.
+The `agt` CLI is Go too and uses the same protocol and transport packages. It must stay pure Go (no cgo, no Zig): it never imports `worker`, `daemon` or `db`, and a test in `cmd/agt` enforces that. It reaches session state only through the protocol. Golden-frame tests pin the protocol's bytes, since CLIs and daemons of different builds talk to each other.
 
 Preserve existing user-visible behavior unless there is a compelling reason to change it.
 
@@ -286,7 +286,7 @@ rather than merely:
 
 ```text
 cmd/agentd/          serve, upgrade, remote, bench, session-worker
-cmd/agent/           the `agent` CLI (and its end-to-end PTY tests)
+cmd/agt/             the `agt` CLI (and its end-to-end PTY tests)
 internal/
   cli/               the CLI: commands, picker, attach, overlay
   daemon/            session registry, proxies, lifecycle, supervision
@@ -437,25 +437,25 @@ Preserve the existing user experience where practical.
 The commands are:
 
 ```text
-agent new [--cwd DIR] [NAME]
-agent list | ls
-agent attach
-agent attachments
-agent detach
-agent history
-agent diff
-agent artifacts
-agent artifact
-agent send-input
-agent status
-agent events
-agent kill
-agent rm
-agent daemon info | restart | upgrade
-agent host add | ls | info | rm
-agent hosts
-agent workspace add | ls | rm
-agent remote id
+agt new [--cwd DIR] [NAME]
+agt list | ls
+agt attach
+agt attachments
+agt detach
+agt history
+agt diff
+agt artifacts
+agt artifact
+agt send-input
+agt status
+agt events
+agt kill
+agt rm
+agt daemon info | restart | upgrade
+agt host add | ls | info | rm
+agt hosts
+agt workspace add | ls | rm
+agt remote id
 ```
 
 Do not rename commands merely because implementation internals changed.
@@ -519,19 +519,19 @@ Done:
 - The transport split: the daemon serves `transport.Stream`s from any `transport.Listener`.
 - The daemon's QUIC listener (off unless `[remote] listen` is set): one QUIC stream per control stream, attachment or transfer, mutual TLS with pinned Ed25519 keys, managed with `agentd remote id|list|authorize|revoke`.
 - `agentd remote enable [ADDRESS] | disable | status`: detects a Tailscale address (or asks about the default-route one), edits `[remote] listen`, restarts the daemon; an unbindable listen address is retried in the background.
-- The CLI's QUIC client: `agent --host NAME` and `NAME/session` addresses, `agent host add|ls|rm` (confirm-on-first-use key pinning in `hosts.toml`), and `agent remote id` (`remote/client.key`).
-- Pairing: `agentd remote pair` shows a one-time 9-digit code and `agent host add NAME ADDRESS --code CODE` uses it to pin the daemon's key and authorize the client's in one step (CPace PAKE over the `agentd-pair` ALPN, bound to both keys and the TLS connection; one window at a time, 5 minutes, 3 wrong codes; `internal/transport/pair.go`).
+- The CLI's QUIC client: `agt --host NAME` and `NAME/session` addresses, `agt host add|ls|rm` (confirm-on-first-use key pinning in `hosts.toml`), and `agt remote id` (`remote/client.key`).
+- Pairing: `agentd remote pair` shows a one-time 9-digit code and `agt host add NAME ADDRESS --code CODE` uses it to pin the daemon's key and authorize the client's in one step (CPace PAKE over the `agentd-pair` ALPN, bound to both keys and the TLS connection; one window at a time, 5 minutes, 3 wrong codes; `internal/transport/pair.go`).
 - Dead remote clients are noticed within 15s, and a remote attachment that loses its connection reconnects and reattaches by itself.
-- Git state and artifacts, read-only (`internal/repo`): a session records its base commit at creation; `GetGitState` (commits and changed files since the base, untracked included) and artifact streams (`diff`, `patch`, `history`, `history.vt`) in bounded chunks under flow control; `agent diff`, `agent artifacts`, `agent artifact`, and a git section in `agent status`, locally and over QUIC.
+- Git state and artifacts, read-only (`internal/repo`): a session records its base commit at creation; `GetGitState` (commits and changed files since the base, untracked included) and artifact streams (`diff`, `patch`, `history`, `history.vt`) in bounded chunks under flow control; `agt diff`, `agt artifacts`, `agt artifact`, and a git section in `agt status`, locally and over QUIC.
 - Session resumption: per-incarnation session UIDs (a reattach never lands on a recreated session), attach ids unique per incarnation, reattach replaces the lost attachment at once, lagging clients are resynced from an exact-boundary snapshot, every output/input buffer is bounded (ARCHITECTURE.md lists them), and lifecycle requests carry tokens so a remote CLI retries them safely after a lost connection.
 - The connection handshake (`Hello`/`Welcome`): version and capability negotiation, host description, and a control stream of tagged requests; stream roles are set by a stream's first frame.
-- Events and attention: workers read bells, OSC 9/777 notifications, idleness and the PTY's foreground process; lifecycle and attention events persist in `state.db` (resumable ids, bounded per session); attach acknowledges; events streams (`SubscribeEvents`) feed `agent events --follow [--notify|--exec]`, locally or remotely; `ls`, `status`, the picker and the overlay show attention and activity.
-- Live worker handoff: `agentd upgrade` / `agent daemon upgrade` replace the daemon, then each session's worker re-execs into the new binary keeping its pid, agent, PTY, socket and exact terminal state (libghostty snapshot); attachments, local ones included, reattach by themselves. Restart and crash guarantees are documented in ARCHITECTURE.md.
+- Events and attention: workers read bells, OSC 9/777 notifications, idleness and the PTY's foreground process; lifecycle and attention events persist in `state.db` (resumable ids, bounded per session); attach acknowledges; events streams (`SubscribeEvents`) feed `agt events --follow [--notify|--exec]`, locally or remotely; `ls`, `status`, the picker and the overlay show attention and activity.
+- Live worker handoff: `agentd upgrade` / `agt daemon upgrade` replace the daemon, then each session's worker re-execs into the new binary keeping its pid, agent, PTY, socket and exact terminal state (libghostty snapshot); attachments, local ones included, reattach by themselves. Restart and crash guarantees are documented in ARCHITECTURE.md.
 
-- Host health (`agent hosts`), machine capabilities (`agent host info`), and placement hints (`agent --host auto new`).
-- Resource usage: workers and the daemon report their own (`GetSessionStats`/`GetDaemonStats`, `agent status --stats`, `agent daemon stats`), and `agentd bench sessions` measures sessions at scale (BENCHMARKS.md, "Sessions at scale").
+- Host health (`agt hosts`), machine capabilities (`agt host info`), and placement hints (`agt --host auto new`).
+- Resource usage: workers and the daemon report their own (`GetSessionStats`/`GetDaemonStats`, `agt status --stats`, `agt daemon stats`), and `agentd bench sessions` measures sessions at scale (BENCHMARKS.md, "Sessions at scale").
 
-- Cross-host discovery (`agent ls --all`, `agent events --all`) and global session ids (daemon id + session UID).
+- Cross-host discovery (`agt ls --all`, `agt events --all`) and global session ids (daemon id + session UID).
 - Program status (OSC 7501) as the sole attention source: libghostty parses the reports, the worker keeps the records (`internal/worker/status.go`) and answers the detection query, the program's word decides activity/attention (blocked/done/error activities and events; progress, app, kind and message in `state.db` v6 and under `CapSessionStatus`), and records survive handoffs. The bell/notification/idle heuristics were removed once Claude Code adopted the protocol: a non-reporting program shows as plainly running, bells/notifications are info-only observability events, and the stall watch (non-reporting foreground command silent for 30m) is the one remaining timing signal.
 
 Next:
@@ -548,7 +548,7 @@ Do not begin QUIC before the transport split: the session and ownership model ha
 Keep this future workflow in mind when making architectural decisions:
 
 ```sh
-agent --host devbox new --cwd /srv/repo auth-refactor
+agt --host devbox new --cwd /srv/repo auth-refactor
 ```
 
 The user asks Claude Code to refactor authentication and run the tests. The remote machine runs:
@@ -570,7 +570,7 @@ The agent continues.
 Hours later, possibly from another machine:
 
 ```sh
-agent attach devbox/auth-refactor
+agt attach devbox/auth-refactor
 ```
 
 The client establishes a new QUIC connection.

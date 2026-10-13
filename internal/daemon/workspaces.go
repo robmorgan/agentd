@@ -81,7 +81,7 @@ func (s *Server) resolveCwd(req *protocol.CreateSession) (string, *string, error
 		return "", nil, err
 	}
 	if w == nil {
-		return "", nil, fmt.Errorf("workspace `%s` not found; add it with `agent workspace add`", name)
+		return "", nil, fmt.Errorf("workspace `%s` not found; add it with `agt workspace add`", name)
 	}
 	if req.Cwd == "" {
 		return w.Path, &name, nil

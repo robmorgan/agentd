@@ -1,7 +1,7 @@
 # Architecture
 
 `agentd` is a local daemon that owns coding-agent sessions: their PTYs, processes, terminal state,
-and metadata. `agent` is a thin client that sends requests over the resolved runtime root's
+and metadata. `agt` is a thin client that sends requests over the resolved runtime root's
 `agentd.sock` and prints or streams the responses.
 
 ```text
@@ -23,8 +23,8 @@ Both binaries are one Go module at the repository root.
 
 | Package | What it does |
 |---|---|
-| `cmd/agentd` | `serve [--daemonize]`, `upgrade`, `remote enable\|disable\|status` (set `[remote] listen` and restart the daemon), `remote pair\|id\|list\|authorize\|revoke`, `bench sessions` (`internal/bench`: measures sessions on a private daemon), `session-worker` (also `--handoff-probe` and `--resume-fd`, for live handoff). `upgrade` replaces the daemon, then hands running sessions' workers over to the new binary. The agent CLI runs `serve --daemonize`. |
-| `cmd/agent`, `internal/cli` | The `agent` CLI: commands, the session picker, attach and the Ctrl-Y overlay (plain ANSI), and `hosts.toml` for remote hosts. Pure Go: it never imports `worker`, `daemon` or `db`, and `cmd/agent`'s tests check that, then drive both real binaries through PTYs. |
+| `cmd/agentd` | `serve [--daemonize]`, `upgrade`, `remote enable\|disable\|status` (set `[remote] listen` and restart the daemon), `remote pair\|id\|list\|authorize\|revoke`, `bench sessions` (`internal/bench`: measures sessions on a private daemon), `session-worker` (also `--handoff-probe` and `--resume-fd`, for live handoff). `upgrade` replaces the daemon, then hands running sessions' workers over to the new binary. The agt CLI runs `serve --daemonize`. |
+| `cmd/agt`, `internal/cli` | The `agt` CLI: commands, the session picker, attach and the Ctrl-Y overlay (plain ANSI), and `hosts.toml` for remote hosts. Pure Go: it never imports `worker`, `daemon` or `db`, and `cmd/agt`'s tests check that, then drive both real binaries through PTYs. |
 | `internal/daemon` | `agentd serve`: lock/socket/pid file lifecycle, create/kill/rm/ls/get, attach and request proxies to workers, history, daemon management, worker supervision and startup reconciliation. Tests run the daemon in-process against real worker processes. |
 | `internal/worker` | One session: PTY via `creack/pty`, shadow terminal via `go.mitchellh.com/libghostty`, per-session Unix socket, activity and attention detection from the PTY stream, and live handoff to a new binary (`handoff.go`; OS-specific waits in `sys_linux.go`, `sys_darwin.go`). Real-PTY tests run under `-race`. |
 | `internal/repo` | Read-only views of the git repository a session works in, for the daemon: git state, the diff and patch artifacts. Runs the system `git`; tests use real temporary repositories. |
@@ -55,7 +55,7 @@ attachment; the agent keeps running and any later connection can reattach.
 
 The daemon is disposable too. Each worker runs in its own process session, so stopping, crashing,
 or restarting the daemon does not touch running sessions. A new daemon finds them again through
-`state.db` and the per-session sockets. `agent daemon restart` is therefore always safe.
+`state.db` and the per-session sockets. `agt daemon restart` is therefore always safe.
 
 A session counts as live only if its worker accepts a connection on its socket. Pids recorded in
 `state.db` are never trusted on their own: after a crash or reboot they may belong to unrelated
@@ -85,7 +85,7 @@ the daemon and the session's worker write it: the worker the outcome it knows fi
 daemon what it can only infer.
 
 ```text
-                 agent new (the daemon inserts the record)
+                 agt new (the daemon inserts the record)
                       │
                       ▼
                  ┌──────────┐   cwd missing, spawn failed, worker not up in 5 s,
@@ -101,7 +101,7 @@ daemon what it can only infer.
                       ▼ (it died while no daemon supervised it)
               unknown_recovered
 
-  agent rm (or kill --rm): stops the session if it runs, then deletes the record and logs
+  agt rm (or kill --rm): stops the session if it runs, then deletes the record and logs
 ```
 
 * `creating`: the daemon has allocated the name and UID and is starting `agentd session-worker`.
@@ -123,7 +123,7 @@ daemon what it can only infer.
   an outcome a worker wrote on its way out.
 
 `exited`, `failed` and `unknown_recovered` are final: a session never restarts. Its history stays
-readable (`agent history` reads the logs the worker wrote at exit) until `agent rm` deletes the
+readable (`agt history` reads the logs the worker wrote at exit) until `agt rm` deletes the
 record and logs; the name can then be used again, by a new incarnation with a new UID.
 
 ### Daemon restarts
@@ -141,8 +141,8 @@ safe:
   refused by `MarkRunning`, stops its agent and exits).
 * A daemon supervises only the workers it spawned. A worker that crashes under a later daemon is
   found by probing its socket, so its session becomes `unknown_recovered` rather than `failed`.
-* `agent daemon restart` stops the daemon even with sessions running. A plain shutdown request is
-  refused while sessions run. `agent daemon upgrade` replaces the daemon and then hands each running
+* `agt daemon restart` stops the daemon even with sessions running. A plain shutdown request is
+  refused while sessions run. `agt daemon upgrade` replaces the daemon and then hands each running
   worker over to the new binary (see "Live Handoff").
 * A worker that claims its session (`MarkRunning`) while a starting daemon reconciles keeps it:
   reconciliation fails only rows still `creating`, so a session is never recorded failed while its
@@ -159,12 +159,12 @@ state, attention); the live PTY, agent process and terminal state live in the se
 
 | Event | Survives | Lost | Reconciled by |
 |---|---|---|---|
-| Daemon restart (`agent daemon restart`, SIGTERM) | Every session: workers, agents, PTYs, terminal state, metadata | Open connections: attachments and control streams end (CLIs reattach and repaint), and a one-shot request in flight fails (the CLI never resends one it wrote) | The new daemon reads `state.db`; running sessions whose socket answers stay running |
+| Daemon restart (`agt daemon restart`, SIGTERM) | Every session: workers, agents, PTYs, terminal state, metadata | Open connections: attachments and control streams end (CLIs reattach and repaint), and a one-shot request in flight fails (the CLI never resends one it wrote) | The new daemon reads `state.db`; running sessions whose socket answers stay running |
 | Daemon crash (SIGKILL, panic, OOM) | Same as a restart | Same as a restart, plus supervision of the workers it spawned: a worker that dies later is found by a socket probe (`unknown_recovered`) rather than reaped (`failed`) | The kernel releases the lock; the next daemon removes the stale socket and reconciles as above. A session it was creating is either never inserted, `failed` ("agentd stopped while the session was starting", and its worker, refused by `MarkRunning`, kills its agent and exits), or `running` if the worker got there first |
 | Worker crash (SIGKILL) | Metadata | The session: its PTY is hung up, so the kernel sends the agent SIGHUP; terminal history not yet written to `logs/` (it is written when a session ends) | Recorded `failed` by the daemon that spawned the worker, or `unknown_recovered` when a probe finds its socket refusing. An agent that ignores SIGHUP survives, orphaned, with a dead terminal: agentd does not signal recorded pids, which may have been reused |
 | Agent exits or crashes | Metadata, history (written to `logs/`) | The live session | The worker records `exited` (exit 0, or a kill) or `failed` with the reason, and sends `SessionEnded` to attached clients |
 | Machine reboot | Metadata, history of ended sessions, keys, config | Every live session (processes and PTYs), and the unsaved history of those sessions | Sessions recorded running are `unknown_recovered` once the next daemon finds their sockets refusing or gone |
-| Upgrade with live handoff (`agent daemon upgrade`, `agentd upgrade`) | Everything a daemon restart keeps, and the worker itself moves to the new binary: same pid, same agent (still its child), same PTY, socket path, exact terminal state, attach numbering; queued input reaches the agent first, and output written during the handoff waits in the PTY | Attachments end with `SessionRestarting` (clients that do not know it are detached instead); a connection arriving during the exec just waits for the new image | The new image restores the state and touches the session's row (`MarkResumed`); nothing else changes in `state.db` |
+| Upgrade with live handoff (`agt daemon upgrade`, `agentd upgrade`) | Everything a daemon restart keeps, and the worker itself moves to the new binary: same pid, same agent (still its child), same PTY, socket path, exact terminal state, attach numbering; queued input reaches the agent first, and output written during the handoff waits in the PTY | Attachments end with `SessionRestarting` (clients that do not know it are detached instead); a connection arriving during the exec just waits for the new image | The new image restores the state and touches the session's row (`MarkResumed`); nothing else changes in `state.db` |
 | Upgrade without handoff (the handoff was refused or failed before the exec) | The session, unchanged, on its previous binary | Attachments, if the failure came after clients were told to restart (they reattach to the same worker) | Nothing to reconcile; `agentd upgrade` names the session and the reason |
 | New image dies after the exec | Metadata | The session, as for a worker crash | As for a worker crash; `agentd upgrade` reports the session as lost |
 
@@ -306,7 +306,7 @@ SSH uses host keys and `authorized_keys`, with no certificate authority:
 Pairing (`internal/transport/pair.go`) sets up both halves of that trust from a short code instead
 of copying fingerprints between machines. `agentd remote pair` asks the daemon (a management
 request on the local socket only) to open a pairing window. The daemon shows a 9-digit code, and
-`agent host add NAME ADDRESS --code CODE` proves it knows the code:
+`agt host add NAME ADDRESS --code CODE` proves it knows the code:
 
 * A pairing client connects with ALPN `agentd-pair` instead of `agentd`. The daemon completes that
   handshake for any client key, but only while a window is open, and serves such a connection
@@ -333,10 +333,10 @@ and our protocol adds the key confirmation it leaves to callers. If a maintained
 CPace for Go appears, it can replace this one: only `pair.go` uses it, and pairing is not
 persisted, so changing it affects only CLIs and daemons that pair across that change.
 
-The `agent` CLI is the client (`internal/cli/client.go`, over the same `internal/transport`
+The `agt` CLI is the client (`internal/cli/client.go`, over the same `internal/transport`
 QUIC code as the daemon). Its key is
 `remote/client.key`, in the same format as the daemon's, and `hosts.toml` maps host names to an
-address and the daemon fingerprint pinned by `agent host add`. One CLI process opens at most one
+address and the daemon fingerprint pinned by `agt host add`. One CLI process opens at most one
 QUIC connection, with one control stream for its requests and one stream per attachment or
 transfer, so an attachment and the overlay's requests share a connection. A remote host is never started, restarted or upgraded from the CLI.
 With TLS 1.3 a client can finish its half of the handshake
@@ -408,7 +408,7 @@ before and after.
 
 ## Wire Protocol
 
-`agent` and `agentd` communicate over a custom framed binary protocol, implemented in
+`agt` and `agentd` communicate over a custom framed binary protocol, implemented in
 `internal/protocol` and used by both binaries. Golden-frame tests pin its bytes, so a CLI and a
 daemon of different builds, possibly on different machines, stay compatible. The current version
 is 1.
@@ -440,11 +440,11 @@ input makes a decoder panic or allocate without bound, and that whatever decodes
 same value.
 
 A second, deliberately tiny daemon management protocol (framed at header version 0, JSON payloads)
-carries daemon status and shutdown for `agent daemon info`, `restart` and `upgrade`, so those keep
+carries daemon status and shutdown for `agt daemon info`, `restart` and `upgrade`, so those keep
 working even when the CLI and daemon speak different versions of the main protocol. Its status
 includes connection-level metrics: the streams the daemon is serving, and for each open QUIC
 connection the client key, remote address, stream counts, QUIC's smoothed RTT, bytes sent and
-received, and packets lost (`agent daemon info`, `agentd remote status`).
+received, and packets lost (`agt daemon info`, `agentd remote status`).
 
 ### Streams and their roles
 
@@ -697,22 +697,22 @@ itself wake them at once. A poll costs about 130µs (`BenchmarkLastEventID`, mos
 connection), under 0.1% of a core, and none is made without subscribers. `ListEvents{AfterID,
 SessionID, Limit}` is the one-shot form on the control stream (at most 1000 per answer).
 
-**Clients.** `agent events [SESSION] [--follow]` prints events or follows them; following keeps
+**Clients.** `agt events [SESSION] [--follow]` prints events or follows them; following keeps
 the id of the last event it handled and, when the stream ends (a daemon restart, a lost
 connection), subscribes again after it, so nothing is missed or repeated. `--notify` rings the bell
 and asks the user's terminal for a desktop notification (OSC 9, or OSC 777 on VTE terminals, foot
 and urxvt; passed through tmux) for action-level events, and `--exec CMD` runs a command per event
 with the event in `AGENTD_EVENT_*` variables: these are the task-level notifications, and they work
-the same against a remote host. `agent ls`, `agent status`, the picker and the Ctrl-Y overlay show
+the same against a remote host. `agt ls`, `agt status`, the picker and the Ctrl-Y overlay show
 attention and activity, and order live sessions needing action first.
 
 ## Creating a Session
 
-When you create a session (`agent new [--cwd DIR] [NAME]`), the daemon:
+When you create a session (`agt new [--cwd DIR] [NAME]`), the daemon:
 
 1. Validates the name and agent, and resolves `cwd` on its own machine: an absolute path, a
    `~/` path expanded against the daemon user's home, or a path relative to a named workspace
-   (stored in `state.db`, managed with `agent workspace`). The directory must exist; it does not
+   (stored in `state.db`, managed with `agt workspace`). The directory must exist; it does not
    need to be a git repository.
 2. If `cwd` is in a git repository with a commit, reads HEAD's commit and branch: the session's
    base (see "Git State And Artifacts"). Nothing else about git is touched.
@@ -778,7 +778,7 @@ time) and the changed files (path, old path for renames, status, added and delet
 Lists are capped (200 commits, with the total count; 1000 files) and say when they were cut; git is
 stopped as soon as enough has been read, so a huge repository costs a bounded read. Failures (git
 not installed, the directory gone, a timeout after 30s) are reported inside the answer rather than
-failing the request, so `agent status` always works. It works for ended sessions too, while their
+failing the request, so `agt status` always works. It works for ended sessions too, while their
 directory exists.
 
 **Artifacts.** `ListArtifacts` names what can be downloaded: `diff` (a unified diff of everything
@@ -824,7 +824,7 @@ its process from the OS (resident and private memory, CPU time, threads, open fi
 runtime (goroutines, heap, memory held from the OS), the agent's top process, and its terminal and
 fan-out (size, scrollback rows, PTY bytes and reads, chunks dropped for lagging clients). Asked
 to, it also formats a reattach snapshot and replays it into a fresh terminal, timing both. The
-daemon answers `GetDaemonStats` for its own process. `agent status --stats` and `agent daemon
+daemon answers `GetDaemonStats` for its own process. `agt status --stats` and `agt daemon
 stats` show them, and `agentd bench sessions` uses them to measure sessions at scale
 (BENCHMARKS.md, "Sessions at scale").
 
@@ -833,7 +833,7 @@ Private memory is reported beside RSS because RSS counts the pages every worker 
 RSS over many sessions overstates their cost. libghostty's memory is outside the Go runtime; the
 worker reports what its terminal holds as libghostty counts it (`Terminal.MemoryUsage`: pages,
 resident bytes, and how many pages are compressed) to clients that negotiated `terminal-memory`,
-shown by `agent status --stats` and in `agent daemon stats`' TERMINAL column. A new terminal holds
+shown by `agt status --stats` and in `agt daemon stats`' TERMINAL column. A new terminal holds
 about 25 KB (`BenchmarkTerminalMemory`), a full scrollback about 9.4 MiB.
 
 Quiet scrollback is compressed. On the worker's one-second tick, once no output has arrived for
@@ -851,7 +851,7 @@ A session's id is its name. Names are unique among the sessions that exist, but 
 again once its session is removed, so a name alone cannot tell a client whether the session it
 knew is the one there now. Every session therefore also has a UID: 128 random bits, generated when
 the session is created, stored in `state.db` and never changed or reused. One UID is one
-incarnation of a name. `agent status` shows it. When several hosts are known to one client, a
+incarnation of a name. `agt status` shows it. When several hosts are known to one client, a
 global id is the host's identity (its key fingerprint) plus the UID; neither part depends on the
 name.
 
@@ -863,7 +863,7 @@ lifecycle, all in the worker (`internal/worker/worker.go`, `serveAttach`):
    whenever the block runs out, so an attach rarely waits on a database write. Ids are never
    reused within an incarnation, not even by a later worker for the same session, though a worker
    that stops (or hands off) before using its block leaves a gap. (Reuse would let a client that
-   names an old id, to replace it or `agent detach --attach` it, hit someone else's attachment.) On the owner goroutine it then applies
+   names an old id, to replace it or `agt detach --attach` it, hit someone else's attachment.) On the owner goroutine it then applies
    the client's size, takes the snapshot (laid out for that size), subscribes the attachment to
    output and lists it, in one step, so the snapshot is an exact boundary: the output that follows
    continues it. If the output so far ends inside an escape sequence, that step waits for the rest
@@ -976,9 +976,9 @@ keystrokes.
 
 Each host's daemon owns its own sessions; there is no directory of sessions anywhere else. The CLI
 makes several hosts feel like one workspace by asking each in turn (`internal/cli/hosts.go`,
-`allhosts.go`): `agent hosts` probes this machine's daemon and every host in `hosts.toml` in
-parallel within four seconds; `agent ls --all` merges their session lists into one, ordered by
-what needs attention first, with a HOST column; `agent events --all` follows every host's event
+`allhosts.go`): `agt hosts` probes this machine's daemon and every host in `hosts.toml` in
+parallel within four seconds; `agt ls --all` merges their session lists into one, ordered by
+what needs attention first, with a HOST column; `agt events --all` follows every host's event
 stream on its own connection, each resuming after its own last event. An unreachable host is
 reported and skipped, never waited on.
 
@@ -986,9 +986,9 @@ A session's global identifier is its daemon's id and its UID (`protocol.GlobalSe
 daemon's id is the fingerprint of its key (`remote/daemon.key`, created at startup if missing),
 which is also what remote clients pin, so a host has one id however clients name it. The UID
 changes with every incarnation of a name. `host/name` stays the address people type; the global id
-is what scripts can keep (`agent ls --json`, `agent status`).
+is what scripts can keep (`agt ls --json`, `agt status`).
 
-`agent --host auto new` is a placement hint, not a scheduler: among hosts that are online, have the
+`agt --host auto new` is a placement hint, not a scheduler: among hosts that are online, have the
 agent and (with `--workspace`) the workspace, it picks the fewest running sessions per CPU.
 
 ## Runtime Root
@@ -1037,7 +1037,7 @@ We use `libghostty-vt` to restore the previous state of the terminal when a clie
 
 How it works:
 
-* user creates or re-attaches to a session with `agent attach <name>` or by focusing it in the TUI
+* user creates or re-attaches to a session with `agt attach <name>` or by focusing it in the TUI
 * user interacts with terminal stdin
 * stdin gets sent to the PTY via the daemon and the session worker
 * the worker sends PTY output to attached clients and to `ghostty-vt`
@@ -1052,7 +1052,7 @@ left off as if they didn't disconnect from the terminal session at all.
 
 The worker uses `go.mitchellh.com/libghostty`, whose pinned `libghostty-vt` needs Zig 0.16 and is
 built `ReleaseFast` under `.build/` by `scripts/build-libghostty.sh`. Only the worker links it:
-the `agent` CLI never imports the worker (or the daemon and its SQLite store), and a test keeps it
+the `agt` CLI never imports the worker (or the daemon and its SQLite store), and a test keeps it
 buildable with `CGO_ENABLED=0`.
 
 ### The FFI boundary
@@ -1099,7 +1099,7 @@ first. It is built from libghostty's VT formatter, with these additions (`termin
   repaint the screen later on the same stream (an overlay closing, a resync) carry no
   scrollback, and neither does the CLI's own reattach after a lost connection or a worker
   restart. The client's terminal already holds what scrolled off before them; what scrolled off
-  while it was away is in `agent history`. Without the feature (an older CLI or worker), every
+  while it was away is in `agt history`. Without the feature (an older CLI or worker), every
   snapshot carries all of the scrollback, as before.
 
 Tests restore snapshots into a second terminal and compare them cell by cell

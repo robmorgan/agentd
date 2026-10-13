@@ -6,7 +6,7 @@
 // The OS-specific readers live in build-tagged files: macOS asks libproc
 // (cgo), Linux reads /proc. Elsewhere Read returns ErrUnsupported.
 //
-// Only agentd uses this package; the agent CLI gets the numbers over the
+// Only agentd uses this package; the agt CLI gets the numbers over the
 // protocol.
 package procstat
 

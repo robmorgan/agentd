@@ -246,7 +246,7 @@ The purpose is not merely a language rewrite. The Go implementation should becom
 * [x] Implement local Unix socket listener
 * [x] Implement existing framed protocol in Go
 * [x] Implement client library
-* [x] Implement CLI transport using Go client (the `agent` CLI is Go, in `internal/cli`)
+* [x] Implement CLI transport using Go client (the `agt` CLI is Go, in `internal/cli`)
 * [x] Spawn agent processes under PTYs
 * [x] Support detach without process termination
 * [x] Support interactive reattach
@@ -262,17 +262,17 @@ The purpose is not merely a language rewrite. The Go implementation should becom
 The following must work entirely through the Go daemon:
 
 ```sh
-agent new --cwd ~/src/project feature-x
+agt new --cwd ~/src/project feature-x
 
-agent ls
+agt ls
 
-agent attach <task>
+agt attach <task>
 
 # detach
 
-agent attach <task>
+agt attach <task>
 
-agent kill <task>
+agt kill <task>
 ```
 
 No remote support is required yet.
@@ -387,7 +387,7 @@ The protocol should operate over explicit message and stream abstractions rather
 
 * [x] Extract transport-neutral protocol package (`internal/protocol` over the stream/listener seam in `internal/transport`)
 * [x] Resolve session working directories on the daemon (`~/` paths and named workspaces managed
-      with `agent workspace`), so a remote client does not need the host's paths
+      with `agt workspace`), so a remote client does not need the host's paths
 * [x] Define connection handshake (`Hello`/`Welcome`, opening the control stream)
 * [x] Define protocol capability negotiation (capability lists in `Hello`/`Welcome`)
 * [x] Define protocol version negotiation (version ranges in `Hello`, the daemon picks)
@@ -424,7 +424,7 @@ The protocol does not need to become a generic RPC framework.
 
 # Phase 4 — QUIC remote transport
 
-Add direct secure remote connectivity between an `agent` client and `agentd`.
+Add direct secure remote connectivity between an `agt` client and `agentd`.
 
 QUIC is the primary remote transport.
 
@@ -433,7 +433,7 @@ QUIC is the primary remote transport.
 ```text
 MacBook
 
-agent --host devbox attach auth-refactor
+agt --host devbox attach auth-refactor
 
           │
           │ QUIC
@@ -489,21 +489,21 @@ One slow session should not unnecessarily stall unrelated sessions.
 ## Deliverables
 
 * [x] Add QUIC listener to `agentd`
-* [x] Add QUIC client transport (`agent --host`)
+* [x] Add QUIC client transport (`agt --host`)
 * [x] One-command setup (`agentd remote enable`, detecting a Tailscale address)
 * [x] Establish TLS identity model (self-signed Ed25519 keys, pinned by fingerprint)
 * [x] Authenticate machines/clients (mutual TLS: authorized client keys, pinned daemon key)
-* [x] Pair machines with a one-time code (`agentd remote pair`, `agent host add --code`: CPace over a pairing ALPN)
+* [x] Pair machines with a one-time code (`agentd remote pair`, `agt host add --code`: CPace over a pairing ALPN)
 * [x] Define stream roles (one bidirectional stream per request or attachment)
 * [x] Define stream negotiation (a stream's first frame sets its role)
 * [x] Support remote:
 
   * [x] `ls`
-  * [x] `new` (`agent --host H new --cwd DIR`)
+  * [x] `new` (`agt --host H new --cwd DIR`)
   * [x] `attach`
   * [x] `send`
   * [x] `history`
-  * [x] `diff` (`agent diff HOST/SESSION`, and `agent artifact` for the other artifacts)
+  * [x] `diff` (`agt diff HOST/SESSION`, and `agt artifact` for the other artifacts)
   * [x] `kill`
 * [x] Preserve sessions across network loss (`TestRemoteAttachReconnects`, `TestQUICNoticesSilentClient`, `TestReattachAfterExtendedOutage`)
 * [x] Reconnect cleanly (the CLI reattaches by itself, to the same incarnation, replacing its lost attachment)
@@ -734,7 +734,7 @@ agentd v2
 * [x] Preserve task metadata across restart (`state.db` plus per-session workers; `TestSessionSurvivesDaemonRestart`, `TestDaemonSIGKILLWithLiveSessions`, `TestUpgradeWithLiveSessions`)
 * [x] Investigate live PTY handoff (workers re-exec in place keeping the PTY, socket and agent; ARCHITECTURE.md, "Live Handoff")
 * [x] Prototype FD transfer (exec-inherited descriptors in `internal/worker/handoff.go`; the rejected SCM_RIGHTS design in `internal/worker/fdpass_test.go`)
-* [x] Prototype daemon upgrade (`agentd upgrade` / `agent daemon upgrade` hand running sessions to the new binary)
+* [x] Prototype daemon upgrade (`agentd upgrade` / `agt daemon upgrade` hand running sessions to the new binary)
 * [x] Ensure clients can reconnect after upgrade (attachments reattach on `SessionRestarting` and when the local daemon goes away)
 * [x] Add crash-recovery tests (`internal/daemon/crash_test.go`, `handoff_failure_test.go`)
 
@@ -852,19 +852,19 @@ agent appears stalled
       `working`/`blocked`/`done`/`error` (with kind, message and progress) decides activity and
       attention, with the bell/notification/idle heuristics as the fallback for programs that do
       not report; records survive worker handoffs, and the fields reach clients under
-      `CapSessionStatus` (`agent ls`, `agent status`, `agent ls --json`)
+      `CapSessionStatus` (`agt ls`, `agt status`, `agt ls --json`)
     * Deferred: mapping ConEmu progress (OSC 9;4) to a synthetic record until a native report
-      arrives; listing a program's full record tree (ids) in `agent status`
+      arrives; listing a program's full record tree (ids) in `agt status`
 * [x] Add event persistence (`events` in `state.db`, newest 500 per session)
-* [x] Surface attention in CLI (`agent ls`, `agent status`, `agent events`)
+* [x] Surface attention in CLI (`agt ls`, `agt status`, `agt events`)
 * [x] Surface attention in TUI (picker and `Ctrl-Y` switcher order and mark sessions needing action)
-* [x] Track task elapsed time (`agent ls` age, `agent status` elapsed)
+* [x] Track task elapsed time (`agt ls` age, `agt status` elapsed)
 * [x] Track agent/process status (activity, PTY foreground process, title)
-* [x] Expose Git state (`GetGitState`, `agent status`; the base is recorded at session creation)
+* [x] Expose Git state (`GetGitState`, `agt status`; the base is recorded at session creation)
 * [x] Expose produced commits (commits since the base; the `patch` artifact)
-* [x] Expose changed files (staged, unstaged and untracked since the base; `agent diff --stat`)
-* [x] Expose artifacts (`agent artifacts`, `agent artifact`: diff, patch, history)
-* [x] Support task-level notifications (`agent events --follow --notify | --exec`)
+* [x] Expose changed files (staged, unstaged and untracked since the base; `agt diff --stat`)
+* [x] Expose artifacts (`agt artifacts`, `agt artifact`: diff, patch, history)
+* [x] Support task-level notifications (`agt events --follow --notify | --exec`)
 
 ## Principle
 
@@ -883,7 +883,7 @@ Once remote `agentd` is stable, make multiple hosts feel like one workspace with
 ## Example
 
 ```text
-agent hosts
+agt hosts
 
 NAME        STATUS     SESSIONS
 local       online     2
@@ -895,23 +895,23 @@ gpu-01      offline    0
 Potential commands:
 
 ```sh
-agent --host devbox-1 new --cwd /srv/repo auth-tests
+agt --host devbox-1 new --cwd /srv/repo auth-tests
 
-agent sessions --all
+agt sessions --all
 
-agent attach devbox-1/auth-tests
+agt attach devbox-1/auth-tests
 ```
 
 ## Deliverables
 
-* [x] Host configuration (`agent host add|ls|rm`, `hosts.toml`)
+* [x] Host configuration (`agt host add|ls|rm`, `hosts.toml`)
 * [x] Host aliases (`--host NAME`, `NAME/session`)
-* [x] Host health (`agent hosts` / `agent host ls`: online, offline, unauthorized, latency, load)
-* [x] Cross-host session discovery (`agent ls --all`, `agent events --all`)
-* [x] Stable global session identifiers (daemon id + session UID, shown by `agent status` and `agent ls --json`)
+* [x] Host health (`agt hosts` / `agt host ls`: online, offline, unauthorized, latency, load)
+* [x] Cross-host session discovery (`agt ls --all`, `agt events --all`)
+* [x] Stable global session identifiers (daemon id + session UID, shown by `agt status` and `agt ls --json`)
 * [x] Host-aware CLI UX (HOST column, `local/` and `host/` addresses everywhere, `--host local|auto`)
-* [x] Machine capabilities (`Welcome` host description; `agent host info`)
-* [x] Simple placement hints (`agent --host auto new`: least running sessions per CPU among hosts with the agent and workspace)
+* [x] Machine capabilities (`Welcome` host description; `agt host info`)
+* [x] Simple placement hints (`agt --host auto new`: least running sessions per CPU among hosts with the agent and workspace)
 
 Avoid implementing a scheduler until real usage requires one.
 
@@ -1236,7 +1236,7 @@ Until that flow is excellent, avoid adding unnecessary infrastructure around it.
 `agentd` should eventually make this ordinary:
 
 ```sh
-agent --host devbox new --cwd /srv/repo auth-refactor
+agt --host devbox new --cwd /srv/repo auth-refactor
 ```
 
 Ask the agent to refactor the authentication middleware and run the test suite. Close the laptop.
@@ -1244,7 +1244,7 @@ Ask the agent to refactor the authentication middleware and run the test suite. 
 Come back later from another machine:
 
 ```sh
-agent sessions --all
+agt sessions --all
 ```
 
 See:
@@ -1258,7 +1258,7 @@ desktop    docs             codex    completed   notice
 Then:
 
 ```sh
-agent attach devbox/auth-refactor
+agt attach devbox/auth-refactor
 ```
 
 and immediately continue interacting with the exact session that was already running.
