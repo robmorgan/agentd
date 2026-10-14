@@ -622,7 +622,7 @@ func (rt *runtime) handleConnection(conn transport.Stream) (keep bool, err error
 	case req.ListAttachments != nil:
 		var attachments []session.AttachmentRecord
 		_ = rt.owner.do(func(s *ownerState) error { attachments = s.listAttachments(); return nil })
-		return false, reply(&protocol.Response{Attachments: &attachments})
+		return false, protocol.WriteResponseWith(conn, protocol.OwnFeatures(), &protocol.Response{Attachments: &attachments})
 	case req.DetachAttachment != nil:
 		id := req.DetachAttachment.AttachID
 		if err := rt.owner.do(func(s *ownerState) error { return s.detachAttachment(id) }); err != nil {
@@ -728,6 +728,10 @@ func (rt *runtime) serveAttach(conn transport.Stream, reader *bufio.Reader, req 
 	if slices.Contains(features, protocol.CapAttachScrollback) {
 		initial, repaint = scrollbackRows(req.ScrollbackRows), 0
 	}
+	// Size ownership applies to every attachment; only a client that
+	// asked for CapAttachSizeOwner can take the size or hear who has it.
+	sizeOwner := slices.Contains(features, protocol.CapAttachSizeOwner)
+	takeSize := sizeOwner && req.TakeSize
 
 	seq, err := rt.nextAttachSeq()
 	if errors.Is(err, db.ErrNoSuchIncarnation) {
@@ -736,9 +740,13 @@ func (rt *runtime) serveAttach(conn transport.Stream, reader *bufio.Reader, req 
 		return refuse(fmt.Errorf("failed to number the attachment: %w", err))
 	}
 	var att *attachResult
+	var ownership protocol.SizeOwnership
 	if err := rt.owner.doAtGround(func(s *ownerState) error {
 		var err error
-		att, err = s.attach(fmt.Sprintf("%s-%d", req.Kind, seq), req.Kind, req.Geometry, replaces, initial)
+		att, err = s.attach(fmt.Sprintf("%s-%d", req.Kind, seq), req.Kind, req.Geometry, replaces, initial, takeSize, sizeOwner)
+		if err == nil {
+			ownership = s.ownership(att.attachID)
+		}
 		return err
 	}); err != nil {
 		return refuse(err)
@@ -769,6 +777,7 @@ func (rt *runtime) serveAttach(conn transport.Stream, reader *bufio.Reader, req 
 	if slices.Contains(features, protocol.CapSessionUID) {
 		attached.SessionUID = rt.uid
 	}
+	attached.SizeOwner = ownership
 	if err := protocol.WriteResponse(conn, &protocol.Response{Attached: attached}); err != nil {
 		return err
 	}
@@ -816,6 +825,21 @@ loop:
 			if err := protocol.WriteResponse(conn, &protocol.Response{PtyOutput: &protocol.Bytes{Data: data}}); err != nil {
 				return err
 			}
+		case <-att.sizeNote:
+			if !sizeOwner {
+				continue
+			}
+			var now protocol.SizeOwnership
+			if err := rt.owner.do(func(s *ownerState) error { now = s.ownership(att.attachID); return nil }); err != nil {
+				return err
+			}
+			if now == ownership {
+				continue
+			}
+			ownership = now
+			if err := protocol.WriteResponse(conn, &protocol.Response{AttachSizeOwner: &now}); err != nil {
+				return err
+			}
 		case <-att.detach:
 			break loop
 		case <-att.restart:
@@ -853,12 +877,29 @@ loop:
 			switch {
 			case in.req.AttachResize != nil:
 				ng := *in.req.AttachResize
-				if err := rt.owner.do(func(s *ownerState) error { return s.resize(ng) }); err != nil {
+				if err := rt.owner.do(func(s *ownerState) error { return s.setSize(att.attachID, ng) }); err != nil {
+					return err
+				}
+			case in.req.AttachLeave != nil && sizeOwner:
+				if err := rt.owner.do(func(s *ownerState) error { s.noteLeave(att.attachID); return nil }); err != nil {
+					return err
+				}
+			case in.req.AttachTakeSize != nil && sizeOwner:
+				ng := *in.req.AttachTakeSize
+				if err := rt.owner.do(func(s *ownerState) error {
+					if !hasSize(ng) {
+						return nil
+					}
+					return s.takeSize(att.attachID, ng)
+				}); err != nil {
 					return err
 				}
 			case in.req.AttachInput != nil:
 				data := in.req.AttachInput.Data
-				if err := rt.owner.do(func(s *ownerState) error { return s.writeInput(data) }); err != nil {
+				if err := rt.owner.do(func(s *ownerState) error {
+					s.noteInput(att.attachID, data, time.Now())
+					return s.writeInput(data)
+				}); err != nil {
 					if errors.Is(err, errOwnerStopped) {
 						return err
 					}

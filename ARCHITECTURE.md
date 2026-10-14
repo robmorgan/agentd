@@ -456,7 +456,7 @@ separate negotiation round trip is needed (`protocol.Request.Role`):
 |---|---|---|
 | request | any one-shot request | one response, then the stream ends |
 | control | `Hello` | `Welcome`, then any number of tagged one-shot requests and their tagged responses, in any order |
-| attach | `AttachSession` | `Attached` with a snapshot, then `PtyOutput` (and `AttachResync`, if negotiated) frames one way and `AttachInput`, `AttachResize`, `AttachSnapshot` the other, until either side ends it |
+| attach | `AttachSession` | `Attached` with a snapshot, then `PtyOutput` (and `AttachResync`, `AttachSizeOwner`, if negotiated) frames one way and `AttachInput`, `AttachResize`, `AttachSnapshot` (and `AttachTakeSize`, `AttachLeave`) the other, until either side ends it |
 | events | `SubscribeEvents` | `Event` frames, server to client, in id order: the backlog the request asked for, then live ones, until the client closes the stream |
 | artifact | `GetArtifact` | `ArtifactChunk` frames, then `EndOfStream` (or an `Error`: the artifact is incomplete). On a stream of its own, a large transfer never delays the control stream or an attachment |
 | artifact | `GetHistory` | one `History` response holding the whole history (the `history` artifacts stream the same content) |
@@ -498,6 +498,7 @@ features both listed. Today there is one protocol version (1), and these capabil
 | `worker-handoff` | `HandoffSession` and `HandedOff`, between agentd and a session worker only (a worker lists it in its answer to `Hello`) |
 | `terminal-memory` | the shadow terminal's memory appended to `SessionStats` |
 | `attach-scrollback` | attach stream: `AttachSession.ScrollbackRows` caps the scrollback in the attach snapshot (see "Bounded scrollback") |
+| `attach-size-owner` | attach stream: `AttachSession.TakeSize`, `Attached.SizeOwner`, `AttachTakeSize`, `AttachLeave` and `AttachSizeOwner`; attachment records carry their sizes after the list (see "Size ownership") |
 
 The protocol grows without breaking older peers this way: a new message kind, or a field appended
 to the end of an existing message or struct (a session record, even inside a list), comes with a
@@ -554,12 +555,13 @@ tokened request after a lost remote connection (see "Duplicate And Replayed Requ
 | `GetSessionStats` | `SessionStats` (`runtime-stats`) | request |
 | `GetDaemonStats` | `DaemonStats` (`runtime-stats`) | request |
 | `SubscribeEvents` | `Event`, repeated | events |
-| `AttachSession` | `Attached` (or `SessionEnded` for a finished session), then `PtyOutput`, `AttachSnapshot`, `AttachResync`, and finally `SessionEnded`, `EndOfStream`, `SessionRestarting` or `Error` | attach |
+| `AttachSession` | `Attached` (or `SessionEnded` for a finished session), then `PtyOutput`, `AttachSnapshot`, `AttachResync`, `AttachSizeOwner`, and finally `SessionEnded`, `EndOfStream`, `SessionRestarting` or `Error` | attach |
 | `HandoffSession` | `HandedOff` (from the new image) | request, agentd to a worker only |
 
 Any request may instead be answered with `Error`. Kinds are numbered by area so that parallel work
 does not collide: 1-19 and 101-118 are the base protocol, 30-39 and 130-139 git state and
-artifacts, 150-159 session resumption (`AttachResync` is 150), 60-69 and 160-169 worker handoff.
+artifacts, 50-59 and 150-159 attach streams (`AttachTakeSize` is 50, `AttachLeave` 51, `AttachResync` 150,
+`AttachSizeOwner` 151), 60-69 and 160-169 worker handoff.
 
 `attach` is the bidirectional case. After the initial `AttachSession` request and `Attached`
 response (which carries a snapshot of the current screen), the worker streams `PtyOutput` frames
@@ -749,7 +751,8 @@ For each session there are three kinds of state:
 - the worker's live PTY and output fan-out used by `attach` and `send-input`
 
 PTY input can come from an interactive `attach` or a background `send-input`. Multiple clients may
-attach to the same session concurrently; input is shared and resize is last-writer-wins.
+attach to the same session concurrently; input is shared, and one of them owns the size (see "Size
+ownership").
 
 Killing a session asks the worker, over its socket, to stop (the worker handles SIGTERM the same
 way). The worker stops the agent's whole process group (SIGKILL after five seconds), writes the
@@ -864,14 +867,14 @@ lifecycle, all in the worker (`internal/worker/worker.go`, `serveAttach`):
    reused within an incarnation, not even by a later worker for the same session, though a worker
    that stops (or hands off) before using its block leaves a gap. (Reuse would let a client that
    names an old id, to replace it or `agt detach --attach` it, hit someone else's attachment.) On the owner goroutine it then applies
-   the client's size, takes the snapshot (laid out for that size), subscribes the attachment to
+   the client's size if it is to own the size (below), takes the snapshot (laid out for the session's size), subscribes the attachment to
    output and lists it, in one step, so the snapshot is an exact boundary: the output that follows
    continues it. If the output so far ends inside an escape sequence, that step waits for the rest
    of it (at most 100 ms; see "libghostty-vt"). `Attached`
    carries the id and the snapshot (and with `session-uid`, the UID).
 2. **Live.** Output flows to the client through its bounded queue (below); its input, resizes and
-   snapshot requests flow back. Several attachments may be live at once; input is shared and resize
-   is last-writer-wins.
+   snapshot requests flow back. Several attachments may be live at once; input is shared, and only
+   the size owner's resizes reach the PTY.
 3. **End.** Any of: the client half-closes the stream (detach) or its stream fails (disconnect, a
    dead peer noticed after the 15-second timeout, a write that fails); `DetachAttachment` or
    `DetachSession` names it; a later attach replaces it; the session ends (`SessionEnded` follows
@@ -891,6 +894,42 @@ saw. `Replaces` names the old attachment, which the worker drops at once (it is 
 receiving output immediately; its handler ends within the 2-second grace) instead of keeping it
 until its connection is noticed dead. A replace is honoured only together with a matching
 `ExpectUID`, since ids are only unique within an incarnation.
+
+### Size ownership
+
+A PTY has one size, and every attached terminal gets output laid out for it. One attachment, the
+**size owner**, decides it (`internal/worker/size.go`); the others are **pending**: the worker
+records the size each reports (at attach and in `AttachResize`) but does not apply it, so a second
+viewer, a phone, say, never reflows the agent's screen for everyone by attaching.
+
+* The first attachment with a size owns it. An attachment that reports no size (zero rows or
+  columns, like `agentd bench`'s) never does.
+* When the owner leaves (a detach or switch, which the CLI announces with `AttachLeave` before
+  closing its stream; `DetachAttachment`; closing its terminal, since the CLI detaches on SIGHUP
+  and SIGTERM), the pending attachment used most recently (its last input, else its attach) takes
+  over at once, and the session takes its size. With none left, nobody owns the size, it stays,
+  and the next attachment takes it.
+* A pending attachment takes the size over with `AttachSession.TakeSize` (`agt attach
+  --take-size`) or `AttachTakeSize` on its stream (the overlay's Take Over Size).
+* A reattach whose `Replaces` names the owner inherits the ownership, so a client that lost its
+  connection comes back owning the size rather than finding a pending client resized it.
+* An owner whose stream is cut rather than left may be about to reattach: a daemon restart cuts
+  every attachment it proxies at once, a live handoff ends every attachment at once, and a remote
+  client's connection can drop. So when the owner's stream ends during a handoff, or ends without
+  `AttachLeave` from a client that sends it, the owner's id stays reserved (across a handoff it
+  travels in the handoff state): the other clients reattach as pending without resizing, and the
+  owner's reattach inherits the size by `Replaces`. If the owner has not come back within 10
+  seconds, the most recently used attachment takes over; so does it when an owner's CLI is killed
+  outright. A client without `attach-size-owner` never sends `AttachLeave`, and its end hands the
+  size on at once.
+
+With `attach-size-owner`, a client hears who owns the size: `Attached` carries the ownership, and
+the worker sends `AttachSizeOwner` whenever the owner or the session's size changes. Each
+attachment has a one-slot signal for that (a change merges with one not yet sent, and the owner
+goroutine never blocks on it); the attachment's handler reads the current ownership when it gets
+to it and sends it in order with the output. Attachment records (`agt attachments`) carry each
+attachment's size and whether it owns the session's. Older clients get the same policy without
+the notes, and cannot take the size over.
 
 ### Output positions
 
@@ -1070,8 +1109,8 @@ call overhead is under 1%, while output through the worker is limited by the ker
 ### The reattach snapshot
 
 The snapshot is VT bytes that the CLI writes to the user's terminal after clearing it, laid out
-for that terminal's size: the worker resizes the PTY and its terminal to the attaching client
-first. It is built from libghostty's VT formatter, with these additions (`terminal.go`):
+for the session's size: when the attaching client is to own the size, the worker resizes the PTY
+and its terminal to it first. It is built from libghostty's VT formatter, with these additions (`terminal.go`):
 
 * **An exact boundary.** It is taken only where the parser is between escape sequences and UTF-8
   characters (`VTGround`). If an attach arrives mid-sequence, it waits for the next PTY read and
@@ -1136,5 +1175,5 @@ formatter's):
 * **The client's own state.** The snapshot assumes a terminal in its default state: modes are
   emitted only where they differ from the defaults, and a block cursor is not emitted. The CLI
   clears the screen first and resets the common modes when it detaches.
-* **Other clients' sizes.** The snapshot fits the attaching client; any other client attached at
-  another size keeps getting output laid out for the PTY's size, which the last resize set.
+* **Other clients' sizes.** The snapshot fits the session's size, which the size owner set; a
+  pending client at another size gets output laid out for that size (see "Size ownership").

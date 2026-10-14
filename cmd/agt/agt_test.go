@@ -153,11 +153,17 @@ type term struct {
 
 func (e *env) start(args ...string) *term {
 	e.t.Helper()
+	return e.startSized(30, 100, args...)
+}
+
+// startSized is start in a terminal of rows by cols.
+func (e *env) startSized(rows, cols uint16, args ...string) *term {
+	e.t.Helper()
 	ptmx, tty, err := pty.Open()
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	pty.Setsize(ptmx, &pty.Winsize{Rows: 30, Cols: 100})
+	pty.Setsize(ptmx, &pty.Winsize{Rows: rows, Cols: cols})
 	cmd := exec.Command(filepath.Join(binDir, "agt"), args...)
 	cmd.Env = e.environ()
 	cmd.Dir = e.work
@@ -340,6 +346,77 @@ func TestAttachEndToEnd(t *testing.T) {
 	if out := e.mustRun("agt", "kill", "--rm", "demo"); !strings.Contains(out, "terminated session demo") || !strings.Contains(out, "removed session demo") {
 		t.Fatalf("kill --rm:\n%s", out)
 	}
+}
+
+// The first terminal attached owns the session's size; others are pending
+// until they take it over (overlay or --take-size) or the owner leaves.
+func TestSizeOwnershipEndToEnd(t *testing.T) {
+	e := newEnv(t, "")
+	a := e.start("new", "demo")
+	ma := a.expect(0, "attached to demo")
+
+	b := e.startSized(40, 120, "attach", "demo")
+	mb := b.expect(0, "attached to demo")
+	b.write("stty size\r")
+	mb = b.expect(mb, "30 100")
+	if out := e.mustRun("agt", "attachments", "demo"); !strings.Contains(out, "size-owner\t100x30") || !strings.Contains(out, "pending\t120x40") {
+		t.Fatalf("attachments:\n%s", out)
+	}
+
+	// Ctrl-Y, r, Enter: the pending terminal takes the size over.
+	b.write("\x19")
+	mb = b.expect(mb, "Switch Session")
+	b.write("r")
+	mb = b.expect(mb, "Take Over Size")
+	b.write("\r")
+	mb = b.expect(mb, "\x1b[2J\x1b[H")
+	b.write("stty size\r")
+	mb = b.expect(mb, "40 120")
+	time.Sleep(50 * time.Millisecond)
+	a.write("stty size\r")
+	ma = a.expect(ma, "40 120")
+
+	// --take-size, and the size returns to the most recently used
+	// terminal (a, which typed last) once that one detaches.
+	c := e.startSized(24, 80, "attach", "--take-size", "demo")
+	mc := c.expect(0, "attached to demo")
+	c.write("stty size\r")
+	c.expect(mc, "24 80")
+	c.write("\x1c")
+	c.wait()
+	b.write("stty size\r")
+	mb = b.expect(mb, "30 100")
+
+	// A daemon restart cuts every attachment at once; the owner keeps the
+	// size when they reattach, although b typed last.
+	b.write("true\r")
+	time.Sleep(50 * time.Millisecond)
+	e.mustRun("agt", "daemon", "restart")
+	deadline := time.Now().Add(10 * time.Second)
+	for out := e.mustRun("agt", "attachments", "demo"); strings.Count(out, "\n") < 2; out = e.mustRun("agt", "attachments", "demo") {
+		if time.Now().After(deadline) {
+			t.Fatalf("the terminals never reattached:\n%s", out)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if out := e.mustRun("agt", "attachments", "demo"); !strings.Contains(out, "size-owner\t100x30") {
+		t.Fatalf("the owner lost the size over a daemon restart:\n%s", out)
+	}
+
+	// Closing the owner's terminal hands the size on.
+	a.cmd.Process.Signal(unix.SIGHUP)
+	a.cmd.Wait()
+	deadline = time.Now().Add(10 * time.Second)
+	for !strings.Contains(e.mustRun("agt", "attachments", "demo"), "size-owner\t120x40") {
+		if time.Now().After(deadline) {
+			t.Fatalf("b never took over:\n%s", e.mustRun("agt", "attachments", "demo"))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	b.write("stty size\r")
+	b.expect(mb, "40 120")
+	b.write("\x1c")
+	b.wait()
 }
 
 // startAndDetach creates a session and detaches from it at once.

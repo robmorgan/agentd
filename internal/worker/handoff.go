@@ -107,6 +107,9 @@ type handoffState struct {
 
 	Terminal terminalHandoff
 	Geometry protocol.Geometry
+	// SizeOwner is the id of the attachment that owned the size, reserved
+	// for its reattach (size.go). Empty from an older image.
+	SizeOwner string
 	// Status carries the program status records (OSC 7501): a blocked
 	// agent must stay blocked across a handoff, since the program will
 	// not re-report on its own. Nil from an older image.
@@ -224,6 +227,7 @@ func (rt *runtime) tryHandoff(req *handoffRequest, state *ownerState) (err error
 			StartedAt: rt.startedAt,
 			Terminal:  *term,
 			Geometry:  s.geometry,
+			SizeOwner: s.sizeOwner,
 			Status:    s.status.handoff(),
 		}
 		if s.activity != nil {
@@ -495,5 +499,9 @@ func resumeRuntime(st *handoffState) (*runtime, *ownerState, error) {
 	state.activity.restoreAlertMemory(st.Status)
 	state.owner = rt.owner
 	state.geometry = st.Geometry
+	state.sizeOwner = st.SizeOwner
+	if state.sizeOwner != "" {
+		state.armSizeOwnerGrace()
+	}
 	return rt, state, nil
 }

@@ -227,6 +227,8 @@ type client struct {
 	attachID string
 	snapshot []byte
 	output   bytes.Buffer
+	// sizes are the AttachSizeOwner frames received, in order.
+	sizes []protocol.SizeOwnership
 }
 
 func (h *harness) attach(g protocol.Geometry) *client {
@@ -276,6 +278,10 @@ func (c *client) expectOutput(want string) {
 	c.t.Helper()
 	for !strings.Contains(c.output.String(), want) {
 		resp := c.read()
+		if resp.AttachSizeOwner != nil {
+			c.sizes = append(c.sizes, *resp.AttachSizeOwner)
+			continue
+		}
 		if resp.PtyOutput == nil {
 			c.t.Fatalf("waiting for %q: unexpected response %#v", want, resp)
 		}
@@ -283,15 +289,20 @@ func (c *client) expectOutput(want string) {
 	}
 }
 
-// expectEnd skips PTY output and returns the first other response.
+// expectEnd skips PTY output and size notes and returns the first other
+// response.
 func (c *client) expectEnd() *protocol.Response {
 	c.t.Helper()
 	for {
 		resp := c.read()
-		if resp.PtyOutput == nil {
+		switch {
+		case resp.AttachSizeOwner != nil:
+			c.sizes = append(c.sizes, *resp.AttachSizeOwner)
+		case resp.PtyOutput != nil:
+			c.output.Write(resp.PtyOutput.Data)
+		default:
 			return resp
 		}
-		c.output.Write(resp.PtyOutput.Data)
 	}
 }
 
@@ -410,10 +421,12 @@ func TestResize(t *testing.T) {
 	c.input("size\n")
 	c.expectOutput("40 120")
 
-	// The most recent attacher's geometry wins.
+	// The first attacher owns the size: a second one, and its resizes,
+	// leave it alone (size_test.go covers the handovers).
 	c2 := h.attach(protocol.Geometry{Cols: 90, Rows: 20})
+	c2.send(&protocol.Request{AttachResize: &protocol.Geometry{Cols: 70, Rows: 20}})
 	c2.input("size\n")
-	c2.expectOutput("20 90")
+	c2.expectOutput("40 120")
 
 	c2.input("done\n")
 	c2.expectEnd()

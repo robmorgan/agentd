@@ -566,7 +566,26 @@ func TestMultipleAttachersThroughDaemon(t *testing.T) {
 	a.expectOutput("got:one")
 	b.expectOutput("got:one")
 
-	resp := h.request(&protocol.Request{DetachAttachment: &protocol.DetachAttachment{SessionID: id, AttachID: a.attachID}})
+	// The first attacher owns the size. A control stream with the
+	// capability hears it; a plain request gets the records without it.
+	c := h.control()
+	c.send(1, &protocol.Request{ListAttachments: &protocol.SessionRef{SessionID: id}})
+	_, resp := c.read()
+	if resp.Attachments == nil || len(*resp.Attachments) != 2 {
+		t.Fatalf("attachments on the control stream: %#v", resp)
+	}
+	for _, r := range *resp.Attachments {
+		if owns := r.AttachID == a.attachID; r.SizeOwner != owns || r.Cols != defaultGeometry.Cols {
+			t.Fatalf("attachment record %+v (owner should be %s)", r, a.attachID)
+		}
+	}
+	for _, r := range h.attachments(id) {
+		if r.SizeOwner || r.Cols != 0 {
+			t.Fatalf("sizes sent to a client without the capability: %+v", r)
+		}
+	}
+
+	resp = h.request(&protocol.Request{DetachAttachment: &protocol.DetachAttachment{SessionID: id, AttachID: a.attachID}})
 	if resp.Ok == nil {
 		t.Fatalf("detach attachment: %#v", resp)
 	}

@@ -29,7 +29,7 @@ func TestAttachStreamEndings(t *testing.T) {
 		{"ended", frame{resp: &protocol.Response{SessionEnded: &protocol.SessionEnded{SessionID: "a"}}}, nil, outcomeEnded},
 	} {
 		for _, overlay := range []bool{false, true} {
-			res, done, err := handleFrame(tc.f, overlay)
+			res, done, err := handleFrame(tc.f, overlay, nil)
 			if !done || !errors.Is(err, tc.wantErr) || (err == nil && res.outcome != tc.outcome) {
 				t.Errorf("%s (overlay %v): %+v, %v, %v", tc.name, overlay, res, done, err)
 			}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -89,14 +90,18 @@ func (a *app) commands() []*cobra.Command {
 		return a.kill(args[0], true)
 	}), "<SESSION_ID>", "<SESSION_ID>"))
 
-	cmds = append(cmds, annotate(a.command("attach SESSION", "Attach to a live session PTY", oneArg, func(args []string) error {
+	var takeSize bool
+	attach := a.command("attach SESSION", "Attach to a live session PTY", oneArg, func(args []string) error {
 		id := args[0]
 		c, err := a.connect([]*string{&id}, "", nil)
 		if err != nil {
 			return err
 		}
+		c.takeSize = takeSize
 		return c.attachSession(id)
-	}), "<SESSION_ID>", "<SESSION_ID>"))
+	})
+	attach.Flags().BoolVar(&takeSize, "take-size", false, "Resize the session to this terminal even if another attached client owns its size")
+	cmds = append(cmds, annotate(attach, "[OPTIONS] <SESSION_ID>", "<SESSION_ID>"))
 
 	var detachAttach string
 	var detachAll bool
@@ -224,8 +229,19 @@ func (a *app) commands() []*cobra.Command {
 		if err != nil {
 			return err
 		}
+		// Daemons that track size ownership report a size for every
+		// attachment that has one; older ones report none.
+		sized := slices.ContainsFunc(*resp.Attachments, func(at session.AttachmentRecord) bool { return at.SizeOwner || at.Cols != 0 })
 		for _, at := range *resp.Attachments {
-			fmt.Printf("%s\t%s\t%s\t%s\n", at.AttachID, at.SessionID, at.Kind, at.ConnectedAt.Format(time.RFC3339Nano))
+			fmt.Printf("%s\t%s\t%s\t%s", at.AttachID, at.SessionID, at.Kind, at.ConnectedAt.Format(time.RFC3339Nano))
+			if sized {
+				role := "pending"
+				if at.SizeOwner {
+					role = "size-owner"
+				}
+				fmt.Printf("\t%s\t%dx%d", role, at.Cols, at.Rows)
+			}
+			fmt.Println()
 		}
 		return nil
 	}), "<SESSION_ID>", "<SESSION_ID>"))

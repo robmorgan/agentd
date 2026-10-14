@@ -189,6 +189,12 @@ const (
 	// CapTerminalMemory: SessionStats ends with the shadow terminal's
 	// memory (TerminalMemory).
 	CapTerminalMemory = "terminal-memory"
+	// CapAttachSizeOwner: one attachment owns the session's size and the
+	// others are pending. On an attach stream it adds
+	// AttachSession.TakeSize, Attached.SizeOwner, the AttachTakeSize and
+	// AttachLeave requests and AttachSizeOwner frames; on a control stream, attachment
+	// records carry SizeOwner, Cols and Rows.
+	CapAttachSizeOwner = "attach-size-owner"
 )
 
 // GlobalSessionID identifies one incarnation of a session across every
@@ -209,13 +215,13 @@ const MinProtocolVersion uint16 = 1
 // Capabilities is what this build supports.
 func Capabilities() []string {
 	return []string{CapControlStream, CapGitState, CapArtifacts, CapSessionUID, CapRequestTokens, CapAttachFeatures, CapAttachReplace, CapAttachResync, CapRuntimeStats,
-		CapEvents, CapSessionActivity, CapSessionStatus, CapDaemonID, CapSessionRestart, CapWorkerHandoff, CapTerminalMemory, CapAttachScrollback}
+		CapEvents, CapSessionActivity, CapSessionStatus, CapDaemonID, CapSessionRestart, CapWorkerHandoff, CapTerminalMemory, CapAttachScrollback, CapAttachSizeOwner}
 }
 
 // AttachCapabilities are the capabilities that apply to an attach stream,
 // listed in AttachSession.Features.
 func AttachCapabilities() []string {
-	return []string{CapSessionUID, CapAttachReplace, CapAttachResync, CapSessionRestart, CapAttachScrollback}
+	return []string{CapSessionUID, CapAttachReplace, CapAttachResync, CapSessionRestart, CapAttachScrollback, CapAttachSizeOwner}
 }
 
 // AttachFeatures is the attach-stream features a client may ask for given

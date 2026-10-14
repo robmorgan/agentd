@@ -22,6 +22,12 @@ type ownerState struct {
 	terminal    *terminalState
 	geometry    protocol.Geometry
 	attachments map[string]*ownerAttachment
+	// sizeOwner is the id of the attachment that owns the size, empty for
+	// none. After a handoff, or the owner's stream being cut, it may name
+	// one that has not reattached yet; see size.go. sizeReserve counts
+	// those reservations, so only the latest one's grace timer acts.
+	sizeOwner   string
+	sizeReserve int
 	output      *broadcaster
 	input       *ptyInput
 	// outputBytes and outputChunks count the PTY output published
@@ -51,12 +57,27 @@ type ownerState struct {
 type ownerAttachment struct {
 	kind        session.AttachmentKind
 	connectedAt time.Time
-	sub         *subscriber
-	detach      chan struct{}
-	detachOnce  sync.Once
+	// geometry is the size the client last reported, applied only while
+	// it owns the size; lastUsed is its attach or its last input, which
+	// picks the next owner (size.go).
+	geometry protocol.Geometry
+	lastUsed time.Time
+	// sizeNote (one slot, never blocks) signals a change of the size or
+	// its owner to the attachment's handler.
+	sizeNote chan struct{}
+	// announcesLeave is set for a client that says when it leaves on
+	// purpose (AttachLeave, with CapAttachSizeOwner), and left once it
+	// has, or once it was detached: an owner that ends without leaving
+	// was cut, and its reattach is waited for (size.go).
+	announcesLeave bool
+	left           bool
+	sub            *subscriber
+	detach         chan struct{}
+	detachOnce     sync.Once
 }
 
 func (a *ownerAttachment) signalDetach() {
+	a.left = true
 	a.detachOnce.Do(func() { close(a.detach) })
 }
 
@@ -214,7 +235,11 @@ func (s *ownerState) resize(g protocol.Geometry) error {
 	if err := s.terminal.resize(g.Cols, g.Rows, cellWidthPx(g), cellHeightPx(g)); err != nil {
 		return err
 	}
+	changed := g != s.geometry
 	s.geometry = g
+	if changed {
+		s.notifySize()
+	}
 	return nil
 }
 
@@ -353,6 +378,7 @@ type attachResult struct {
 	snapshot []byte
 	detach   chan struct{}
 	restart  chan struct{}
+	sizeNote chan struct{}
 	sub      *subscriber
 }
 
@@ -361,7 +387,7 @@ type attachResult struct {
 // scrollback rows of scrollback (allScrollback for all). If replaces names
 // a live attachment, that one is dropped at once: the client says it was
 // its own, on a connection it has lost.
-func (s *ownerState) attach(attachID string, kind session.AttachmentKind, g protocol.Geometry, replaces string, scrollback int) (*attachResult, error) {
+func (s *ownerState) attach(attachID string, kind session.AttachmentKind, g protocol.Geometry, replaces string, scrollback int, takeSize, announcesLeave bool) (*attachResult, error) {
 	connectedAt := time.Now().UTC()
 	if old, ok := s.attachments[replaces]; ok && replaces != "" {
 		// Its handler may be blocked writing to the dead connection; it
@@ -372,18 +398,39 @@ func (s *ownerState) attach(attachID string, kind session.AttachmentKind, g prot
 		delete(s.attachments, replaces)
 	}
 
-	// Resize first, so the snapshot is laid out for the client's terminal:
-	// one formatted at the previous size lands wrapped and with the cursor
-	// on the wrong row in a terminal of another size.
-	if err := s.resize(g); err != nil {
-		return nil, err
+	// The size owner's replacement inherits the size (also a reserved
+	// owner's, after a handoff or a cut); with no owner, the first attachment with
+	// a size takes it; otherwise this one is pending (size.go).
+	owns := hasSize(g) && (takeSize || s.sizeOwner == "" || (replaces != "" && replaces == s.sizeOwner))
+	a := &ownerAttachment{
+		kind: kind, connectedAt: connectedAt, geometry: g, lastUsed: connectedAt,
+		sizeNote: make(chan struct{}, 1), detach: make(chan struct{}), announcesLeave: announcesLeave,
+	}
+	if owns {
+		// Resize first, so the snapshot is laid out for the client's
+		// terminal: one formatted at the previous size lands wrapped and
+		// with the cursor on the wrong row in a terminal of another size.
+		if err := s.resize(g); err != nil {
+			return nil, err
+		}
+		if s.sizeOwner != attachID {
+			s.sizeOwner = attachID
+			s.notifySize()
+		}
+	} else if replaces != "" && replaces == s.sizeOwner {
+		// The owner came back without a size: the next one takes over.
+		s.promote()
 	}
 	snapshot, err := s.snapshot(scrollback)
 	if err != nil {
+		if owns {
+			s.sizeOwner = ""
+			s.promote()
+		}
 		return nil, err
 	}
 
-	a := &ownerAttachment{kind: kind, connectedAt: connectedAt, sub: s.output.subscribe(), detach: make(chan struct{})}
+	a.sub = s.output.subscribe()
 	s.attachments[attachID] = a
 	// An interactive attach shows the user the screen: done and error
 	// records have been seen (the same moment the daemon acknowledges
@@ -399,12 +446,22 @@ func (s *ownerState) attach(attachID string, kind session.AttachmentKind, g prot
 		snapshot: snapshot,
 		detach:   a.detach,
 		restart:  s.restart,
+		sizeNote: a.sizeNote,
 		sub:      a.sub,
 	}, nil
 }
 
 func (s *ownerState) removeAttachment(attachID string) {
+	a, ok := s.attachments[attachID]
+	if !ok {
+		// Already replaced by its reattach, which took over its
+		// ownership too.
+		return
+	}
 	delete(s.attachments, attachID)
+	if attachID == s.sizeOwner {
+		s.ownerLeft(a.announcesLeave && !a.left)
+	}
 }
 
 func (s *ownerState) listAttachments() []session.AttachmentRecord {
@@ -412,6 +469,7 @@ func (s *ownerState) listAttachments() []session.AttachmentRecord {
 	for id, a := range s.attachments {
 		out = append(out, session.AttachmentRecord{
 			AttachID: id, SessionID: s.sessionID, Kind: a.kind, ConnectedAt: a.connectedAt,
+			SizeOwner: id == s.sizeOwner, Cols: a.geometry.Cols, Rows: a.geometry.Rows,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ConnectedAt.Before(out[j].ConnectedAt) })

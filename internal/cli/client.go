@@ -38,6 +38,10 @@ type client struct {
 	// stream may dial the remote connection, which takes mu.
 	controlMu sync.Mutex
 	control   *controlStream
+
+	// takeSize makes the next attach take the session's size from the
+	// attachment that owns it (`agt attach --take-size`).
+	takeSize bool
 }
 
 const (
