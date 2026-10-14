@@ -18,7 +18,7 @@ import (
 
 // Daemonize starts `<exe> serve` detached from the caller's session and
 // terminal, with output appended to agentd.log in the root, and returns without
-// waiting. The agent CLI polls the socket to know when it is up.
+// waiting. The agt CLI polls the socket to know when it is up.
 func Daemonize(p *paths.AppPaths, exe string) error {
 	if err := p.EnsureLayout(); err != nil {
 		return err

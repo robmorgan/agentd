@@ -102,7 +102,7 @@ func TestReservedHostNames(t *testing.T) {
 		}
 	}
 	a := &app{paths: testClient(t).paths, host: autoHostName}
-	if _, err := a.connect(nil, "", nil); err == nil || !strings.Contains(err.Error(), "only chooses a host for `agent new`") {
+	if _, err := a.connect(nil, "", nil); err == nil || !strings.Contains(err.Error(), "only chooses a host for `agt new`") {
 		t.Fatalf("--host auto: %v", err)
 	}
 }

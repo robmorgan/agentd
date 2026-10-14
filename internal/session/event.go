@@ -11,7 +11,7 @@ import (
 // or worker caused or observed, or a signal the worker read from the PTY
 // stream (a bell, a desktop notification, output stopping or starting).
 // Events are persisted in state.db and numbered by one counter per runtime
-// root, so a client can follow them from any point (`agent events`).
+// root, so a client can follow them from any point (`agt events`).
 //
 // Every event has an attention level. A session's record carries the
 // attention it currently needs: the highest level of the events raised
@@ -31,7 +31,7 @@ const (
 	EventStarted EventKind = "started"
 	// EventExited: the agent exited on its own with status 0 (notice).
 	EventExited EventKind = "exited"
-	// EventKilled: the agent was stopped on request (`agent kill`) (info).
+	// EventKilled: the agent was stopped on request (`agt kill`) (info).
 	EventKilled EventKind = "killed"
 	// EventFailed: the session failed to start, or the agent exited with a
 	// non-zero status (action).
