@@ -602,7 +602,7 @@ happened to a session: an id, the session, a time, a kind, an attention level (`
 Kinds travel as strings, so a client shows kinds newer than itself instead of failing to decode them.
 
 **Host events** are about the machine rather than a session: who was allowed to reach the daemon
-remotely, and who did. They have an empty session id, so the unfiltered feed (`agent events`,
+remotely, and who did. They have an empty session id, so the unfiltered feed (`agt events`,
 `--all`) shows them next to session events, and the CLI names the host in the session column
 (`host` for this machine). A session's own feed never includes them, and they raise no session's
 attention. `agentd remote authorize` and `revoke` run outside the daemon, so they write their

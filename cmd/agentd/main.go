@@ -266,7 +266,7 @@ func runRemote(argv []string) int {
 // The change has already been made, so failing to record it only warns.
 func auditRemote(p *paths.AppPaths, kind session.EventKind, summary string) {
 	if err := daemon.RecordHostEvent(p, kind, summary); err != nil {
-		fmt.Fprintf(os.Stderr, "agentd: warning: could not record this in agent events: %v\n", err)
+		fmt.Fprintf(os.Stderr, "agentd: warning: could not record this in agt events: %v\n", err)
 	}
 }
 

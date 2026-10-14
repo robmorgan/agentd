@@ -529,7 +529,7 @@ Pairing code: 482-193-675
 
 The laptop pins the devbox's key, the devbox authorizes the laptop's key, and `agentd remote pair`
 reports which machine paired. A mistyped code can be entered again. The code works once, expires
-after 5 minutes, and closes after 3 wrong attempts. Both outcomes are recorded in `agent events`, with
+after 5 minutes, and closes after 3 wrong attempts. Both outcomes are recorded in `agt events`, with
 the address the attempt came from. Neither end can be fooled into trusting a
 machine that does not know the code: the two run a password-authenticated key exchange (CPace),
 so someone on the network gets one guess per attempt and cannot test codes offline. No service

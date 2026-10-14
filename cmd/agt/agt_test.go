@@ -417,7 +417,7 @@ func TestRemoteAttachEndToEnd(t *testing.T) {
 	// Who may connect, and who did, is on record next to the sessions'
 	// events. Authorizing a key again changes nothing, so records nothing.
 	e.mustRun("agentd", "remote", "authorize", clientKey, "test")
-	audit := e.mustRun("agent", "events")
+	audit := e.mustRun("agt", "events")
 	authorized := regexp.MustCompile(`host\s+notice\s+authorized\s+test \(` + regexp.QuoteMeta(clientKey) + `\) authorized by hand`)
 	if n := len(authorized.FindAllString(audit, -1)); n != 1 ||
 		!regexp.MustCompile(`host\s+info\s+connected\s+test \(`+regexp.QuoteMeta(clientKey)+`\) connected from 127\.0\.0\.1`).MatchString(audit) {
@@ -499,7 +499,7 @@ func TestRemoteAttachEndToEnd(t *testing.T) {
 	tm.wait()
 
 	e.mustRun("agentd", "remote", "revoke", clientKey)
-	if out := e.mustRun("agent", "events"); !regexp.MustCompile(`host\s+notice\s+revoked\s+test \(` + regexp.QuoteMeta(clientKey) + `\) revoked`).MatchString(out) {
+	if out := e.mustRun("agt", "events"); !regexp.MustCompile(`host\s+notice\s+revoked\s+test \(` + regexp.QuoteMeta(clientKey) + `\) revoked`).MatchString(out) {
 		t.Fatalf("events after revoking:\n%s", out)
 	}
 }
