@@ -3,6 +3,7 @@ package cli
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/robmorgan/agentd/internal/protocol"
 	"github.com/robmorgan/agentd/internal/session"
@@ -70,7 +71,7 @@ func TestOverlayKeys(t *testing.T) {
 	}
 	o.handle(char('n'))
 	o.handle(char('e'))
-	if items := filteredPalette(o.paletteQuery); len(items) != 1 || items[0].title != "New Session" {
+	if items := filteredPalette(o.paletteQuery); len(items) != 1 || items[0].title != "New session" {
 		t.Fatalf("filtered %+v", items)
 	}
 	o.handle(key(keyEnter))
@@ -97,15 +98,39 @@ func TestOverlayDraws(t *testing.T) {
 	o := newOverlay(testClient(t), "alpha")
 	o.sessions = []session.Record{demo("alpha"), demo("beta")}
 	body := o.body(60, 20)
-	if got := stripANSI(body[0].render(60)); !strings.HasPrefix(got, "> ") || runeLen(got) != 60 {
+	if got := stripANSI(body[1].render(60, o.theme)); !strings.HasPrefix(got, " Commands ") || !strings.Contains(got, "/alpha  ") || strings.Contains(got, "╱") {
+		t.Fatalf("title %q", got)
+	}
+	if got := stripANSI(body[3].render(60, o.theme)); !strings.HasPrefix(got, " ❯ ") || runeLen(got) != 60 {
 		t.Fatalf("prompt %q", got)
 	}
-	if got := stripANSI(body[2].render(60)); !strings.HasPrefix(got, " s  Switch Session") {
+	if got := stripANSI(body[5].render(60, o.theme)); !strings.HasPrefix(got, "▌ Switch session") || !strings.HasSuffix(got, "s ") {
 		t.Fatalf("first item %q", got)
 	}
+	if got := stripANSI(body[6].render(60, o.theme)); !strings.HasPrefix(got, "  New session") {
+		t.Fatalf("second item %q", got)
+	}
+	if got := stripANSI(body[18].render(60, o.theme)); !strings.Contains(got, "enter run") {
+		t.Fatalf("hints %q", got)
+	}
 	o.mode = overlaySwitcher
-	if got := stripANSI(o.body(60, 20)[2].render(60)); !strings.Contains(got, "beta") || !strings.Contains(got, "/tmp/beta") {
+	if got := stripANSI(o.body(60, 20)[5].render(60, o.theme)); !strings.Contains(got, "beta") || !strings.Contains(got, "/tmp/beta") {
 		t.Fatalf("switcher row %q", got)
+	}
+	for d, want := range map[time.Duration]string{
+		40 * time.Second:                              "40s",
+		12 * time.Minute:                              "12m",
+		3*time.Hour + 5*time.Minute:                   "3h5m",
+		51*time.Hour + 44*time.Minute + 9*time.Second: "2d3h44m",
+		48 * time.Hour:                                "2d",
+	} {
+		if got := formatUptime(d); got != want {
+			t.Errorf("formatUptime(%v) = %q, want %q", d, got, want)
+		}
+	}
+	o.mode = overlayStopConfirm
+	if got := stripANSI(o.body(60, 20)[5].render(60, o.theme)); !strings.Contains(got, "Stop") || !strings.Contains(got, "Cancel") {
+		t.Fatalf("stop buttons %q", got)
 	}
 	if x, y, w, h := overlayRect(100, 30); x != 10 || y != 3 || w != 80 || h != 24 {
 		t.Fatalf("rect %d %d %d %d", x, y, w, h)

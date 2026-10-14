@@ -309,7 +309,7 @@ func TestAttachEndToEnd(t *testing.T) {
 	m = tm.expect(0, "attached to demo")
 	m = tm.expect(m, "hi-3")
 	tm.write("\x19")
-	m = tm.expect(m, "Switch Session")
+	m = tm.expect(m, "Switch session")
 	tm.write("\x1b[27u")
 	m = tm.expect(m, "\x1b[2J\x1b[H")
 	tm.write("echo after-overlay\r")
