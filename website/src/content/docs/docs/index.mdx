@@ -1,0 +1,74 @@
+---
+title: Quickstart
+description: Install agtd, start an agent as a task, and supervise it without keeping its terminal open.
+prev: false
+---
+
+import Terminal from '../../../components/Terminal.astro';
+import AgtLs from '../../../components/AgtLs.astro';
+import Note from '../../../components/Note.astro';
+
+<p class="lead">Install agtd, start an agent as a task, and supervise it without keeping its terminal open.</p>
+
+## Install
+
+On macOS, Debian/Ubuntu or Arch (Omarchy included), run the install script:
+
+<Terminal title="shell" commands={['curl -fsSL https://agtd.sh/install.sh | bash']} />
+
+It installs `agt` and `agentd` side by side in `~/.local/bin`. Set `AGENTD_PREFIX` to change the prefix. The script can be run again at any time:
+
+- Missing base packages come from apt or pacman. On macOS it asks for the Xcode command line tools.
+- Go and Zig are used from `PATH` when new enough; otherwise pinned releases are downloaded for the build only.
+- Binaries are only replaced when the build differs. A running daemon hands its sessions to the new binary without stopping them.
+- On Linux with systemd it installs a user unit, so the daemon starts at boot. `AGENTD_NO_SERVICE=1` skips this.
+
+<Note title="Remote access stays off">
+	The installer never turns on remote access. See [Enable on a devbox](/docs/remote/enable/) when you want it.
+</Note>
+
+## Start a task
+
+Give the task a name. agtd creates a session and starts your default agent in an attached PTY, in the current directory.
+
+<Terminal commands={['agt new fix-tests']} />
+
+Pass `--cwd DIR` to run it somewhere else. To keep two agents apart in one repository, create a git worktree yourself and point the session at it.
+
+## See what needs you
+
+List every session. Sessions that need you come first.
+
+<AgtLs
+	rows={[
+		{ run: 'needs', age: '4m', name: 'dep-bump', activity: 'blocked 1m', cwd: '~/src/app', attention: 'permission: Use Bash?' },
+		{ run: 'running', age: '12m', name: 'fix-tests', activity: 'working', cwd: '~/src/app' },
+		{ run: 'exited', age: '6m', name: 'docs-readme', activity: 'exited', cwd: '~/src/docs', attention: 'finished (exit 0)' },
+	]}
+/>
+
+Run `agt` with no arguments to open the TUI for a quick overview of all sessions.
+
+## Attach and detach
+
+Open a new tab in your own terminal and attach to the running session. Several clients can attach to one session at once.
+
+<Terminal commands={['agt attach fix-tests']} />
+
+Detach with `ctrl + \`. The screen is cleared and the session's output stays in your terminal's scrollback. Switch to the previous session with `ctrl + [` and the next with `ctrl + ]`.
+
+## Review what it produced
+
+Everything is measured from the commit the session started on: commits since, staged and unstaged edits, and new files.
+
+<Terminal
+	commands={['agt diff fix-tests --stat', 'agt status fix-tests', 'agt artifact fix-tests patch -o fix-tests.mbox']}
+/>
+
+agtd only reads the repository. It never writes to it, its index or its refs.
+
+## Stop and clean up
+
+<Terminal commands={['agt kill fix-tests', 'agt rm fix-tests']} />
+
+`agt rm` removes the session and cleans up its artifacts.

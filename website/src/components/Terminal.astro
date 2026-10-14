@@ -1,0 +1,20 @@
+---
+/*
+ * A terminal window showing agt the way it prints. Pass commands to show
+ * prompts; agt output with colour goes through AgtLs instead. Long lines
+ * scroll inside the window rather than wrapping.
+ */
+interface Props {
+	/** The program named in the title bar: "agt" or "shell". */
+	title?: string;
+	commands: string[];
+	class?: string;
+}
+
+const { title = 'agt', commands, class: className } = Astro.props;
+---
+
+<figure class:list={['agtd-term not-content', className]}>
+	<div class="agtd-term-bar">{title}</div>
+	<pre class="agtd-term-body">{commands.map((cmd, i) => <>{i > 0 && '\n'}<span class="agtd-t-dim">❯</span> {cmd}</>)}</pre>
+</figure>

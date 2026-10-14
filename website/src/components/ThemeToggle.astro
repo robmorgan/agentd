@@ -1,0 +1,80 @@
+---
+/*
+ * Cycles light → dark → system. Shares Starlight's storage key, so the choice
+ * holds across the landing page and the docs: "light", "dark", or "" for
+ * system. Replaces Starlight's ThemeSelect in the docs.
+ */
+---
+
+<agtd-theme-toggle>
+	<button type="button" class="icon-btn" aria-label="Theme">
+		<svg class="mode-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path></svg>
+		<svg class="mode-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+		<svg class="mode-system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"></rect><path d="M8 20h8M12 16v4"></path></svg>
+	</button>
+</agtd-theme-toggle>
+
+<style>
+	agtd-theme-toggle {
+		display: inline-flex;
+	}
+	svg {
+		display: none !important;
+	}
+	agtd-theme-toggle[data-mode='light'] .mode-light,
+	agtd-theme-toggle[data-mode='dark'] .mode-dark,
+	agtd-theme-toggle[data-mode='system'] .mode-system {
+		display: block !important;
+	}
+</style>
+
+<script>
+	const KEY = 'starlight-theme';
+	const ORDER = ['light', 'dark', 'system'] as const;
+	type Mode = (typeof ORDER)[number];
+
+	function stored(): Mode {
+		try {
+			const v = localStorage.getItem(KEY);
+			if (v === 'light' || v === 'dark') return v;
+		} catch {}
+		return 'system';
+	}
+
+	function systemTheme() {
+		return matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+	}
+
+	function apply(mode: Mode) {
+		document.documentElement.dataset.theme = mode === 'system' ? systemTheme() : mode;
+		document.querySelectorAll('agtd-theme-toggle').forEach((el) => (el as ThemeToggle).render(mode));
+	}
+
+	class ThemeToggle extends HTMLElement {
+		connectedCallback() {
+			this.render(stored());
+			this.querySelector('button')?.addEventListener('click', () => {
+				const next = ORDER[(ORDER.indexOf(stored()) + 1) % ORDER.length];
+				try {
+					localStorage.setItem(KEY, next === 'system' ? '' : next);
+				} catch {}
+				apply(next);
+			});
+		}
+
+		render(mode: Mode) {
+			const theme = mode === 'system' ? systemTheme() : mode;
+			const next = ORDER[(ORDER.indexOf(mode) + 1) % ORDER.length];
+			const label = `Theme: ${mode}${mode === 'system' ? ` (${theme})` : ''}. Switch to ${next}`;
+			this.dataset.mode = mode;
+			const button = this.querySelector('button');
+			button?.setAttribute('aria-label', label);
+			button?.setAttribute('title', label);
+		}
+	}
+
+	customElements.define('agtd-theme-toggle', ThemeToggle);
+	matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
+		if (stored() === 'system') apply('system');
+	});
+</script>

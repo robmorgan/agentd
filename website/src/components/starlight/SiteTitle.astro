@@ -1,0 +1,75 @@
+---
+/*
+ * The docs header's left side: the logo (home is the landing page), a "docs"
+ * label, and the top navigation from the docs design.
+ */
+const path = Astro.url.pathname;
+const links = [
+	{ label: 'Guides', href: '/docs/', current: !/^\/docs\/(reference|remote)\//.test(path) },
+	{ label: 'CLI reference', href: '/docs/reference/cli/', current: path.startsWith('/docs/reference/') },
+	{ label: 'Remote access', href: '/docs/remote/enable/', current: path.startsWith('/docs/remote/') },
+];
+---
+
+<div class="agtd-title">
+	<a href="/" class="agtd-logo" aria-label="agtd home">
+		<img class="on-dark" src="/brand/agtd-logo-on-dark.svg" alt="agtd" width="70" height="28" />
+		<img class="on-light" src="/brand/agtd-logo-on-light.svg" alt="agtd" width="70" height="28" />
+	</a>
+	<a href="/docs/" class="agtd-docs-label">docs</a>
+	<nav aria-label="Docs sections" class="agtd-topnav">
+		{links.map((l) => <a href={l.href} aria-current={l.current ? 'page' : undefined}>{l.label}</a>)}
+	</nav>
+</div>
+
+<style>
+	.agtd-title {
+		display: flex;
+		align-items: center;
+		gap: var(--space-4);
+		min-width: 0;
+	}
+	.agtd-logo {
+		display: flex;
+		align-items: center;
+		padding: 6px 0;
+	}
+	.agtd-logo img {
+		height: 28px;
+		width: auto;
+		display: block;
+	}
+	.agtd-docs-label {
+		font-family: var(--font-mono);
+		font-size: 13px;
+		line-height: 20px;
+		font-weight: 500;
+		color: var(--text-muted);
+		text-decoration: none;
+	}
+	.agtd-topnav {
+		display: none;
+		gap: var(--space-1);
+		margin-left: var(--space-6);
+	}
+	.agtd-topnav a {
+		font-family: var(--font-sans);
+		font-size: 15px;
+		line-height: 24px;
+		font-weight: 500;
+		text-decoration: none;
+		color: var(--text-muted);
+		padding: 10px 12px;
+		border-radius: var(--radius-sm);
+		white-space: nowrap;
+	}
+	.agtd-topnav a:hover,
+	.agtd-topnav a[aria-current='page'] {
+		color: var(--text);
+	}
+	@media (min-width: 72rem) {
+		.agtd-topnav {
+			display: flex;
+		}
+	}
+</style>

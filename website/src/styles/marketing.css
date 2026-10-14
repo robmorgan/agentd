@@ -1,0 +1,278 @@
+/* The landing page (the "agtd.sh /" artboard). Tokens come from tokens.css. */
+
+html {
+	background: var(--ground);
+}
+body {
+	margin: 0;
+	background: var(--ground);
+	color: var(--text);
+	font-family: var(--font-sans);
+	font-size: 17px;
+	line-height: 28px;
+	min-height: 100vh;
+	-webkit-font-smoothing: antialiased;
+	transition:
+		background-color 150ms,
+		color 150ms;
+}
+
+a {
+	color: var(--text);
+	text-decoration-color: var(--text-muted);
+	text-underline-offset: 3px;
+}
+a:hover {
+	text-decoration-color: var(--text);
+}
+a:focus-visible,
+button:focus-visible {
+	outline: 2px solid transparent;
+	box-shadow: var(--focus-ring);
+	border-radius: var(--radius-sm);
+}
+
+code {
+	font-family: var(--font-mono);
+	font-size: 0.86em;
+	background: var(--surface);
+	border: 1px solid var(--line);
+	border-radius: var(--radius-sm);
+	padding: 1px 5px;
+}
+
+.skip-link {
+	position: absolute;
+	left: var(--space-4);
+	top: -100px;
+	padding: var(--space-2) var(--space-4);
+	background: var(--surface);
+	border: 1px solid var(--line);
+	z-index: 10;
+}
+.skip-link:focus {
+	top: var(--space-4);
+}
+
+.wrap {
+	max-width: 1200px;
+	margin: 0 auto;
+	padding-inline: var(--space-6);
+}
+
+/* Type scale */
+.t-display {
+	font-family: var(--font-mono);
+	font-size: 56px;
+	line-height: 64px;
+	font-weight: 500;
+	margin: 0;
+}
+.t-heading {
+	font-family: var(--font-mono);
+	font-size: 32px;
+	line-height: 40px;
+	font-weight: 500;
+	margin: 0;
+}
+.t-title {
+	font-family: var(--font-mono);
+	font-size: 20px;
+	line-height: 28px;
+	font-weight: 500;
+	margin: 0;
+}
+.t-small {
+	font-size: 15px;
+	line-height: 24px;
+}
+.t-label {
+	font-size: 13px;
+	line-height: 20px;
+	font-weight: 500;
+	letter-spacing: 0.01em;
+}
+.muted {
+	color: var(--text-muted);
+}
+
+/* Header and footer */
+.site-header {
+	border-bottom: 1px solid var(--line);
+}
+.header-row {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: var(--space-4);
+	padding-block: 12px;
+}
+.header-logo {
+	display: flex;
+	align-items: center;
+	padding: 6px 0;
+}
+.header-logo img {
+	height: 28px;
+	width: auto;
+	display: block;
+}
+.header-nav,
+.footer-nav {
+	display: flex;
+	flex-wrap: wrap;
+	gap: var(--space-1);
+	margin-left: auto;
+	align-items: center;
+}
+.nav-link {
+	font-family: var(--font-sans);
+	font-size: 15px;
+	line-height: 24px;
+	font-weight: 500;
+	text-decoration: none;
+	color: var(--text-muted);
+	padding: 10px 12px;
+	border-radius: var(--radius-sm);
+}
+.nav-link:hover,
+.nav-link[aria-current='page'] {
+	color: var(--text);
+}
+.site-footer {
+	border-top: 1px solid var(--line);
+}
+.footer-row {
+	display: flex;
+	flex-wrap: wrap;
+	gap: var(--space-4);
+	align-items: center;
+	padding-block: 32px;
+}
+.footer-row img {
+	height: 24px;
+	width: auto;
+	display: block;
+}
+
+/* Sections */
+.section {
+	padding-block: var(--space-24);
+	border-top: 1px solid var(--line);
+}
+.split {
+	display: flex;
+	flex-wrap: wrap;
+	gap: var(--space-12);
+}
+.stack {
+	display: flex;
+	flex-direction: column;
+	gap: var(--space-4);
+}
+.prose-p {
+	margin: 0;
+	max-width: 640px;
+}
+
+/* Hero */
+.hero {
+	padding-top: var(--space-24);
+	padding-bottom: 72px;
+	display: flex;
+	flex-direction: column;
+	gap: 32px;
+}
+.hero-logo img {
+	height: 72px;
+	width: auto;
+	display: block;
+}
+.hero-install {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 12px var(--space-4);
+	max-width: 840px;
+	box-sizing: border-box;
+	padding: var(--space-4) var(--space-4) var(--space-4) var(--space-6);
+	background: var(--surface);
+	border: 1px solid var(--line);
+	border-radius: var(--radius-md);
+}
+.hero-cmd {
+	flex: 1 1 420px;
+	min-width: 0;
+	overflow-x: auto;
+	white-space: nowrap;
+	font-family: var(--font-mono);
+	font-size: 24px;
+	line-height: 36px;
+	font-weight: 500;
+	color: var(--text);
+}
+.hero-cmd .p {
+	color: var(--text-muted);
+	margin-right: 14px;
+}
+.copy-btn .done,
+.copy-btn[data-copied] .idle {
+	display: none;
+}
+.copy-btn[data-copied] .done {
+	display: block;
+}
+
+/* Feature cards */
+.cards {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+	gap: var(--space-4);
+}
+.card {
+	background: var(--surface);
+	border: 1px solid var(--line);
+	border-radius: var(--radius-lg);
+	padding: var(--space-6);
+	display: flex;
+	flex-direction: column;
+	gap: var(--space-2);
+}
+.card p {
+	margin: 0;
+}
+
+@media (max-width: 760px) {
+	.t-display {
+		font-size: 36px;
+		line-height: 44px;
+	}
+	.t-heading {
+		font-size: 26px;
+		line-height: 34px;
+	}
+	.section {
+		padding-block: var(--space-12);
+	}
+	.hero {
+		padding-top: var(--space-12);
+	}
+	.hero-logo img {
+		height: 48px;
+	}
+	.hero-install {
+		flex-wrap: nowrap;
+		padding-left: var(--space-4);
+	}
+	.hero-cmd {
+		flex-basis: 0;
+		font-size: 16px;
+		line-height: 24px;
+	}
+	.wrap {
+		padding-inline: var(--space-4);
+	}
+	.cards {
+		grid-template-columns: 1fr;
+	}
+}

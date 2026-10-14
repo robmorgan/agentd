@@ -1,0 +1,22 @@
+{
+  "name": "agtd-website",
+  "type": "module",
+  "version": "0.0.1",
+  "scripts": {
+    "copy-install": "cp ../install.sh public/install.sh",
+    "predev": "npm run copy-install",
+    "dev": "astro dev",
+    "prebuild": "npm run copy-install",
+    "build": "astro build",
+    "preview": "astro preview",
+    "astro": "astro"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.42.6",
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "@fontsource/ibm-plex-sans": "^5.3.0",
+    "astro": "^7.2.10",
+    "sharp": "^0.35.3"
+  },
+  "private": true
+}

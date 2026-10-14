@@ -1,0 +1,72 @@
+---
+title: Attention model
+description: Several agents create an attention problem. Sessions emit attention signals, and agtd surfaces the ones that need you.
+---
+
+import Terminal from '../../../components/Terminal.astro';
+import AgtLs from '../../../components/AgtLs.astro';
+import Note from '../../../components/Note.astro';
+
+<p class="lead">Several agents create an attention problem. Instead of streaming logs, sessions emit attention signals, and agtd surfaces the ones that need you.</p>
+
+## Attention levels
+
+Every signal has a level. Clients sort and surface sessions by it, not by raw output.
+
+<div class="agtd-levels not-content">
+	<div class="agtd-level"><span class="agtd-level-name">info</span><span class="agtd-level-desc">A background update.</span></div>
+	<div class="agtd-level"><span class="agtd-level-name">notice</span><span class="agtd-level-desc">Something meaningful happened: an agent went quiet, a session finished.</span></div>
+	<div class="agtd-level"><span class="agtd-level-name">action</span><span class="agtd-level-desc">You need to step in: a permission prompt, a question, a failure.</span></div>
+</div>
+
+## Program status reports
+
+The signal is the program's own word. Through [program status reports](https://mitchellh.com/writing/program-status-osc7501) (OSC 7501), a program says it is `working` (with progress), `blocked` on you and why, `done` or `error`, with a one-line message.
+
+agtd does not guess. A program that does not report shows as running, with no inferred waiting or idleness. A session needs attention until you look at it: attaching or detaching acknowledges it.
+
+<AgtLs />
+
+Sessions that need you come first in `agt ls`, in the picker and in the `Ctrl-Y` switcher. `agt status NAME` shows the details.
+
+## Which agents report
+
+- **Claude Code** reports natively since 2.1.295: permission prompts, questions and finished turns surface with their message, with nothing to configure.
+- **Agents that don't report yet** (Codex, older Claude Code, plain tools) show as running, with the foreground command and terminal title as context. A non-reporting command that is silent for half an hour records a `stalled` notice.
+
+<Note title="Bells don't raise attention">
+	Bells and desktop notifications (OSC 9 and OSC 777) are recorded as info-level events in `agt events`, but raise no attention and trigger no `--notify`.
+</Note>
+
+## Making agents ask out loud
+
+Any program can report with one escape sequence. agtd answers the protocol's detection query for every session, attached or not.
+
+<Terminal title="shell" commands={["printf '\\e]7501;state=blocked:kind=permission:msg=%s\\e\\\\' \"$(printf 'Deploy?' | base64)\""]} />
+
+Wrap a tool you already use to report how it finished:
+
+<Terminal
+	title="shell"
+	commands={[
+		"mytool; printf '\\e]7501;state=%s:msg=%s\\e\\\\' \\\n    \"$([ $? -eq 0 ] && echo done || echo error)\" \"$(printf 'mytool finished' | base64)\"",
+	]}
+/>
+
+Typing into the session counts a `blocked` report as answered until the program reports again.
+
+## Following events
+
+Every session keeps its newest 500 events. Follow them, or get a desktop notification when a session needs you.
+
+<Terminal
+	commands={[
+		'agt events',
+		'agt events fix-tests --follow',
+		'agt events --follow --notify',
+		`agt events --follow --level action --exec 'say "$AGENTD_EVENT_SESSION needs you"'`,
+		'agt events --json --after 120',
+	]}
+/>
+
+`--notify` writes to your terminal, so it pops a notification wherever your terminal supports one: iTerm2, Ghostty, WezTerm and kitty use OSC 9; VTE terminals, foot and urxvt use OSC 777. Inside tmux, `set -g allow-passthrough on`.

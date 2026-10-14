@@ -1,0 +1,60 @@
+---
+/*
+ * `agt ls` as it prints, in the README's column layout. Colour only what agt
+ * colours: the ● of a running session, ⚠ and its attention summary, and dim
+ * headers, paths and exited sessions.
+ */
+type Run = 'needs' | 'running' | 'exited';
+
+interface Row {
+	run: Run;
+	age: string;
+	name: string;
+	activity: string;
+	cwd: string;
+	attention?: string;
+}
+
+interface Props {
+	rows?: Row[];
+	class?: string;
+}
+
+const defaultRows: Row[] = [
+	{ run: 'needs', age: '12m', name: 'fix-tests', activity: 'blocked 2m', cwd: '~/src/app', attention: 'permission: Run the tests?' },
+	{ run: 'running', age: '40m', name: 'dep-bump', activity: 'working 47%', cwd: '~/src/app' },
+	{ run: 'running', age: '3m', name: 'docs', activity: 'idle 5m', cwd: '~/src/docs', attention: 'Updated the README' },
+	{ run: 'exited', age: '1h', name: 'refactor', activity: 'exited', cwd: '~/src/app', attention: 'finished (exit 0)' },
+];
+
+const { rows = defaultRows, class: className } = Astro.props;
+
+const glyph: Record<Run, string> = { needs: '⚠', running: '●', exited: '○' };
+const header = '  RUN  AGE    NAME            ACTIVITY     CWD                 ATTENTION';
+
+// Each row as plain-text segments, padded to the README's columns, with the
+// class agt would colour it in. Rendered on one line below: whitespace
+// between JSX elements would leak into the <pre>.
+const lines = rows.map((r) => {
+	const age = r.age.padEnd(7);
+	const activity = r.activity.padEnd(13);
+	if (r.run === 'exited') {
+		const text = `  ${glyph.exited}    ${age}${r.name.padEnd(16)}${activity}${r.cwd.padEnd(20)}${r.attention ?? ''}`;
+		return [{ text: text.trimEnd(), cls: 'agtd-t-dim' }];
+	}
+	return [
+		{ text: '  ' },
+		{ text: glyph[r.run], cls: r.run === 'needs' ? 'agtd-t-sig' : 'agtd-t-ok' },
+		{ text: '    ' + age },
+		{ text: r.name, cls: 'agtd-t-bold' },
+		{ text: ' '.repeat(Math.max(1, 16 - r.name.length)) + activity },
+		{ text: r.attention ? r.cwd.padEnd(20) : r.cwd, cls: 'agtd-t-dim' },
+		{ text: r.attention ?? '', cls: r.run === 'needs' ? 'agtd-t-sig' : undefined },
+	];
+});
+---
+
+<figure class:list={['agtd-term not-content', className]}>
+	<div class="agtd-term-bar">agt</div>
+	<pre class="agtd-term-body"><span class="agtd-t-dim">❯</span> agt ls{'\n\n'}<span class="agtd-t-dim">{header}</span>{lines.map((segs) => <>{'\n'}{segs.map((s) => (s.cls ? <span class={s.cls}>{s.text}</span> : s.text))}</>)}</pre>
+</figure>
