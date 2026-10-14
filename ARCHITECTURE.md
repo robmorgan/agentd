@@ -592,8 +592,22 @@ happened to a session: an id, the session, a time, a kind, an attention level (`
 | `done` | notice | the worker, when the program reports it finished (OSC 7501) |
 | `error` | action | the worker, when the program reports it failed and stopped (OSC 7501) |
 | `acknowledged` | info | the daemon, when the user looked at the session (below) |
+| `paired` | notice | the daemon, when a machine paired with a one-time code (host event) |
+| `pair_failed` | notice | the daemon, when a pairing window closed after 3 wrong codes; the summary names the last address that guessed (host event) |
+| `authorized` | notice | `agentd remote authorize`, when it adds a key (host event) |
+| `revoked` | notice | `agentd remote revoke` (host event) |
+| `connected` | info | the daemon, when an authorized remote client connects; at most once per key and address every 10 minutes, since every remote command connects (host event) |
+| `disconnected` | info | the daemon, when it drops a live connection because its key was revoked (host event) |
 
 Kinds travel as strings, so a client shows kinds newer than itself instead of failing to decode them.
+
+**Host events** are about the machine rather than a session: who was allowed to reach the daemon
+remotely, and who did. They have an empty session id, so the unfiltered feed (`agt events`,
+`--all`) shows them next to session events, and the CLI names the host in the session column
+(`host` for this machine). A session's own feed never includes them, and they raise no session's
+attention. `agentd remote authorize` and `revoke` run outside the daemon, so they write their
+events to `state.db` directly, as workers do; the daemon records the rest. Handshakes refused for
+an unknown key are not recorded yet.
 
 **Program status (OSC 7501) is the primary source.** A program that speaks the [program status
 protocol](https://www.superlogical.com/rex/docs/build/program-status) reports what it is doing
@@ -635,7 +649,8 @@ the workers. Ids come from `AUTOINCREMENT`, so they increase per runtime root an
 because every write is an immediate transaction, ids are committed in order, and a reader that has
 seen id N never later finds a new event below N. An id is therefore a cursor. Each session keeps
 its newest 500 events, pruned in the transaction that inserts a new one, and removing a session
-removes its events, so the table is bounded by the sessions retained. A lifecycle change and its
+removes its events, so the table is bounded by the sessions retained. Host events are pruned as their
+own bucket of 2000. A lifecycle change and its
 event are written in one transaction.
 
 **Attention.** A session record's `attention`, `attention_summary` and `attention_at` are the

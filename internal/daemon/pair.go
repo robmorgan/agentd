@@ -13,6 +13,7 @@ import (
 
 	"github.com/robmorgan/agentd/internal/paths"
 	"github.com/robmorgan/agentd/internal/protocol"
+	"github.com/robmorgan/agentd/internal/session"
 	"github.com/robmorgan/agentd/internal/transport"
 )
 
@@ -72,9 +73,16 @@ func (s *Server) servePair(conn transport.Stream) error {
 	r := w.Result()
 	if r.Err != nil {
 		fmt.Fprintf(os.Stderr, "agentd: pairing ended: %v\n", r.Err)
+		// Someone guessing codes is worth a record; a window that expired
+		// or was cancelled here is not.
+		if errors.Is(r.Err, transport.ErrTooManyWrongCodes) {
+			s.recordHostEvent(session.EventPairFailed, fmt.Sprintf("pairing %v, the last from %s", r.Err, hostOf(r.Remote)))
+		}
 		return fail(r.Err.Error())
 	}
 	fmt.Fprintf(os.Stderr, "agentd: paired with %s (%s) from %s; it is now authorized\n", r.Fingerprint, r.Name, r.Remote)
+	s.recordHostEvent(session.EventPaired,
+		fmt.Sprintf("%s paired from %s", transport.DescribeClient(r.Fingerprint, r.Name), hostOf(r.Remote)))
 	return protocol.WriteManagementResponse(conn, &protocol.ManagementResponse{Paired: &protocol.ManagementPaired{
 		Fingerprint: r.Fingerprint, Name: r.Name, Remote: r.Remote.String(),
 	}})

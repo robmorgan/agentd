@@ -54,6 +54,12 @@ func TestPairingAuthorizesARemoteClient(t *testing.T) {
 	if len(clients) != 1 || clients[0].Fingerprint != client.Fingerprint || clients[0].Name != "laptop" {
 		t.Fatalf("authorized clients = %+v", clients)
 	}
+	// The pairing is on record, recorded before `agentd remote pair` heard
+	// of it.
+	if evs := hostEvents(h); kinds(evs) != "paired" ||
+		evs[0].Summary != "laptop ("+client.Fingerprint+") paired from 127.0.0.1" {
+		t.Fatalf("host events = %+v", evs)
+	}
 	if !remoteRequestWorks(h, client) {
 		t.Fatal("paired client was refused")
 	}

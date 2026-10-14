@@ -36,6 +36,16 @@ func TestFormatEvent(t *testing.T) {
 	if _, ok := mapFromJSON(t, eventJSON(ev, ""))["host"]; ok {
 		t.Fatal("local events name a host")
 	}
+
+	// A host event (pairing, connections) has no session; its column
+	// names the host instead of being blank.
+	host := session.Event{ID: 43, At: ev.At, Kind: session.EventPaired, Attention: session.AttentionNotice, Summary: "laptop paired"}
+	if got := formatEvent(host, "", today); got != "08:30:05  #43  host  notice  paired        laptop paired" {
+		t.Fatalf("host event: %q", got)
+	}
+	if got := formatEvent(host, "devbox", today); !strings.Contains(got, "  devbox  notice  paired") {
+		t.Fatalf("remote host event: %q", got)
+	}
 }
 
 func readFile(t *testing.T, path string) string {

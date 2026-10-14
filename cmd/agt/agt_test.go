@@ -414,6 +414,15 @@ func TestRemoteAttachEndToEnd(t *testing.T) {
 	if out := e.mustRun("agt", "--host", "dev", "ls"); !strings.Contains(out, "demo") {
 		t.Fatalf("remote ls:\n%s", out)
 	}
+	// Who may connect, and who did, is on record next to the sessions'
+	// events. Authorizing a key again changes nothing, so records nothing.
+	e.mustRun("agentd", "remote", "authorize", clientKey, "test")
+	audit := e.mustRun("agt", "events")
+	authorized := regexp.MustCompile(`host\s+notice\s+authorized\s+test \(` + regexp.QuoteMeta(clientKey) + `\) authorized by hand`)
+	if n := len(authorized.FindAllString(audit, -1)); n != 1 ||
+		!regexp.MustCompile(`host\s+info\s+connected\s+test \(`+regexp.QuoteMeta(clientKey)+`\) connected from 127\.0\.0\.1`).MatchString(audit) {
+		t.Fatalf("events after authorizing (%d authorized):\n%s", n, audit)
+	}
 
 	// Host health: this machine, the reachable host, and one that is not.
 	// `agt host add` refuses a host it cannot reach, so write this one.
@@ -488,6 +497,11 @@ func TestRemoteAttachEndToEnd(t *testing.T) {
 	tm.expect(m, "over-quic")
 	tm.write("\x1c")
 	tm.wait()
+
+	e.mustRun("agentd", "remote", "revoke", clientKey)
+	if out := e.mustRun("agt", "events"); !regexp.MustCompile(`host\s+notice\s+revoked\s+test \(` + regexp.QuoteMeta(clientKey) + `\) revoked`).MatchString(out) {
+		t.Fatalf("events after revoking:\n%s", out)
+	}
 }
 
 // gitIn runs git in dir for test setup, standing in for an agent at work.

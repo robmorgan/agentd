@@ -22,6 +22,12 @@ import (
 // retained one; ids are not dense in any case, since they are shared by
 // all sessions.
 //
+// Host events are about the machine rather than a session (pairing,
+// authorization, revocation, remote connections); they have an empty
+// session_id, which no session has, so they appear in the unfiltered feed
+// next to session events. They are pruned as their own bucket of
+// MaxHostEvents, so they never crowd out a session's history.
+//
 // Ordering: every write is an immediate transaction (connect's
 // _txlock=immediate), so writers are serialised and ids are committed in
 // increasing order. A reader that has seen id N will never later find a
@@ -29,6 +35,10 @@ import (
 
 // MaxEventsPerSession bounds the events kept per session.
 const MaxEventsPerSession = 500
+
+// MaxHostEvents bounds the host events kept. They are an audit record, so
+// more of them are kept than of any one session.
+const MaxHostEvents = 2000
 
 // NewEvent is an event to record. A zero At means now; an empty Attention
 // means the kind's default.
@@ -54,8 +64,13 @@ func (e NewEvent) at() string {
 	return e.At.UTC().Format(rfc3339)
 }
 
-// insertEvent inserts e and prunes its session's oldest events.
+// insertEvent inserts e and prunes its session's (or the host's) oldest
+// events.
 func insertEvent(tx *sql.Tx, e NewEvent) (uint64, error) {
+	keep := MaxEventsPerSession
+	if e.SessionID == "" {
+		keep = MaxHostEvents
+	}
 	res, err := tx.Exec(`INSERT INTO events (session_id, at, kind, attention, summary) VALUES (?1, ?2, ?3, ?4, ?5)`,
 		e.SessionID, e.at(), string(e.Kind), string(e.attention()), e.Summary)
 	if err != nil {
@@ -67,8 +82,22 @@ func insertEvent(tx *sql.Tx, e NewEvent) (uint64, error) {
 	}
 	_, err = tx.Exec(`DELETE FROM events WHERE session_id = ?1 AND id <= (
             SELECT id FROM events WHERE session_id = ?1 ORDER BY id DESC LIMIT 1 OFFSET ?2)`,
-		e.SessionID, MaxEventsPerSession)
+		e.SessionID, keep)
 	return uint64(id), err
+}
+
+// RecordHostEvent records an event about the machine rather than a
+// session: pairing, authorization, revocation, remote connections. Its
+// SessionID is ignored, and it raises no session's attention.
+func (d *Database) RecordHostEvent(e NewEvent) (uint64, error) {
+	e.SessionID = ""
+	var id uint64
+	err := d.tx(func(tx *sql.Tx) error {
+		var err error
+		id, err = insertEvent(tx, e)
+		return err
+	})
+	return id, err
 }
 
 // rankSQL ranks the attention column like session.AttentionLevel.Rank.
