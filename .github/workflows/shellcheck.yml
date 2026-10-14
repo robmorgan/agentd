@@ -1,0 +1,27 @@
+name: shellcheck
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # A pinned release rather than the runner's, so CI and a local
+      # `make shellcheck` agree on which warnings exist.
+      - name: Install shellcheck
+        env:
+          SHELLCHECK_VERSION: "0.11.0"
+        run: |
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" |
+            tar -xJ
+          sudo install -m 0755 "shellcheck-v${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
+      - name: Lint shell scripts
+        run: make shellcheck
