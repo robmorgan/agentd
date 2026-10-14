@@ -1,5 +1,5 @@
 // Package protocol implements the framed binary wire protocol shared by the
-// agent CLI, the daemon, and session workers. Golden-frame tests pin its
+// agt CLI, the daemon, and session workers. Golden-frame tests pin its
 // bytes, so a CLI and a daemon of different builds (or on different
 // machines) keep understanding each other.
 package protocol

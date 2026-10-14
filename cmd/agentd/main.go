@@ -1,7 +1,7 @@
 // Command agentd is the Go implementation of the agentd daemon and its
 // session worker:
 //
-//	agentd serve [--daemonize]   run the daemon (the agent CLI starts it)
+//	agentd serve [--daemonize]   run the daemon (the agt CLI starts it)
 //	agentd upgrade               replace the running daemon, and hand running
 //	                             sessions' workers, over to this binary
 //	agentd bench sessions ...    measure what sessions cost, on a private daemon
@@ -380,7 +380,7 @@ func runRemoteEnable(p *paths.AppPaths, argv []string) int {
 	fmt.Printf("  key %s\n\n", id.Fingerprint)
 	fmt.Println("To connect from another machine, pair it: run `agentd remote pair` here and")
 	fmt.Println("follow its instructions. Or, on that machine, run:")
-	fmt.Printf("  agent host add %s %s --fingerprint %s\n", shortHostname(), status.Remote, id.Fingerprint)
+	fmt.Printf("  agt host add %s %s --fingerprint %s\n", shortHostname(), status.Remote, id.Fingerprint)
 	fmt.Println("and then authorize it here with the command it prints.")
 	return 0
 }
@@ -393,7 +393,7 @@ func runRemotePair(p *paths.AppPaths) int {
 	paired, err := daemon.Pair(ctx, p, func(w *protocol.ManagementPairing) {
 		fmt.Printf("Pairing code: %s\n\n", w.Code)
 		fmt.Println("On the machine you connect from, run:")
-		fmt.Printf("  agent host add %s %s --code %s\n\n", shortHostname(), displayAddress(w.Remote), w.Code)
+		fmt.Printf("  agt host add %s %s --code %s\n\n", shortHostname(), displayAddress(w.Remote), w.Code)
 		fmt.Printf("Waiting until %s (Ctrl-C to cancel)...\n", w.ExpiresAt.Local().Format("15:04:05"))
 	})
 	if err != nil {
@@ -516,7 +516,7 @@ func confirm(question string) (bool, error) {
 }
 
 // shortHostname is this machine's name without its domain, as a suggested
-// host name for `agent host add`.
+// host name for `agt host add`.
 func shortHostname() string {
 	name, err := os.Hostname()
 	if err != nil || name == "" {

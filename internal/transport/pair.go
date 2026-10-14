@@ -22,7 +22,7 @@ import (
 
 // Pairing replaces copying key fingerprints between machines with a short
 // code: `agentd remote pair` opens a pairing window on the daemon and shows
-// a code, and `agent host add ... --code` on the client proves it knows the
+// a code, and `agt host add ... --code` on the client proves it knows the
 // code. Both then trust each other's key: the daemon authorizes the
 // client's, and the client pins the daemon's.
 //

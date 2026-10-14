@@ -23,18 +23,18 @@ import (
 	"github.com/robmorgan/agentd/internal/transport/transporttest"
 )
 
-// These tests drive the real agent and agentd binaries through real PTYs.
+// These tests drive the real agt and agentd binaries through real PTYs.
 
 var binDir string
 
 func TestMain(m *testing.M) {
-	dir, err := os.MkdirTemp("", "agent-bin-")
+	dir, err := os.MkdirTemp("", "agt-bin-")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	binDir = dir
-	for _, b := range []struct{ name, pkg, cgo string }{{"agentd", "../agentd", ""}, {"agent", ".", "0"}} {
+	for _, b := range []struct{ name, pkg, cgo string }{{"agentd", "../agentd", ""}, {"agt", ".", "0"}} {
 		build := exec.Command("go", "build", "-o", filepath.Join(dir, b.name), b.pkg)
 		build.Stdout, build.Stderr = os.Stderr, os.Stderr
 		if b.cgo != "" {
@@ -60,7 +60,7 @@ func TestAgentStaysPureGoAndOffTheDaemonsState(t *testing.T) {
 	for _, dep := range strings.Fields(string(out)) {
 		for _, banned := range []string{"internal/worker", "internal/daemon", "internal/db", "libghostty", "modernc.org/sqlite"} {
 			if strings.Contains(dep, banned) {
-				t.Errorf("agent depends on %s", dep)
+				t.Errorf("agt depends on %s", dep)
 			}
 		}
 	}
@@ -126,7 +126,7 @@ func (e *env) cleanup() {
 		protocol.WriteRequest(s, &protocol.Request{ListSessions: protocol.Empty})
 		if resp, _ := protocol.ReadResponse(s); resp != nil && resp.Sessions != nil {
 			for _, rec := range *resp.Sessions {
-				e.run("agent", "kill", "--rm", rec.SessionID)
+				e.run("agt", "kill", "--rm", rec.SessionID)
 			}
 		}
 		s.Close()
@@ -140,7 +140,7 @@ func (e *env) cleanup() {
 	os.RemoveAll(e.root)
 }
 
-// term is agent running on a PTY, as it would in a terminal.
+// term is agt running on a PTY, as it would in a terminal.
 type term struct {
 	t    *testing.T
 	pty  *os.File
@@ -158,7 +158,7 @@ func (e *env) start(args ...string) *term {
 		e.t.Fatal(err)
 	}
 	pty.Setsize(ptmx, &pty.Winsize{Rows: 30, Cols: 100})
-	cmd := exec.Command(filepath.Join(binDir, "agent"), args...)
+	cmd := exec.Command(filepath.Join(binDir, "agt"), args...)
 	cmd.Env = e.environ()
 	cmd.Dir = e.work
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = tty, tty, tty
@@ -225,7 +225,7 @@ func (tm *term) expectWithin(mark int, want string, timeout time.Duration) int {
 
 func (tm *term) mark() int { return len(tm.output()) }
 
-// waitErr waits for agent to exit and returns how it exited.
+// waitErr waits for agt to exit and returns how it exited.
 func (tm *term) waitErr() error {
 	tm.t.Helper()
 	exited := make(chan error, 1)
@@ -234,12 +234,12 @@ func (tm *term) waitErr() error {
 	case err := <-exited:
 		return err
 	case <-time.After(10 * time.Second):
-		tm.t.Fatalf("agent did not exit:\n%q", tm.output())
+		tm.t.Fatalf("agt did not exit:\n%q", tm.output())
 		return nil
 	}
 }
 
-// wait waits for agent to exit and checks it exited cleanly, leaving the
+// wait waits for agt to exit and checks it exited cleanly, leaving the
 // terminal as it found it.
 func (tm *term) wait() {
 	tm.t.Helper()
@@ -248,20 +248,20 @@ func (tm *term) wait() {
 	select {
 	case err := <-exited:
 		if err != nil {
-			tm.t.Fatalf("agent exited with %v:\n%q", err, tm.output())
+			tm.t.Fatalf("agt exited with %v:\n%q", err, tm.output())
 		}
 	case <-time.After(10 * time.Second):
-		tm.t.Fatalf("agent did not exit:\n%q", tm.output())
+		tm.t.Fatalf("agt did not exit:\n%q", tm.output())
 	}
 	flags, err := unix.FcntlInt(tm.tty.Fd(), unix.F_GETFL, 0)
 	if err != nil || flags&unix.O_NONBLOCK != 0 {
-		tm.t.Fatalf("agent left the terminal non-blocking (flags %#x, %v)", flags, err)
+		tm.t.Fatalf("agt left the terminal non-blocking (flags %#x, %v)", flags, err)
 	}
 	// The master reports the terminal's modes; the slave may already be
 	// revoked now that its session leader has exited.
 	attrs, err := unix.IoctlGetTermios(int(tm.pty.Fd()), ioctlGetTermios)
 	if err != nil || attrs.Lflag&unix.ICANON == 0 || attrs.Lflag&unix.ECHO == 0 {
-		tm.t.Fatalf("agent left the terminal in raw mode (%+v, %v)", attrs, err)
+		tm.t.Fatalf("agt left the terminal in raw mode (%+v, %v)", attrs, err)
 	}
 }
 
@@ -273,7 +273,7 @@ const restoreSequence = "\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l
 func TestAttachEndToEnd(t *testing.T) {
 	e := newEnv(t, "")
 
-	// agent new starts the daemon and attaches to the new session.
+	// agt new starts the daemon and attaches to the new session.
 	tm := e.start("new", "demo")
 	tm.expect(0, "\x1b]0;demo - agentd\x07")
 	m := tm.expect(0, "attached to demo")
@@ -294,7 +294,7 @@ func TestAttachEndToEnd(t *testing.T) {
 	}
 
 	// The session outlives the client.
-	if out := e.mustRun("agent", "ls"); !strings.Contains(out, "demo") || !strings.Contains(out, "●") {
+	if out := e.mustRun("agt", "ls"); !strings.Contains(out, "demo") || !strings.Contains(out, "●") {
 		t.Fatalf("ls after detach:\n%s", out)
 	}
 
@@ -323,21 +323,21 @@ func TestAttachEndToEnd(t *testing.T) {
 	tm.expect(m, "session two finished (exit 0)")
 	tm.wait()
 
-	if out := e.mustRun("agent", "status", "two"); !strings.Contains(out, "status: exited") {
+	if out := e.mustRun("agt", "status", "two"); !strings.Contains(out, "status: exited") {
 		t.Fatalf("status two:\n%s", out)
 	}
-	if out := e.mustRun("agent", "history", "demo"); !strings.Contains(out, "after-overlay") {
+	if out := e.mustRun("agt", "history", "demo"); !strings.Contains(out, "after-overlay") {
 		t.Fatalf("history:\n%s", out)
 	}
-	e.mustRun("agent", "send-input", "demo", "echo", "from-send-input\r")
+	e.mustRun("agt", "send-input", "demo", "echo", "from-send-input\r")
 	deadline := time.Now().Add(5 * time.Second)
-	for !strings.Contains(e.mustRun("agent", "history", "demo"), "from-send-input") {
+	for !strings.Contains(e.mustRun("agt", "history", "demo"), "from-send-input") {
 		if time.Now().After(deadline) {
 			t.Fatal("send-input did not reach the session")
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if out := e.mustRun("agent", "kill", "--rm", "demo"); !strings.Contains(out, "terminated session demo") || !strings.Contains(out, "removed session demo") {
+	if out := e.mustRun("agt", "kill", "--rm", "demo"); !strings.Contains(out, "terminated session demo") || !strings.Contains(out, "removed session demo") {
 		t.Fatalf("kill --rm:\n%s", out)
 	}
 }
@@ -380,7 +380,7 @@ func TestPickerEndToEnd(t *testing.T) {
 func TestRemoteAttachEndToEnd(t *testing.T) {
 	e := newEnv(t, "\n[remote]\nlisten = \"127.0.0.1:0\"\n")
 	e.startAndDetach("demo")
-	info := e.mustRun("agent", "daemon", "info")
+	info := e.mustRun("agt", "daemon", "info")
 	addr := ""
 	for _, line := range strings.Split(info, "\n") {
 		if v, ok := strings.CutPrefix(line, "remote: "); ok {
@@ -391,27 +391,27 @@ func TestRemoteAttachEndToEnd(t *testing.T) {
 		t.Fatalf("remote not listening:\n%s", info)
 	}
 	daemonKey := strings.TrimSpace(e.mustRun("agentd", "remote", "id"))
-	clientKey := strings.TrimSpace(e.mustRun("agent", "remote", "id"))
+	clientKey := strings.TrimSpace(e.mustRun("agt", "remote", "id"))
 
 	// A wrong pin is refused; the right one is added without a prompt.
-	if out, err := e.run("agent", "host", "add", "dev", addr, "--fingerprint", clientKey); err == nil || !strings.Contains(out, "not adding `dev`") {
+	if out, err := e.run("agt", "host", "add", "dev", addr, "--fingerprint", clientKey); err == nil || !strings.Contains(out, "not adding `dev`") {
 		t.Fatalf("wrong fingerprint: %v\n%s", err, out)
 	}
-	e.mustRun("agent", "host", "add", "dev", addr, "--fingerprint", daemonKey)
-	if out := e.mustRun("agent", "host", "ls", "--no-probe"); !strings.Contains(out, "dev\t"+addr+"\t"+daemonKey) {
+	e.mustRun("agt", "host", "add", "dev", addr, "--fingerprint", daemonKey)
+	if out := e.mustRun("agt", "host", "ls", "--no-probe"); !strings.Contains(out, "dev\t"+addr+"\t"+daemonKey) {
 		t.Fatalf("host ls --no-probe:\n%s", out)
 	}
-	if out := e.mustRun("agent", "host", "ls"); !regexp.MustCompile(`dev\s+` + regexp.QuoteMeta(addr) + `\s+unauthorized`).MatchString(out) {
+	if out := e.mustRun("agt", "host", "ls"); !regexp.MustCompile(`dev\s+` + regexp.QuoteMeta(addr) + `\s+unauthorized`).MatchString(out) {
 		t.Fatalf("host ls before authorizing:\n%s", out)
 	}
 
 	// Until this machine is authorized the daemon refuses it, and the CLI
 	// says how to fix that.
-	if out, err := e.run("agent", "--host", "dev", "ls"); err == nil || !strings.Contains(out, "agentd remote authorize "+clientKey) {
+	if out, err := e.run("agt", "--host", "dev", "ls"); err == nil || !strings.Contains(out, "agentd remote authorize "+clientKey) {
 		t.Fatalf("unauthorized: %v\n%s", err, out)
 	}
 	e.mustRun("agentd", "remote", "authorize", clientKey, "test")
-	if out := e.mustRun("agent", "--host", "dev", "ls"); !strings.Contains(out, "demo") {
+	if out := e.mustRun("agt", "--host", "dev", "ls"); !strings.Contains(out, "demo") {
 		t.Fatalf("remote ls:\n%s", out)
 	}
 	// Who may connect, and who did, is on record next to the sessions'
@@ -425,17 +425,17 @@ func TestRemoteAttachEndToEnd(t *testing.T) {
 	}
 
 	// Host health: this machine, the reachable host, and one that is not.
-	// `agent host add` refuses a host it cannot reach, so write this one.
+	// `agt host add` refuses a host it cannot reach, so write this one.
 	if err := transport.AddHost(paths.FromRoot(e.root).HostsPath(), transport.Host{Name: "gone", Address: "127.0.0.1:9", Fingerprint: daemonKey}); err != nil {
 		t.Fatal(err)
 	}
-	out := e.mustRun("agent", "hosts")
+	out := e.mustRun("agt", "hosts")
 	for _, want := range []string{`local\s+\(this machine\)\s+online\s+\S+\s+1/1`, `dev\s+` + regexp.QuoteMeta(addr) + `\s+online\s+\S+\s+1/1\s+\d+\s+sh\s`, `gone\s+127\.0\.0\.1:9\s+offline`} {
 		if !regexp.MustCompile(want).MatchString(out) {
 			t.Fatalf("hosts: no %s in\n%s", want, out)
 		}
 	}
-	info = e.mustRun("agent", "host", "info", "dev")
+	info = e.mustRun("agt", "host", "info", "dev")
 	for _, want := range []string{"fingerprint: " + daemonKey, "status: online", "agents: sh", "capabilities: control-stream"} {
 		if !strings.Contains(info, want) {
 			t.Fatalf("host info: no %q in\n%s", want, info)
@@ -443,11 +443,11 @@ func TestRemoteAttachEndToEnd(t *testing.T) {
 	}
 	// Sessions across hosts: here "local" and "dev" are the same daemon,
 	// so the same session shows twice, under one global id.
-	if out := regexp.MustCompile("\x1b\\[[0-9;]*m").ReplaceAllString(e.mustRun("agent", "ls", "--all"), ""); !regexp.MustCompile(`local\s+demo`).MatchString(out) || !regexp.MustCompile(`dev\s+demo`).MatchString(out) {
+	if out := regexp.MustCompile("\x1b\\[[0-9;]*m").ReplaceAllString(e.mustRun("agt", "ls", "--all"), ""); !regexp.MustCompile(`local\s+demo`).MatchString(out) || !regexp.MustCompile(`dev\s+demo`).MatchString(out) {
 		t.Fatalf("ls --all:\n%s", out)
 	}
 	var ids []string
-	for _, line := range strings.Split(strings.TrimSpace(e.mustRun("agent", "ls", "--all", "--json")), "\n") {
+	for _, line := range strings.Split(strings.TrimSpace(e.mustRun("agt", "ls", "--all", "--json")), "\n") {
 		if !strings.HasPrefix(line, "{") {
 			continue // stderr: the unreachable host
 		}
@@ -466,13 +466,13 @@ func TestRemoteAttachEndToEnd(t *testing.T) {
 	if len(ids) != 2 || ids[0] != ids[1] {
 		t.Fatalf("global ids = %v", ids)
 	}
-	if out := e.mustRun("agent", "status", "dev/demo"); !strings.Contains(out, "host: dev") || !strings.Contains(out, "global_id: "+ids[0]) {
+	if out := e.mustRun("agt", "status", "dev/demo"); !strings.Contains(out, "host: dev") || !strings.Contains(out, "global_id: "+ids[0]) {
 		t.Fatalf("status dev/demo:\n%s", out)
 	}
-	if out := e.mustRun("agent", "events", "--all"); !strings.Contains(out, "local/demo") || !strings.Contains(out, "dev/demo") {
+	if out := e.mustRun("agt", "events", "--all"); !strings.Contains(out, "local/demo") || !strings.Contains(out, "dev/demo") {
 		t.Fatalf("events --all:\n%s", out)
 	}
-	e.mustRun("agent", "host", "rm", "gone")
+	e.mustRun("agt", "host", "rm", "gone")
 
 	// Placement picks the lighter host: both are this daemon here, so the
 	// tie goes to this machine.
@@ -482,11 +482,11 @@ func TestRemoteAttachEndToEnd(t *testing.T) {
 	tm.write("\x1c")
 	tm.wait()
 	// Events come over QUIC too, named by host.
-	if out := e.mustRun("agent", "events", "dev/demo"); !strings.Contains(out, "dev/demo  info    created") {
+	if out := e.mustRun("agt", "events", "dev/demo"); !strings.Contains(out, "dev/demo  info    created") {
 		t.Fatalf("remote events:\n%s", out)
 	}
 	follow := e.start("--host", "dev", "events", "--follow", "--lines", "0")
-	e.mustRun("agent", "--host", "dev", "send-input", "demo",
+	e.mustRun("agt", "--host", "dev", "send-input", "demo",
 		`printf '\033]7501;state=blocked:kind=permission:msg=RGVwbG95Pw==\033\\'`+"\r")
 	follow.expect(0, "dev/demo  action  blocked")
 
@@ -537,7 +537,7 @@ func TestDiffAndArtifactsEndToEnd(t *testing.T) {
 	os.WriteFile(filepath.Join(e.work, "README"), []byte("hello\nworld\n"), 0o644)
 	os.WriteFile(filepath.Join(e.work, "notes.txt"), []byte("todo\n"), 0o644)
 
-	diff := e.mustRun("agent", "diff", "demo")
+	diff := e.mustRun("agt", "diff", "demo")
 	for _, want := range []string{"+++ b/feature.go", "+world", "+++ b/notes.txt"} {
 		if !strings.Contains(diff, want) {
 			t.Fatalf("diff lacks %q:\n%s", want, diff)
@@ -546,27 +546,27 @@ func TestDiffAndArtifactsEndToEnd(t *testing.T) {
 	if strings.Contains(diff, "\x1b[") {
 		t.Fatalf("diff to a pipe is coloured:\n%q", diff)
 	}
-	if out := e.mustRun("agent", "diff", "--name-only", "demo"); out != "README\nfeature.go\nnotes.txt\n" {
+	if out := e.mustRun("agt", "diff", "--name-only", "demo"); out != "README\nfeature.go\nnotes.txt\n" {
 		t.Fatalf("--name-only:\n%s", out)
 	}
-	if out := e.mustRun("agent", "diff", "--stat", "demo"); !strings.Contains(out, " feature.go | 1 +") || !strings.Contains(out, "3 files changed, 3 insertions(+)") {
+	if out := e.mustRun("agt", "diff", "--stat", "demo"); !strings.Contains(out, " feature.go | 1 +") || !strings.Contains(out, "3 files changed, 3 insertions(+)") {
 		t.Fatalf("--stat:\n%s", out)
 	}
-	status := e.mustRun("agent", "status", "demo")
+	status := e.mustRun("agt", "status", "demo")
 	for _, want := range []string{"git_branch: main", "git_commits: 1 since base", "add the feature (Agent,", "git_changed_files: 3 (1 added, 1 modified, 1 untracked), +3 -0"} {
 		if !strings.Contains(status, want) {
 			t.Fatalf("status lacks %q:\n%s", want, status)
 		}
 	}
-	if out := e.mustRun("agent", "artifacts", "demo"); !strings.Contains(out, "diff\tdiff\t-\t") || !strings.Contains(out, "patch\tpatch\t-\t1 commit since") || !strings.Contains(out, "history.vt\t") {
+	if out := e.mustRun("agt", "artifacts", "demo"); !strings.Contains(out, "diff\tdiff\t-\t") || !strings.Contains(out, "patch\tpatch\t-\t1 commit since") || !strings.Contains(out, "history.vt\t") {
 		t.Fatalf("artifacts:\n%s", out)
 	}
 	mbox := filepath.Join(e.root, "out.mbox")
-	e.mustRun("agent", "artifact", "demo", "patch", "-o", mbox)
+	e.mustRun("agt", "artifact", "demo", "patch", "-o", mbox)
 	if data, _ := os.ReadFile(mbox); !bytes.Contains(data, []byte("Subject: [PATCH] add the feature")) {
 		t.Fatalf("patch artifact:\n%s", data)
 	}
-	if out, err := e.run("agent", "artifact", "demo", "nope", "-o", filepath.Join(e.root, "nope")); err == nil || !strings.Contains(out, "no artifact `nope`") {
+	if out, err := e.run("agt", "artifact", "demo", "nope", "-o", filepath.Join(e.root, "nope")); err == nil || !strings.Contains(out, "no artifact `nope`") {
 		t.Fatalf("unknown artifact: %v\n%s", err, out)
 	}
 	if _, err := os.Stat(filepath.Join(e.root, "nope")); err == nil {
@@ -574,22 +574,22 @@ func TestDiffAndArtifactsEndToEnd(t *testing.T) {
 	}
 
 	// The same over QUIC, with --host and with a host/session address.
-	info := e.mustRun("agent", "daemon", "info")
+	info := e.mustRun("agt", "daemon", "info")
 	addr := ""
 	for _, line := range strings.Split(info, "\n") {
 		if v, ok := strings.CutPrefix(line, "remote: "); ok {
 			addr = v
 		}
 	}
-	e.mustRun("agent", "host", "add", "dev", addr, "--fingerprint", strings.TrimSpace(e.mustRun("agentd", "remote", "id")))
-	e.mustRun("agentd", "remote", "authorize", strings.TrimSpace(e.mustRun("agent", "remote", "id")), "test")
-	if remote := e.mustRun("agent", "--host", "dev", "diff", "demo"); remote != diff {
+	e.mustRun("agt", "host", "add", "dev", addr, "--fingerprint", strings.TrimSpace(e.mustRun("agentd", "remote", "id")))
+	e.mustRun("agentd", "remote", "authorize", strings.TrimSpace(e.mustRun("agt", "remote", "id")), "test")
+	if remote := e.mustRun("agt", "--host", "dev", "diff", "demo"); remote != diff {
 		t.Fatalf("remote diff differs:\n%s", remote)
 	}
-	if out := e.mustRun("agent", "diff", "--name-only", "dev/demo"); out != "README\nfeature.go\nnotes.txt\n" {
+	if out := e.mustRun("agt", "diff", "--name-only", "dev/demo"); out != "README\nfeature.go\nnotes.txt\n" {
 		t.Fatalf("remote --name-only:\n%s", out)
 	}
-	if out := e.mustRun("agent", "artifact", "dev/demo", "patch"); !strings.Contains(out, "Subject: [PATCH] add the feature") {
+	if out := e.mustRun("agt", "artifact", "dev/demo", "patch"); !strings.Contains(out, "Subject: [PATCH] add the feature") {
 		t.Fatalf("remote patch:\n%s", out)
 	}
 }
@@ -607,15 +607,15 @@ func TestRemoteAttachReconnects(t *testing.T) {
 	probe.Close()
 	e := newEnv(t, "\n[remote]\nlisten = \""+addr+"\"\n")
 	e.startAndDetach("demo")
-	e.mustRun("agent", "host", "add", "dev", addr, "--fingerprint", strings.TrimSpace(e.mustRun("agentd", "remote", "id")))
-	e.mustRun("agentd", "remote", "authorize", strings.TrimSpace(e.mustRun("agent", "remote", "id")), "test")
+	e.mustRun("agt", "host", "add", "dev", addr, "--fingerprint", strings.TrimSpace(e.mustRun("agentd", "remote", "id")))
+	e.mustRun("agentd", "remote", "authorize", strings.TrimSpace(e.mustRun("agt", "remote", "id")), "test")
 
 	tm := e.start("attach", "dev/demo")
 	m := tm.expect(0, "attached to demo")
 	tm.write("export N=before; echo $N-1\r")
 	m = tm.expect(m, "before-1")
 
-	e.mustRun("agent", "daemon", "restart")
+	e.mustRun("agt", "daemon", "restart")
 	m = tm.expect(m, "connection to dev lost, reconnecting")
 	// The session's screen is repainted, and input reaches it again.
 	m = tm.expect(m, "before-1")
@@ -637,7 +637,7 @@ func TestRemoteAttachReconnects(t *testing.T) {
 	tm.write("\x1c")
 	tm.wait()
 	// Start the daemon again so cleanup can stop the session.
-	e.mustRun("agent", "ls")
+	e.mustRun("agt", "ls")
 }
 
 // A remote attachment that loses its connection reattaches only to the
@@ -656,9 +656,9 @@ func TestRemoteReattachRefusesARecreatedSession(t *testing.T) {
 	// The client reaches the daemon through a relay that stands in for
 	// the network.
 	relay := transporttest.NewRelay(t, addr)
-	e.mustRun("agent", "host", "add", "dev", relay.Addr(), "--fingerprint", strings.TrimSpace(e.mustRun("agentd", "remote", "id")))
-	e.mustRun("agentd", "remote", "authorize", strings.TrimSpace(e.mustRun("agent", "remote", "id")), "test")
-	if out := e.mustRun("agent", "status", "demo"); !strings.Contains(out, "uid: ") {
+	e.mustRun("agt", "host", "add", "dev", relay.Addr(), "--fingerprint", strings.TrimSpace(e.mustRun("agentd", "remote", "id")))
+	e.mustRun("agentd", "remote", "authorize", strings.TrimSpace(e.mustRun("agt", "remote", "id")), "test")
+	if out := e.mustRun("agt", "status", "demo"); !strings.Contains(out, "uid: ") {
 		t.Fatalf("status shows no uid:\n%s", out)
 	}
 
@@ -670,23 +670,23 @@ func TestRemoteReattachRefusesARecreatedSession(t *testing.T) {
 	// The connection is lost, and while the client cannot get back in the
 	// session is replaced by another of the same name.
 	relay.BlockNew(true)
-	e.mustRun("agent", "daemon", "restart")
+	e.mustRun("agt", "daemon", "restart")
 	m = tm.expect(m, "connection to dev lost, reconnecting")
-	e.mustRun("agent", "kill", "--rm", "demo")
+	e.mustRun("agt", "kill", "--rm", "demo")
 	e.startAndDetach("demo")
 	relay.BlockNew(false)
 
 	tm.expectWithin(m, "is not the session you were attached to", 30*time.Second)
 	if err := tm.waitErr(); err == nil {
-		t.Fatal("agent exited cleanly after refusing to reattach")
+		t.Fatal("agt exited cleanly after refusing to reattach")
 	}
-	if out := e.mustRun("agent", "attachments", "demo"); strings.Contains(out, "attach-") {
+	if out := e.mustRun("agt", "attachments", "demo"); strings.Contains(out, "attach-") {
 		t.Fatalf("the new session got an attachment:\n%s", out)
 	}
 }
 
-// A blocked status report reaches `agent events --follow --notify` (and
-// the user's terminal as a notification), shows in `agent ls` and
+// A blocked status report reaches `agt events --follow --notify` (and
+// the user's terminal as a notification), shows in `agt ls` and
 // `status`, and attaching acknowledges it; a bell is information only.
 // Following survives a daemon restart.
 func TestEventsEndToEnd(t *testing.T) {
@@ -698,26 +698,26 @@ func TestEventsEndToEnd(t *testing.T) {
 	m = follow.expect(m, "started")
 
 	// A bell is recorded as information: no notification, no attention.
-	e.mustRun("agent", "send-input", "demo", `printf '\a'`+"\r")
+	e.mustRun("agt", "send-input", "demo", `printf '\a'`+"\r")
 	m = follow.expect(m, "info    bell          bell")
 
 	// The program's own word carries the attention.
-	e.mustRun("agent", "send-input", "demo",
+	e.mustRun("agt", "send-input", "demo",
 		`printf '\033]7501;state=blocked:kind=permission:msg=RGVwbG95Pw==\033\\'`+"\r")
 	m = follow.expect(m, "action  blocked       permission: Deploy?")
 	m = follow.expect(m, "\a\x1b]9;agentd: demo: permission: Deploy?")
 
-	ls := e.mustRun("agent", "ls")
+	ls := e.mustRun("agt", "ls")
 	if !strings.Contains(ls, "⚠") || !strings.Contains(ls, "blocked") || !strings.Contains(ls, "ATTENTION") {
 		t.Fatalf("ls:\n%s", ls)
 	}
-	status := e.mustRun("agent", "status", "demo")
+	status := e.mustRun("agt", "status", "demo")
 	for _, want := range []string{"attention: action", "attention_summary: permission: Deploy?", "activity: blocked", "elapsed: "} {
 		if !strings.Contains(status, want) {
 			t.Fatalf("status lacks %q:\n%s", want, status)
 		}
 	}
-	if out := e.mustRun("agent", "events", "--json", "--level", "action"); !strings.Contains(out, `"kind":"blocked"`) || strings.Contains(out, `"kind":"bell"`) {
+	if out := e.mustRun("agt", "events", "--json", "--level", "action"); !strings.Contains(out, `"kind":"blocked"`) || strings.Contains(out, `"kind":"bell"`) {
 		t.Fatalf("events --json:\n%s", out)
 	}
 
@@ -727,12 +727,12 @@ func TestEventsEndToEnd(t *testing.T) {
 	tm.write("\x1c")
 	tm.wait()
 	m = follow.expect(m, "acknowledged")
-	if ls := e.mustRun("agent", "ls"); strings.Contains(ls, "⚠") {
+	if ls := e.mustRun("agt", "ls"); strings.Contains(ls, "⚠") {
 		t.Fatalf("ls after attach:\n%s", ls)
 	}
 
 	// The follower resumes after a restart without repeating anything.
-	e.mustRun("agent", "daemon", "restart")
+	e.mustRun("agt", "daemon", "restart")
 	m = follow.expect(m, "reconnecting")
 	m = follow.expect(m, "recovered")
 	if n := strings.Count(follow.output(), "action  blocked"); n != 1 {
@@ -752,39 +752,39 @@ func TestProgramStatusEndToEnd(t *testing.T) {
 
 	// The shell echoes the command as typed, which is harmless text; the
 	// report reaches the terminal when printf runs.
-	e.mustRun("agent", "send-input", "demo",
+	e.mustRun("agt", "send-input", "demo",
 		`printf '\033]7501;state=blocked:kind=permission:app=claude-code:progress=40:msg=RGVwbG95Pw==\033\\'`+"\r")
 	m = follow.expect(m, "action  blocked")
 	m = follow.expect(m, "permission: Deploy?")
 
-	ls := e.mustRun("agent", "ls")
+	ls := e.mustRun("agt", "ls")
 	if !strings.Contains(ls, "⚠") || !strings.Contains(ls, "blocked") {
 		t.Fatalf("ls:\n%s", ls)
 	}
-	status := e.mustRun("agent", "status", "demo")
+	status := e.mustRun("agt", "status", "demo")
 	for _, want := range []string{"activity: blocked", "status_app: claude-code", "status_kind: permission",
 		"status_progress: 40%", "status_msg: Deploy?", "attention_summary: permission: Deploy?"} {
 		if !strings.Contains(status, want) {
 			t.Fatalf("status lacks %q:\n%s", want, status)
 		}
 	}
-	if out := e.mustRun("agent", "ls", "--json"); !strings.Contains(out, `"status_kind":"permission"`) ||
+	if out := e.mustRun("agt", "ls", "--json"); !strings.Contains(out, `"status_kind":"permission"`) ||
 		!strings.Contains(out, `"status_progress":40`) {
 		t.Fatalf("ls --json:\n%s", out)
 	}
 
 	// The program finishes; the record replaces the blocked one.
-	e.mustRun("agent", "send-input", "demo", `printf '\033]7501;state=done:msg=RGVwbG95ZWQ=\033\\'`+"\r")
+	e.mustRun("agt", "send-input", "demo", `printf '\033]7501;state=done:msg=RGVwbG95ZWQ=\033\\'`+"\r")
 	m = follow.expect(m, "notice  done")
 	follow.expect(m, "Deployed")
-	if status := e.mustRun("agent", "status", "demo"); !strings.Contains(status, "activity: done") {
+	if status := e.mustRun("agt", "status", "demo"); !strings.Contains(status, "activity: done") {
 		t.Fatalf("status after done:\n%s", status)
 	}
 }
 
-// A local attachment survives `agent daemon upgrade`, which replaces the
+// A local attachment survives `agt daemon upgrade`, which replaces the
 // daemon and hands the session's worker over to the new binary while the
-// shell keeps running, and `agent daemon restart`: both times the CLI
+// shell keeps running, and `agt daemon restart`: both times the CLI
 // attaches again by itself and the same shell answers.
 func TestLocalAttachSurvivesUpgradeAndRestart(t *testing.T) {
 	e := newEnv(t, "")
@@ -793,7 +793,7 @@ func TestLocalAttachSurvivesUpgradeAndRestart(t *testing.T) {
 	tm.write("export N=before; echo $N-1\r")
 	m = tm.expect(m, "before-1")
 
-	out := e.mustRun("agent", "daemon", "upgrade")
+	out := e.mustRun("agt", "daemon", "upgrade")
 	if !strings.Contains(out, "Session demo now runs") {
 		t.Fatalf("upgrade did not hand the session off:\n%s", out)
 	}
@@ -805,7 +805,7 @@ func TestLocalAttachSurvivesUpgradeAndRestart(t *testing.T) {
 	tm.write("echo $N-2\r")
 	m = tm.expect(m, "before-2")
 
-	e.mustRun("agent", "daemon", "restart")
+	e.mustRun("agt", "daemon", "restart")
 	m = tm.expect(m, "connection to agentd lost, reconnecting")
 	m = tm.expect(m, "before-2")
 	tm.write("echo $N-3\r")
@@ -814,14 +814,14 @@ func TestLocalAttachSurvivesUpgradeAndRestart(t *testing.T) {
 	tm.wait()
 }
 
-// `agent host add` without flags shows the daemon's key and asks for the
+// `agt host add` without flags shows the daemon's key and asks for the
 // code `agentd remote pair` shows there; pairing pins the key and
 // authorizes this machine in one step. A wrong code can be retried.
 func TestHostAddPairsAtThePrompt(t *testing.T) {
 	e := newEnv(t, "\n[remote]\nlisten = \"127.0.0.1:0\"\n")
-	e.mustRun("agent", "ls") // starts the daemon
+	e.mustRun("agt", "ls") // starts the daemon
 	addr := ""
-	for _, line := range strings.Split(e.mustRun("agent", "daemon", "info"), "\n") {
+	for _, line := range strings.Split(e.mustRun("agt", "daemon", "info"), "\n") {
 		if v, ok := strings.CutPrefix(line, "remote: "); ok {
 			addr = v
 		}
@@ -867,10 +867,10 @@ func TestHostAddPairsAtThePrompt(t *testing.T) {
 	if err := pair.Wait(); err != nil || !strings.Contains(pairOut.String(), "now authorized") {
 		t.Fatalf("agentd remote pair: %v\n%s", err, pairOut.String())
 	}
-	if out := e.mustRun("agent", "host", "ls", "--no-probe"); !strings.Contains(out, "dev\t"+addr+"\t"+daemonKey) {
+	if out := e.mustRun("agt", "host", "ls", "--no-probe"); !strings.Contains(out, "dev\t"+addr+"\t"+daemonKey) {
 		t.Fatalf("host ls --no-probe:\n%s", out)
 	}
-	e.mustRun("agent", "--host", "dev", "ls")
+	e.mustRun("agt", "--host", "dev", "ls")
 }
 
 // syncBuffer is a bytes.Buffer that a command writes while a test reads it.

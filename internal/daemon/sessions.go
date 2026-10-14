@@ -264,7 +264,7 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 		}
 	}
 	// A client that does not know this daemon's configuration (a remote
-	// `agent --host`) leaves the agent empty to get the daemon's default.
+	// `agt --host`) leaves the agent empty to get the daemon's default.
 	if req.Agent == "" {
 		req.Agent = s.config.DefaultAgent
 	}
@@ -294,7 +294,7 @@ func (s *Server) createSession(req *protocol.CreateSession) (*session.CreateResu
 	}
 
 	// Checked here as well as in the worker so a bad cwd is refused before
-	// any process is spawned. The record is kept, failed, so `agent ls`
+	// any process is spawned. The record is kept, failed, so `agt ls`
 	// shows what happened.
 	if info, err := os.Stat(cwd); err != nil {
 		return fail(fmt.Errorf("working directory `%s` does not exist", cwd))

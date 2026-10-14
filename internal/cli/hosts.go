@@ -18,7 +18,7 @@ import (
 
 // localHostName names this machine's own daemon wherever hosts are listed
 // or chosen. It cannot be used for a remote host, and neither can
-// autoHostName, which asks `agent new` to choose a host.
+// autoHostName, which asks `agt new` to choose a host.
 const (
 	localHostName = "local"
 	autoHostName  = "auto"
@@ -29,7 +29,7 @@ const (
 // takes about this long when a host is down.
 const probeTimeout = 4 * time.Second
 
-// Host states, as listed by `agent host ls`.
+// Host states, as listed by `agt host ls`.
 const (
 	hostOnline       = "online"
 	hostOffline      = "offline"
@@ -152,7 +152,7 @@ func classifyProbe(err error) string {
 	return hostError
 }
 
-// renderHosts writes the host table of `agent host ls`.
+// renderHosts writes the host table of `agt host ls`.
 func renderHosts(w io.Writer, probes []*hostProbe) {
 	rows := [][]string{{"NAME", "ADDRESS", "STATUS", "LATENCY", "SESSIONS", "CPUS", "AGENTS", "VERSION"}}
 	for _, p := range probes {
@@ -203,7 +203,7 @@ func formatLatency(d time.Duration) string {
 	return fmt.Sprintf("%dms", d.Milliseconds())
 }
 
-// renderHostInfo writes `agent host info`: the machine and daemon behind a
+// renderHostInfo writes `agt host info`: the machine and daemon behind a
 // host.
 func renderHostInfo(w io.Writer, p *hostProbe) {
 	fmt.Fprintf(w, "name: %s\n", p.name)
@@ -236,7 +236,7 @@ func renderHostInfo(w io.Writer, p *hostProbe) {
 	fmt.Fprintf(w, "capabilities: %s\n", escapeControls(strings.Join(p.welcome.Capabilities, ", ")))
 }
 
-// placement is where `agent new --host auto` runs a session, and why.
+// placement is where `agt new --host auto` runs a session, and why.
 type placement struct {
 	probe  *hostProbe
 	reason string

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Creates a DigitalOcean droplet running agentd, paired with this machine, so
-# that `agent --host NAME ...` works right away; and destroys it again.
+# that `agt --host NAME ...` works right away; and destroys it again.
 #
 #   scripts/do-devbox.sh create NAME [options]
 #   scripts/do-devbox.sh destroy NAME [--yes]
@@ -18,10 +18,10 @@
 #   4. as that user: runs install.sh, which builds agentd and installs the
 #      systemd unit that starts it at boot, and installs Claude Code
 #   5. listens on the droplet's public address (only paired keys can connect)
-#      and pairs this machine with it: `agent host add NAME ADDRESS --code ...`
+#      and pairs this machine with it: `agt host add NAME ADDRESS --code ...`
 #
 # destroy deletes the droplet (only one tagged `agentd`), forgets its SSH host
-# key, and removes the host from `agent host ls`. The firewall is kept for the
+# key, and removes the host from `agt host ls`. The firewall is kept for the
 # next droplet.
 #
 # Options for create:
@@ -32,7 +32,7 @@
 #   --local         build this checkout's working tree instead (tracked files, uncommitted changes included)
 #   --no-claude     do not install Claude Code
 #
-# Needs doctl (authenticated: `doctl auth init`), ssh, and the agent CLI.
+# Needs doctl (authenticated: `doctl auth init`), ssh, and the agt CLI.
 
 # Commands run over ssh expand ~ and variables on purpose: ~ on the droplet,
 # variables here.
@@ -68,9 +68,9 @@ droplet_field() {
     awk -v n="$1" '$1 == n { print $2; exit }'
 }
 
-# host_exists NAME reports whether the agent CLI already has a host NAME.
+# host_exists NAME reports whether the agt CLI already has a host NAME.
 host_exists() {
-  agent host ls 2>/dev/null | awk -v n="$1" 'NR > 1 && $1 == n { found = 1 } END { exit !found }'
+  agt host ls 2>/dev/null | awk -v n="$1" 'NR > 1 && $1 == n { found = 1 } END { exit !found }'
 }
 
 # ssh_key_ids prints, comma separated, the ids of the account's SSH keys that
@@ -197,7 +197,7 @@ pair() {
     rm -rf "${tmp}"
     die "agentd remote pair did not show a code"
   fi
-  if ! agent host add "${name}" "${address}" --code "${code}"; then
+  if ! agt host add "${name}" "${address}" --code "${code}"; then
     kill "${pid}" 2>/dev/null || true
     rm -rf "${tmp}"
     die "pairing failed; retry with: ssh ${target} ~/.local/bin/agentd remote pair"
@@ -224,14 +224,14 @@ cmd_create() {
     shift
   done
   [[ -n "${name}" ]] || die "usage: $0 create NAME [options]"
-  # A droplet name becomes its hostname, and the agent CLI's host name.
+  # A droplet name becomes its hostname, and the agt CLI's host name.
   [[ "${name}" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die "NAME must be lowercase letters, digits and dashes"
   [[ "${user}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "--user ${user} is not a valid user name"
   [[ "${user}" != root ]] || die "agents should not run as root; pick another --user"
-  need doctl ssh ssh-keygen agent
+  need doctl ssh ssh-keygen agt
   doctl account get >/dev/null 2>&1 || die "doctl is not authenticated; run doctl auth init"
   [[ -z "$(droplet_field "${name}" ID)" ]] || die "a droplet called ${name} already exists (destroy it first: $0 destroy ${name})"
-  host_exists "${name}" && die "agent already has a host called ${name}; remove it first: agent host rm ${name}"
+  host_exists "${name}" && die "agt already has a host called ${name}; remove it first: agt host rm ${name}"
 
   local keys
   keys="$(ssh_key_ids)"
@@ -263,8 +263,8 @@ cmd_create() {
   step "Ready"
   cat >&2 <<EOF
 
-  agent --host ${name} new --cwd DIR NAME   start a session there
-  agent attach ${name}/NAME                 attach to it
+  agt --host ${name} new --cwd DIR NAME   start a session there
+  agt attach ${name}/NAME                 attach to it
   ssh ${target}                    log in (clone repos, sign in to Claude Code)
   $0 destroy ${name}       delete the droplet
 EOF
@@ -281,14 +281,14 @@ cmd_destroy() {
     shift
   done
   [[ -n "${name}" ]] || die "usage: $0 destroy NAME [--yes]"
-  need doctl ssh-keygen agent
+  need doctl ssh-keygen agt
   local id ip
   id="$(droplet_field "${name}" ID)"
   ip="$(droplet_field "${name}" PublicIPv4)"
   if [[ -z "${id}" ]]; then
     # The host may be one the user added by hand; leave it alone.
     note "no droplet called ${name} is tagged ${TAG}; nothing deleted"
-    host_exists "${name}" && note "agent still has a host called ${name}; remove it with: agent host rm ${name}"
+    host_exists "${name}" && note "agt still has a host called ${name}; remove it with: agt host rm ${name}"
     return 0
   fi
   if [[ "${yes}" != 1 ]]; then
@@ -300,8 +300,8 @@ cmd_destroy() {
   doctl compute droplet delete "${id}" --force
   [[ -n "${ip}" ]] && ssh-keygen -R "${ip}" >/dev/null 2>&1 || true
   if host_exists "${name}"; then
-    step "Removing host ${name} from agent"
-    agent host rm "${name}" >/dev/null
+    step "Removing host ${name} from agt"
+    agt host rm "${name}" >/dev/null
   fi
 }
 

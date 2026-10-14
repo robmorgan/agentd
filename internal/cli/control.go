@@ -52,7 +52,7 @@ func openControl(ctx context.Context, s transport.Stream) (*controlStream, error
 		s.SetDeadline(deadline)
 	}
 	reader := bufio.NewReader(s)
-	err := protocol.WriteRequest(s, &protocol.Request{Hello: protocol.NewHello("agent " + Version)})
+	err := protocol.WriteRequest(s, &protocol.Request{Hello: protocol.NewHello("agt " + Version)})
 	var resp *protocol.Response
 	if err == nil {
 		resp, err = protocol.ReadResponse(reader)

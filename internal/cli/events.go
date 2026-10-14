@@ -20,7 +20,7 @@ import (
 	"github.com/robmorgan/agentd/internal/transport"
 )
 
-// `agent events`: a daemon's recorded session events, once or followed.
+// `agt events`: a daemon's recorded session events, once or followed.
 //
 // Following is resumable by design: events are persisted and numbered, so
 // the CLI keeps the id of the last event it handled and, when the stream
@@ -57,7 +57,7 @@ func (a *app) events(sessionArg string, opts eventsOptions) error {
 	if opts.notify {
 		h.alerts = openAlertTerminal()
 		if h.alerts == nil {
-			fmt.Fprintln(os.Stderr, "agent events: no terminal to notify on; --notify does nothing")
+			fmt.Fprintln(os.Stderr, "agt events: no terminal to notify on; --notify does nothing")
 		} else {
 			defer h.alerts.Close()
 		}
@@ -86,7 +86,7 @@ func (c *client) runEvents(id string, opts eventsOptions, h *eventHandler) error
 		return err
 	}
 	if !protocol.HasCapability(w.Capabilities, protocol.CapEvents) {
-		return errors.New("this agentd does not record events; upgrade it (`agent daemon upgrade`)")
+		return errors.New("this agentd does not record events; upgrade it (`agt daemon upgrade`)")
 	}
 	var sessionID *string
 	if id != "" {
@@ -128,7 +128,7 @@ func (c *client) runEvents(id string, opts eventsOptions, h *eventHandler) error
 	return c.followEvents(cursor, sessionID, h)
 }
 
-// eventsAllHosts runs `agent events --all`: one reader per host (this
+// eventsAllHosts runs `agt events --all`: one reader per host (this
 // machine's daemon and every host in hosts.toml), each on its own
 // goroutine with its own connection, sharing one handler whose lock keeps
 // their lines whole. Event ids are per host, so --after is refused. Without
@@ -165,7 +165,7 @@ func (a *app) eventsAllHosts(opts eventsOptions, h *eventHandler) error {
 				err := c.runEvents("", opts, &hh)
 				if err == nil || !opts.follow || errors.Is(err, errHandler) || !(transport.IsConnectionLost(err) || errors.Is(err, context.DeadlineExceeded)) {
 					if err != nil {
-						fmt.Fprintf(os.Stderr, "agent events: %s: %v\n", hh.host, err)
+						fmt.Fprintf(os.Stderr, "agt events: %s: %v\n", hh.host, err)
 					}
 					return
 				}
@@ -229,7 +229,7 @@ func (c *client) followEvents(cursor uint64, sessionID *string, h *eventHandler)
 			reason = err.Error()
 		}
 		delay = min(max(2*delay, eventsFirstRetry), eventsMaxRetry)
-		fmt.Fprintf(os.Stderr, "agent events: %s; reconnecting in %s\n", reason, delay)
+		fmt.Fprintf(os.Stderr, "agt events: %s; reconnecting in %s\n", reason, delay)
 		// A lost remote connection is dead; the next stream dials anew.
 		c.close()
 		time.Sleep(delay)
@@ -319,7 +319,7 @@ func (h *eventHandler) handle(ev session.Event) error {
 		cmd.Env = append(os.Environ(), eventEnv(ev, h.host)...)
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 		if err := cmd.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "agent events: --exec for event %d: %v\n", ev.ID, err)
+			fmt.Fprintf(os.Stderr, "agt events: --exec for event %d: %v\n", ev.ID, err)
 		}
 	}
 	return nil
@@ -352,7 +352,7 @@ func eventSession(ev session.Event, host string) string {
 	return ev.SessionID
 }
 
-// formatEvent is one line of `agent events`: time (with the date when it is
+// formatEvent is one line of `agt events`: time (with the date when it is
 // not today), id, session, attention, kind and summary.
 func formatEvent(ev session.Event, host string, now time.Time) string {
 	at := ev.At.Local()
