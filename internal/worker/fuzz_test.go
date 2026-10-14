@@ -58,7 +58,7 @@ func FuzzSnapshotRestore(f *testing.F) {
 		client.VTWrite([]byte("\x1b[2J\x1b[H"))
 		client.VTWrite(snap)
 		if d := diffRestored(ts.term, client); d != "" {
-			if pendingWrapOverBlank(ts.term) || alternateScrollback(ts.term) || graphemeModeChanged(ts.term, data) {
+			if alternateScrollback(ts.term) || graphemeModeChanged(ts.term, data) {
 				return // a known limit; see TestSnapshotKnownLimits
 			}
 			t.Fatalf("restored terminal differs:\n%s\nsnapshot: %q", d, snap)
@@ -106,16 +106,6 @@ func graphemeModeChanged(term *libghostty.Terminal, data []byte) bool {
 func alternateScrollback(term *libghostty.Terminal) bool {
 	screen, _ := term.ActiveScreen()
 	return screen == libghostty.ScreenAlternate && must(term.ScrollbackRows()) > 0
-}
-
-// pendingWrapOverBlank reports whether the cursor has a pending wrap over a
-// blank cell, which the formatter cannot restore.
-func pendingWrapOverBlank(term *libghostty.Terminal) bool {
-	if !must(term.CursorPendingWrap()) {
-		return false
-	}
-	ref := must(term.GridRef(libghostty.Point{Tag: libghostty.PointTagActive, X: must(term.CursorX()), Y: uint32(must(term.CursorY()))}))
-	return len(must(ref.Graphemes())) == 0
 }
 
 // A small terminal makes wrapping, scrolling and scrollback cheap to reach.

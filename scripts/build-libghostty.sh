@@ -5,14 +5,14 @@
 # match the GIT_TAG in that module's CMakeLists.txt, or be a later commit with
 # the same C API (include/ghostty). It is currently ahead, on a Ghostty main
 # that keeps that API (only additions) and brings the formatter's origin mode
-# fix (ghostty #14588) and program status revision 0.4 (#14630). Requires
-# Zig 0.16+.
+# fix (ghostty #14588), program status revision 0.4 (#14630) and the
+# formatter's pending wrap over a blank cell (#14670). Requires Zig 0.16+.
 #
 # Usage: scripts/build-libghostty.sh            # builds into .build
 #        eval "$(scripts/build-libghostty.sh --env)"   # only print exports
 set -euo pipefail
 
-GHOSTTY_COMMIT="24da727f6857b5350b4a502bdcb30ab942b36e81"
+GHOSTTY_COMMIT="81598385d608dda4946093d6d6a234d204a2f225"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD="${HERE}/../.build"
 SRC="${BUILD}/ghostty"
