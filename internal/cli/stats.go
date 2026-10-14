@@ -33,7 +33,7 @@ func (c *client) sessionStats(id string) (*protocol.SessionStats, error) {
 	return resp.SessionStats, nil
 }
 
-// printSessionStats is the --stats part of `agent status`.
+// printSessionStats is the --stats part of `agt status`.
 func printSessionStats(w io.Writer, s *protocol.SessionStats) {
 	fmt.Fprintf(w, "worker: %s\n", describeProcess(s.Worker))
 	fmt.Fprintf(w, "agent: %s\n", describeProcess(s.Agent))
@@ -70,11 +70,11 @@ func formatCPU(p protocol.ProcessStats) string {
 	return time.Duration(p.CPUUserNanos + p.CPUSystemNanos).Round(time.Millisecond).String()
 }
 
-// statsParallelism bounds the session stats requests `agent daemon stats`
+// statsParallelism bounds the session stats requests `agt daemon stats`
 // has in flight; the daemon serves up to 16 per control stream.
 const statsParallelism = 8
 
-// printDaemonStats is `agent daemon stats`: the daemon process, then one
+// printDaemonStats is `agt daemon stats`: the daemon process, then one
 // row per running session, then totals.
 func (c *client) printDaemonStats(w io.Writer) error {
 	resp, err := c.call(&protocol.Request{GetDaemonStats: protocol.Empty}, 0, func(r *protocol.Response) bool { return r.DaemonStats != nil })

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs (or upgrades) agentd and the agent CLI from source, on macOS,
+# Installs (or upgrades) agentd and the agt CLI from source, on macOS,
 # Debian/Ubuntu and Arch (Omarchy included). It is safe to run again: it
 # only installs what is missing, reuses the toolchains and the libghostty
 # build it made before, and if a daemon is running, upgrades it with a live
@@ -15,7 +15,7 @@
 # systemd it also installs a user unit that starts the daemon at boot.
 #
 # Environment:
-#   AGENTD_PREFIX      install agent and agentd into $AGENTD_PREFIX/bin (default ~/.local)
+#   AGENTD_PREFIX      install agt and agentd into $AGENTD_PREFIX/bin (default ~/.local)
 #   AGENTD_REF         branch, tag or commit to build when cloning (default main)
 #   AGENTD_SRC         where to clone the source (default ~/.local/share/agentd/src)
 #   AGENTD_NO_UPGRADE  set to 1 to leave a running daemon alone
@@ -263,7 +263,7 @@ daemon_stale() {
 upgrade_daemon() {
   local bindir="$1" needed="$2"
   if [[ -z "$(daemon_pid)" ]]; then
-    step "Daemon: not running (agent starts it when needed)"
+    step "Daemon: not running (agt starts it when needed)"
     return
   fi
   if [[ "${needed}" != 1 ]]; then
@@ -271,19 +271,19 @@ upgrade_daemon() {
     return
   fi
   if [[ "${AGENTD_NO_UPGRADE:-}" == 1 ]]; then
-    step "Daemon: running; left alone (AGENTD_NO_UPGRADE=1). Run \`agent daemon upgrade\` to switch to the new binary."
+    step "Daemon: running; left alone (AGENTD_NO_UPGRADE=1). Run \`agt daemon upgrade\` to switch to the new binary."
     return
   fi
   step "Daemon: running; upgrading it, sessions are handed over live"
   if ! "${bindir}/agentd" upgrade; then
-    note "the upgrade failed; the old daemon may still be running. Retry with \`agent daemon upgrade\`."
+    note "the upgrade failed; the old daemon may still be running. Retry with \`agt daemon upgrade\`."
   fi
 }
 
 # install_service makes the daemon start at boot on Linux with systemd, so a
 # devbox that reboots takes remote connections again without anyone logging
 # in: a systemd user unit, enabled, plus lingering for this user so their
-# systemd starts at boot. Anywhere else it does nothing; there the agent CLI
+# systemd starts at boot. Anywhere else it does nothing; there the agt CLI
 # starts the daemon when it is first needed, as it always does.
 #
 # The unit only starts the daemon the way the CLI does (serve --daemonize)
@@ -305,7 +305,7 @@ install_service() {
     return
   fi
   if ! command -v systemctl >/dev/null 2>&1 || [[ ! -d /run/systemd/system ]]; then
-    step "Service: no systemd; the daemon starts when agent first needs it"
+    step "Service: no systemd; the daemon starts when agt first needs it"
     return
   fi
   if ! systemctl --user show-environment >/dev/null 2>&1; then
@@ -355,7 +355,7 @@ EOF
     ! loginctl enable-linger "${user}" 2>/dev/null &&
     ! as_root loginctl enable-linger "${user}"; then
     systemctl --user disable --quiet agentd.service 2>/dev/null || true
-    step "Service: not enabled, since lingering could not be turned on (loginctl enable-linger ${user}); the daemon starts when agent first needs it"
+    step "Service: not enabled, since lingering could not be turned on (loginctl enable-linger ${user}); the daemon starts when agt first needs it"
     return
   fi
   systemctl --user enable --quiet agentd.service
@@ -376,14 +376,42 @@ install_binary() {
   note "${name}: installed"
 }
 
+# install_alias keeps `agent`, the CLI's old name, as a link to agt in BINDIR,
+# unless another program owns that name: Cursor's and Grok's CLIs install an
+# `agent` of their own into ~/.local/bin, and must not be overwritten. An
+# `agent` left by an earlier agentd (its --help mentions agentd) is replaced
+# by the link.
+install_alias() {
+  local bindir="$1"
+  local link="${bindir}/agent"
+  if [[ -L "${link}" ]]; then
+    case "$(readlink "${link}")" in
+      agt | "${bindir}/agt") note "agent: links to agt" ;;
+      *) note "agent: left alone; it links to $(readlink "${link}"), not agt" ;;
+    esac
+    return
+  fi
+  if [[ -e "${link}" ]]; then
+    if "${link}" --help 2>/dev/null | grep -q agentd; then
+      ln -sf agt "${link}"
+      note "agent: the earlier agentd CLI, replaced by a link to agt"
+    else
+      note "agent: left alone; ${link} is another program (use agt)"
+    fi
+    return
+  fi
+  ln -s agt "${link}"
+  note "agent: links to agt, for the old name"
+}
+
 finish() {
   local bindir="$1"
   local found
-  found="$(command -v agent 2>/dev/null || true)"
+  found="$(command -v agt 2>/dev/null || true)"
   case ":${PATH}:" in
     *":${bindir}:"*)
-      if [[ -n "${found}" && "${found}" != "${bindir}/agent" ]]; then
-        note "warning: \`agent\` on your PATH is ${found}, which comes before ${bindir}/agent"
+      if [[ -n "${found}" && "${found}" != "${bindir}/agt" ]]; then
+        note "warning: \`agt\` on your PATH is ${found}, which comes before ${bindir}/agt"
       fi
       ;;
     *)
@@ -404,13 +432,13 @@ finish() {
       fi
       ;;
   esac
-  step "Installed $("${bindir}/agent" --version) in ${bindir}"
+  step "Installed $("${bindir}/agt" --version) in ${bindir}"
   cat >&2 <<EOF
 
 Next:
-  agent new [--cwd DIR] NAME     start an agent session (agent --help for more)
+  agt new [--cwd DIR] NAME     start an agent session (agt --help for more)
   agentd remote enable           let other machines connect (QUIC), then
-  agentd remote pair             show a code for \`agent host add\` on the client
+  agentd remote pair             show a code for \`agt host add\` on the client
 EOF
 }
 
@@ -435,8 +463,9 @@ main() {
   daemon_stale && needed=1
   make -C "${src}" build ZIG="${ZIG}" >&2
   install -d "${bindir}"
-  install_binary "${src}" "${bindir}" agent || true
+  install_binary "${src}" "${bindir}" agt || true
   install_binary "${src}" "${bindir}" agentd && needed=1
+  install_alias "${bindir}"
 
   upgrade_daemon "${bindir}" "${needed}"
   install_service "${bindir}"

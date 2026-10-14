@@ -9,7 +9,7 @@ import (
 )
 
 // Every call opens and closes its own SQLite connection (see connect), so
-// these include that cost; it is what each `agent ls` and every worker
+// these include that cost; it is what each `agt ls` and every worker
 // state change pays.
 
 func openWithSessions(b *testing.B, n int) *Database {

@@ -19,7 +19,7 @@ import (
 )
 
 // client reaches one daemon: the local one over its Unix socket, or a
-// remote one over QUIC (agent --host NAME).
+// remote one over QUIC (agt --host NAME).
 //
 // The protocol's unit is a stream: the control stream that carries every
 // one-shot request, one per attach session, one per transfer. Locally a
@@ -49,7 +49,7 @@ const (
 	daemonStopTimeout  = 5 * time.Second
 	pollInterval       = 100 * time.Millisecond
 
-	upgradeHint = "run `agent daemon upgrade` (set AGENTD_BIN to choose the daemon binary)"
+	upgradeHint = "run `agt daemon upgrade` (set AGENTD_BIN to choose the daemon binary)"
 )
 
 func (c *client) remoteName() string {
@@ -109,7 +109,7 @@ func (c *client) remoteConnection(ctx context.Context) (*transport.QUICClient, e
 	case errors.As(err, &changed):
 		return nil, &hostKeyChangedError{changed: changed, msg: fmt.Sprintf("the key of host `%s` (%s) has changed!\n  pinned:    %s\n  presented: %s\n"+
 			"This could mean someone is intercepting the connection, or the daemon's key was recreated.\n"+
-			"If you trust the new key, run `agent host rm %s` and add the host again.",
+			"If you trust the new key, run `agt host rm %s` and add the host again.",
 			c.host.Name, c.host.Address, c.host.Fingerprint, changed.Presented, c.host.Name)}
 	case err != nil:
 		return nil, fmt.Errorf("could not reach agentd on `%s` (%s): %w", c.host.Name, c.host.Address, err)
@@ -394,15 +394,15 @@ func (c *client) manage(req *protocol.ManagementRequest, timeout time.Duration) 
 
 // prepareDaemon makes sure a daemon is there for a command. Every command
 // goes through the daemon, which alone owns session state; with no
-// compatible daemon a command fails and names the fix. `agent daemon`
+// compatible daemon a command fails and names the fix. `agt daemon`
 // subcommands only need something to talk to, since they exist to repair a
-// missing or mismatched daemon; `agent daemon upgrade` needs nothing. A
+// missing or mismatched daemon; `agt daemon upgrade` needs nothing. A
 // remote daemon is never started, restarted or replaced from here.
 func (c *client) prepareDaemon(daemonCommand string) error {
 	if c.host != nil {
 		switch daemonCommand {
 		case "restart", "upgrade":
-			return fmt.Errorf("`agent daemon %s` only manages the local daemon; run `agentd` on `%s` instead", daemonCommand, c.host.Name)
+			return fmt.Errorf("`agt daemon %s` only manages the local daemon; run `agentd` on `%s` instead", daemonCommand, c.host.Name)
 		case "":
 			return c.ensureCompatible()
 		}

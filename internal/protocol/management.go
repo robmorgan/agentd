@@ -9,7 +9,7 @@ import (
 
 // The daemon management protocol is a separate, deliberately tiny protocol
 // framed like the main one but at DaemonManagementVersion, with JSON payloads.
-// It exists so `agent daemon info|restart|upgrade` keep working when the CLI
+// It exists so `agt daemon info|restart|upgrade` keep working when the CLI
 // and daemon speak different versions of the main protocol.
 const (
 	kDaemonStatusRequest    uint16 = 20_001

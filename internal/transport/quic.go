@@ -434,7 +434,7 @@ func DialQUIC(ctx context.Context, addr string, id *Identity, pinned string) (*Q
 }
 
 // ProbeFingerprint learns the key the daemon at addr presents, without
-// pinning one, for `agent host add`. It works before this client is
+// pinning one, for `agt host add`. It works before this client is
 // authorized: the daemon shows its certificate before judging the client's.
 func ProbeFingerprint(ctx context.Context, addr string, id *Identity) (string, error) {
 	conn, presented, err := dialEach(ctx, addr, id, "", ALPN)

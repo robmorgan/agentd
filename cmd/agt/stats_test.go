@@ -9,7 +9,7 @@ func TestStatsEndToEnd(t *testing.T) {
 	e := newEnv(t, "")
 	e.startAndDetach("busy")
 
-	out := e.mustRun("agent", "status", "--stats", "busy")
+	out := e.mustRun("agt", "status", "--stats", "busy")
 	for _, want := range []string{"status: running", "worker: pid ", "goroutines ", "agent: pid ", "terminal: 100x30"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("status --stats lacks %q:\n%s", want, out)
@@ -20,7 +20,7 @@ func TestStatsEndToEnd(t *testing.T) {
 		t.Errorf("agent line: %s", agent)
 	}
 
-	out = e.mustRun("agent", "daemon", "stats")
+	out = e.mustRun("agt", "daemon", "stats")
 	for _, want := range []string{"daemon: pid ", "SESSION", "busy", "total: 1 running sessions"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("daemon stats lacks %q:\n%s", want, out)

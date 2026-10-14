@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 echo -e "
-❯ agent ls
+❯ agt ls
 
   RUN   Δ   ↑   AGE   NAME            BRANCH
   \x1b[38;5;46m●\x1b[0m     -   -   \x1b[2m9h\x1b[0m    \x1b[1mcalm-foxes\x1b[0m      \x1b[2magent/calm-foxes\x1b[0m
@@ -9,7 +9,7 @@ echo -e "
   \x1b[38;5;196m✖\x1b[0m     \x1b[38;5;220m5\x1b[0m   -   \x1b[2m19m\x1b[0m   \x1b[1mswift-geckos\x1b[0m    \x1b[2magent/swift-geckos\x1b[0m"
 
 echo -e "
-❯ agent ls
+❯ agt ls
 
   RUN   Δ   ↑   AGE   NAME            BRANCH
   \x1b[38;5;46m●\x1b[0m     -   -   \x1b[2m9h\x1b[0m    \x1b[1mcalm-foxes\x1b[0m      \x1b[2magent/calm-foxes\x1b[0m

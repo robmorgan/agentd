@@ -587,7 +587,7 @@ func TestCreateValidation(t *testing.T) {
 	h := newHarness(t)
 
 	// A missing cwd fails before a worker is spawned; the record is kept,
-	// failed, so `agent ls` shows what happened.
+	// failed, so `agt ls` shows what happened.
 	wantError(t, h.create("lost", "sh", filepath.Join(h.cwd, "missing")), "does not exist")
 	if rec := h.session("lost"); rec.Status != session.StatusFailed || rec.WorkerPID != nil {
 		t.Fatalf("record after bad cwd = %#v", rec)

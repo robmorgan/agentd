@@ -1,6 +1,6 @@
 ---
 name: do-devbox
-description: Spin up, list or tear down a DigitalOcean droplet running agentd, paired with this machine so `agent --host NAME` works at once. Use when the user wants a remote devbox, a cloud machine for agents, to try agentd remotely, or to delete such a droplet.
+description: Spin up, list or tear down a DigitalOcean droplet running agentd, paired with this machine so `agt --host NAME` works at once. Use when the user wants a remote devbox, a cloud machine for agents, to try agentd remotely, or to delete such a droplet.
 allowed-tools:
   - Bash
   - Read
@@ -17,8 +17,8 @@ state, and reports the result. Read the script's header (`scripts/do-devbox.sh
 ## Before running anything
 
 1. Check the tools: `doctl account get` (if it fails, the user must run
-   `! doctl auth init` themselves) and `agent --version`.
-2. Show what exists: `scripts/do-devbox.sh ls` and `agent host ls --no-probe`.
+   `! doctl auth init` themselves) and `agt --version`.
+2. Show what exists: `scripts/do-devbox.sh ls` and `agt host ls --no-probe`.
 
 ## create
 
@@ -37,20 +37,20 @@ scripts/do-devbox.sh create NAME [--region SLUG] [--size SLUG] [--user NAME] [--
   Use `--local` to test this checkout's working tree, including uncommitted
   changes, for example before a branch is pushed.
 - NAME: lowercase letters, digits and dashes. It becomes the droplet's name and
-  the host name in `agent host ls`; the script refuses a name either already
+  the host name in `agt host ls`; the script refuses a name either already
   uses.
 - It takes 5 to 10 minutes, mostly the build. Run it in the background with
   output to a log in the job's tmp directory, and watch for lines starting with
   `==>` or `error:`; it ends with `==> Ready`.
-- Afterwards, check `agent hosts` shows the host online. Then tell the user
+- Afterwards, check `agt hosts` shows the host online. Then tell the user
   that Claude Code on the droplet still needs signing in, in the first session
-  they start there (`agent --host NAME new --cwd '~' NAME`, then attach).
+  they start there (`agt --host NAME new --cwd '~' NAME`, then attach).
 
 If create fails partway, the droplet may exist without being paired. Read the
 log, fix the cause, then either `destroy` and create again, or finish the
 remaining steps by hand: `agentd remote enable IP:7433 --yes` and
 `agentd remote pair` on the droplet (from a login shell, `bash -lc`), then
-`agent host add NAME IP:7433 --code CODE` here.
+`agt host add NAME IP:7433 --code CODE` here.
 
 ## destroy
 

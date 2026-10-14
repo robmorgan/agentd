@@ -125,7 +125,7 @@ func styleSummary(text string, a session.AttentionLevel) string {
 }
 
 // displayCwd shortens a session cwd for list views by replacing the home
-// directory with ~. The full path is still shown by `agent status`.
+// directory with ~. The full path is still shown by `agt status`.
 func displayCwd(cwd, home string) string {
 	cwd = escapeControls(cwd)
 	home = strings.TrimRight(home, "/")

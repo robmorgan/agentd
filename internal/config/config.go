@@ -1,4 +1,4 @@
-// Package config reads config.toml, which the daemon and the agent CLI
+// Package config reads config.toml, which the daemon and the agt CLI
 // share. Unknown keys and tables are ignored.
 package config
 
@@ -29,7 +29,7 @@ type RemoteConfig struct {
 	Listen string `toml:"listen"`
 }
 
-// AttachConfig is how `agent attach` fills the terminal.
+// AttachConfig is how `agt attach` fills the terminal.
 type AttachConfig struct {
 	// ScrollbackRows caps the rows of a session's scrollback an attach
 	// copies into the terminal, the most recent ones: -1 copies all of it,
@@ -80,9 +80,9 @@ command = "codex"
 args = []
 model_flag = "--model"
 
-# How much of a session's scrollback "agent attach" copies into the
+# How much of a session's scrollback "agt attach" copies into the
 # terminal: the most recent rows (-1 for all of it, 0 for the screen only).
-# "agent history" has the rest.
+# "agt history" has the rest.
 [attach]
 scrollback_rows = 1000
 `

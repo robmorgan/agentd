@@ -48,7 +48,7 @@ const (
 	codexDefaultModel = "gpt-5.4"
 )
 
-// `agent list`
+// `agt list`
 
 type sessionListLayout struct {
 	visible, run, age, name, activity, cwd int
@@ -81,7 +81,7 @@ func fitColumns(name, cwd *int, available, fixed int) {
 	shrink(cwd, sessionListCwdFloorWidth)
 }
 
-// listLayout fits the columns of `agent list` into width. With summaries
+// listLayout fits the columns of `agt list` into width. With summaries
 // (some session has attention to explain) an ATTENTION column takes what
 // the others leave, and the list may be wider.
 func listLayout(width int, summaries bool) sessionListLayout {
@@ -104,7 +104,7 @@ func listLayout(width int, summaries bool) sessionListLayout {
 	}
 	// The attention column, with its separator, gets what is left once
 	// name and cwd have their usual widths; without room for it, they keep
-	// the room. `agent status` shows the summary in full.
+	// the room. `agt status` shows the summary in full.
 	fitColumns(&l.name, &l.cwd, l.visible-sessionListSummaryMinWidth, fixed+2)
 	if l.name < sessionListNameMinWidth || l.cwd < sessionListCwdMinWidth {
 		l.name, l.cwd = sessionListNameMinWidth, sessionListCwdMinWidth
@@ -121,9 +121,9 @@ func renderSessionListLines(sessions []session.Record, width int, now time.Time)
 	return renderSessionList(sessions, nil, width, now)
 }
 
-// renderSessionList renders `agent list`. hosts, when not nil, names the
+// renderSessionList renders `agt list`. hosts, when not nil, names the
 // host of each session (hosts[i] for sessions[i]) and adds a HOST column,
-// for `agent list --all`.
+// for `agt list --all`.
 func renderSessionList(sessions []session.Record, hosts []string, width int, now time.Time) []string {
 	index := make(map[*session.Record]int, len(sessions))
 	for i := range sessions {
@@ -185,7 +185,7 @@ func renderSessionList(sessions []session.Record, hosts []string, width int, now
 	return lines
 }
 
-// The session picker (bare `agent`)
+// The session picker (bare `agt`)
 
 type pickerMode int
 
@@ -523,7 +523,7 @@ func (p *picker) handleDeleteKey(ev keyEvent) (string, bool, error) {
 }
 
 func remoteCreateHint(host string) string {
-	return fmt.Sprintf("start sessions on `%s` with `agent --host %s new --cwd DIR`", host, host)
+	return fmt.Sprintf("start sessions on `%s` with `agt --host %s new --cwd DIR`", host, host)
 }
 
 func (p *picker) createSession(agent string) (string, bool, error) {

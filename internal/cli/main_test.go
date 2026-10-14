@@ -36,33 +36,33 @@ func TestCommandsParse(t *testing.T) {
 		pos   []string
 		flags map[string]string
 	}{
-		{[]string{"new", "fix-failing-tests"}, "agent new", []string{"fix-failing-tests"}, nil},
-		{[]string{"new", "--cwd", "/tmp", "--agent", "codex", "--workspace", "mono", "x"}, "agent new", []string{"x"}, map[string]string{"cwd": "/tmp", "agent": "codex", "workspace": "mono"}},
-		{[]string{"rm", "demo"}, "agent rm", []string{"demo"}, nil},
-		{[]string{"kill", "--rm", "demo"}, "agent kill", []string{"demo"}, map[string]string{"rm": "true"}},
-		{[]string{"detach"}, "agent detach", nil, nil},
-		{[]string{"detach", "demo", "--attach", "a1"}, "agent detach", []string{"demo"}, map[string]string{"attach": "a1"}},
-		{[]string{"attachments", "demo"}, "agent attachments", []string{"demo"}, nil},
-		{[]string{"history", "demo", "--vt"}, "agent history", []string{"demo"}, map[string]string{"vt": "true"}},
-		{[]string{"ls"}, "agent list", nil, nil},
-		{[]string{"sessions"}, "agent list", nil, nil},
-		{[]string{"workspace", "add", "mono", "~/src"}, "agent workspace add", []string{"mono", "~/src"}, nil},
-		{[]string{"workspace", "ls"}, "agent workspace list", nil, nil},
-		{[]string{"daemon", "restart"}, "agent daemon restart", nil, nil},
-		{[]string{"daemon", "stats"}, "agent daemon stats", nil, nil},
-		{[]string{"status", "--stats", "demo"}, "agent status", []string{"demo"}, map[string]string{"stats": "true"}},
-		{[]string{"daemon", "upgrade"}, "agent daemon upgrade", nil, nil},
-		{[]string{"host", "add", "dev", "10.0.0.1:7433", "--fingerprint", "SHA256:x"}, "agent host add", []string{"dev", "10.0.0.1:7433"}, map[string]string{"fingerprint": "SHA256:x"}},
-		{[]string{"--host", "dev", "ls"}, "agent list", nil, map[string]string{"host": "dev"}},
-		{[]string{"runtime", "demo"}, "agent runtime", []string{"demo"}, nil},
-		{[]string{"diff", "demo"}, "agent diff", []string{"demo"}, nil},
-		{[]string{"diff", "--stat", "dev/demo"}, "agent diff", []string{"dev/demo"}, map[string]string{"stat": "true"}},
-		{[]string{"--host", "dev", "diff", "--name-only", "demo"}, "agent diff", []string{"demo"}, map[string]string{"name-only": "true", "host": "dev"}},
-		{[]string{"artifacts", "demo"}, "agent artifacts", []string{"demo"}, nil},
-		{[]string{"artifact", "demo", "patch", "-o", "out.mbox"}, "agent artifact", []string{"demo", "patch"}, map[string]string{"output": "out.mbox"}},
-		{[]string{"events"}, "agent events", nil, map[string]string{"follow": "false", "lines": "20"}},
+		{[]string{"new", "fix-failing-tests"}, "agt new", []string{"fix-failing-tests"}, nil},
+		{[]string{"new", "--cwd", "/tmp", "--agent", "codex", "--workspace", "mono", "x"}, "agt new", []string{"x"}, map[string]string{"cwd": "/tmp", "agent": "codex", "workspace": "mono"}},
+		{[]string{"rm", "demo"}, "agt rm", []string{"demo"}, nil},
+		{[]string{"kill", "--rm", "demo"}, "agt kill", []string{"demo"}, map[string]string{"rm": "true"}},
+		{[]string{"detach"}, "agt detach", nil, nil},
+		{[]string{"detach", "demo", "--attach", "a1"}, "agt detach", []string{"demo"}, map[string]string{"attach": "a1"}},
+		{[]string{"attachments", "demo"}, "agt attachments", []string{"demo"}, nil},
+		{[]string{"history", "demo", "--vt"}, "agt history", []string{"demo"}, map[string]string{"vt": "true"}},
+		{[]string{"ls"}, "agt list", nil, nil},
+		{[]string{"sessions"}, "agt list", nil, nil},
+		{[]string{"workspace", "add", "mono", "~/src"}, "agt workspace add", []string{"mono", "~/src"}, nil},
+		{[]string{"workspace", "ls"}, "agt workspace list", nil, nil},
+		{[]string{"daemon", "restart"}, "agt daemon restart", nil, nil},
+		{[]string{"daemon", "stats"}, "agt daemon stats", nil, nil},
+		{[]string{"status", "--stats", "demo"}, "agt status", []string{"demo"}, map[string]string{"stats": "true"}},
+		{[]string{"daemon", "upgrade"}, "agt daemon upgrade", nil, nil},
+		{[]string{"host", "add", "dev", "10.0.0.1:7433", "--fingerprint", "SHA256:x"}, "agt host add", []string{"dev", "10.0.0.1:7433"}, map[string]string{"fingerprint": "SHA256:x"}},
+		{[]string{"--host", "dev", "ls"}, "agt list", nil, map[string]string{"host": "dev"}},
+		{[]string{"runtime", "demo"}, "agt runtime", []string{"demo"}, nil},
+		{[]string{"diff", "demo"}, "agt diff", []string{"demo"}, nil},
+		{[]string{"diff", "--stat", "dev/demo"}, "agt diff", []string{"dev/demo"}, map[string]string{"stat": "true"}},
+		{[]string{"--host", "dev", "diff", "--name-only", "demo"}, "agt diff", []string{"demo"}, map[string]string{"name-only": "true", "host": "dev"}},
+		{[]string{"artifacts", "demo"}, "agt artifacts", []string{"demo"}, nil},
+		{[]string{"artifact", "demo", "patch", "-o", "out.mbox"}, "agt artifact", []string{"demo", "patch"}, map[string]string{"output": "out.mbox"}},
+		{[]string{"events"}, "agt events", nil, map[string]string{"follow": "false", "lines": "20"}},
 		{[]string{"events", "dev/demo", "-f", "--json", "--notify", "--level", "action", "--exec", "echo hi", "-n", "5", "--after", "42"},
-			"agent events", []string{"dev/demo"}, map[string]string{"follow": "true", "json": "true", "notify": "true", "level": "action", "exec": "echo hi", "lines": "5"}},
+			"agt events", []string{"dev/demo"}, map[string]string{"follow": "true", "json": "true", "notify": "true", "level": "action", "exec": "echo hi", "lines": "5"}},
 	} {
 		cmd, pos := parse(t, tc.args...)
 		if cmd.CommandPath() != tc.path || strings.Join(pos, " ") != strings.Join(tc.pos, " ") {
@@ -105,7 +105,7 @@ func TestHelp(t *testing.T) {
 	var root bytes.Buffer
 	writeHelp(&root, (&app{}).rootCommand())
 	help := root.String()
-	for _, want := range []string{"agentd - agent multiplexer", "agent 0.1.0", "list         List known sessions [aliases: ls]", "-V, --version"} {
+	for _, want := range []string{"agentd - agent multiplexer", "agt 0.1.0", "list         List known sessions [aliases: ls]", "-V, --version"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("root help lacks %q:\n%s", want, help)
 		}
@@ -116,7 +116,7 @@ func TestHelp(t *testing.T) {
 	daemon, _ := parse(t, "daemon")
 	var b bytes.Buffer
 	writeHelp(&b, daemon)
-	if strings.Contains(b.String(), "agentd - agent multiplexer") || !strings.Contains(b.String(), "agent daemon") {
+	if strings.Contains(b.String(), "agentd - agent multiplexer") || !strings.Contains(b.String(), "agt daemon") {
 		t.Errorf("daemon help:\n%s", b.String())
 	}
 }
@@ -244,10 +244,10 @@ func TestDetachSessionID(t *testing.T) {
 }
 
 func TestDaemonExecutable(t *testing.T) {
-	if got, _ := daemonExecutableFrom("/custom/agentd", "/bin/agent", nil); got != "/custom/agentd" {
+	if got, _ := daemonExecutableFrom("/custom/agentd", "/bin/agt", nil); got != "/custom/agentd" {
 		t.Fatalf("AGENTD_BIN: %q", got)
 	}
-	if got, _ := daemonExecutableFrom("", "/opt/bin/agent", nil); got != "/opt/bin/agentd" {
+	if got, _ := daemonExecutableFrom("", "/opt/bin/agt", nil); got != "/opt/bin/agentd" {
 		t.Fatalf("next to agent: %q", got)
 	}
 }
