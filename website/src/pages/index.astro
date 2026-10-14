@@ -1,0 +1,185 @@
+---
+import Marketing from '../layouts/Marketing.astro';
+import Terminal from '../components/Terminal.astro';
+import AgtLs from '../components/AgtLs.astro';
+
+const install = 'curl -fsSL https://agtd.sh/install.sh | bash';
+---
+
+<Marketing
+	title="agtd: run coding agents like processes"
+	description="agtd turns coding agents into durable tasks with state, artifacts, and history. Run Claude Code, Codex or any TTY-based agent in parallel, and supervise work instead of terminal tabs."
+>
+	<section class="wrap hero">
+		<div class="hero-logo">
+			<img class="on-dark" src="/brand/agtd-logo-on-dark.svg" alt="agtd" width="181" height="72" />
+			<img class="on-light" src="/brand/agtd-logo-on-light.svg" alt="agtd" width="181" height="72" />
+		</div>
+		<div class="stack" style="gap: 8px; max-width: 900px">
+			<h1 class="t-display">Run coding agents like processes.</h1>
+			<p class="t-heading muted">Supervise them like jobs.</p>
+		</div>
+		<p class="prose-p">
+			agtd turns coding agents into durable tasks with state, artifacts, and history. Run Claude Code, Codex
+			or any TTY-based agent in parallel. Instead of babysitting terminal tabs, you supervise work.
+		</p>
+		<div class="stack" style="gap: 12px">
+			<div class="hero-install">
+				<div class="hero-cmd"><span class="p" aria-hidden="true">❯</span>{install}</div>
+				<button type="button" class="icon-btn copy-btn" data-copy={install} aria-label="Copy install command" title="Copy install command">
+					<svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="3" width="8" height="4" rx="1"></rect><path d="M16 5h2a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"></path></svg>
+					<svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg>
+				</button>
+			</div>
+			<p class="t-small muted" style="margin: 0">
+				macOS, Debian/Ubuntu and Arch. Installs <code>agt</code> and <code>agentd</code> to <code>~/.local/bin</code>.
+			</p>
+		</div>
+		<div style="display: flex; flex-wrap: wrap; gap: 12px">
+			<a class="agtd-btn" href="/docs/">Read the docs</a>
+			<a class="agtd-btn" href="https://github.com/robmorgan/agentd">View on GitHub</a>
+		</div>
+		<AgtLs class="hero-term" />
+		<p class="t-small muted" style="margin: 0">
+			Sessions that need you come first, in <code>agt ls</code>, in the picker and in the switcher.
+		</p>
+	</section>
+
+	<section class="section">
+		<div class="wrap split">
+			<div class="stack" style="flex: 1 1 420px">
+				<h2 class="t-heading">tmux multiplexes terminals. agtd supervises agents.</h2>
+				<p class="prose-p" style="max-width: 560px">
+					Developers are running several coding agents at once. Past the first one, things get messy. agtd runs
+					each agent as a task inside a managed session: a working directory you choose, a dedicated PTY,
+					retained terminal history and persistent artifacts.
+				</p>
+			</div>
+			<div style="flex: 1 1 360px">
+				<p class="t-label muted" style="margin: 0 0 8px">Without a supervisor</p>
+				<ul class="agtd-list">
+					<li><span class="agtd-dot" aria-hidden="true"></span>Terminals everywhere</li>
+					<li><span class="agtd-dot" aria-hidden="true"></span>Scrolling logs</li>
+					<li><span class="agtd-dot" aria-hidden="true"></span>Lost artifacts</li>
+					<li><span class="agtd-dot" aria-hidden="true"></span>Agents waiting on you, unseen</li>
+				</ul>
+			</div>
+		</div>
+	</section>
+
+	<section class="section">
+		<div class="wrap stack" style="gap: 40px">
+			<h2 class="t-heading">What agtd manages that your terminal can't</h2>
+			<div class="cards">
+				<div class="card">
+					<h3 class="t-title">Native terminal first</h3>
+					<p class="t-small muted">
+						Ghostty, iTerm2, Kitty, WezTerm: keep the terminal you chose. Open a tab and run
+						<code>agt attach fix-tests</code>. Native scrollback, native search, native copy/paste. For free.
+					</p>
+				</div>
+				<div class="card">
+					<h3 class="t-title">Attention, not logs</h3>
+					<p class="t-small muted">
+						Sessions report when they are working, blocked or done. Know when an agent needs you without
+						watching it, and follow it with <code>agt events --follow --notify</code>.
+					</p>
+				</div>
+				<div class="card">
+					<h3 class="t-title">Durable sessions</h3>
+					<p class="t-small muted">
+						Agents keep running after you disconnect. Sessions survive the daemon restarting, crashing or being
+						upgraded, with a live handoff to the new binary.
+					</p>
+				</div>
+				<div class="card">
+					<h3 class="t-title">What a session produced</h3>
+					<p class="t-small muted">
+						Commits, staged and unstaged edits and new files since the session started. Review with
+						<code>agt diff</code>, download a patch for <code>git am</code>.
+					</p>
+				</div>
+				<div class="card">
+					<h3 class="t-title">Your devbox, from your laptop</h3>
+					<p class="t-small muted">
+						Reach sessions over QUIC on a LAN, Tailscale or WireGuard, with pinned keys and no hosted service.
+						Close the laptop; the agent continues. In preview.
+					</p>
+				</div>
+				<div class="card">
+					<h3 class="t-title">Vendor-neutral</h3>
+					<p class="t-small muted">
+						Claude Code, Codex, or any TTY-based agent. Configure them in <code>config.toml</code> and pick one
+						per task.
+					</p>
+				</div>
+			</div>
+		</div>
+	</section>
+
+	<section id="install" class="section">
+		<div class="wrap split">
+			<div class="stack" style="flex: 1 1 360px">
+				<h2 class="t-heading">Install</h2>
+				<p style="margin: 0">On macOS, Debian/Ubuntu or Arch (Omarchy included).</p>
+				<p class="t-small muted" style="margin: 0">
+					The script installs <code>agt</code> and <code>agentd</code> side by side in <code>~/.local/bin</code>.
+					Run it again at any time to upgrade: a running daemon hands its sessions to the new binary without
+					stopping them. It never turns on remote access.
+				</p>
+				<p class="t-small" style="margin: 0"><a href="/docs/#install">Install options and what the script does</a></p>
+			</div>
+			<div class="stack" style="flex: 1 1 560px; min-width: 0">
+				<Terminal title="shell" commands={[install]} />
+				<p class="t-small muted" style="margin: 0">
+					Or run <code>./install.sh</code> from a checkout, which builds that checkout. <code>AGENTD_PREFIX</code>
+					changes the prefix.
+				</p>
+			</div>
+		</div>
+	</section>
+
+	<section class="section">
+		<div class="wrap split">
+			<div class="stack" style="flex: 1 1 360px">
+				<h2 class="t-heading">Start your first task</h2>
+				<p style="margin: 0">Give it a name. agtd creates a session and starts your default agent in an attached PTY.</p>
+				<p class="t-small muted" style="margin: 0">
+					Detach with <code>ctrl + \</code>; the session keeps running. Switch to the previous or next session
+					with <code>ctrl + [</code> and <code>ctrl + ]</code>.
+				</p>
+			</div>
+			<Terminal
+				class="split-term"
+				commands={['agt new fix-tests', 'agt attach fix-tests', 'agt diff fix-tests --stat', 'agt kill fix-tests', 'agt rm fix-tests']}
+			/>
+		</div>
+	</section>
+</Marketing>
+
+<style>
+	.hero :global(.hero-term) {
+		margin-top: 32px;
+	}
+	:global(.split-term) {
+		flex: 1 1 560px;
+	}
+</style>
+
+<script>
+	document.querySelectorAll<HTMLButtonElement>('.copy-btn').forEach((btn) => {
+		btn.addEventListener('click', async () => {
+			try {
+				await navigator.clipboard.writeText(btn.dataset.copy ?? '');
+			} catch {
+				return;
+			}
+			btn.dataset.copied = '';
+			btn.setAttribute('aria-label', 'Copied');
+			setTimeout(() => {
+				delete btn.dataset.copied;
+				btn.setAttribute('aria-label', 'Copy install command');
+			}, 2000);
+		});
+	});
+</script>

@@ -1,0 +1,218 @@
+/*
+ * Starlight in agtd's clothes: its colour and type variables mapped onto the
+ * tokens in tokens.css, plus the docs artboards' prose rules.
+ */
+
+:root,
+:root[data-theme='light'] {
+	--sl-font: var(--font-sans);
+	--sl-font-mono: var(--font-mono);
+
+	--sl-color-white: var(--text);
+	--sl-color-gray-1: var(--text);
+	--sl-color-gray-2: var(--text);
+	--sl-color-gray-3: var(--text-muted);
+	--sl-color-gray-4: var(--quiet);
+	--sl-color-gray-5: var(--line);
+	--sl-color-gray-6: var(--surface);
+	--sl-color-gray-7: var(--surface);
+	--sl-color-black: var(--ground);
+
+	--sl-color-accent-low: var(--surface);
+	--sl-color-accent: var(--signal);
+	--sl-color-accent-high: var(--signal-text);
+
+	--sl-color-text: var(--text);
+	--sl-color-text-accent: var(--text);
+	--sl-color-text-invert: var(--on-signal);
+	--sl-color-bg: var(--ground);
+	--sl-color-bg-nav: var(--ground);
+	--sl-color-bg-sidebar: var(--ground);
+	--sl-color-bg-inline-code: var(--surface);
+	--sl-color-bg-accent: var(--signal);
+	--sl-color-hairline-light: var(--line);
+	--sl-color-hairline: var(--line);
+	--sl-color-hairline-shade: var(--line);
+
+	--sl-text-body: 17px;
+	--sl-line-height: 28px;
+	--sl-line-height-headings: 1.25;
+	--sl-text-h1: 32px;
+	--sl-text-h2: 20px;
+	--sl-text-h3: 17px;
+	--sl-content-width: 680px;
+	--sl-sidebar-width: 264px;
+
+	/* Flat: panels are set apart by line, not elevation. */
+	--sl-shadow-sm: none;
+	--sl-shadow-md: none;
+	--sl-shadow-lg: none;
+}
+
+body {
+	-webkit-font-smoothing: antialiased;
+}
+
+/* Headings and titles in the mono face */
+h1,
+h2,
+h3,
+h4,
+.sl-markdown-content :is(h1, h2, h3, h4) {
+	font-family: var(--font-mono);
+	font-weight: 500;
+	color: var(--text);
+}
+/* Starlight wraps each heading in a flex row; the section rule goes on it. */
+.sl-markdown-content .sl-heading-wrapper.level-h2 {
+	margin-top: var(--space-12);
+	padding-top: var(--space-6);
+	border-top: 1px solid var(--line);
+}
+.sl-markdown-content h2 {
+	line-height: 28px;
+}
+
+/* The lead paragraph under a page title */
+.sl-markdown-content .lead {
+	font-size: 19px;
+	line-height: 30px;
+	color: var(--text-muted);
+}
+
+/* Links: text-coloured with a muted underline, as on the landing page */
+.sl-markdown-content a:not(.not-content *) {
+	color: var(--text);
+	text-decoration-color: var(--text-muted);
+	text-underline-offset: 3px;
+}
+.sl-markdown-content a:not(.not-content *):hover {
+	text-decoration-color: var(--text);
+}
+
+/* Inline code */
+.sl-markdown-content code:not(:where(.not-content *, pre *)) {
+	font-size: 0.86em;
+	background: var(--surface);
+	border: 1px solid var(--line);
+	border-radius: var(--radius-sm);
+	padding: 1px 5px;
+}
+
+/* Terminal windows in prose */
+.sl-markdown-content .agtd-term {
+	margin-top: 20px;
+}
+
+/* Sidebar: muted links, the current page raised on surface */
+.sidebar-content {
+	--sl-color-hairline-light: transparent;
+}
+.sidebar-content .group-label .large {
+	font-size: 13px;
+	line-height: 20px;
+	font-weight: 500;
+	letter-spacing: 0.01em;
+	color: var(--text-muted);
+}
+.sidebar-content a {
+	font-size: 15px;
+	line-height: 24px;
+	color: var(--text-muted);
+	border-radius: var(--radius-sm);
+}
+.sidebar-content a:hover {
+	color: var(--text);
+}
+.sidebar-content a[aria-current='page'],
+.sidebar-content a[aria-current='page']:hover,
+.sidebar-content a[aria-current='page']:focus {
+	color: var(--text);
+	font-weight: 400;
+	background: var(--surface);
+	box-shadow: inset 0 0 0 1px var(--line);
+}
+
+/* On this page */
+starlight-toc h2,
+mobile-starlight-toc h2 {
+	font-family: var(--font-sans);
+	font-size: 13px;
+	font-weight: 500;
+	color: var(--text-muted);
+}
+starlight-toc a {
+	font-size: 14px;
+	color: var(--text-muted);
+}
+starlight-toc a[aria-current='true'],
+starlight-toc a:hover {
+	color: var(--text);
+}
+
+/* Search: a quiet input with a text-muted control border */
+site-search > button {
+	border-color: var(--text-muted);
+	border-radius: var(--radius-md);
+	background: var(--surface);
+	color: var(--text-muted);
+}
+
+/* Previous / next */
+.pagination-links a {
+	border: 1px solid var(--line);
+	border-radius: var(--radius-lg);
+	box-shadow: none;
+	color: var(--text);
+}
+.pagination-links a:hover {
+	border-color: var(--text-muted);
+}
+.pagination-links .link-title {
+	font-family: var(--font-mono);
+	font-weight: 500;
+	font-size: 17px;
+	color: var(--text);
+}
+
+/* Keyboard focus is the one shadow */
+:is(a, button, input, select, summary):focus-visible {
+	outline: 2px solid transparent;
+	box-shadow: var(--focus-ring);
+	border-radius: var(--radius-sm);
+}
+
+/* Attention levels (docs/attention-model) */
+.agtd-levels {
+	margin-top: 20px;
+	display: flex;
+	flex-direction: column;
+	border: 1px solid var(--line);
+	border-radius: var(--radius-lg);
+	overflow: hidden;
+}
+.agtd-level {
+	display: flex;
+	flex-wrap: wrap;
+	gap: var(--space-1) var(--space-6);
+	padding: 12px 20px;
+	background: var(--surface);
+}
+.agtd-level + .agtd-level {
+	border-top: 1px solid var(--line);
+	margin-top: 0;
+}
+.agtd-level-name {
+	flex: 0 0 96px;
+	font-family: var(--font-mono);
+	font-weight: 500;
+	font-size: 15px;
+	line-height: 28px;
+	color: var(--text);
+}
+.agtd-level-desc {
+	flex: 1 1 320px;
+	font-size: 15px;
+	line-height: 28px;
+	color: var(--text-muted);
+}
