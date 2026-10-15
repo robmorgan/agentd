@@ -1,0 +1,52 @@
+---
+/* A quiet callout: a label and one or two sentences, on surface. */
+interface Props {
+	title: string;
+}
+
+const { title } = Astro.props;
+---
+
+<div class="agtd-note not-content">
+	<p class="agtd-note-title">{title}</p>
+	<div class="agtd-note-body"><slot /></div>
+</div>
+
+<style>
+	.agtd-note {
+		margin-top: var(--space-6);
+		padding: var(--space-4) 20px;
+		background: var(--surface);
+		border: 1px solid var(--line);
+		border-radius: var(--radius-lg);
+	}
+	.agtd-note-title {
+		margin: 0;
+		font-family: var(--font-sans);
+		font-size: 13px;
+		line-height: 20px;
+		font-weight: 500;
+		letter-spacing: 0.01em;
+		color: var(--text);
+	}
+	.agtd-note-body {
+		margin-top: var(--space-1);
+		font-size: 15px;
+		line-height: 24px;
+		color: var(--text-muted);
+	}
+	.agtd-note-body :global(p) {
+		margin: 0;
+	}
+	.agtd-note-body :global(a) {
+		color: var(--text);
+	}
+	.agtd-note-body :global(code) {
+		font-family: var(--font-mono);
+		font-size: 0.86em;
+		background: var(--ground);
+		border: 1px solid var(--line);
+		border-radius: var(--radius-sm);
+		padding: 1px 5px;
+	}
+</style>

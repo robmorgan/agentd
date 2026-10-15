@@ -295,6 +295,8 @@ func TestSnapshotRestores(t *testing.T) {
 		{"cursor position", "a\r\nb\x1b[5;17H"},
 		{"cursor at the right edge with a pending wrap", strings.Repeat("x", 80)},
 		{"pending wrap on a wide character", strings.Repeat("x", 78) + "界"},
+		// Restoring a saved cursor after its line was erased.
+		{"pending wrap over a blank cell", "\x1b[1;80Hx\x1b7\x1b[2K\x1b8"},
 		{"hidden cursor", "text\x1b[?25l"},
 		{"blinking bar cursor", "\x1b[5 q"},
 		{"steady underline cursor", "\x1b[4 q"},
@@ -424,13 +426,6 @@ func TestSnapshotKnownLimits(t *testing.T) {
 			// the hyperlinks of text already on the screen.
 			name: "hyperlinked text", stream: "\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ after",
 			differs: []string{"RowFlags"},
-		},
-		{
-			// The formatter restores a pending wrap by printing the cell
-			// under the cursor again, which does nothing for a blank
-			// cell (here the wrap comes back with a restored cursor).
-			name: "pending wrap over a blank cell", stream: "\x1b[1;80Hx\x1b7\x1b[2K\x1b8",
-			differs: []string{"PendingWrap"},
 		},
 		{
 			// Without grapheme clustering a zero-width codepoint joins the

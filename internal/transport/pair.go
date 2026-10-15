@@ -140,6 +140,8 @@ type PairingWindow struct {
 }
 
 // PairResult is how a pairing window ended. Err is nil when a client paired.
+// Remote is the paired client's address, or, when the window closed after
+// too many wrong codes, the address of the last client that guessed.
 type PairResult struct {
 	Fingerprint string
 	Name        string
@@ -150,6 +152,9 @@ type PairResult struct {
 var (
 	errPairingExpired = errors.New("the pairing code expired")
 	errPairingClosed  = errors.New("pairing was cancelled")
+	// ErrTooManyWrongCodes ends a pairing window after PairingAttempts
+	// wrong codes.
+	ErrTooManyWrongCodes = fmt.Errorf("closed after %d wrong codes", PairingAttempts)
 )
 
 // Open opens a pairing window lasting ttl. authorize is called, once, with
@@ -246,14 +251,14 @@ func (w *PairingWindow) release() {
 }
 
 // wrongCode counts a wrong guess and returns what to tell the client. The
-// window closes at PairingAttempts.
-func (w *PairingWindow) wrongCode() string {
+// window closes at PairingAttempts, reporting remote as the last to guess.
+func (w *PairingWindow) wrongCode(remote net.Addr) string {
 	w.p.mu.Lock()
 	w.failures++
 	closing := w.failures >= PairingAttempts
 	w.p.mu.Unlock()
 	if closing {
-		w.end(PairResult{Err: fmt.Errorf("closed after %d wrong codes", PairingAttempts)})
+		w.end(PairResult{Remote: remote, Err: ErrTooManyWrongCodes})
 		return "wrong pairing code; pairing is now closed, so run `agentd remote pair` again for a new code"
 	}
 	return "wrong pairing code"
@@ -370,7 +375,7 @@ func (q *QUICListener) servePairing(conn *quic.Conn, clientFP string) {
 		return
 	}
 	if !hmac.Equal(m.Proof.MAC, pairMAC(key, "client")) {
-		refuse(w.wrongCode())
+		refuse(w.wrongCode(conn.RemoteAddr()))
 		return
 	}
 	if err := w.succeed(clientFP, pairName(hello.Name), conn.RemoteAddr()); err != nil {

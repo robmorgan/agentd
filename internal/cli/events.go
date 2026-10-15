@@ -336,7 +336,16 @@ func parseLevel(v string) (session.AttentionLevel, error) {
 	return level, nil
 }
 
+// eventSession is the session column: the session, after its host's name
+// for a remote host. A host event (pairing, connections; no session) shows
+// the host's name, or "host" for this machine's daemon.
 func eventSession(ev session.Event, host string) string {
+	if ev.SessionID == "" {
+		if host != "" {
+			return host
+		}
+		return "host"
+	}
 	if host != "" {
 		return host + "/" + ev.SessionID
 	}

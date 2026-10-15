@@ -1,4 +1,4 @@
-.PHONY: libghostty build agt agentd test test-cgocheck test-linux vet dev-run install
+.PHONY: libghostty build agt agentd test test-cgocheck test-linux vet shellcheck dev-run install
 
 ZIG ?= zig
 VERSION ?= 0.1.0
@@ -31,12 +31,17 @@ test: libghostty
 test-cgocheck: libghostty
 	GOEXPERIMENT=cgocheck2 go test ./internal/worker/
 
-# The same suite on Linux, in Docker (scripts/test-linux.sh).
+# The same suite on Linux: directly on a Linux host, otherwise in Docker
+# (scripts/test-linux.sh; AGENTD_TEST_DOCKER=1 forces Docker).
 test-linux:
 	./scripts/test-linux.sh
 
 vet: libghostty
 	go vet ./...
+
+# Every tracked shell script (CI runs this too: .github/workflows/shellcheck.yml).
+shellcheck:
+	git ls-files -z '*.sh' | xargs -0 shellcheck
 
 # The CLI looks for agentd next to its own executable, or at $AGENTD_BIN.
 dev-run: build

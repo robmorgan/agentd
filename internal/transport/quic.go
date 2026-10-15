@@ -85,6 +85,9 @@ type QUICOptions struct {
 	Authorized func(fingerprint string) bool
 	// OnConnect, if set, is told about each authenticated connection.
 	OnConnect func(fingerprint string, remote net.Addr)
+	// OnRevoked, if set, is told once about each connection closed because
+	// its key is no longer authorized.
+	OnRevoked func(fingerprint string, remote net.Addr)
 	// RecheckInterval is how often open connections are checked against
 	// Authorized; zero means every 5 seconds.
 	RecheckInterval time.Duration
@@ -127,6 +130,9 @@ type connEntry struct {
 	// are open now. Each stream decrements open once, when it is closed.
 	opened atomic.Uint64
 	open   atomic.Int64
+	// revoked is set by the first to close the connection for a revoked
+	// key (acceptStreams or recheck), so OnRevoked hears of it once.
+	revoked atomic.Bool
 }
 
 // ConnectionInfo describes one open client connection, for status output.
@@ -285,7 +291,7 @@ func (q *QUICListener) acceptStreams(conn *quic.Conn, entry *connEntry) {
 		if !q.opts.Authorized(entry.fingerprint) {
 			s.CancelRead(0)
 			s.CancelWrite(0)
-			conn.CloseWithError(0, "client key revoked")
+			q.closeRevoked(conn, entry)
 			return
 		}
 		entry.opened.Add(1)
@@ -316,26 +322,35 @@ func (q *QUICListener) recheck() {
 		case <-ticker.C:
 		}
 		q.mu.Lock()
-		open := make(map[*quic.Conn]string, len(q.conns))
+		open := make(map[*quic.Conn]*connEntry, len(q.conns))
 		for conn, e := range q.conns {
 			if !e.pairing {
-				open[conn] = e.fingerprint
+				open[conn] = e
 			}
 		}
 		q.mu.Unlock()
 		// Authorized reads a file, so it is called outside the lock, once
 		// per key rather than per connection.
 		verdict := map[string]bool{}
-		for conn, fp := range open {
-			ok, seen := verdict[fp]
+		for conn, e := range open {
+			ok, seen := verdict[e.fingerprint]
 			if !seen {
-				ok = q.opts.Authorized(fp)
-				verdict[fp] = ok
+				ok = q.opts.Authorized(e.fingerprint)
+				verdict[e.fingerprint] = ok
 			}
 			if !ok {
-				conn.CloseWithError(0, "client key revoked")
+				q.closeRevoked(conn, e)
 			}
 		}
+	}
+}
+
+// closeRevoked closes a connection whose key is no longer authorized and
+// tells OnRevoked, once per connection.
+func (q *QUICListener) closeRevoked(conn *quic.Conn, e *connEntry) {
+	conn.CloseWithError(0, "client key revoked")
+	if e.revoked.CompareAndSwap(false, true) && q.opts.OnRevoked != nil {
+		q.opts.OnRevoked(e.fingerprint, conn.RemoteAddr())
 	}
 }
 

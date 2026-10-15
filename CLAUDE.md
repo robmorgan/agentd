@@ -360,7 +360,7 @@ Particularly consider:
 - concurrent input
 - slow remote clients
 
-Run the Go race detector as part of development. Linux behaves differently from macOS (PTYs, process reaping): run `make test-linux` (Docker) for changes there.
+Run the Go race detector as part of development. Linux behaves differently from macOS (PTYs, process reaping): run `make test-linux` (directly on Linux, Docker elsewhere) for changes there.
 
 # Backpressure
 
@@ -535,11 +535,13 @@ Done:
 
 - Cross-host discovery (`agt ls --all`, `agt events --all`) and global session ids (daemon id + session UID).
 - Program status (OSC 7501) as the sole attention source: libghostty parses the reports, the worker keeps the records (`internal/worker/status.go`) and answers the detection query, the program's word decides activity/attention (blocked/done/error activities and events; progress, app, kind and message in `state.db` v6 and under `CapSessionStatus`), and records survive handoffs. The bell/notification/idle heuristics were removed once Claude Code adopted the protocol: a non-reporting program shows as plainly running, bells/notifications are info-only observability events, and the stall watch (non-reporting foreground command silent for 30m) is the one remaining timing signal.
-- Size ownership: one attachment owns the session's size and the others are pending; the most recently used one takes over when the owner leaves, a pending one can take it (`agt attach --take-size`, the overlay's Take Over Size), and a reattach or handoff keeps it (`internal/worker/size.go`, `CapAttachSizeOwner`).
+- Size ownership: one attachment owns the session's size and the others are pending; the most recently used one takes over when the owner leaves, a pending one can take it (`agt attach --take-size`, the overlay's Take over size), and a reattach or handoff keeps it (`internal/worker/size.go`, `CapAttachSizeOwner`).
 - `install.sh`: an idempotent install from source for macOS, Debian/Ubuntu and Arch (private Go/Zig toolchains when the ones on PATH are too old; a rerun upgrades a running daemon with a live handoff).
 
+- Audit: pairings, failed pairings, manual authorizations and revocations, and remote connections are host events (empty session id) in `agt events` (`internal/daemon/audit.go`).
+
 Next:
-1. Per-client permissions and audit, if remote peers need to be limited.
+1. Per-client permissions, if remote peers need to be limited.
 
 Known gaps:
 - History is only saved when a session exits.

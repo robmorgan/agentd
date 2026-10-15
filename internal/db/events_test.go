@@ -195,6 +195,42 @@ func TestEventQueries(t *testing.T) {
 	}
 }
 
+// Value: protects=host events (pairing, connections) showing in the
+// unfiltered feed, staying out of a session's, and being pruned as their
+// own bucket; fails_when=RecordHostEvent goes through RecordEvent (which
+// drops events without a session row), the empty session_id stops meaning
+// "host", or host events share a session's pruning; why_new=every event
+// so far belonged to a session; seam=none
+func TestHostEvents(t *testing.T) {
+	store := newStore(t)
+	store.InsertSession(NewSession{SessionID: "a", Agent: "sh", Mode: session.ModeExecute, Cwd: "/"})
+	id, err := store.RecordHostEvent(NewEvent{SessionID: "ignored", Kind: session.EventPaired, Summary: "laptop paired"})
+	if err != nil || id == 0 {
+		t.Fatalf("RecordHostEvent = %d, %v", id, err)
+	}
+	all, _ := store.EventsAfter(0, "", 100) // created a, paired
+	if kindsOf(all) != "created paired" || all[1].SessionID != "" || all[1].Attention != session.AttentionNotice {
+		t.Fatalf("all events: %+v", all)
+	}
+	if got, _ := store.LatestEvents(0, "a", 100); kindsOf(got) != "created" {
+		t.Fatalf("session a's events: %s", kindsOf(got))
+	}
+	// A host event raises no session's attention.
+	if rec := store.mustGet(t, "a"); rec.Attention != session.AttentionInfo {
+		t.Fatalf("session attention = %s", rec.Attention)
+	}
+
+	for i := range MaxHostEvents + 10 {
+		if _, err := store.RecordHostEvent(NewEvent{Kind: session.EventConnected, Summary: fmt.Sprint(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	all, _ = store.EventsAfter(0, "", 10_000)
+	if len(all) != MaxHostEvents+1 || all[0].Kind != session.EventCreated || all[len(all)-1].Summary != fmt.Sprint(MaxHostEvents+9) {
+		t.Fatalf("kept %d events, first %s, last %q", len(all), all[0].Kind, all[len(all)-1].Summary)
+	}
+}
+
 // SetActivity is keyed on the worker, so a stale worker cannot touch a
 // newer session or one that has ended.
 func TestSetActivityGuards(t *testing.T) {

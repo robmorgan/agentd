@@ -1,0 +1,84 @@
+---
+import '@fontsource/ibm-plex-mono/400.css';
+import '@fontsource/ibm-plex-mono/500.css';
+import '@fontsource/ibm-plex-sans/400.css';
+import '@fontsource/ibm-plex-sans/500.css';
+import '../styles/tokens.css';
+import '../styles/marketing.css';
+import ThemeToggle from '../components/ThemeToggle.astro';
+
+interface Props {
+	title: string;
+	description: string;
+}
+
+const { title, description } = Astro.props;
+const canonical = new URL(Astro.url.pathname, Astro.site);
+const ogImage = new URL('/agtd-icon-512.png', Astro.site);
+---
+
+<!doctype html>
+<html lang="en" data-theme="dark">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>{title}</title>
+		<meta name="description" content={description} />
+		<link rel="canonical" href={canonical} />
+		<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+		<link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png" />
+		<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+		<meta property="og:type" content="website" />
+		<meta property="og:title" content={title} />
+		<meta property="og:description" content={description} />
+		<meta property="og:url" content={canonical} />
+		<meta property="og:image" content={ogImage} />
+		<meta name="twitter:card" content="summary" />
+		<meta name="theme-color" content="#0f1113" />
+		{/* The same logic as Starlight's ThemeProvider, inlined to avoid a flash. */}
+		<script is:inline>
+			(() => {
+				let stored = null;
+				try {
+					stored = localStorage.getItem('starlight-theme');
+				} catch {}
+				const theme = stored || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+				document.documentElement.dataset.theme = theme === 'light' ? 'light' : 'dark';
+			})();
+		</script>
+	</head>
+	<body>
+		<a class="skip-link" href="#main">Skip to content</a>
+		<header class="site-header">
+			<div class="wrap header-row">
+				<a href="/" aria-label="agtd home" class="header-logo">
+					<img class="on-dark" src="/brand/agtd-logo-on-dark.svg" alt="agtd" width="70" height="28" />
+					<img class="on-light" src="/brand/agtd-logo-on-light.svg" alt="agtd" width="70" height="28" />
+				</a>
+				<nav aria-label="Main" class="header-nav">
+					<a class="nav-link" href="/docs/">Docs</a>
+					<a class="nav-link" href="/#install">Install</a>
+					<a class="nav-link" href="https://github.com/robmorgan/agentd">GitHub</a>
+				</nav>
+				<ThemeToggle />
+			</div>
+		</header>
+
+		<main id="main">
+			<slot />
+		</main>
+
+		<footer class="site-footer">
+			<div class="wrap footer-row">
+				<img class="on-dark" src="/brand/agtd-mark-on-dark.svg" alt="" width="15" height="24" />
+				<img class="on-light" src="/brand/agtd-mark-on-light.svg" alt="" width="15" height="24" />
+				<span class="t-small muted">agtd. Quiet infrastructure for coding agents.</span>
+				<nav aria-label="Footer" class="footer-nav">
+					<a class="nav-link" href="/docs/">Docs</a>
+					<a class="nav-link" href="https://github.com/robmorgan/agentd">GitHub</a>
+					<a class="nav-link" href="https://github.com/robmorgan/agentd/blob/main/LICENSE">License</a>
+				</nav>
+			</div>
+		</footer>
+	</body>
+</html>

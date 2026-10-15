@@ -75,6 +75,29 @@ const (
 	// EventAcknowledged: the user looked at the session, clearing its
 	// attention (info).
 	EventAcknowledged EventKind = "acknowledged"
+
+	// Host events are about the machine, not a session (their SessionID is
+	// empty): an audit record of who can reach the daemon remotely.
+
+	// EventPaired: a machine paired with a one-time code and is now
+	// authorized; the summary names it, its key and its address (notice).
+	EventPaired EventKind = "paired"
+	// EventPairFailed: a pairing window closed after too many wrong codes;
+	// the summary carries the last address that tried (notice).
+	EventPairFailed EventKind = "pair_failed"
+	// EventAuthorized: a client key was authorized by hand with `agentd
+	// remote authorize` (notice).
+	EventAuthorized EventKind = "authorized"
+	// EventRevoked: a client key was revoked with `agentd remote revoke`
+	// (notice).
+	EventRevoked EventKind = "revoked"
+	// EventConnected: an authorized remote client connected. Recorded at
+	// most once per key and address every few minutes, since every remote
+	// command connects (info).
+	EventConnected EventKind = "connected"
+	// EventDisconnected: the daemon dropped a remote client's connection
+	// because its key was revoked (info).
+	EventDisconnected EventKind = "disconnected"
 )
 
 // DefaultAttention is the attention level events of kind k are recorded
@@ -83,7 +106,8 @@ func (k EventKind) DefaultAttention() AttentionLevel {
 	switch k {
 	case EventFailed, EventWorkerLost, EventBlocked, EventError:
 		return AttentionAction
-	case EventExited, EventIdle, EventStalled, EventDone:
+	case EventExited, EventIdle, EventStalled, EventDone,
+		EventPaired, EventPairFailed, EventAuthorized, EventRevoked:
 		return AttentionNotice
 	}
 	return AttentionInfo

@@ -27,6 +27,7 @@ import (
 	"github.com/robmorgan/agentd/internal/daemon"
 	"github.com/robmorgan/agentd/internal/paths"
 	"github.com/robmorgan/agentd/internal/protocol"
+	"github.com/robmorgan/agentd/internal/session"
 	"github.com/robmorgan/agentd/internal/transport"
 	"github.com/robmorgan/agentd/internal/worker"
 	"golang.org/x/term"
@@ -238,10 +239,13 @@ func runRemote(argv []string) int {
 		}
 		if added {
 			fmt.Printf("authorized %s\n", argv[1])
+			name := transport.AuthorizedName(authorized, argv[1])
+			auditRemote(p, session.EventAuthorized, transport.DescribeClient(argv[1], name)+" authorized by hand")
 		} else {
 			fmt.Printf("%s was already authorized\n", argv[1])
 		}
 	case len(argv) == 2 && argv[0] == "revoke":
+		name := transport.AuthorizedName(authorized, argv[1])
 		removed, err := transport.Revoke(authorized, argv[1])
 		if err != nil {
 			return fail(err)
@@ -250,11 +254,20 @@ func runRemote(argv []string) int {
 			return fail(fmt.Errorf("%s is not authorized", argv[1]))
 		}
 		fmt.Printf("revoked %s\n", argv[1])
+		auditRemote(p, session.EventRevoked, transport.DescribeClient(argv[1], name)+" revoked")
 	default:
 		usage()
 		return 2
 	}
 	return 0
+}
+
+// auditRemote records a change to the authorized clients as a host event.
+// The change has already been made, so failing to record it only warns.
+func auditRemote(p *paths.AppPaths, kind session.EventKind, summary string) {
+	if err := daemon.RecordHostEvent(p, kind, summary); err != nil {
+		fmt.Fprintf(os.Stderr, "agentd: warning: could not record this in agt events: %v\n", err)
+	}
 }
 
 // runRemoteEnable sets [remote] listen and restarts the daemon to apply it.

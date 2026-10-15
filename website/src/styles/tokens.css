@@ -1,0 +1,213 @@
+/*
+ * The agtd design system (claude.ai "agtd" design system: tokens.json and
+ * components/bundle.css), shared by the landing page and the Starlight docs.
+ *
+ * Dark is the first theme. The theme lives in <html data-theme>, set before
+ * paint by Starlight's ThemeProvider in the docs and by the same inline script
+ * on the landing page; both read localStorage["starlight-theme"].
+ */
+
+/* The symbols agt prints (● ⚠ ❯ ○) that IBM Plex Mono lacks. */
+@font-face {
+	font-family: 'agtd glyphs';
+	src: url('/fonts/agtd-glyphs-400.woff2') format('woff2');
+	font-weight: 400;
+	font-display: swap;
+}
+@font-face {
+	font-family: 'agtd glyphs';
+	src: url('/fonts/agtd-glyphs-700.woff2') format('woff2');
+	font-weight: 500 700;
+	font-display: swap;
+}
+
+:root {
+	--ground: #0f1113;
+	--surface: #181a1d;
+	--line: #2a2d32;
+	--text: #ebedef;
+	--text-muted: #8b9098;
+	--quiet: #83868c;
+	--signal: #fda934;
+	--signal-text: #fda934;
+	--on-signal: #0f1113;
+	--ok: #8cc265;
+	--focus-ring: 0 0 0 2px #0f1113, 0 0 0 4px #fda934;
+
+	--font-mono: 'IBM Plex Mono', 'agtd glyphs', ui-monospace, Menlo, Consolas, monospace;
+	--font-sans: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
+
+	--space-1: 4px;
+	--space-2: 8px;
+	--space-4: 16px;
+	--space-6: 24px;
+	--space-12: 48px;
+	--space-24: 96px;
+
+	--radius-sm: 6px;
+	--radius-md: 10px;
+	--radius-lg: 12px;
+	--radius-full: 9999px;
+
+	color-scheme: dark;
+}
+
+:root[data-theme='light'] {
+	--ground: #f8f7f4;
+	--surface: #ffffff;
+	--line: #dcdddf;
+	--text: #1c1e22;
+	--text-muted: #5e636b;
+	--quiet: #74777d;
+	--signal: #e48215;
+	--signal-text: #a65c12;
+	--on-signal: #0f1113;
+	--ok: #3e8e41;
+	--focus-ring: 0 0 0 2px #f8f7f4, 0 0 0 4px #a65c12;
+
+	color-scheme: light;
+}
+
+/* Logo files per theme: the logo is never typed or recoloured. */
+:root[data-theme='light'] .on-dark,
+:root:not([data-theme='light']) .on-light {
+	display: none !important;
+}
+
+/* Button */
+.agtd-btn {
+	box-sizing: border-box;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: var(--space-2);
+	height: 44px;
+	padding: 0 var(--space-4);
+	border: 1px solid var(--text-muted);
+	border-radius: var(--radius-sm);
+	background: transparent;
+	color: var(--text);
+	font-family: var(--font-mono);
+	font-size: 14px;
+	font-weight: 500;
+	line-height: 20px;
+	text-decoration: none;
+	cursor: pointer;
+}
+.agtd-btn:hover {
+	border-color: var(--text);
+}
+.agtd-btn-signal {
+	background: var(--signal);
+	border-color: var(--signal);
+	color: var(--on-signal);
+}
+.agtd-btn:focus-visible {
+	outline: 2px solid transparent;
+	outline-offset: 2px;
+	box-shadow: var(--focus-ring);
+}
+
+/* Terminal */
+.agtd-term {
+	margin: 0;
+	min-width: 0;
+	background: var(--surface);
+	border: 1px solid var(--line);
+	border-radius: var(--radius-md);
+	overflow: hidden;
+	color: var(--text);
+}
+.agtd-term-bar {
+	height: 32px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	border-bottom: 1px solid var(--line);
+	font-family: var(--font-sans);
+	font-size: 12px;
+	color: var(--text-muted);
+}
+.agtd-term-body {
+	margin: 0;
+	padding: var(--space-4) var(--space-6);
+	overflow-x: auto;
+	background: transparent;
+	border: 0;
+	color: var(--text);
+	font-family: var(--font-mono);
+	font-size: 14px;
+	line-height: 22px;
+	white-space: pre;
+}
+.agtd-t-dim {
+	color: var(--text-muted);
+}
+.agtd-t-ok {
+	color: var(--ok);
+}
+.agtd-t-sig {
+	color: var(--signal-text);
+}
+.agtd-t-bold {
+	font-weight: 500;
+	color: var(--text);
+}
+
+/* Dot */
+.agtd-dot {
+	display: inline-block;
+	flex: none;
+	width: 0.5em;
+	height: 0.5em;
+	border-radius: var(--radius-full);
+	background: var(--quiet);
+}
+.agtd-dot-signal {
+	background: var(--signal);
+}
+.agtd-list {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	display: grid;
+	gap: var(--space-2);
+	font-family: var(--font-sans);
+	font-size: 17px;
+	line-height: 28px;
+}
+.agtd-list li {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+}
+
+/* Theme toggle and other square icon buttons */
+.icon-btn {
+	box-sizing: border-box;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex: none;
+	width: 44px;
+	height: 44px;
+	padding: 0;
+	border: 1px solid var(--line);
+	border-radius: var(--radius-sm);
+	background: transparent;
+	color: var(--text-muted);
+	cursor: pointer;
+}
+.icon-btn:hover {
+	color: var(--text);
+	border-color: var(--text-muted);
+}
+.icon-btn:focus-visible {
+	outline: 2px solid transparent;
+	box-shadow: var(--focus-ring);
+}
+.icon-btn svg {
+	width: 20px;
+	height: 20px;
+	display: block;
+}
