@@ -897,7 +897,7 @@ Potential commands:
 ```sh
 agt --host devbox-1 new --cwd /srv/repo auth-tests
 
-agent sessions --all
+agt ls --all
 
 agt attach devbox-1/auth-tests
 ```
@@ -912,8 +912,68 @@ agt attach devbox-1/auth-tests
 * [x] Host-aware CLI UX (HOST column, `local/` and `host/` addresses everywhere, `--host local|auto`)
 * [x] Machine capabilities (`Welcome` host description; `agt host info`)
 * [x] Simple placement hints (`agt --host auto new`: least running sessions per CPU among hosts with the agent and workspace)
+* [ ] Moving and forking sessions between hosts (future; see below)
 
 Avoid implementing a scheduler until real usage requires one.
+
+## Future: moving and forking sessions
+
+Goal: move a session to another machine and keep its name, or fork it into a second session, on
+the same host or another one.
+
+```sh
+agt move auth-refactor --to devbox
+agt fork devbox/auth-refactor --to gpu-01 auth-refactor-alt
+```
+
+### Checkpoint and restore, not process migration
+
+Moving a live process (CRIU and the like) is fragile, Linux-only, and impossible between macOS and
+Linux. It is also unnecessary: a coding agent's useful state is not in process memory. A move is
+checkpoint and restore at the agent level:
+
+| State | Moves? | How |
+|---|---|---|
+| Working tree since the base commit | yes | the recorded base commit, plus a git bundle of commits since it and the `patch` artifact for uncommitted and untracked changes |
+| Agent conversation | yes, per agent | the agent's own resume support (Claude Code and Codex keep transcripts on disk and resume them; Claude Code can also fork a resumed conversation). Exact flags and storage layout to be verified per agent; Claude Code keys transcripts by cwd, so a different destination path matters |
+| Terminal screen and history | as a view | the libghostty snapshot the worker handoff already uses, replayed as scrollback on the destination |
+| Running processes (a test run in progress) | no | the move waits for a quiet point: program status (OSC 7501) says when the agent is idle, waiting or done |
+| Destination directory | mapped | workspaces resolve the same name to each host's own path |
+
+A move pauses at a quiet point, takes a checkpoint, restores it on the destination with the agent
+resumed, and only then stops the original. A fork is the same without stopping the original. A
+plain shell session can move only its cwd and history.
+
+### Identity
+
+Moving a session changes which process it is, but not which piece of work it is. The layers:
+
+* **UID** stays per incarnation. A moved session is a new process, so it gets a new UID; a
+  reattach must never land on a different process.
+* **Global id** (daemon id + UID) changes on a move too. That is correct for "which process".
+* **Lineage id** (new): random, created with the session, carried by a move, and new for a fork,
+  which records its parent's. This answers "which piece of work".
+* **Short id**, if added, derives from the lineage id rather than the UID, so it keeps resolving
+  after a move. Settle this before short ids ship, or their meaning changes later.
+* **Name** is unique per daemon, so a move keeps it when the destination has it free and stops
+  for a new one otherwise. The address still changes (`mac/auth-refactor` becomes
+  `devbox/auth-refactor`), so the source keeps a tombstone ("moved to devbox, lineage …") and
+  attaching to the old address reports or follows the move. A fork takes a new name.
+
+### Who transfers
+
+The client moves the checkpoint: it pulls from the source daemon and pushes to the destination,
+over the existing transfer streams. The CLI is already authorized on both. Direct daemon-to-daemon
+transfer would need a new trust relationship between daemons, which conflicts with per-client
+permissions. The cost is that the data passes through the client, which is acceptable for patches
+and transcripts.
+
+### Order
+
+1. Lineage id in `state.db` (equal to the UID at creation); short ids derived from it.
+2. Agent-level checkpoint and restore for Claude Code, then Codex.
+3. `agt fork` on one host (no transfer, so it exercises checkpoint and restore alone).
+4. `agt move` and `agt fork --to` between hosts, with tombstones.
 
 ---
 
