@@ -37,12 +37,21 @@ const (
 // Request is the union of all client to daemon and daemon to worker requests.
 // Exactly one field is set. The kind is encoded by which pointer is non-nil.
 type Request struct {
-	GetDaemonInfo    *struct{}
-	ShutdownDaemon   *struct{}
-	CreateSession    *CreateSession
-	KillSession      *KillSession
-	AttachSession    *AttachSession
-	AttachResize     *Geometry
+	GetDaemonInfo  *struct{}
+	ShutdownDaemon *struct{}
+	CreateSession  *CreateSession
+	KillSession    *KillSession
+	AttachSession  *AttachSession
+	AttachResize   *Geometry
+	// AttachTakeSize (CapAttachSizeOwner), on an attach stream, makes this
+	// attachment the session's size owner at the geometry given.
+	AttachTakeSize *Geometry
+	// AttachLeave (CapAttachSizeOwner), on an attach stream, says the
+	// client is leaving on purpose (a detach, a switch), sent before it
+	// closes the stream: if it owns the size, the next attachment takes
+	// over at once. A stream that ends without it was cut, and the owner's
+	// reattach is waited for.
+	AttachLeave      *struct{}
 	DetachSession    *DetachSession
 	DetachAttachment *DetachAttachment
 	AttachInput      *Bytes
@@ -140,6 +149,21 @@ type AttachSession struct {
 	// ScrollbackRows (CapAttachScrollback) caps the scrollback rows in
 	// Attached's snapshot (AllScrollbackRows for all of them).
 	ScrollbackRows uint32
+	// TakeSize (CapAttachSizeOwner) makes this attachment the size owner
+	// even if another attachment owns the size.
+	TakeSize bool
+}
+
+// SizeOwnership tells an attachment who owns the session's size: only the
+// owner's geometry reaches the PTY; the others are pending. See
+// CapAttachSizeOwner.
+type SizeOwnership struct {
+	// Owner is whether the attachment this is sent to is the owner.
+	Owner bool
+	// OwnerID is the owning attachment's id, empty when there is none.
+	OwnerID string
+	// Geometry is the session's current size.
+	Geometry Geometry
 }
 
 // AllScrollbackRows in AttachSession.ScrollbackRows asks for every
@@ -224,8 +248,11 @@ type Response struct {
 	// on, and this replaces the screen. Like AttachSnapshot it is an exact
 	// boundary: the output that follows continues from it.
 	AttachResync *Bytes
-	Event        *session.Event
-	Events       *[]session.Event
+	// AttachSizeOwner (CapAttachSizeOwner) is unsolicited on an attach
+	// stream: the size owner or the session's size changed.
+	AttachSizeOwner *SizeOwnership
+	Event           *session.Event
+	Events          *[]session.Event
 	// HandedOff answers HandoffSession (CapWorkerHandoff).
 	HandedOff *HandedOff
 	// SessionRestarting (CapSessionRestart) ends an attach stream whose
@@ -249,6 +276,8 @@ type Attached struct {
 	// SessionUID (CapSessionUID) is the UID of the incarnation attached
 	// to, for the client to expect on a reattach.
 	SessionUID string
+	// SizeOwner (CapAttachSizeOwner) is the size ownership at attach.
+	SizeOwner SizeOwnership
 }
 
 // HasFeature reports whether the attach stream uses capability c.
@@ -309,6 +338,9 @@ const (
 	kGetDaemonStatsRequest  kind = 71
 	// 60-69: worker handoff (handoff.go).
 	kHandoffSessionRequest kind = 60
+	// 50-59: attach streams.
+	kAttachTakeSizeRequest kind = 50
+	kAttachLeaveRequest    kind = 51
 
 	kDaemonInfoResponse     kind = 101
 	kCreateSessionResponse  kind = 102
@@ -340,6 +372,8 @@ const (
 
 	// Session resumption (kinds 150-159).
 	kAttachResyncResponse kind = 150
+	// Size ownership on attach streams.
+	kAttachSizeOwnerResponse kind = 151
 
 	// Worker handoff (kinds 160-169).
 	kHandedOffResponse         kind = 160
@@ -608,11 +642,19 @@ func encodeRequest(req *Request, f Features) (kind, []byte, error) {
 			if a.HasFeature(CapAttachScrollback) {
 				e.u32(a.ScrollbackRows)
 			}
+			if a.HasFeature(CapAttachSizeOwner) {
+				e.bool(a.TakeSize)
+			}
 		}
 		return kAttachSessionRequest, e.buf, e.err
 	case req.AttachResize != nil:
 		e.geometry(*req.AttachResize)
 		return kAttachResizeRequest, e.buf, e.err
+	case req.AttachTakeSize != nil:
+		e.geometry(*req.AttachTakeSize)
+		return kAttachTakeSizeRequest, e.buf, e.err
+	case req.AttachLeave != nil:
+		return kAttachLeaveRequest, nil, nil
 	case req.DetachSession != nil:
 		e.str(req.DetachSession.SessionID)
 		e.bool(req.DetachSession.All)
@@ -733,11 +775,19 @@ func decodeRequest(k kind, payload []byte, f Features) (*Request, error) {
 			if a.HasFeature(CapAttachScrollback) {
 				a.ScrollbackRows = d.u32()
 			}
+			if a.HasFeature(CapAttachSizeOwner) {
+				a.TakeSize = d.bool()
+			}
 		}
 		req.AttachSession = a
 	case kAttachResizeRequest:
 		g := d.geometry()
 		req.AttachResize = &g
+	case kAttachTakeSizeRequest:
+		g := d.geometry()
+		req.AttachTakeSize = &g
+	case kAttachLeaveRequest:
+		req.AttachLeave = Empty
 	case kDetachSessionRequest:
 		req.DetachSession = &DetachSession{SessionID: d.str(), All: d.bool()}
 	case kDetachAttachmentRequest:
@@ -821,6 +871,9 @@ func encodeResponse(resp *Response, f Features) (kind, []byte, error) {
 			if a.HasFeature(CapSessionUID) {
 				e.str(a.SessionUID)
 			}
+			if a.HasFeature(CapAttachSizeOwner) {
+				e.sizeOwnership(a.SizeOwner)
+			}
 		}
 		return kAttachedResponse, e.buf, e.err
 	case resp.AttachSnapshot != nil:
@@ -851,6 +904,15 @@ func encodeResponse(resp *Response, f Features) (kind, []byte, error) {
 			e.str(a.SessionID)
 			e.attachmentKind(a.Kind)
 			e.datetime(a.ConnectedAt)
+		}
+		// Appended (CapAttachSizeOwner): each record's size, after the
+		// list, so a decoder reads them when present.
+		if e.f.Has(CapAttachSizeOwner) {
+			for _, a := range *resp.Attachments {
+				e.bool(a.SizeOwner)
+				e.u16(a.Cols)
+				e.u16(a.Rows)
+			}
 		}
 		return kAttachmentsResponse, e.buf, e.err
 	case resp.History != nil:
@@ -918,6 +980,9 @@ func encodeResponse(resp *Response, f Features) (kind, []byte, error) {
 	case resp.AttachResync != nil:
 		e.bytes(resp.AttachResync.Data)
 		return kAttachResyncResponse, e.buf, e.err
+	case resp.AttachSizeOwner != nil:
+		e.sizeOwnership(*resp.AttachSizeOwner)
+		return kAttachSizeOwnerResponse, e.buf, e.err
 	case resp.Event != nil:
 		e.event(resp.Event)
 		return kEventResponse, e.buf, e.err
@@ -964,6 +1029,9 @@ func decodeResponse(k kind, payload []byte, f Features) (*Response, error) {
 			if a.HasFeature(CapSessionUID) {
 				a.SessionUID = d.str()
 			}
+			if a.HasFeature(CapAttachSizeOwner) {
+				a.SizeOwner = d.sizeOwnership()
+			}
 		}
 		resp.Attached = a
 	case kAttachSnapshotResponse:
@@ -991,6 +1059,12 @@ func decodeResponse(k kind, payload []byte, f Features) (*Response, error) {
 			attachments = append(attachments, session.AttachmentRecord{
 				AttachID: d.str(), SessionID: d.str(), Kind: d.attachmentKind(), ConnectedAt: d.datetime(),
 			})
+		}
+		if d.more() {
+			for i := range attachments {
+				a := &attachments[i]
+				a.SizeOwner, a.Cols, a.Rows = d.bool(), d.u16(), d.u16()
+			}
 		}
 		resp.Attachments = &attachments
 	case kHistoryResponse:
@@ -1041,6 +1115,9 @@ func decodeResponse(k kind, payload []byte, f Features) (*Response, error) {
 		resp.DaemonStats = &DaemonStats{Daemon: d.processStats(), OpenStreams: d.u32()}
 	case kAttachResyncResponse:
 		resp.AttachResync = &Bytes{d.bytes()}
+	case kAttachSizeOwnerResponse:
+		o := d.sizeOwnership()
+		resp.AttachSizeOwner = &o
 	case kEventResponse:
 		ev := d.event()
 		resp.Event = &ev
@@ -1145,6 +1222,12 @@ func (e *encoder) geometry(g Geometry) {
 	e.u16(g.Rows)
 	e.u16(g.PixelWidth)
 	e.u16(g.PixelHeight)
+}
+
+func (e *encoder) sizeOwnership(o SizeOwnership) {
+	e.bool(o.Owner)
+	e.str(o.OwnerID)
+	e.geometry(o.Geometry)
 }
 
 func (e *encoder) datetime(t time.Time) {
@@ -1454,6 +1537,10 @@ func (d *decoder) optI32() *int32 {
 
 func (d *decoder) geometry() Geometry {
 	return Geometry{Cols: d.u16(), Rows: d.u16(), PixelWidth: d.u16(), PixelHeight: d.u16()}
+}
+
+func (d *decoder) sizeOwnership() SizeOwnership {
+	return SizeOwnership{Owner: d.bool(), OwnerID: d.str(), Geometry: d.geometry()}
 }
 
 func (d *decoder) datetime() time.Time {

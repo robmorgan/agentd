@@ -184,6 +184,9 @@ Before changing implementation language or transport architecture, document the 
       `TestCreateAttachDetachReattach`, CLI `TestAttachEndToEnd`)
 * [x] Create resize integration tests (worker `TestResize`, `TestZeroGeometryKeepsCurrentSize`,
       `TestReattachSnapshotFitsNewSize`; CLI `TestAttachEndToEnd` resizes its PTY)
+* [x] Size ownership with several attachers: the first attachment owns the size, pending ones
+      take it over (`--take-size`, the overlay) or inherit it when the owner leaves, a reattach
+      or handoff keeps it (worker `size_test.go`; CLI `TestSizeOwnershipEndToEnd`)
 * [x] Test multiple simultaneous attachers (worker `TestMultipleAttachers`, `TestSlowAttacherDoesNotStallOthers`;
       daemon `TestMultipleAttachersThroughDaemon`)
 * [x] Document daemon restart behavior (ARCHITECTURE.md, "Lifecycles")

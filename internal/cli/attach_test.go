@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -62,7 +63,7 @@ func TestFormatSessionEnd(t *testing.T) {
 }
 
 func TestOverlayKeys(t *testing.T) {
-	o := newOverlay(testClient(t), "alpha")
+	o := newOverlay(testClient(t), "alpha", nil)
 	if out, err := o.handle(keyEvent{code: keyChar, r: 'y', mods: modCtrl}); err != nil || out.kind != overlayStay {
 		t.Fatalf("ctrl-y: %+v %v", out, err)
 	}
@@ -71,7 +72,7 @@ func TestOverlayKeys(t *testing.T) {
 	}
 	o.handle(char('n'))
 	o.handle(char('e'))
-	if items := filteredPalette(o.paletteQuery); len(items) != 1 || items[0].title != "New session" {
+	if items := o.filteredPalette(); len(items) != 1 || items[0].title != "New session" {
 		t.Fatalf("filtered %+v", items)
 	}
 	o.handle(key(keyEnter))
@@ -95,7 +96,7 @@ func TestOverlayKeys(t *testing.T) {
 }
 
 func TestOverlayDraws(t *testing.T) {
-	o := newOverlay(testClient(t), "alpha")
+	o := newOverlay(testClient(t), "alpha", nil)
 	o.sessions = []session.Record{demo("alpha"), demo("beta")}
 	body := o.body(60, 20)
 	if got := stripANSI(body[1].render(60, o.theme)); !strings.HasPrefix(got, " Commands ") || !strings.Contains(got, "/alpha  ") || strings.Contains(got, "╱") {
@@ -137,5 +138,60 @@ func TestOverlayDraws(t *testing.T) {
 	}
 	if got := wrapText("Press Enter to stop the current session, or Esc to cancel.", 20); len(got) != 3 || got[0] != "Press Enter to stop" {
 		t.Fatalf("wrap %q", got)
+	}
+}
+
+// The overlay offers to take the size only while another attachment owns
+// it, and choosing that closes it with overlayTookSize.
+func TestOverlayTakeSize(t *testing.T) {
+	titles := func(o *overlay) []string {
+		var out []string
+		for _, item := range o.filteredPalette() {
+			out = append(out, item.title)
+		}
+		return out
+	}
+	if got := titles(newOverlay(testClient(t), "alpha", nil)); slices.Contains(got, takeSizeItem.title) {
+		t.Fatalf("take-size offered without size ownership: %v", got)
+	}
+	owner := &protocol.SizeOwnership{Owner: true, OwnerID: "attach-1"}
+	if got := titles(newOverlay(testClient(t), "alpha", owner)); slices.Contains(got, takeSizeItem.title) {
+		t.Fatalf("take-size offered to the owner: %v", got)
+	}
+	pending := &protocol.SizeOwnership{OwnerID: "attach-1", Geometry: protocol.Geometry{Cols: 100, Rows: 30}}
+	o := newOverlay(testClient(t), "alpha", pending)
+	for _, r := range "take" {
+		o.handle(char(r))
+	}
+	if got := titles(o); len(got) != 1 || got[0] != takeSizeItem.title {
+		t.Fatalf("filtered %v", got)
+	}
+	if out, err := o.handle(key(keyEnter)); err != nil || out.kind != overlayTookSize {
+		t.Fatalf("enter: %+v %v", out, err)
+	}
+	if got := len(paletteItems); got != 4 {
+		t.Fatalf("the take-size item leaked into the shared palette: %d items", got)
+	}
+
+	if got := sizeDetails(pending); !strings.Contains(got, "100x30, set by attach-1") {
+		t.Fatalf("pending details %q", got)
+	}
+	if got := sizeDetails(&protocol.SizeOwnership{Owner: true, Geometry: protocol.Geometry{Cols: 80, Rows: 24}}); !strings.Contains(got, "80x24, set by this terminal") {
+		t.Fatalf("owner details %q", got)
+	}
+}
+
+// Size notes update the attachment's ownership without ending it.
+func TestSizeOwnerFrames(t *testing.T) {
+	size := &protocol.SizeOwnership{OwnerID: "attach-1"}
+	note := protocol.SizeOwnership{Owner: true, OwnerID: "attach-2", Geometry: protocol.Geometry{Cols: 90, Rows: 20}}
+	for _, overlay := range []bool{false, true} {
+		*size = protocol.SizeOwnership{}
+		if _, done, err := handleFrame(frame{resp: &protocol.Response{AttachSizeOwner: &note}}, overlay, size); done || err != nil || *size != note {
+			t.Fatalf("size note (overlay %v): done %v err %v size %+v", overlay, done, err, size)
+		}
+	}
+	if _, done, err := handleFrame(frame{resp: &protocol.Response{AttachSizeOwner: &note}}, false, nil); done || err != nil {
+		t.Fatalf("size note without tracking: done %v err %v", done, err)
 	}
 }

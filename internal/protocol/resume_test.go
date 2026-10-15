@@ -199,3 +199,84 @@ func TestRequestTokensAndDigests(t *testing.T) {
 		}
 	}
 }
+
+// Size ownership (CapAttachSizeOwner): TakeSize follows the other attach
+// fields, Attached ends with the ownership, and the request and the note
+// are kinds of their own.
+func TestSizeOwnerGoldenFrames(t *testing.T) {
+	assertRequestGolden(t, &Request{AttachSession: &AttachSession{
+		SessionID: "ab", Kind: session.AttachmentAttach, Geometry: Geometry{Cols: 80, Rows: 24},
+		Features: []string{CapAttachSizeOwner}, TakeSize: true,
+	}}, []byte{
+		0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x29, 0x00, 0x00, 0x00,
+		0x02, 0x00, 0x00, 0x00, 'a', 'b', // session id
+		0x01,                                           // attach
+		0x50, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, // geometry
+		0x01, 0x00, 0x00, 0x00, // features
+		0x11, 0x00, 0x00, 0x00, 'a', 't', 't', 'a', 'c', 'h', '-', 's', 'i', 'z', 'e', '-', 'o', 'w', 'n', 'e', 'r',
+		0x01, // take size
+	})
+	assertRequestGolden(t, &Request{AttachTakeSize: &Geometry{Cols: 120, Rows: 40}}, []byte{
+		0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, // kind 50
+		0x08, 0x00, 0x00, 0x00,
+		0x78, 0x00, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00,
+	})
+	assertRequestGolden(t, &Request{AttachLeave: Empty}, []byte{
+		0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x33, 0x00, 0x00, 0x00, 0x00, 0x00, // kind 51
+		0x00, 0x00, 0x00, 0x00,
+	})
+	assertResponseGolden(t, &Response{Attached: &Attached{
+		AttachID: "a", Snapshot: []byte("s"), Features: []string{CapAttachSizeOwner},
+		SizeOwner: SizeOwnership{Owner: true, OwnerID: "a", Geometry: Geometry{Cols: 80, Rows: 24}},
+	}}, []byte{
+		0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x68, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x31, 0x00, 0x00, 0x00,
+		0x01, 0x00, 0x00, 0x00, 'a', // attach id
+		0x01, 0x00, 0x00, 0x00, 's', // snapshot
+		0x01, 0x00, 0x00, 0x00, // features
+		0x11, 0x00, 0x00, 0x00, 'a', 't', 't', 'a', 'c', 'h', '-', 's', 'i', 'z', 'e', '-', 'o', 'w', 'n', 'e', 'r',
+		0x01,                        // owner
+		0x01, 0x00, 0x00, 0x00, 'a', // owner id
+		0x50, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, // geometry
+	})
+	assertResponseGolden(t, &Response{AttachSizeOwner: &SizeOwnership{OwnerID: "b", Geometry: Geometry{Cols: 80, Rows: 24}}}, []byte{
+		0x50, 0x44, 0x47, 0x41, 0x01, 0x00, 0x97, 0x00, 0x00, 0x00, 0x00, 0x00, // kind 151
+		0x0e, 0x00, 0x00, 0x00,
+		0x00,                        // not the owner
+		0x01, 0x00, 0x00, 0x00, 'b', // owner id
+		0x50, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, // geometry
+	})
+}
+
+// Attachment records carry their sizes after the list, only for a peer
+// with the capability; a decoder reads them when present.
+func TestAttachmentSizesAfterTheList(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	recs := []session.AttachmentRecord{
+		{AttachID: "attach-1", SessionID: "s", Kind: session.AttachmentAttach, ConnectedAt: now, SizeOwner: true, Cols: 100, Rows: 30},
+		{AttachID: "attach-2", SessionID: "s", Kind: session.AttachmentAttach, ConnectedAt: now, Cols: 90, Rows: 20},
+	}
+	var buf bytes.Buffer
+	if err := WriteResponseWith(&buf, featuresOf(CapAttachSizeOwner), &Response{Attachments: &recs}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := ReadResponse(&buf)
+	if err != nil || !reflect.DeepEqual(*resp.Attachments, recs) {
+		t.Fatalf("attachments = %#v, %v", resp, err)
+	}
+	// Without the capability the sizes are left out.
+	buf.Reset()
+	if err := WriteResponse(&buf, &Response{Attachments: &recs}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err = ReadResponse(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range *resp.Attachments {
+		if a.SizeOwner || a.Cols != 0 || a.Rows != 0 {
+			t.Fatalf("sizes sent without the capability: %#v", a)
+		}
+	}
+}

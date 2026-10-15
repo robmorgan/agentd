@@ -129,6 +129,11 @@ type AttachmentRecord struct {
 	SessionID   string
 	Kind        AttachmentKind
 	ConnectedAt time.Time
+	// SizeOwner is whether this attachment owns the session's size, and
+	// Cols and Rows are the size it last reported (only from a peer with
+	// CapAttachSizeOwner; zero otherwise).
+	SizeOwner  bool
+	Cols, Rows uint16
 }
 
 func ParseStatus(v string) (Status, error) {

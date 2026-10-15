@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -23,6 +24,9 @@ const (
 	overlayNewSession
 	overlayDetails
 	overlayStopConfirm
+	// overlayTakeSize is a palette action rather than a mode: the
+	// attachment takes the session's size and the overlay closes.
+	overlayTakeSize
 )
 
 type overlayOutcomeKind int
@@ -31,6 +35,9 @@ const (
 	overlayStay overlayOutcomeKind = iota
 	overlayClose
 	overlaySwitch
+	// overlayTookSize closes the overlay after the attachment asked to
+	// own the session's size.
+	overlayTookSize
 )
 
 type overlayOutcome struct {
@@ -50,10 +57,17 @@ var paletteItems = []paletteItem{
 	{"x", "Stop session", overlayStopConfirm},
 }
 
-func filteredPalette(query string) []paletteItem {
+// takeSizeItem is offered while another attachment owns the size.
+var takeSizeItem = paletteItem{"r", "Take over size", overlayTakeSize}
+
+func (o *overlay) filteredPalette() []paletteItem {
+	items := paletteItems
+	if o.size != nil && !o.size.Owner {
+		items = append(slices.Clip(items), takeSizeItem)
+	}
 	var out []paletteItem
-	for _, item := range paletteItems {
-		if matchesQuery(item.hint+" "+item.title, query) {
+	for _, item := range items {
+		if matchesQuery(item.hint+" "+item.title, o.paletteQuery) {
 			out = append(out, item)
 		}
 	}
@@ -64,6 +78,9 @@ type overlay struct {
 	c       *client
 	session string // the attached session
 	keys    keyDecoder
+	// size is the attachment's size ownership, nil when the session's
+	// worker does not track it (protocol.CapAttachSizeOwner).
+	size *protocol.SizeOwnership
 
 	sessions         []session.Record
 	mode             overlayMode
@@ -81,8 +98,8 @@ type overlay struct {
 	now              func() time.Time
 }
 
-func newOverlay(c *client, id string) *overlay {
-	return &overlay{c: c, session: id, theme: overlayThemeFor(os.Getenv), now: time.Now}
+func newOverlay(c *client, id string, size *protocol.SizeOwnership) *overlay {
+	return &overlay{c: c, session: id, size: size, theme: overlayThemeFor(os.Getenv), now: time.Now}
 }
 
 func (o *overlay) open() error {
@@ -158,12 +175,15 @@ func (o *overlay) handle(ev keyEvent) (overlayOutcome, error) {
 }
 
 func (o *overlay) handlePalette(ev keyEvent) (overlayOutcome, error) {
-	items := filteredPalette(o.paletteQuery)
+	items := o.filteredPalette()
 	switch {
 	case ev.code == keyEsc:
 		return overlayOutcome{kind: overlayClose}, nil
 	case ev.code == keyEnter:
 		if o.paletteSelected < len(items) {
+			if items[o.paletteSelected].mode == overlayTakeSize {
+				return overlayOutcome{kind: overlayTookSize}, nil
+			}
 			return overlayOutcome{}, o.run(items[o.paletteSelected].mode)
 		}
 	case ev.code == keyUp:
@@ -203,6 +223,9 @@ func (o *overlay) run(mode overlayMode) error {
 			return err
 		}
 		o.detailText = sessionDetails(resp.Session, o.now())
+		if o.size != nil {
+			o.detailText += "\n" + sizeDetails(o.size)
+		}
 		o.detailScroll = 0
 	}
 	o.mode = mode
@@ -309,6 +332,18 @@ func sessionDetails(s *session.Record, now time.Time) string {
 		text += fmt.Sprintf("\nattention  %s: %s", s.Attention, row.summary)
 	}
 	return text
+}
+
+// sizeDetails says who owns the session's size.
+func sizeDetails(o *protocol.SizeOwnership) string {
+	size := fmt.Sprintf("%dx%d", o.Geometry.Cols, o.Geometry.Rows)
+	switch {
+	case o.Owner:
+		return "size       " + size + ", set by this terminal"
+	case o.OwnerID == "":
+		return "size       " + size
+	}
+	return fmt.Sprintf("size       %s, set by %s (Ctrl-Y, Take over size)", size, o.OwnerID)
 }
 
 func sessionStatusText(s *session.Record) string {
@@ -596,7 +631,7 @@ func (o *overlay) body(width, height int) []line {
 	switch o.mode {
 	case overlayPalette:
 		put(top, o.input("❯", o.paletteQuery, "Type to filter", true))
-		for i, item := range filteredPalette(o.paletteQuery) {
+		for i, item := range o.filteredPalette() {
 			if top+2+i >= bottom {
 				break
 			}

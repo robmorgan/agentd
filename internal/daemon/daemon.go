@@ -656,7 +656,7 @@ func (s *Server) respond(req *protocol.Request, f protocol.Features) (resp *prot
 		return protocol.ErrorResponsef("attach snapshot requests are only valid during an active attach"), nil
 	case req.AttachInput != nil:
 		return protocol.ErrorResponsef("attach_input is only valid during an attached session"), nil
-	case req.AttachResize != nil:
+	case req.AttachResize != nil, req.AttachTakeSize != nil, req.AttachLeave != nil:
 		return protocol.ErrorResponsef("attach_resize is only valid during an attached session"), nil
 	case req.DetachSession != nil:
 		return s.forward(req.DetachSession.SessionID, req), nil

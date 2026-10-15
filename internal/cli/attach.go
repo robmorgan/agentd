@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -134,6 +135,8 @@ type attachStream struct {
 	frames chan frame
 	done   chan struct{}
 	exited chan struct{}
+	// announcesLeave: the worker takes AttachLeave (CapAttachSizeOwner).
+	announcesLeave bool
 }
 
 func startAttachStream(s transport.Stream, r *bufio.Reader) *attachStream {
@@ -157,6 +160,20 @@ func startAttachStream(s transport.Stream, r *bufio.Reader) *attachStream {
 
 func (a *attachStream) send(req *protocol.Request) error { return protocol.WriteRequest(a.s, req) }
 
+// leave tells the worker this client is leaving on purpose (a detach, a
+// switch, the session ending), so that if it owns the session's size the
+// next attachment takes over at once, then stops the stream. A stream that
+// was cut is stopped without it, which keeps the size reserved for its
+// reattach.
+func (a *attachStream) leave() {
+	if a.announcesLeave {
+		// A stalled stream must not hold up the detach.
+		a.s.SetWriteDeadline(time.Now().Add(time.Second))
+		_ = a.send(&protocol.Request{AttachLeave: protocol.Empty})
+	}
+	a.stop()
+}
+
 // stop half-closes the stream, which tells the daemon this client detached,
 // then closes it and waits for the reader.
 func (a *attachStream) stop() {
@@ -174,7 +191,7 @@ func (a *attachStream) stop() {
 // offered (protocol.AttachFeatures): the session's UID, replacing prev's
 // attachment when prev knows the UID, resyncs after lag, and at most
 // scrollback rows of scrollback in the snapshot (-1 for all).
-func (c *client) connectAttach(ctx context.Context, id string, prev attachIdentity, scrollback int) (*attachStream, *protocol.Attached, *protocol.SessionEnded, error) {
+func (c *client) connectAttach(ctx context.Context, id string, prev attachIdentity, scrollback int, takeSize bool) (*attachStream, *protocol.Attached, *protocol.SessionEnded, error) {
 	cs, err := c.controlStream(ctx)
 	if err != nil {
 		return nil, nil, nil, err
@@ -204,6 +221,7 @@ func (c *client) connectAttach(ctx context.Context, id string, prev attachIdenti
 			attach.ScrollbackRows = uint32(scrollback)
 		}
 	}
+	attach.TakeSize = takeSize && attach.HasFeature(protocol.CapAttachSizeOwner)
 	req := &protocol.Request{AttachSession: attach}
 	if err := protocol.WriteRequest(s, req); err != nil {
 		s.Close()
@@ -222,7 +240,9 @@ func (c *client) connectAttach(ctx context.Context, id string, prev attachIdenti
 		// ctx was cancelled after the answer arrived, closing s.
 		return nil, nil, nil, ctx.Err()
 	case resp.Attached != nil:
-		return startAttachStream(s, r), resp.Attached, nil, nil
+		a := startAttachStream(s, r)
+		a.announcesLeave = slices.Contains(resp.Attached.Features, protocol.CapAttachSizeOwner)
+		return a, resp.Attached, nil, nil
 	case resp.SessionEnded != nil:
 		s.Close()
 		return nil, nil, resp.SessionEnded, nil
@@ -246,7 +266,11 @@ func (c *client) connectAttach(ctx context.Context, id string, prev attachIdenti
 // see reattach.
 func (c *client) attachOnce(id, uid string, titled *bool) (res attachResult, err error) {
 	ident := attachIdentity{uid: uid}
-	stream, attached, ended, err := c.connectAttach(context.Background(), id, ident, c.attachScrollbackRows())
+	// --take-size applies to the session first attached; a switch to
+	// another one does not take its size.
+	takeSize := c.takeSize
+	c.takeSize = false
+	stream, attached, ended, err := c.connectAttach(context.Background(), id, ident, c.attachScrollbackRows(), takeSize)
 	if err != nil {
 		return attachResult{}, err
 	}
@@ -256,7 +280,7 @@ func (c *client) attachOnce(id, uid string, titled *bool) (res attachResult, err
 	ident.update(attached)
 	defer func() {
 		if stream != nil {
-			stream.stop()
+			stream.leave()
 		}
 	}()
 
@@ -277,13 +301,18 @@ func (c *client) attachOnce(id, uid string, titled *bool) (res attachResult, err
 	winch := make(chan os.Signal, 1)
 	signal.Notify(winch, syscall.SIGWINCH)
 	defer signal.Stop(winch)
+	// Closing the terminal (SIGHUP) or a kill detaches cleanly, so the
+	// worker hears this client leave rather than lose its stream.
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGHUP, syscall.SIGTERM)
+	defer signal.Stop(quit)
 
 	keys := stdinChunks()
 	var parser attachParser
 	snapshot := attached.Snapshot
 	for {
 		writeOut(attachStartupBytes(snapshot))
-		res, err := c.runAttachment(id, stream, keys, &parser, winch)
+		res, err := c.runAttachment(id, stream, keys, &parser, winch, quit, sizeOwnership(attached))
 		if err == nil || !c.reconnectable(err) {
 			return res, err
 		}
@@ -302,6 +331,16 @@ func (c *client) attachOnce(id, uid string, titled *bool) (res attachResult, err
 	}
 }
 
+// sizeOwnership is the attachment's size ownership as it attached, nil when
+// the worker does not track it.
+func sizeOwnership(attached *protocol.Attached) *protocol.SizeOwnership {
+	if !attached.HasFeature(protocol.CapAttachSizeOwner) {
+		return nil
+	}
+	o := attached.SizeOwner
+	return &o
+}
+
 // attachScrollbackRows is the configured cap on the scrollback an attach
 // copies into the terminal ([attach] scrollback_rows; -1 for all of it).
 func (c *client) attachScrollbackRows() int {
@@ -314,7 +353,10 @@ func (c *client) attachScrollbackRows() int {
 
 // runAttachment runs one attach stream until it ends, the user detaches or
 // switches, or it fails.
-func (c *client) runAttachment(id string, stream *attachStream, keys <-chan []byte, parser *attachParser, winch <-chan os.Signal) (attachResult, error) {
+//
+// size is the attachment's size ownership (nil if not tracked), kept up to
+// date from AttachSizeOwner frames for the overlay.
+func (c *client) runAttachment(id string, stream *attachStream, keys <-chan []byte, parser *attachParser, winch, quit <-chan os.Signal, size *protocol.SizeOwnership) (attachResult, error) {
 	var ov *overlay
 	redraw := false
 	for {
@@ -332,7 +374,7 @@ func (c *client) runAttachment(id string, stream *attachStream, keys <-chan []by
 			}
 			redraw = true
 			if ov != nil {
-				res, closed, err := c.overlayInput(ov, chunk, stream)
+				res, closed, err := c.overlayInput(ov, chunk, stream, size)
 				if err != nil || res != nil {
 					return deref(res), err
 				}
@@ -350,7 +392,7 @@ func (c *client) runAttachment(id string, stream *attachStream, keys <-chan []by
 				case actionDetach:
 					return attachResult{outcome: outcomeDetached}, nil
 				case actionOpenOverlay:
-					ov = newOverlay(c, id)
+					ov = newOverlay(c, id, size)
 					if err := ov.open(); err != nil {
 						return attachResult{}, err
 					}
@@ -369,13 +411,15 @@ func (c *client) runAttachment(id string, stream *attachStream, keys <-chan []by
 					break
 				}
 			}
+		case <-quit:
+			return attachResult{outcome: outcomeDetached}, nil
 		case <-winch:
 			redraw = true
 			if err := stream.send(resizeRequest()); err != nil {
 				return attachResult{}, err
 			}
 		case f := <-stream.frames:
-			res, done, err := handleFrame(f, ov != nil)
+			res, done, err := handleFrame(f, ov != nil, size)
 			if err != nil || done {
 				return res, err
 			}
@@ -460,7 +504,7 @@ func (c *client) reattach(id string, prev attachIdentity, keys <-chan []byte, pa
 			var a attempt
 			// The terminal already holds the scrollback the first
 			// snapshot copied, so a reattach repaints only the screen.
-			a.stream, a.attached, a.ended, a.err = c.connectAttach(ctx, id, prev, 0)
+			a.stream, a.attached, a.ended, a.err = c.connectAttach(ctx, id, prev, 0, false)
 			result <- a
 		}()
 		finished := waitUnlessDetached(done, keys, parser)
@@ -469,7 +513,7 @@ func (c *client) reattach(id string, prev attachIdentity, keys <-chan []byte, pa
 		switch {
 		case !finished:
 			if a.stream != nil {
-				a.stream.stop()
+				a.stream.leave()
 			}
 			return nil, nil, detached, nil
 		case a.err == nil && a.ended != nil:
@@ -540,8 +584,8 @@ func deref(r *attachResult) attachResult {
 
 // handleFrame handles one frame of a live attachment. While the overlay is
 // open, output is dropped: the screen is redrawn from a snapshot when it
-// closes.
-func handleFrame(f frame, overlayOpen bool) (attachResult, bool, error) {
+// closes. Size ownership notes update size.
+func handleFrame(f frame, overlayOpen bool, size *protocol.SizeOwnership) (attachResult, bool, error) {
 	switch {
 	case f.err != nil:
 		return attachResult{}, true, f.err
@@ -565,6 +609,11 @@ func handleFrame(f frame, overlayOpen bool) (attachResult, bool, error) {
 			writeOut(resyncBytes(f.resp.AttachResync.Data))
 		}
 		return attachResult{}, false, nil
+	case f.resp.AttachSizeOwner != nil:
+		if size != nil {
+			*size = *f.resp.AttachSizeOwner
+		}
+		return attachResult{}, false, nil
 	case f.resp.AttachSnapshot != nil:
 		if overlayOpen {
 			return attachResult{}, true, errors.New("unexpected attach snapshot response outside overlay restore")
@@ -578,15 +627,23 @@ func handleFrame(f frame, overlayOpen bool) (attachResult, bool, error) {
 
 // overlayInput feeds input to the open overlay. closed reports that it
 // closed and the screen was restored.
-func (c *client) overlayInput(ov *overlay, chunk []byte, stream *attachStream) (res *attachResult, closed bool, err error) {
+func (c *client) overlayInput(ov *overlay, chunk []byte, stream *attachStream, size *protocol.SizeOwnership) (res *attachResult, closed bool, err error) {
 	for _, ev := range ov.keys.push(chunk) {
 		out, err := ov.handle(ev)
 		if err != nil {
 			return nil, false, err
 		}
 		switch out.kind {
-		case overlayClose:
-			restored, ended, err := restoreSnapshot(stream)
+		case overlayTookSize, overlayClose:
+			if out.kind == overlayTookSize {
+				// The worker resizes before it answers the snapshot
+				// asked for next, so the restored screen has the new size.
+				cols, rows, pw, ph := terminalGeometry()
+				if err := stream.send(&protocol.Request{AttachTakeSize: &protocol.Geometry{Cols: cols, Rows: rows, PixelWidth: pw, PixelHeight: ph}}); err != nil {
+					return nil, false, err
+				}
+			}
+			restored, ended, err := restoreSnapshot(stream, size)
 			if err != nil {
 				return nil, false, err
 			}
@@ -606,7 +663,7 @@ func (c *client) overlayInput(ov *overlay, chunk []byte, stream *attachStream) (
 // restoreSnapshot asks for the current screen after the overlay closes,
 // skipping output that arrives first. Input waits (bounded, in the stdin
 // channel) until it is done.
-func restoreSnapshot(stream *attachStream) ([]byte, *protocol.SessionEnded, error) {
+func restoreSnapshot(stream *attachStream, size *protocol.SizeOwnership) ([]byte, *protocol.SessionEnded, error) {
 	if err := stream.send(&protocol.Request{AttachSnapshot: protocol.Empty}); err != nil {
 		return nil, nil, err
 	}
@@ -622,6 +679,10 @@ func restoreSnapshot(stream *attachStream) ([]byte, *protocol.SessionEnded, erro
 			return f.resp.AttachSnapshot.Data, nil, nil
 		case f.resp.PtyOutput != nil, f.resp.AttachResync != nil:
 			// Superseded by the snapshot asked for.
+		case f.resp.AttachSizeOwner != nil:
+			if size != nil {
+				*size = *f.resp.AttachSizeOwner
+			}
 		case f.resp.SessionEnded != nil:
 			return nil, f.resp.SessionEnded, nil
 		case f.resp.EndOfStream != nil:

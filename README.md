@@ -79,7 +79,12 @@ agt attach fix-tests
 ```
 
 Multiple clients can attach to the same running session at once, including the TUI and one or
-more `agt attach` processes.
+more `agt attach` processes. The first one to attach sets the session's size; the others see the
+agent at that size without resizing it. To resize the session to your terminal instead, use
+`ctrl + y` then `r` (Take over size), or attach with `agt attach --take-size fix-tests`. When the
+terminal that sets the size detaches or is closed, the one used most recently takes over; one that
+only lost its connection (or rode out a daemon restart) keeps the size if it reconnects within 10
+seconds.
 
 Detach the local `agt attach` client using `ctrl + \`; the screen is cleared, and the session's
 output stays in your terminal's scrollback. Switch to the previous attached session
@@ -447,7 +452,8 @@ Interactive PTY attach is available with `agt attach <name>`. Detach with `Ctrl-
 the previous running session with `Ctrl-[`, or switch to the next running session with `Ctrl-]`, or
 `agt detach <name> --attach <attach_id>` for a specific client, or
 `agt detach <name> --all` to disconnect every attached client on the session.
-Use `agt attachments <name>` to inspect the current attachment ids.
+Use `agt attachments <name>` to inspect the current attachment ids, which one sets the session's
+size (`size-owner`), and the size each one has.
 Attach clears the visible screen and repaints from the daemon's retained terminal state; if the
 restored session was using the alternate screen, replay restores that state naturally. It also
 copies the session's most recent 1,000 rows of scrollback into your terminal, so you can scroll

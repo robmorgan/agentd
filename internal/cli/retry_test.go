@@ -206,7 +206,7 @@ func TestResyncFrames(t *testing.T) {
 		t.Fatalf("resync bytes %q", got)
 	}
 	f := frame{resp: &protocol.Response{AttachResync: &protocol.Bytes{Data: []byte("s")}}}
-	if _, done, err := handleFrame(f, true); done || err != nil {
+	if _, done, err := handleFrame(f, true, nil); done || err != nil {
 		t.Fatalf("resync with the overlay open ended the attachment: %v", err)
 	}
 }
