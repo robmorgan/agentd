@@ -303,7 +303,7 @@ make dev-run ARGS="list"
 On macOS, Debian/Ubuntu or Arch (Omarchy included):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/robmorgan/agentd/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/robmorgan/agtd/main/install.sh | bash
 ```
 
 or `./install.sh` from a checkout, which builds that checkout. The script installs `agt` and
