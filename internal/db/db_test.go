@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/robmorgan/agentd/internal/session"
+	"github.com/robmorgan/agtd/internal/session"
 )
 
 func openRaw(t *testing.T, path string) *sql.DB {

@@ -1,4 +1,4 @@
-module github.com/robmorgan/agentd
+module github.com/robmorgan/agtd
 
 go 1.26.0
 

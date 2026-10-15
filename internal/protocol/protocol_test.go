@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/robmorgan/agentd/internal/session"
+	"github.com/robmorgan/agtd/internal/session"
 )
 
 func strp(s string) *string { return &s }

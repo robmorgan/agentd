@@ -15,9 +15,9 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
-	"github.com/robmorgan/agentd/internal/config"
-	"github.com/robmorgan/agentd/internal/paths"
-	"github.com/robmorgan/agentd/internal/transport"
+	"github.com/robmorgan/agtd/internal/config"
+	"github.com/robmorgan/agtd/internal/paths"
+	"github.com/robmorgan/agtd/internal/transport"
 )
 
 // Version is the client version, reported by `agt --version` and

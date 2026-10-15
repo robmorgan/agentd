@@ -6,7 +6,7 @@ import (
 
 	"go.mitchellh.com/libghostty"
 
-	"github.com/robmorgan/agentd/internal/session"
+	"github.com/robmorgan/agtd/internal/session"
 )
 
 // Program status (OSC 7501).

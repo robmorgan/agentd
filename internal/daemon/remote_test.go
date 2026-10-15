@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/robmorgan/agentd/internal/config"
+	"github.com/robmorgan/agtd/internal/config"
 )
 
 func TestEditRemoteListen(t *testing.T) {

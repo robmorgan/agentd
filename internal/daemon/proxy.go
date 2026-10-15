@@ -7,9 +7,9 @@ import (
 	"io"
 	"time"
 
-	"github.com/robmorgan/agentd/internal/protocol"
-	"github.com/robmorgan/agentd/internal/session"
-	"github.com/robmorgan/agentd/internal/transport"
+	"github.com/robmorgan/agtd/internal/protocol"
+	"github.com/robmorgan/agtd/internal/session"
+	"github.com/robmorgan/agtd/internal/transport"
 )
 
 // workerRequestTimeout bounds a one-shot request to a worker so a wedged

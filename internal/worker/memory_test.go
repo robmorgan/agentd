@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/robmorgan/agentd/internal/procstat"
+	"github.com/robmorgan/agtd/internal/procstat"
 )
 
 // fillText is enough 80-column lines to fill a session's scrollback to its

@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/robmorgan/agentd/internal/protocol"
+	"github.com/robmorgan/agtd/internal/protocol"
 )
 
 // Duplicate and replayed requests.

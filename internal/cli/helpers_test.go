@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/robmorgan/agentd/internal/paths"
-	"github.com/robmorgan/agentd/internal/session"
+	"github.com/robmorgan/agtd/internal/paths"
+	"github.com/robmorgan/agtd/internal/session"
 )
 
 var ansi = regexp.MustCompile("\x1b\\[[0-9;?<>=]*[ -/]*[@-~]")

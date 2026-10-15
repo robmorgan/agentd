@@ -16,7 +16,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
-	"github.com/robmorgan/agentd/internal/config"
+	"github.com/robmorgan/agtd/internal/config"
 )
 
 // DefaultRemotePort is the UDP port `agentd remote enable` listens on when

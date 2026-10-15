@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/robmorgan/agentd/internal/config"
-	"github.com/robmorgan/agentd/internal/protocol"
-	"github.com/robmorgan/agentd/internal/session"
+	"github.com/robmorgan/agtd/internal/config"
+	"github.com/robmorgan/agtd/internal/protocol"
+	"github.com/robmorgan/agtd/internal/session"
 )
 
 // The Ctrl-Y overlay: a box drawn over the attached session, with a command

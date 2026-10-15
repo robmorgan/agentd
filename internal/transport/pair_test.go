@@ -12,7 +12,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 
-	"github.com/robmorgan/agentd/internal/protocol"
+	"github.com/robmorgan/agtd/internal/protocol"
 )
 
 // pairingHarness is an echo listener whose Authorized check is a set that a

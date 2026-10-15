@@ -10,8 +10,8 @@ import (
 
 	"github.com/creack/pty"
 
-	"github.com/robmorgan/agentd/internal/protocol"
-	"github.com/robmorgan/agentd/internal/session"
+	"github.com/robmorgan/agtd/internal/protocol"
+	"github.com/robmorgan/agtd/internal/session"
 )
 
 // ownerState is only ever touched by the owner goroutine. All other

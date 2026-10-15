@@ -10,9 +10,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/robmorgan/agentd/internal/db"
-	"github.com/robmorgan/agentd/internal/protocol"
-	"github.com/robmorgan/agentd/internal/session"
+	"github.com/robmorgan/agtd/internal/db"
+	"github.com/robmorgan/agtd/internal/protocol"
+	"github.com/robmorgan/agtd/internal/session"
 )
 
 // These tests hand real session workers over to another agentd executable
