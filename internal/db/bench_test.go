@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/robmorgan/agentd/internal/session"
+	"github.com/robmorgan/agtd/internal/session"
 )
 
 // Every call opens and closes its own SQLite connection (see connect), so

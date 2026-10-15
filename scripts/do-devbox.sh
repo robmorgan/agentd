@@ -28,7 +28,7 @@
 #   --region SLUG   droplet region (default ${DO_REGION:-sgp1}; see `doctl compute region list`)
 #   --size SLUG     droplet size (default ${DO_SIZE:-s-2vcpu-4gb}; see `doctl compute size list`)
 #   --user NAME     the user agentd runs as (default: your local user name)
-#   --ref REF       build this branch, tag or commit of github.com/robmorgan/agentd (default main)
+#   --ref REF       build this branch, tag or commit of github.com/robmorgan/agtd (default main)
 #   --local         build this checkout's working tree instead (tracked files, uncommitted changes included)
 #   --no-claude     do not install Claude Code
 #
@@ -43,7 +43,7 @@ TAG="agentd"           # every droplet this script manages, and the firewall's t
 FIREWALL="agentd"
 PORT=7433              # agentd's default QUIC port
 IMAGE="ubuntu-24-04-x64"
-REPO_RAW="https://raw.githubusercontent.com/robmorgan/agentd"
+REPO_RAW="https://raw.githubusercontent.com/robmorgan/agtd"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR)
 
 step() { printf '==> %s\n' "$*" >&2; }

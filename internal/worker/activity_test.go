@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/robmorgan/agentd/internal/db"
-	"github.com/robmorgan/agentd/internal/session"
+	"github.com/robmorgan/agtd/internal/db"
+	"github.com/robmorgan/agtd/internal/session"
 )
 
 // The shadow terminal reports the effects agents use to ask for the user,

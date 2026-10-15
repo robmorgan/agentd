@@ -17,7 +17,7 @@ import (
 	"filippo.io/cpace"
 	"github.com/quic-go/quic-go"
 
-	"github.com/robmorgan/agentd/internal/protocol"
+	"github.com/robmorgan/agtd/internal/protocol"
 )
 
 // Pairing replaces copying key fingerprints between machines with a short

@@ -10,8 +10,8 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/robmorgan/agentd/internal/db"
-	"github.com/robmorgan/agentd/internal/session"
+	"github.com/robmorgan/agtd/internal/db"
+	"github.com/robmorgan/agtd/internal/session"
 )
 
 // Activity and attention detection.

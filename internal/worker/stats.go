@@ -3,8 +3,8 @@ package worker
 import (
 	"time"
 
-	"github.com/robmorgan/agentd/internal/procstat"
-	"github.com/robmorgan/agentd/internal/protocol"
+	"github.com/robmorgan/agtd/internal/procstat"
+	"github.com/robmorgan/agtd/internal/protocol"
 )
 
 // stats measures the session: this worker process (from the OS and its own

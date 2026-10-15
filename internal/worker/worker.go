@@ -34,11 +34,11 @@ import (
 
 	"github.com/creack/pty"
 
-	"github.com/robmorgan/agentd/internal/db"
-	"github.com/robmorgan/agentd/internal/paths"
-	"github.com/robmorgan/agentd/internal/protocol"
-	"github.com/robmorgan/agentd/internal/session"
-	"github.com/robmorgan/agentd/internal/transport"
+	"github.com/robmorgan/agtd/internal/db"
+	"github.com/robmorgan/agtd/internal/paths"
+	"github.com/robmorgan/agtd/internal/protocol"
+	"github.com/robmorgan/agtd/internal/session"
+	"github.com/robmorgan/agtd/internal/transport"
 )
 
 const (

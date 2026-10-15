@@ -5,7 +5,7 @@
 # build it made before, and if a daemon is running, upgrades it with a live
 # handoff so running sessions keep going.
 #
-#   curl -fsSL https://raw.githubusercontent.com/robmorgan/agentd/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/robmorgan/agtd/main/install.sh | bash
 #   ./install.sh                  # from a checkout: builds that checkout
 #
 # Go and Zig are used from PATH when new enough; otherwise pinned releases are
@@ -27,7 +27,7 @@
 
 set -euo pipefail
 
-REPO_URL="https://github.com/robmorgan/agentd.git"
+REPO_URL="https://github.com/robmorgan/agtd.git"
 GO_VERSION="1.26.9"   # downloaded when PATH has no Go >= go.mod's
 ZIG_VERSION="0.16.0"  # downloaded when PATH has no Zig >= 0.16
 DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/agentd"
@@ -41,7 +41,7 @@ usage() {
   if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
     sed -n '2,/^$/{s/^# \{0,1\}//;p;}' "${BASH_SOURCE[0]}"
   else
-    echo "See https://github.com/robmorgan/agentd/blob/main/install.sh"
+    echo "See https://github.com/robmorgan/agtd/blob/main/install.sh"
   fi
 }
 
@@ -220,7 +220,7 @@ source_dir() {
     here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   fi
   if [[ -n "${here}" && -f "${here}/go.mod" ]] &&
-    grep -q '^module github.com/robmorgan/agentd$' "${here}/go.mod"; then
+    grep -q '^module github.com/robmorgan/agtd$' "${here}/go.mod"; then
     step "Source: ${here} (this checkout)"
     echo "${here}"
     return
@@ -324,7 +324,7 @@ install_service() {
 # Installed by agentd's install.sh, which rewrites it on every run.
 [Unit]
 Description=agentd, a daemon runtime for supervising coding agents
-Documentation=https://github.com/robmorgan/agentd
+Documentation=https://github.com/robmorgan/agtd
 
 [Service]
 # agentd restarts and upgrades itself without systemd, so this only starts it

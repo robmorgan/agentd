@@ -13,9 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/robmorgan/agentd/internal/paths"
-	"github.com/robmorgan/agentd/internal/protocol"
-	"github.com/robmorgan/agentd/internal/transport"
+	"github.com/robmorgan/agtd/internal/paths"
+	"github.com/robmorgan/agtd/internal/protocol"
+	"github.com/robmorgan/agtd/internal/transport"
 )
 
 // client reaches one daemon: the local one over its Unix socket, or a

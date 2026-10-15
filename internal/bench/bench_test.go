@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/robmorgan/agentd/internal/db"
+	"github.com/robmorgan/agtd/internal/db"
 )
 
 // The bench runs a freshly built agentd as its daemon and workers.

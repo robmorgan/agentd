@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/robmorgan/agentd/internal/protocol"
-	"github.com/robmorgan/agentd/internal/session"
+	"github.com/robmorgan/agtd/internal/protocol"
+	"github.com/robmorgan/agtd/internal/session"
 )
 
 func TestSessionListWithHosts(t *testing.T) {

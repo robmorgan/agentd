@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/robmorgan/agentd/internal/protocol"
-	"github.com/robmorgan/agentd/internal/session"
-	"github.com/robmorgan/agentd/internal/transport"
+	"github.com/robmorgan/agtd/internal/protocol"
+	"github.com/robmorgan/agtd/internal/session"
+	"github.com/robmorgan/agtd/internal/transport"
 )
 
 // Crash recovery: the daemon or a worker dies without warning (SIGKILL), at

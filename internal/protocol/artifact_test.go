@@ -9,7 +9,7 @@ import (
 	"testing/iotest"
 	"time"
 
-	"github.com/robmorgan/agentd/internal/session"
+	"github.com/robmorgan/agtd/internal/session"
 )
 
 func u64p(v uint64) *uint64 { return &v }

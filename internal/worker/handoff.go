@@ -64,10 +64,10 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/robmorgan/agentd/internal/db"
-	"github.com/robmorgan/agentd/internal/paths"
-	"github.com/robmorgan/agentd/internal/protocol"
-	"github.com/robmorgan/agentd/internal/transport"
+	"github.com/robmorgan/agtd/internal/db"
+	"github.com/robmorgan/agtd/internal/paths"
+	"github.com/robmorgan/agtd/internal/protocol"
+	"github.com/robmorgan/agtd/internal/transport"
 )
 
 // handoffVersion is the format of handoffState. A new image refuses a state

@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/robmorgan/agentd/internal/protocol"
-	"github.com/robmorgan/agentd/internal/transport"
+	"github.com/robmorgan/agtd/internal/protocol"
+	"github.com/robmorgan/agtd/internal/transport"
 )
 
 // startPair runs `agentd remote pair` against the harness daemon and
