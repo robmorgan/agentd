@@ -26,3 +26,7 @@ always serves the script on the deployed commit. The copy is not checked in.
 Vercel, with the project's Root Directory set to `website`. `vercel.json` sets
 the build and serves `install.sh` as a shell script. The build reads
 `../install.sh`, so keep "Include files outside the root directory" enabled.
+
+Vercel only builds a commit that changes `website/` or `install.sh` since the
+branch's last deployment (`ignoreCommand` in `vercel.json`); everything else is
+skipped as "Canceled". If git cannot tell, it builds.
