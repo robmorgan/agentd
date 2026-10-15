@@ -228,6 +228,12 @@ source_dir() {
   local src="${AGENTD_SRC:-${DATA_DIR}/src}" ref="${AGENTD_REF:-main}"
   if [[ -d "${src}/.git" ]]; then
     step "Source: updating ${src} to ${ref}"
+    # Clones made before the repository was renamed to agtd still point at
+    # robmorgan/agentd, which only works while GitHub redirects it. Other
+    # origins (an AGENTD_SRC clone of a fork) are left alone.
+    if [[ "$(git -C "${src}" remote get-url origin 2>/dev/null)" == "https://github.com/robmorgan/agentd.git" ]]; then
+      git -C "${src}" remote set-url origin "${REPO_URL}"
+    fi
   else
     step "Source: cloning ${REPO_URL} (${ref}) into ${src}"
     mkdir -p "$(dirname "${src}")"
