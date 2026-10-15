@@ -16,8 +16,8 @@ export default defineConfig({
 				{ tag: 'link', attrs: { rel: 'apple-touch-icon', href: '/apple-touch-icon.png' } },
 				{ tag: 'meta', attrs: { property: 'og:image', content: 'https://agtd.sh/agtd-icon-512.png' } },
 			],
-			social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/robmorgan/agentd' }],
-			editLink: { baseUrl: 'https://github.com/robmorgan/agentd/edit/main/website/' },
+			social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/robmorgan/agtd' }],
+			editLink: { baseUrl: 'https://github.com/robmorgan/agtd/edit/main/website/' },
 			customCss: [
 				'@fontsource/ibm-plex-mono/400.css',
 				'@fontsource/ibm-plex-mono/500.css',
