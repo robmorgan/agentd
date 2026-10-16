@@ -17,7 +17,7 @@ import (
 )
 
 // Daemonize starts `<exe> serve` detached from the caller's session and
-// terminal, with output appended to agentd.log in the root, and returns without
+// terminal, with output appended to agtd.log in the root, and returns without
 // waiting. The agt CLI polls the socket to know when it is up.
 func Daemonize(p *paths.AppPaths, exe string) error {
 	if err := p.EnsureLayout(); err != nil {
@@ -33,7 +33,7 @@ func Daemonize(p *paths.AppPaths, exe string) error {
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to daemonize agentd: %w", err)
+		return fmt.Errorf("failed to daemonize agtd: %w", err)
 	}
 	return cmd.Process.Release()
 }
@@ -106,7 +106,7 @@ func handoffWorker(p *paths.AppPaths, id, exe string) HandoffResult {
 		return res
 	}
 	if !protocol.HasCapability(caps, protocol.CapWorkerHandoff) {
-		res.Err = errors.New("its worker was started by an agentd without live handoff; it picks up the new binary when the session is restarted")
+		res.Err = errors.New("its worker was started by an agtd without live handoff; it picks up the new binary when the session is restarted")
 		return res
 	}
 	conn, err := transport.DialUnix(socket, workerDialTimeout)
@@ -163,7 +163,7 @@ func workerCapabilities(socket string) ([]string, error) {
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(workerDialTimeout))
-	resp, err := exchangeOn(conn, &protocol.Request{Hello: protocol.NewHello("agentd " + Version)})
+	resp, err := exchangeOn(conn, &protocol.Request{Hello: protocol.NewHello("agtd " + Version)})
 	if err != nil || resp.Welcome == nil {
 		// A worker that predates Hello answers it with an error, or
 		// drops the connection if it cannot decode it.
@@ -207,7 +207,7 @@ func waitForDaemon(p *paths.AppPaths) (*protocol.ManagementStatus, error) {
 			return status, nil
 		}
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("timed out waiting for agentd to start; see %s", p.DaemonLogPath())
+			return nil, fmt.Errorf("timed out waiting for agtd to start; see %s", p.DaemonLogPath())
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -251,7 +251,7 @@ func stopDaemon(p *paths.AppPaths) error {
 			return err
 		}
 		if time.Now().After(deadline) {
-			return errors.New("agentd did not stop")
+			return errors.New("agtd did not stop")
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -260,7 +260,7 @@ func stopDaemon(p *paths.AppPaths) error {
 func requestShutdown(p *paths.AppPaths) error {
 	conn, err := transport.DialUnix(p.Socket, workerDialTimeout)
 	if err != nil {
-		return fmt.Errorf("agentd does not answer on %s: %w", p.Socket, err)
+		return fmt.Errorf("agtd does not answer on %s: %w", p.Socket, err)
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(workerDialTimeout))
@@ -269,7 +269,7 @@ func requestShutdown(p *paths.AppPaths) error {
 		_, err = protocol.ReadManagementResponse(bufio.NewReader(conn))
 	}
 	if err != nil {
-		return fmt.Errorf("failed to ask agentd to stop: %w", err)
+		return fmt.Errorf("failed to ask agtd to stop: %w", err)
 	}
 	return nil
 }

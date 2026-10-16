@@ -16,20 +16,20 @@ import (
 	"github.com/robmorgan/agtd/internal/db"
 )
 
-// The bench runs a freshly built agentd as its daemon and workers.
-var agentdBin string
+// The bench runs a freshly built agtd as its daemon and workers.
+var agtdBin string
 
 func TestMain(m *testing.M) {
-	dir, err := os.MkdirTemp("", "agentd-bin-")
+	dir, err := os.MkdirTemp("", "agtd-bin-")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	agentdBin = filepath.Join(dir, "agentd")
-	build := exec.Command("go", "build", "-o", agentdBin, "../../cmd/agentd")
+	agtdBin = filepath.Join(dir, "agtd")
+	build := exec.Command("go", "build", "-o", agtdBin, "../../cmd/agtd")
 	build.Stdout, build.Stderr = os.Stderr, os.Stderr
 	if err := build.Run(); err != nil {
-		fmt.Fprintln(os.Stderr, "building agentd for bench tests:", err)
+		fmt.Fprintln(os.Stderr, "building agtd for bench tests:", err)
 		os.Exit(1)
 	}
 	code := m.Run()
@@ -86,7 +86,7 @@ func processesUnder(t *testing.T, root string) []string {
 func TestRunSmall(t *testing.T) {
 	log := &logWriter{}
 	r, err := Run(context.Background(), Options{
-		Exe: agentdBin, Count: 3, OutputHeavy: 2, Attach: 2, Duration: 300 * time.Millisecond,
+		Exe: agtdBin, Count: 3, OutputHeavy: 2, Attach: 2, Duration: 300 * time.Millisecond,
 		FillLines: 2000, Parallel: 2, Log: log,
 	})
 	if err != nil {
@@ -154,7 +154,7 @@ func TestInterruptedRunCleansUp(t *testing.T) {
 		}
 		cancel()
 	}
-	_, err := Run(ctx, Options{Exe: agentdBin, Count: 4, Parallel: 4, FillLines: 0, Log: log})
+	_, err := Run(ctx, Options{Exe: agtdBin, Count: 4, Parallel: 4, FillLines: 0, Log: log})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run = %v, want it cancelled", err)
 	}

@@ -6,7 +6,7 @@
 
 **What:** Track whether the term "agent multiplexer" causes users to expect
 tmux-like pane management.
-**Why:** Design doc Open Question #1 — the word sets expectations agentd
+**Why:** Design doc Open Question #1 — the word sets expectations agtd
 deliberately doesn't meet.
 **When to act:** If 2+ of first 5 onboarded users express confusion.
 **Action:** Consider reframing to "agent supervisor" or "agent runtime".

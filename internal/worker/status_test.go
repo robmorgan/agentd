@@ -430,7 +430,7 @@ func TestProgramStatusFromThePTY(t *testing.T) {
 	}
 	h.eventually("done activity", func() bool { return h.record().Activity == session.ActivityDone })
 
-	// Clearing the records leaves a session agentd attaches no judgment
+	// Clearing the records leaves a session agtd attaches no judgment
 	// to: plainly working, status fields gone.
 	h.sendInput("clear\n")
 	h.eventually("back to plain working", func() bool {
@@ -770,7 +770,7 @@ func TestAlertMemoryCarriedAcrossHandoff(t *testing.T) {
 }
 
 // Value: protects=records ending (a clear) through the real publishOutput
-// leaving the session at plain working with no inferred event — agentd
+// leaving the session at plain working with no inferred event — agtd
 // attaches no judgment to a program that stopped reporting;
 // fails_when=afterFeed resurrects inference around setNative(nil), or the
 // cleared status columns stop being written through; seam=none

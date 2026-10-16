@@ -9,7 +9,7 @@ import (
 )
 
 // errDaemonRunning means another daemon holds the runtime root's lock.
-var errDaemonRunning = errors.New("agentd is already running")
+var errDaemonRunning = errors.New("agtd is already running")
 
 // acquireLock takes the runtime root's exclusive lock, which the daemon holds
 // for its whole lifetime. The kernel drops it when the process exits however

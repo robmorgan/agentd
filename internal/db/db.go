@@ -618,7 +618,7 @@ func (d *Database) MarkExitedIfActive(sessionID string) error {
 // still running.
 func (d *Database) MarkRecovered(sessionID string) error {
 	_, err := d.RecordEvent(NewEvent{SessionID: sessionID, Kind: session.EventRecovered,
-		Summary: "agentd restarted; the session kept running"})
+		Summary: "agtd restarted; the session kept running"})
 	return err
 }
 

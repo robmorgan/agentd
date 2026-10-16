@@ -165,7 +165,7 @@ func (s *Server) reconcileSessions() error {
 			// still starting, MarkRunning will now refuse it and it exits;
 			// if it claimed the session since the list was read, it keeps
 			// it, and is adopted like any running session.
-			if err := s.db.MarkFailedIfCreating(rec.SessionID, "agentd stopped while the session was starting"); err != nil {
+			if err := s.db.MarkFailedIfCreating(rec.SessionID, "agtd stopped while the session was starting"); err != nil {
 				return err
 			}
 		}
@@ -378,7 +378,7 @@ func (s *Server) spawnWorker(id string, args []string) (*exec.Cmd, <-chan struct
 	defer logFile.Close()
 
 	cmd := exec.Command(s.workerBin, args...)
-	cmd.Env = append(os.Environ(), "AGENTD_DIR="+s.paths.Root)
+	cmd.Env = append(os.Environ(), "AGTD_DIR="+s.paths.Root)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -403,7 +403,7 @@ func (s *Server) spawnWorker(id string, args []string) (*exec.Cmd, <-chan struct
 		// this worker's pid, so it cannot touch a newer session that has
 		// since reused the name.
 		if err := s.db.MarkWorkerLost(id, workerPID, "session worker exited unexpectedly"); err != nil {
-			fmt.Fprintf(os.Stderr, "agentd: failed to record worker exit for %s: %v\n", id, err)
+			fmt.Fprintf(os.Stderr, "agtd: failed to record worker exit for %s: %v\n", id, err)
 		}
 	}()
 	return cmd, exited, nil

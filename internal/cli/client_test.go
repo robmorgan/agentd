@@ -102,7 +102,7 @@ func TestSessionCommandsRefuseIncompatibleDaemon(t *testing.T) {
 	}
 }
 
-// The daemon owns stale-socket cleanup (under agentd.lock), so a start
+// The daemon owns stale-socket cleanup (under agtd.lock), so a start
 // that never answers leaves the socket and pid file alone, even when the
 // pid file names a live process, and points at the daemon log.
 func TestStartDaemonTimesOutWithoutTouchingSocketOrPIDFile(t *testing.T) {
@@ -114,7 +114,7 @@ func TestStartDaemonTimesOutWithoutTouchingSocketOrPIDFile(t *testing.T) {
 	os.WriteFile(c.paths.Socket, nil, 0o600)
 	start := time.Now()
 	err := c.startDaemon("/usr/bin/true", 300*time.Millisecond)
-	if err == nil || !strings.Contains(err.Error(), "timed out waiting for agentd to start") || !strings.Contains(err.Error(), filepath.Join(dir, "agentd.log")) {
+	if err == nil || !strings.Contains(err.Error(), "timed out waiting for agtd to start") || !strings.Contains(err.Error(), filepath.Join(dir, "agtd.log")) {
 		t.Fatalf("got %v", err)
 	}
 	if time.Since(start) > 5*time.Second {

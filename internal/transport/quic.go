@@ -16,7 +16,7 @@ import (
 )
 
 // ALPN identifies the agent protocol inside QUIC's TLS handshake.
-const ALPN = "agentd"
+const ALPN = "agtd"
 
 // DeadPeerTimeout is how long a connection may go without hearing from its
 // peer before it is closed. A client that vanishes without closing (a laptop
@@ -212,7 +212,7 @@ func ListenQUIC(addr string, id *Identity, opts QUICOptions) (*QUICListener, err
 			if cs.NegotiatedProtocol == PairALPN {
 				// Any key may pair, but only while a window is open.
 				if !opts.Pairing.accepting() {
-					return errors.New("agentd is not pairing")
+					return errors.New("agtd is not pairing")
 				}
 				return nil
 			}
@@ -266,7 +266,7 @@ func (q *QUICListener) acceptConns() {
 		}
 		entry := &connEntry{fingerprint: fp, connectedAt: time.Now()}
 		if !q.track(conn, entry) {
-			conn.CloseWithError(0, "agentd is shutting down")
+			conn.CloseWithError(0, "agtd is shutting down")
 			return
 		}
 		if q.opts.OnConnect != nil {
@@ -409,7 +409,7 @@ func (q *QUICListener) Close() error {
 	q.conns = map[*quic.Conn]*connEntry{}
 	q.mu.Unlock()
 	for conn := range conns {
-		conn.CloseWithError(0, "agentd is shutting down")
+		conn.CloseWithError(0, "agtd is shutting down")
 	}
 	return q.l.Close()
 }
@@ -541,7 +541,7 @@ func dialOne(ctx context.Context, addr string, id *Identity, pinned, alpn string
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{id.cert},
 		NextProtos:   []string{alpn},
-		ServerName:   "agentd",
+		ServerName:   "agtd",
 		// The daemon's certificate is self-signed; it is trusted only by
 		// its pinned key fingerprint, checked below. TLS still checks the
 		// handshake signature, so the daemon proves it holds that key.

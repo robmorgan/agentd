@@ -192,7 +192,7 @@ func TestManagementShutdownGoldenFrame(t *testing.T) {
 
 func TestManagementStatusResponseRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
-	status := &ManagementStatus{DaemonVersion: "0.1.0", ProtocolVersion: ProtocolVersion, PID: 42, Root: "/r", Socket: "/r/agentd.sock", RunningSessions: true, Remote: "100.64.0.5:7433"}
+	status := &ManagementStatus{DaemonVersion: "0.1.0", ProtocolVersion: ProtocolVersion, PID: 42, Root: "/r", Socket: "/r/agtd.sock", RunningSessions: true, Remote: "100.64.0.5:7433"}
 	if err := WriteManagementResponse(&buf, &ManagementResponse{Status: status}); err != nil {
 		t.Fatal(err)
 	}

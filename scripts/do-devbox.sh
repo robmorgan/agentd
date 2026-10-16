@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Creates a DigitalOcean droplet running agentd, paired with this machine, so
+# Creates a DigitalOcean droplet running agtd, paired with this machine, so
 # that `agt --host NAME ...` works right away; and destroys it again.
 #
 #   scripts/do-devbox.sh create NAME [options]
@@ -7,27 +7,27 @@
 #   scripts/do-devbox.sh ls
 #
 # create:
-#   1. makes sure the `agentd` firewall exists: SSH and agentd's QUIC port
+#   1. makes sure the `agtd` firewall exists: SSH and agtd's QUIC port
 #      (UDP 7433) in, everything out; it applies to every droplet tagged
-#      `agentd`, so a droplet is covered from its first boot
-#   2. creates the droplet (Ubuntu 24.04, tagged `agentd`) with the SSH keys of
+#      `agtd`, so a droplet is covered from its first boot
+#   2. creates the droplet (Ubuntu 24.04, tagged `agtd`) with the SSH keys of
 #      your DigitalOcean account that this machine holds
 #   3. as root: waits for cloud-init, creates a sudo user with root's SSH keys,
 #      adds swap when the droplet has under 4 GB of memory (building
 #      libghostty needs it)
-#   4. as that user: runs install.sh, which builds agentd and installs the
+#   4. as that user: runs install.sh, which builds agtd and installs the
 #      systemd unit that starts it at boot, and installs Claude Code
 #   5. listens on the droplet's public address (only paired keys can connect)
 #      and pairs this machine with it: `agt host add NAME ADDRESS --code ...`
 #
-# destroy deletes the droplet (only one tagged `agentd`), forgets its SSH host
+# destroy deletes the droplet (only one tagged `agtd`), forgets its SSH host
 # key, and removes the host from `agt host ls`. The firewall is kept for the
 # next droplet.
 #
 # Options for create:
 #   --region SLUG   droplet region (default ${DO_REGION:-sgp1}; see `doctl compute region list`)
 #   --size SLUG     droplet size (default ${DO_SIZE:-s-2vcpu-4gb}; see `doctl compute size list`)
-#   --user NAME     the user agentd runs as (default: your local user name)
+#   --user NAME     the user agtd runs as (default: your local user name)
 #   --ref REF       build this branch, tag or commit of github.com/robmorgan/agtd (default main)
 #   --local         build this checkout's working tree instead (tracked files, uncommitted changes included)
 #   --no-claude     do not install Claude Code
@@ -39,9 +39,9 @@
 # shellcheck disable=SC2088,SC2029
 set -euo pipefail
 
-TAG="agentd"           # every droplet this script manages, and the firewall's target
-FIREWALL="agentd"
-PORT=7433              # agentd's default QUIC port
+TAG="agtd"           # every droplet this script manages, and the firewall's target
+FIREWALL="agtd"
+PORT=7433              # agtd's default QUIC port
 IMAGE="ubuntu-24-04-x64"
 REPO_RAW="https://raw.githubusercontent.com/robmorgan/agtd"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR)
@@ -62,7 +62,7 @@ need() {
 }
 
 # droplet_field NAME FIELD prints FIELD (a doctl column, e.g. ID or
-# PublicIPv4) of the droplet tagged agentd and called NAME, if any.
+# PublicIPv4) of the droplet tagged agtd and called NAME, if any.
 droplet_field() {
   doctl compute droplet list --tag-name "${TAG}" --format "Name,$2" --no-header |
     awk -v n="$1" '$1 == n { print $2; exit }'
@@ -99,13 +99,13 @@ ensure_firewall() {
     >/dev/null
 }
 
-# remote_agentd runs agentd with ARGS on TARGET from a login shell. Commands
+# remote_agtd runs agtd with ARGS on TARGET from a login shell. Commands
 # that start or restart the daemon pass their environment on to it, and so to
 # every session: a login shell's PATH has ~/.local/bin, where claude is.
-remote_agentd() {
+remote_agtd() {
   local target="$1"
   shift
-  ssh "${SSH_OPTS[@]}" "${target}" "bash -lc $(printf '%q' "~/.local/bin/agentd $*")"
+  ssh "${SSH_OPTS[@]}" "${target}" "bash -lc $(printf '%q' "~/.local/bin/agtd $*")"
 }
 
 wait_for_ssh() {
@@ -127,8 +127,8 @@ set -euo pipefail
 user="$1"
 cloud-init status --wait >/dev/null 2>&1 || true
 id -u "${user}" >/dev/null 2>&1 || useradd -m -s /bin/bash -G sudo "${user}"
-echo "${user} ALL=(ALL) NOPASSWD:ALL" >"/etc/sudoers.d/90-agentd-${user}"
-chmod 0440 "/etc/sudoers.d/90-agentd-${user}"
+echo "${user} ALL=(ALL) NOPASSWD:ALL" >"/etc/sudoers.d/90-agtd-${user}"
+chmod 0440 "/etc/sudoers.d/90-agtd-${user}"
 home="$(getent passwd "${user}" | cut -d: -f6)"
 install -d -m 0700 -o "${user}" -g "${user}" "${home}/.ssh"
 install -m 0600 -o "${user}" -g "${user}" /root/.ssh/authorized_keys "${home}/.ssh/authorized_keys"
@@ -144,26 +144,26 @@ fi
 EOF
 }
 
-# install_agentd builds and installs agentd as the droplet's user, from the
+# install_agtd builds and installs agtd as the droplet's user, from the
 # ref on GitHub or from this checkout.
-install_agentd() {
+install_agtd() {
   local target="$1" ref="$2" local_src="$3"
   if [[ "${local_src}" == 1 ]]; then
     local root
     root="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
-    step "Installing agentd from this checkout (${root})"
+    step "Installing agtd from this checkout (${root})"
     # Tracked files deleted in the working tree are left out, or tar would
     # fail on them. COPYFILE_DISABLE and --no-xattrs keep macOS metadata out
     # of the archive.
     git -C "${root}" ls-files -z |
       while IFS= read -r -d '' f; do [[ -e "${root}/${f}" ]] && printf '%s\0' "${f}"; done |
       COPYFILE_DISABLE=1 tar -C "${root}" --null -T - --no-xattrs -czf - |
-      ssh "${SSH_OPTS[@]}" "${target}" 'rm -rf ~/src/agentd && mkdir -p ~/src/agentd && tar -xzf - -C ~/src/agentd'
-    ssh "${SSH_OPTS[@]}" "${target}" '~/src/agentd/install.sh'
+      ssh "${SSH_OPTS[@]}" "${target}" 'rm -rf ~/src/agtd && mkdir -p ~/src/agtd && tar -xzf - -C ~/src/agtd'
+    ssh "${SSH_OPTS[@]}" "${target}" '~/src/agtd/install.sh'
   else
-    step "Installing agentd (${ref})"
+    step "Installing agtd (${ref})"
     ssh "${SSH_OPTS[@]}" "${target}" \
-      "curl -fsSL '${REPO_RAW}/${ref}/install.sh' | AGENTD_REF='${ref}' bash"
+      "curl -fsSL '${REPO_RAW}/${ref}/install.sh' | AGTD_REF='${ref}' bash"
   fi
 }
 
@@ -183,7 +183,7 @@ pair() {
   tmp="$(mktemp -d)"
   out="${tmp}/pair.out"
   step "Pairing this machine with ${name}"
-  remote_agentd "${target}" remote pair >"${out}" 2>&1 &
+  remote_agtd "${target}" remote pair >"${out}" 2>&1 &
   pid=$!
   for _ in $(seq 1 150); do
     code="$(sed -n 's/^Pairing code: //p' "${out}")"
@@ -195,12 +195,12 @@ pair() {
     kill "${pid}" 2>/dev/null || true
     sed 's/^/    /' "${out}" >&2
     rm -rf "${tmp}"
-    die "agentd remote pair did not show a code"
+    die "agtd remote pair did not show a code"
   fi
   if ! agt host add "${name}" "${address}" --code "${code}"; then
     kill "${pid}" 2>/dev/null || true
     rm -rf "${tmp}"
-    die "pairing failed; retry with: ssh ${target} ~/.local/bin/agentd remote pair"
+    die "pairing failed; retry with: ssh ${target} ~/.local/bin/agtd remote pair"
   fi
   wait "${pid}" || true
   rm -rf "${tmp}"
@@ -253,11 +253,11 @@ cmd_create() {
   step "Setting up user ${user}"
   bootstrap "${ip}" "${user}"
   local target="${user}@${ip}"
-  install_agentd "${target}" "${ref}" "${local_src}"
+  install_agtd "${target}" "${ref}" "${local_src}"
   [[ "${claude}" == 1 ]] && install_claude "${target}"
 
   step "Accepting remote clients on ${ip}:${PORT}"
-  remote_agentd "${target}" remote enable "${ip}:${PORT}" --yes >/dev/null
+  remote_agtd "${target}" remote enable "${ip}:${PORT}" --yes >/dev/null
   pair "${target}" "${name}" "${ip}:${PORT}"
 
   step "Ready"

@@ -20,7 +20,7 @@ func (c *client) requireStats() error {
 		return err
 	}
 	if !protocol.HasCapability(w.Capabilities, protocol.CapRuntimeStats) {
-		return fmt.Errorf("this agentd (%s) does not report resource usage; %s", w.DaemonVersion, upgradeHint)
+		return fmt.Errorf("this agtd (%s) does not report resource usage; %s", w.DaemonVersion, upgradeHint)
 	}
 	return nil
 }

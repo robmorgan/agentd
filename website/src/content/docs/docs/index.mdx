@@ -16,12 +16,12 @@ On macOS, Debian/Ubuntu or Arch (Omarchy included), run the install script:
 
 <Terminal title="shell" commands={['curl -fsSL https://agtd.sh/install.sh | bash']} />
 
-It installs `agt` and `agentd` side by side in `~/.local/bin`. Set `AGENTD_PREFIX` to change the prefix. The script can be run again at any time:
+It installs `agt` and `agtd` side by side in `~/.local/bin`. Set `AGTD_PREFIX` to change the prefix. The script can be run again at any time:
 
 - Missing base packages come from apt or pacman. On macOS it asks for the Xcode command line tools.
 - Go and Zig are used from `PATH` when new enough; otherwise pinned releases are downloaded for the build only.
 - Binaries are only replaced when the build differs. A running daemon hands its sessions to the new binary without stopping them.
-- On Linux with systemd it installs a user unit, so the daemon starts at boot. `AGENTD_NO_SERVICE=1` skips this.
+- On Linux with systemd it installs a user unit, so the daemon starts at boot. `AGTD_NO_SERVICE=1` skips this.
 
 <Note title="Remote access stays off">
 	The installer never turns on remote access. See [Enable on a devbox](/docs/remote/enable/) when you want it.

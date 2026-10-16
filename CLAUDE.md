@@ -1,29 +1,29 @@
-You are working in the `agentd` repository: a daemon runtime for supervising coding agents as durable tasks. It is one Go module: the daemon (`agentd serve` plus one `agentd session-worker` per session) and the `agt` CLI (`cmd/agt`, `internal/cli`), with QUIC as the remote transport.
+You are working in the `agtd` repository: a daemon runtime for supervising coding agents as durable tasks. It is one Go module: the daemon (`agtd serve` plus one `agtd session-worker` per session) and the `agt` CLI (`cmd/agt`, `internal/cli`), with QUIC as the remote transport.
 
 Before larger changes, read `README.md`, `ARCHITECTURE.md` and `ROADMAP.md`. The code is the source of truth for current behavior.
 
 # Product direction
 
-`agentd` is:
+`agtd` is:
 
 > A daemon runtime for supervising coding agents as durable tasks.
 
 The central abstraction is not a terminal multiplexer.
 
-`agentd` should own long-running coding-agent sessions and make those sessions durable, reconnectable, remotely accessible, and observable.
+`agtd` should own long-running coding-agent sessions and make those sessions durable, reconnectable, remotely accessible, and observable.
 
-The machine where the work runs should run `agentd`.
+The machine where the work runs should run `agtd`.
 
 Examples:
 
 ```text
 MacBook
-└── agentd
+└── agtd
     ├── Claude Code
     └── Codex
 
 Linux devbox
-└── agentd
+└── agtd
     ├── Claude Code
     ├── Codex
     └── shell
@@ -54,7 +54,7 @@ The architecture, with the remote transport still to come, is approximately:
                        │
                        ▼
               ┌──────────────────┐
-              │      agentd      │
+              │      agtd      │
               │        Go        │
               │                  │
               │ task manager     │
@@ -87,7 +87,7 @@ agt --host devbox attach foo
 
 Linux devbox
 
-agentd
+agtd
  ├── PTY
  ├── terminal state
  └── Claude Code
@@ -225,7 +225,7 @@ Assume connectivity can initially come from:
 
 Do not implement NAT traversal, relays, accounts, organizations, or SaaS infrastructure.
 
-## 5. Sessions belong to agentd, not connections
+## 5. Sessions belong to agtd, not connections
 
 A network connection is ephemeral.
 
@@ -241,7 +241,7 @@ client
 connection #1
    │
    ▼
-agentd ─────── session
+agtd ─────── session
                   │
                   └── coding agent continues
 
@@ -252,12 +252,12 @@ client
 connection #2
    │
    ▼
-agentd ─────── same session
+agtd ─────── same session
 ```
 
 This distinction should influence the internal API now.
 
-## 6. Keep agentd agent-specific
+## 6. Keep agtd agent-specific
 
 Do not turn this into a generic distributed execution platform.
 
@@ -274,7 +274,7 @@ Preserve and strengthen concepts such as:
 - agent lifecycle
 - durable interactive sessions
 
-`agentd` should answer:
+`agtd` should answer:
 
 > Which agent needs my attention?
 
@@ -285,7 +285,7 @@ rather than merely:
 # Package layout
 
 ```text
-cmd/agentd/          serve, upgrade, remote, bench, session-worker
+cmd/agtd/          serve, upgrade, remote, bench, session-worker
 cmd/agt/             the `agt` CLI (and its end-to-end PTY tests)
 internal/
   cli/               the CLI: commands, picker, attach, overlay
@@ -299,7 +299,7 @@ internal/
   paths/             runtime root
   config/            config.toml
   procstat/          process resource usage from the OS and the Go runtime
-  bench/             `agentd bench sessions`
+  bench/             `agtd bench sessions`
 scripts/             libghostty-vt build helper
 ```
 
@@ -428,7 +428,7 @@ When QUIC work begins, evaluate the current Go QUIC ecosystem and select an appr
 
 Do not add QUIC merely to satisfy the roadmap before the protocol and session ownership boundaries are clean.
 
-When real `agentd` workloads expose bugs or meaningful inefficiencies in dependencies, prefer producing clean upstream fixes rather than maintaining unnecessary forks.
+When real `agtd` workloads expose bugs or meaningful inefficiencies in dependencies, prefer producing clean upstream fixes rather than maintaining unnecessary forks.
 
 # CLI
 
@@ -460,7 +460,7 @@ agt remote id
 
 Do not rename commands merely because implementation internals changed.
 
-The CLI binary is `agt`. Its old name, `agent`, collides with Cursor's and Grok's CLIs, which install an `agent` of their own into `~/.local/bin`; `install.sh` only links `agent` to `agt` when nothing else owns the name.
+The CLI binary is `agt` and the daemon is `agtd`. Do not install or link the CLI's old name, `agent`: Cursor's and Grok's CLIs install an `agent` of their own into `~/.local/bin`.
 
 # Non-goals
 
@@ -519,19 +519,19 @@ Done:
 - Liveness is checked through the worker sockets, and a flock enforces a single daemon.
 - Attach fan-out and PTY input are bounded, and the runtime root is private to the user.
 - The transport split: the daemon serves `transport.Stream`s from any `transport.Listener`.
-- The daemon's QUIC listener (off unless `[remote] listen` is set): one QUIC stream per control stream, attachment or transfer, mutual TLS with pinned Ed25519 keys, managed with `agentd remote id|list|authorize|revoke`.
-- `agentd remote enable [ADDRESS] | disable | status`: detects a Tailscale address (or asks about the default-route one), edits `[remote] listen`, restarts the daemon; an unbindable listen address is retried in the background.
+- The daemon's QUIC listener (off unless `[remote] listen` is set): one QUIC stream per control stream, attachment or transfer, mutual TLS with pinned Ed25519 keys, managed with `agtd remote id|list|authorize|revoke`.
+- `agtd remote enable [ADDRESS] | disable | status`: detects a Tailscale address (or asks about the default-route one), edits `[remote] listen`, restarts the daemon; an unbindable listen address is retried in the background.
 - The CLI's QUIC client: `agt --host NAME` and `NAME/session` addresses, `agt host add|ls|rm` (confirm-on-first-use key pinning in `hosts.toml`), and `agt remote id` (`remote/client.key`).
-- Pairing: `agentd remote pair` shows a one-time 9-digit code and `agt host add NAME ADDRESS --code CODE` uses it to pin the daemon's key and authorize the client's in one step (CPace PAKE over the `agentd-pair` ALPN, bound to both keys and the TLS connection; one window at a time, 5 minutes, 3 wrong codes; `internal/transport/pair.go`).
+- Pairing: `agtd remote pair` shows a one-time 9-digit code and `agt host add NAME ADDRESS --code CODE` uses it to pin the daemon's key and authorize the client's in one step (CPace PAKE over the `agtd-pair` ALPN, bound to both keys and the TLS connection; one window at a time, 5 minutes, 3 wrong codes; `internal/transport/pair.go`).
 - Dead remote clients are noticed within 15s, and a remote attachment that loses its connection reconnects and reattaches by itself.
 - Git state and artifacts, read-only (`internal/repo`): a session records its base commit at creation; `GetGitState` (commits and changed files since the base, untracked included) and artifact streams (`diff`, `patch`, `history`, `history.vt`) in bounded chunks under flow control; `agt diff`, `agt artifacts`, `agt artifact`, and a git section in `agt status`, locally and over QUIC.
 - Session resumption: per-incarnation session UIDs (a reattach never lands on a recreated session), attach ids unique per incarnation, reattach replaces the lost attachment at once, lagging clients are resynced from an exact-boundary snapshot, every output/input buffer is bounded (ARCHITECTURE.md lists them), and lifecycle requests carry tokens so a remote CLI retries them safely after a lost connection.
 - The connection handshake (`Hello`/`Welcome`): version and capability negotiation, host description, and a control stream of tagged requests; stream roles are set by a stream's first frame.
 - Events and attention: workers read bells, OSC 9/777 notifications, idleness and the PTY's foreground process; lifecycle and attention events persist in `state.db` (resumable ids, bounded per session); attach acknowledges; events streams (`SubscribeEvents`) feed `agt events --follow [--notify|--exec]`, locally or remotely; `ls`, `status`, the picker and the overlay show attention and activity.
-- Live worker handoff: `agentd upgrade` / `agt daemon upgrade` replace the daemon, then each session's worker re-execs into the new binary keeping its pid, agent, PTY, socket and exact terminal state (libghostty snapshot); attachments, local ones included, reattach by themselves. Restart and crash guarantees are documented in ARCHITECTURE.md.
+- Live worker handoff: `agtd upgrade` / `agt daemon upgrade` replace the daemon, then each session's worker re-execs into the new binary keeping its pid, agent, PTY, socket and exact terminal state (libghostty snapshot); attachments, local ones included, reattach by themselves. Restart and crash guarantees are documented in ARCHITECTURE.md.
 
 - Host health (`agt hosts`), machine capabilities (`agt host info`), and placement hints (`agt --host auto new`).
-- Resource usage: workers and the daemon report their own (`GetSessionStats`/`GetDaemonStats`, `agt status --stats`, `agt daemon stats`), and `agentd bench sessions` measures sessions at scale (BENCHMARKS.md, "Sessions at scale").
+- Resource usage: workers and the daemon report their own (`GetSessionStats`/`GetDaemonStats`, `agt status --stats`, `agt daemon stats`), and `agtd bench sessions` measures sessions at scale (BENCHMARKS.md, "Sessions at scale").
 
 - Cross-host discovery (`agt ls --all`, `agt events --all`) and global session ids (daemon id + session UID).
 - Program status (OSC 7501) as the sole attention source: libghostty parses the reports, the worker keeps the records (`internal/worker/status.go`) and answers the detection query, the program's word decides activity/attention (blocked/done/error activities and events; progress, app, kind and message in `state.db` v6 and under `CapSessionStatus`), and records survive handoffs. The bell/notification/idle heuristics were removed once Claude Code adopted the protocol: a non-reporting program shows as plainly running, bells/notifications are info-only observability events, and the stall watch (non-reporting foreground command silent for 30m) is the one remaining timing signal.
@@ -545,7 +545,7 @@ Next:
 
 Known gaps:
 - History is only saved when a session exits.
-- Agents are not sandboxed: they run as the daemon's user and can reach its socket, although `AGENTD_SOCKET` is no longer injected.
+- Agents are not sandboxed: they run as the daemon's user and can reach its socket, although `AGTD_SOCKET` is no longer injected.
 
 Do not begin QUIC before the transport split: the session and ownership model has to be clean first.
 
@@ -560,7 +560,7 @@ agt --host devbox new --cwd /srv/repo auth-refactor
 The user asks Claude Code to refactor authentication and run the tests. The remote machine runs:
 
 ```text
-agentd
+agtd
   │
   └── PTY
        │
@@ -581,7 +581,7 @@ agt attach devbox/auth-refactor
 
 The client establishes a new QUIC connection.
 
-`agentd` locates the existing session, provides the current terminal state, attaches the client to the live PTY, and interaction continues.
+`agtd` locates the existing session, provides the current terminal state, attaches the client to the live PTY, and interaction continues.
 
 That is the architectural destination.
 

@@ -9,19 +9,19 @@ import (
 
 func TestDiscoverRootPriority(t *testing.T) {
 	cases := []struct {
-		name                   string
-		agentd, xdg, home, tmp string
-		want                   string
+		name                 string
+		agtd, xdg, home, tmp string
+		want                 string
 	}{
-		{"agentd dir wins", "/custom", "/run/user/501", "/home/t", "/var/tmp", "/custom"},
+		{"agtd dir wins", "/custom", "/run/user/501", "/home/t", "/var/tmp", "/custom"},
 		// Home wins over XDG_RUNTIME_DIR: /run/user is wiped on reboot.
-		{"home next", "", "/run/user/501", "/home/t", "/var/tmp", "/home/t/.agentd"},
-		{"xdg without home", "", "/run/user/501", "", "/var/tmp", "/run/user/501/agentd"},
-		{"tmpdir uid", "", "", "", "/var/tmp", "/var/tmp/agentd-501"},
-		{"tmp fallback", "", "", "", "", "/tmp/agentd-501"},
+		{"home next", "", "/run/user/501", "/home/t", "/var/tmp", "/home/t/.agtd"},
+		{"xdg without home", "", "/run/user/501", "", "/var/tmp", "/run/user/501/agtd"},
+		{"tmpdir uid", "", "", "", "/var/tmp", "/var/tmp/agtd-501"},
+		{"tmp fallback", "", "", "", "", "/tmp/agtd-501"},
 	}
 	for _, c := range cases {
-		got, err := discoverRoot(c.agentd, c.xdg, c.home, c.tmp, 501)
+		got, err := discoverRoot(c.agtd, c.xdg, c.home, c.tmp, 501)
 		if err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}
@@ -32,11 +32,11 @@ func TestDiscoverRootPriority(t *testing.T) {
 }
 
 func TestDerivedPaths(t *testing.T) {
-	p := FromRoot("/Users/t/.agentd")
-	if p.Socket != "/Users/t/.agentd/agentd.sock" || p.SessionSocketPath("x") != "/Users/t/.agentd/sessions/x.sock" {
+	p := FromRoot("/Users/t/.agtd")
+	if p.Socket != "/Users/t/.agtd/agtd.sock" || p.SessionSocketPath("x") != "/Users/t/.agtd/sessions/x.sock" {
 		t.Fatalf("unexpected paths: %+v", p)
 	}
-	if p.ClientKeyPath() != "/Users/t/.agentd/remote/client.key" || p.HostsPath() != "/Users/t/.agentd/hosts.toml" {
+	if p.ClientKeyPath() != "/Users/t/.agtd/remote/client.key" || p.HostsPath() != "/Users/t/.agtd/hosts.toml" {
 		t.Fatalf("unexpected remote paths: %q %q", p.ClientKeyPath(), p.HostsPath())
 	}
 }

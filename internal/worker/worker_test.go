@@ -39,7 +39,7 @@ while IFS= read -r l; do
     size) stty size;;
     stall) stty raw; sleep 3; stty -raw; echo unstalled;;
     bye) i=0; while [ $i -lt 2000 ]; do echo "tail $i"; i=$((i+1)); done; echo final-line; exit 0;;
-    where) echo "pwd:$(pwd -P)"; echo "cwd:$AGENTD_CWD";;
+    where) echo "pwd:$(pwd -P)"; echo "cwd:$AGTD_CWD";;
     flood) i=0; while [ $i -lt 20000 ]; do echo "line $i padding padding padding padding"; i=$((i+1)); done; echo flood-done;;
     bigflood) seq -f "line %g padding padding padding padding" 1 200000; echo flood-done;;
     *) echo "got:$l";;
@@ -65,7 +65,7 @@ func startWorker(t testing.TB) *harness {
 }
 
 // newRoot creates a runtime root with one session row and points
-// AGENTD_DIR at it.
+// AGTD_DIR at it.
 func newRoot(t testing.TB) (string, *harness) {
 	t.Helper()
 	// Unix socket paths are limited to ~104 bytes, so avoid t.TempDir().
@@ -74,7 +74,7 @@ func newRoot(t testing.TB) (string, *harness) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
-	t.Setenv("AGENTD_DIR", dir)
+	t.Setenv("AGTD_DIR", dir)
 
 	p := paths.FromRoot(dir)
 	if err := p.EnsureLayout(); err != nil {
@@ -619,7 +619,7 @@ func isConnClosed(err error) bool {
 }
 
 // TestAgentRunsInCwd checks that the agent process starts in Args.Cwd and
-// sees it through AGENTD_CWD. The directory is
+// sees it through AGTD_CWD. The directory is
 // deliberately not a git repository.
 func TestAgentRunsInCwd(t *testing.T) {
 	h := startWorker(t)
@@ -649,7 +649,7 @@ func TestMissingCwdFailsBeforeSpawn(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
-	t.Setenv("AGENTD_DIR", dir)
+	t.Setenv("AGTD_DIR", dir)
 
 	err = Run(Args{
 		SessionID: "missing", Cwd: filepath.Join(dir, "does-not-exist"), UID: "u",

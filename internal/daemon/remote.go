@@ -19,12 +19,12 @@ import (
 	"github.com/robmorgan/agtd/internal/config"
 )
 
-// DefaultRemotePort is the UDP port `agentd remote enable` listens on when
+// DefaultRemotePort is the UDP port `agtd remote enable` listens on when
 // the address does not name one.
 const DefaultRemotePort = "7433"
 
 // AddressKind says what kind of network an address is on, which decides
-// whether `agentd remote enable` may use a detected address without asking.
+// whether `agtd remote enable` may use a detected address without asking.
 type AddressKind int
 
 const (
@@ -71,7 +71,7 @@ func mustCIDR(s string) *net.IPNet {
 	return n
 }
 
-// ListenCandidate is an address `agentd remote enable` could listen on.
+// ListenCandidate is an address `agtd remote enable` could listen on.
 type ListenCandidate struct {
 	IP   net.IP
 	Kind AddressKind

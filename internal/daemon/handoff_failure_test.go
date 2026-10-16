@@ -25,7 +25,7 @@ args = ["-c", '''stty raw -echo; echo stalled; sleep 6; echo resumed; head -c 10
 `
 
 // writeScript writes an executable shell script standing in for a broken
-// agentd binary.
+// agtd binary.
 func writeScript(t *testing.T, name, body string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), name)
@@ -45,11 +45,11 @@ func TestHandoffToABadBinaryKeepsTheSession(t *testing.T) {
 	before := h.session(id)
 
 	for name, exe := range map[string]string{
-		"missing":             filepath.Join(t.TempDir(), "agentd"),
+		"missing":             filepath.Join(t.TempDir(), "agtd"),
 		"exits at once":       writeScript(t, "crashing", "exit 1"),
-		"not agentd":          writeScript(t, "other", "echo agentd 0.0.1"),
+		"not agtd":            writeScript(t, "other", "echo agtd 0.0.1"),
 		"a directory":         h.cwd,
-		"newer handoff only":  writeScript(t, "future", `echo "agentd session-worker handoff 99"`),
+		"newer handoff only":  writeScript(t, "future", `echo "agtd session-worker handoff 99"`),
 		"hangs on the probe?": writeScript(t, "slow", "exit 3"),
 	} {
 		results := h.handoff(exe)
@@ -115,7 +115,7 @@ func TestHandoffToABinaryThatDiesAfterExec(t *testing.T) {
 	id := h.mustCreate("")
 	rec := h.session(id)
 	// Passes the probe, then exits instead of resuming.
-	exe := writeScript(t, "liar", `if [ "$2" = --handoff-probe ]; then echo "agentd session-worker handoff 1"; exit 0; fi; exit 1`)
+	exe := writeScript(t, "liar", `if [ "$2" = --handoff-probe ]; then echo "agtd session-worker handoff 1"; exit 0; fi; exit 1`)
 
 	results := h.handoff(exe)
 	if len(results) != 1 || !results[0].Lost || results[0].HandedOff != nil {
@@ -245,7 +245,7 @@ func TestHandoffExecFailureKeepsTheSession(t *testing.T) {
 	c.input("before\n")
 	c.expectOutput("got:before")
 	before := h.session(id)
-	exe := writeScript(t, "vanishing", `echo "agentd session-worker handoff 1"; rm -f "$0"`)
+	exe := writeScript(t, "vanishing", `echo "agtd session-worker handoff 1"; rm -f "$0"`)
 
 	results := h.handoff(exe)
 	if len(results) != 1 || results[0].HandedOff != nil || results[0].Lost || results[0].Err == nil ||

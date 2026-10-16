@@ -57,7 +57,7 @@ func TestReconnectable(t *testing.T) {
 			t.Errorf("local: %v is not reconnectable", err)
 		}
 	}
-	if !strings.Contains(local.reconnectStatus(errAttachDropped), "connection to agentd lost") ||
+	if !strings.Contains(local.reconnectStatus(errAttachDropped), "connection to agtd lost") ||
 		!strings.Contains(remote.reconnectStatus(errAttachDropped), "connection to dev lost") ||
 		!strings.Contains(local.reconnectStatus(errSessionRestarting), "session restarting") {
 		t.Fatal("unexpected reconnect status")

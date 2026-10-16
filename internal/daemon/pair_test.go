@@ -10,7 +10,7 @@ import (
 	"github.com/robmorgan/agtd/internal/transport"
 )
 
-// startPair runs `agentd remote pair` against the harness daemon and
+// startPair runs `agtd remote pair` against the harness daemon and
 // returns the code it shows and where its result will arrive.
 func startPair(h *harness, ctx context.Context) (string, <-chan error) {
 	h.t.Helper()
@@ -54,7 +54,7 @@ func TestPairingAuthorizesARemoteClient(t *testing.T) {
 	if len(clients) != 1 || clients[0].Fingerprint != client.Fingerprint || clients[0].Name != "laptop" {
 		t.Fatalf("authorized clients = %+v", clients)
 	}
-	// The pairing is on record, recorded before `agentd remote pair` heard
+	// The pairing is on record, recorded before `agtd remote pair` heard
 	// of it.
 	if evs := hostEvents(h); kinds(evs) != "paired" ||
 		evs[0].Summary != "laptop ("+client.Fingerprint+") paired from 127.0.0.1" {
@@ -65,7 +65,7 @@ func TestPairingAuthorizesARemoteClient(t *testing.T) {
 	}
 }
 
-// Interrupting `agentd remote pair` closes its window at once.
+// Interrupting `agtd remote pair` closes its window at once.
 func TestCancellingPairClosesTheWindow(t *testing.T) {
 	h := newHarnessWithConfig(t, remoteConfig)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -90,7 +90,7 @@ func TestCancellingPairClosesTheWindow(t *testing.T) {
 func TestPairNeedsRemoteAccess(t *testing.T) {
 	h := newHarness(t)
 	_, err := Pair(context.Background(), h.paths, func(*protocol.ManagementPairing) { t.Fatal("window opened") })
-	if err == nil || !strings.Contains(err.Error(), "agentd remote enable") {
+	if err == nil || !strings.Contains(err.Error(), "agtd remote enable") {
 		t.Fatalf("err = %v", err)
 	}
 }

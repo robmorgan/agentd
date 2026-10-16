@@ -1,4 +1,4 @@
-# A Linux build and test environment for agentd: `make test-linux` runs the
+# A Linux build and test environment for agtd: `make test-linux` runs the
 # test suite in it, so Linux-only code (PTY and process handling differ
 # from macOS) gets exercised from a Mac. Go and Zig match the versions the
 # README requires.

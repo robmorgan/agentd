@@ -26,7 +26,7 @@ go run internal/worker/testdata/record.go -only vim -v    # one, printing the sc
 ```
 
 It needs libghostty-vt (`PKG_CONFIG_PATH` as in the `Makefile`), and the programs on `PATH`.
-Each program runs in a scratch directory, `/tmp/agentd-demo`, which is created and removed for each
+Each program runs in a scratch directory, `/tmp/agtd-demo`, which is created and removed for each
 recording. The recorder feeds the output through libghostty-vt as the worker does, so terminal
 queries are answered and each scripted step can wait for text on the screen; keys are typed one at
 a time. The shell, editors and clang get a minimal environment with `HOME` set to the scratch

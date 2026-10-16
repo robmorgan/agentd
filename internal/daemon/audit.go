@@ -15,7 +15,7 @@ import (
 
 // Host events (db.RecordHostEvent) are the audit record of who can reach
 // this daemon remotely: pairings, revocations noticed on live connections,
-// and remote connections. `agentd remote authorize` and `revoke` run
+// and remote connections. `agtd remote authorize` and `revoke` run
 // outside the daemon and record their own.
 
 // connectAuditInterval is how often a connection from the same key and
@@ -28,14 +28,14 @@ const connectAuditInterval = 10 * time.Minute
 // way of what it records.
 func (s *Server) recordHostEvent(kind session.EventKind, summary string) {
 	if _, err := s.db.RecordHostEvent(db.NewEvent{Kind: kind, Summary: summary}); err != nil {
-		fmt.Fprintf(os.Stderr, "agentd: recording %s event: %v\n", kind, err)
+		fmt.Fprintf(os.Stderr, "agtd: recording %s event: %v\n", kind, err)
 		return
 	}
 	s.events.notify()
 }
 
 // RecordHostEvent records a host event from outside the daemon, as
-// `agentd remote authorize` and `revoke` do. A running daemon's
+// `agtd remote authorize` and `revoke` do. A running daemon's
 // subscribers see it on their next poll of the events table.
 func RecordHostEvent(p *paths.AppPaths, kind session.EventKind, summary string) error {
 	store, err := db.Open(p.Database)

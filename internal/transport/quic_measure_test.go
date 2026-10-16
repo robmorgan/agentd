@@ -30,7 +30,7 @@ import (
 )
 
 // Stream roles for the mux server, chosen by a stream's first byte. Each
-// stands in for a kind of agentd traffic.
+// stands in for a kind of agtd traffic.
 const (
 	// roleEcho echoes what it reads, as a PTY echoes keystrokes.
 	roleEcho = 'E'
@@ -586,9 +586,9 @@ func TestQUICUnderPacketLoss(t *testing.T) {
 	}
 }
 
-// rawPair connects two quic-go connections with agentd's QUIC settings,
-// optionally with datagrams enabled, which agentd itself does not enable.
-// The test's own handshake skips agentd's key checks, which other tests
+// rawPair connects two quic-go connections with agtd's QUIC settings,
+// optionally with datagrams enabled, which agtd itself does not enable.
+// The test's own handshake skips agtd's key checks, which other tests
 // cover.
 func rawPair(t testing.TB, datagrams bool, via func(addr string) string) (server, client *quic.Conn) {
 	t.Helper()
@@ -618,7 +618,7 @@ func rawPairWith(t testing.TB, conf *quic.Config, via func(addr string) string) 
 	client, err = quic.DialAddr(ctx, addr, &tls.Config{
 		MinVersion:         tls.VersionTLS13,
 		NextProtos:         []string{ALPN},
-		ServerName:         "agentd",
+		ServerName:         "agtd",
 		InsecureSkipVerify: true,
 	}, conf)
 	if err != nil {
@@ -871,18 +871,18 @@ func processCPU() time.Duration {
 
 // Throughput of one 64 MiB transfer at 20 and 100 ms round-trip times, for
 // several stream and connection window limits: the window must cover the
-// bandwidth-delay product, or the transfer waits on window updates. agentd's
-// own limits are the "agentd" case.
+// bandwidth-delay product, or the transfer waits on window updates. agtd's
+// own limits are the "agtd" case.
 func BenchmarkQUICWindowAtRTT(b *testing.B) {
 	const size = 64 << 20
-	agentd := quicConfig(DeadPeerTimeout)
+	agtd := quicConfig(DeadPeerTimeout)
 	for _, rtt := range []time.Duration{20 * time.Millisecond, 100 * time.Millisecond} {
 		for _, w := range []struct {
 			name         string
 			stream, conn uint64
 		}{
 			{"stream=1MiB", 1 << 20, 4 << 20},
-			{"agentd", agentd.MaxStreamReceiveWindow, agentd.MaxConnectionReceiveWindow},
+			{"agtd", agtd.MaxStreamReceiveWindow, agtd.MaxConnectionReceiveWindow},
 			{"stream=16MiB", 16 << 20, 32 << 20},
 		} {
 			b.Run(fmt.Sprintf("rtt=%v/%s", rtt, w.name), func(b *testing.B) {
@@ -933,7 +933,7 @@ func benchmarkWindow(b *testing.B, size int, rtt time.Duration, stream, conn uin
 }
 
 // Small-message round trips and one-way rates, over a stream and as
-// datagrams (enabled here only; agentd does not enable them).
+// datagrams (enabled here only; agtd does not enable them).
 func BenchmarkQUICSmallMessages(b *testing.B) {
 	const size = 64
 	b.Run("stream/round-trip", func(b *testing.B) {

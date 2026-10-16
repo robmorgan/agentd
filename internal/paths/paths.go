@@ -1,4 +1,4 @@
-// Package paths resolves the agentd runtime root and the files under it.
+// Package paths resolves the agtd runtime root and the files under it.
 package paths
 
 import (
@@ -10,7 +10,7 @@ import (
 	"syscall"
 )
 
-const AppDirName = "agentd"
+const AppDirName = "agtd"
 
 type AppPaths struct {
 	Root        string
@@ -32,7 +32,7 @@ func Discover() (*AppPaths, error) {
 		}
 	}
 	root, err := discoverRoot(
-		os.Getenv("AGENTD_DIR"),
+		os.Getenv("AGTD_DIR"),
 		os.Getenv("XDG_RUNTIME_DIR"),
 		home,
 		os.Getenv("TMPDIR"),
@@ -47,8 +47,8 @@ func Discover() (*AppPaths, error) {
 func FromRoot(root string) *AppPaths {
 	return &AppPaths{
 		Root:        root,
-		Socket:      filepath.Join(root, "agentd.sock"),
-		PIDFile:     filepath.Join(root, "agentd.pid"),
+		Socket:      filepath.Join(root, "agtd.sock"),
+		PIDFile:     filepath.Join(root, "agtd.pid"),
 		Database:    filepath.Join(root, "state.db"),
 		Config:      filepath.Join(root, "config.toml"),
 		LogsDir:     filepath.Join(root, "logs"),
@@ -56,14 +56,14 @@ func FromRoot(root string) *AppPaths {
 	}
 }
 
-// discoverRoot picks the root: AGENTD_DIR, else ~/.agentd. The root holds
+// discoverRoot picks the root: AGTD_DIR, else ~/.agtd. The root holds
 // state that must survive reboots (state.db, logs, the remote keys), so a
 // per-boot runtime directory such as XDG_RUNTIME_DIR (/run/user/UID, a
 // tmpfs) is only a fallback for an account without a home directory, as are
 // the temp directories.
-func discoverRoot(agentdDir, xdgRuntimeDir, homeDir, tmpDir string, uid int) (string, error) {
-	if agentdDir != "" {
-		return agentdDir, nil
+func discoverRoot(agtdDir, xdgRuntimeDir, homeDir, tmpDir string, uid int) (string, error) {
+	if agtdDir != "" {
+		return agtdDir, nil
 	}
 	if homeDir != "" {
 		return filepath.Join(homeDir, "."+AppDirName), nil
@@ -104,7 +104,7 @@ func ensurePrivateDir(dir string) error {
 	}
 	switch {
 	case info.Mode()&os.ModeSymlink != 0:
-		return fmt.Errorf("refusing to use %s: it is a symlink; point AGENTD_DIR at a real directory", dir)
+		return fmt.Errorf("refusing to use %s: it is a symlink; point AGTD_DIR at a real directory", dir)
 	case !info.IsDir():
 		return fmt.Errorf("refusing to use %s: it is not a directory", dir)
 	}
@@ -125,10 +125,10 @@ func (p *AppPaths) WorkerLogPath(sessionID string) string {
 	return filepath.Join(p.LogsDir, sessionID+".worker.log")
 }
 
-// DaemonLogPath is where a daemonized `agentd serve` logs. It sits in the
+// DaemonLogPath is where a daemonized `agtd serve` logs. It sits in the
 // root rather than logs/, where any name could collide with a session's.
 func (p *AppPaths) DaemonLogPath() string {
-	return filepath.Join(p.Root, "agentd.log")
+	return filepath.Join(p.Root, "agtd.log")
 }
 
 // RemoteKeyPath is the daemon's key for remote (QUIC) connections.
@@ -154,7 +154,7 @@ func (p *AppPaths) HostsPath() string {
 
 // LockPath is held (flock) by the running daemon for its whole lifetime.
 func (p *AppPaths) LockPath() string {
-	return filepath.Join(p.Root, "agentd.lock")
+	return filepath.Join(p.Root, "agtd.lock")
 }
 
 func (p *AppPaths) LogPath(sessionID string) string {

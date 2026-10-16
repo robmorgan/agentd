@@ -66,7 +66,7 @@ func (s *Server) serveControl(conn transport.Stream, reader *bufio.Reader, hello
 		switch {
 		case errors.As(err, &decodeErr) && tagged:
 			// The frame was read whole, so the stream is still in step.
-			reply(id, protocol.ErrorResponsef("agentd could not decode the request: %v", decodeErr.Err))
+			reply(id, protocol.ErrorResponsef("agtd could not decode the request: %v", decodeErr.Err))
 			continue
 		case err != nil:
 			return err

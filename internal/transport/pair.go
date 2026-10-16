@@ -21,7 +21,7 @@ import (
 )
 
 // Pairing replaces copying key fingerprints between machines with a short
-// code: `agentd remote pair` opens a pairing window on the daemon and shows
+// code: `agtd remote pair` opens a pairing window on the daemon and shows
 // a code, and `agt host add ... --code` on the client proves it knows the
 // code. Both then trust each other's key: the daemon authorizes the
 // client's, and the client pins the daemon's.
@@ -43,7 +43,7 @@ import (
 const (
 	// PairALPN selects the pairing protocol in the TLS handshake instead
 	// of the agent protocol (ALPN).
-	PairALPN = "agentd-pair"
+	PairALPN = "agtd-pair"
 	// PairingTTL is how long a pairing code is valid.
 	PairingTTL = 5 * time.Minute
 	// PairingAttempts is how many wrong codes close a pairing window.
@@ -169,7 +169,7 @@ func (p *Pairing) Open(ttl time.Duration, authorize func(fingerprint, name strin
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.window != nil {
-		return nil, errors.New("another `agentd remote pair` is already waiting; finish or cancel it first")
+		return nil, errors.New("another `agtd remote pair` is already waiting; finish or cancel it first")
 	}
 	w := &PairingWindow{
 		Code:      code,
@@ -259,7 +259,7 @@ func (w *PairingWindow) wrongCode(remote net.Addr) string {
 	w.p.mu.Unlock()
 	if closing {
 		w.end(PairResult{Remote: remote, Err: ErrTooManyWrongCodes})
-		return "wrong pairing code; pairing is now closed, so run `agentd remote pair` again for a new code"
+		return "wrong pairing code; pairing is now closed, so run `agtd remote pair` again for a new code"
 	}
 	return "wrong pairing code"
 }
@@ -283,7 +283,7 @@ func (w *PairingWindow) succeed(fingerprint, name string, remote net.Addr) error
 // connection it runs on.
 func pairContext(conn *quic.Conn, clientFP, daemonFP string) (*cpace.ContextInfo, error) {
 	tlsState := conn.ConnectionState().TLS
-	ekm, err := tlsState.ExportKeyingMaterial("EXPORTER-agentd-pair", nil, 32)
+	ekm, err := tlsState.ExportKeyingMaterial("EXPORTER-agtd-pair", nil, 32)
 	if err != nil {
 		return nil, err
 	}
@@ -295,7 +295,7 @@ func pairContext(conn *quic.Conn, clientFP, daemonFP string) (*cpace.ContextInfo
 // can be reflected back as the other.
 func pairMAC(key []byte, side string) []byte {
 	h := hmac.New(sha256.New, key)
-	h.Write([]byte("agentd pairing " + side))
+	h.Write([]byte("agtd pairing " + side))
 	return h.Sum(nil)
 }
 

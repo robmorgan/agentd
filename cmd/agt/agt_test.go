@@ -23,7 +23,7 @@ import (
 	"github.com/robmorgan/agtd/internal/transport/transporttest"
 )
 
-// These tests drive the real agt and agentd binaries through real PTYs.
+// These tests drive the real agt and agtd binaries through real PTYs.
 
 var binDir string
 
@@ -34,7 +34,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	binDir = dir
-	for _, b := range []struct{ name, pkg, cgo string }{{"agentd", "../agentd", ""}, {"agt", ".", "0"}} {
+	for _, b := range []struct{ name, pkg, cgo string }{{"agtd", "../agtd", ""}, {"agt", ".", "0"}} {
 		build := exec.Command("go", "build", "-o", filepath.Join(dir, b.name), b.pkg)
 		build.Stdout, build.Stderr = os.Stderr, os.Stderr
 		if b.cgo != "" {
@@ -96,7 +96,7 @@ func newEnv(t *testing.T, extraConfig string) *env {
 }
 
 func (e *env) environ() []string {
-	return append(os.Environ(), "AGENTD_DIR="+e.root, "AGENTD_BIN="+filepath.Join(binDir, "agentd"), "TERM=xterm-256color", "PS1=$ ")
+	return append(os.Environ(), "AGTD_DIR="+e.root, "AGTD_BIN="+filepath.Join(binDir, "agtd"), "TERM=xterm-256color", "PS1=$ ")
 }
 
 // run runs a command without a terminal and returns its output.
@@ -281,7 +281,7 @@ func TestAttachEndToEnd(t *testing.T) {
 
 	// agt new starts the daemon and attaches to the new session.
 	tm := e.start("new", "demo")
-	tm.expect(0, "\x1b]0;demo - agentd\x07")
+	tm.expect(0, "\x1b]0;demo - agtd\x07")
 	m := tm.expect(0, "attached to demo")
 	tm.write("echo hi-$((1+2))\r")
 	m = tm.expect(m, "hi-3")
@@ -295,7 +295,7 @@ func TestAttachEndToEnd(t *testing.T) {
 	// Ctrl-\ detaches and puts the terminal back.
 	tm.write("\x1c")
 	tm.wait()
-	if out := tm.output(); !strings.HasSuffix(out, restoreSequence+detachSequence+"\x1b]0;agentd\x07\x1b]2;agentd\x07") {
+	if out := tm.output(); !strings.HasSuffix(out, restoreSequence+detachSequence+"\x1b]0;agtd\x07\x1b]2;agtd\x07") {
 		t.Fatalf("detach did not restore the terminal:\n%q", out[max(len(out)-200, 0):])
 	}
 
@@ -324,7 +324,7 @@ func TestAttachEndToEnd(t *testing.T) {
 	// Ctrl-] switches to the next running session.
 	e.startAndDetach("two")
 	tm.write("\x1d")
-	m = tm.expect(m, "\x1b]0;two - agentd\x07")
+	m = tm.expect(m, "\x1b]0;two - agtd\x07")
 	tm.write("exit\r")
 	tm.expect(m, "session two finished (exit 0)")
 	tm.wait()
@@ -467,7 +467,7 @@ func TestRemoteAttachEndToEnd(t *testing.T) {
 	if !strings.HasPrefix(addr, "127.0.0.1:") {
 		t.Fatalf("remote not listening:\n%s", info)
 	}
-	daemonKey := strings.TrimSpace(e.mustRun("agentd", "remote", "id"))
+	daemonKey := strings.TrimSpace(e.mustRun("agtd", "remote", "id"))
 	clientKey := strings.TrimSpace(e.mustRun("agt", "remote", "id"))
 
 	// A wrong pin is refused; the right one is added without a prompt.
@@ -484,16 +484,16 @@ func TestRemoteAttachEndToEnd(t *testing.T) {
 
 	// Until this machine is authorized the daemon refuses it, and the CLI
 	// says how to fix that.
-	if out, err := e.run("agt", "--host", "dev", "ls"); err == nil || !strings.Contains(out, "agentd remote authorize "+clientKey) {
+	if out, err := e.run("agt", "--host", "dev", "ls"); err == nil || !strings.Contains(out, "agtd remote authorize "+clientKey) {
 		t.Fatalf("unauthorized: %v\n%s", err, out)
 	}
-	e.mustRun("agentd", "remote", "authorize", clientKey, "test")
+	e.mustRun("agtd", "remote", "authorize", clientKey, "test")
 	if out := e.mustRun("agt", "--host", "dev", "ls"); !strings.Contains(out, "demo") {
 		t.Fatalf("remote ls:\n%s", out)
 	}
 	// Who may connect, and who did, is on record next to the sessions'
 	// events. Authorizing a key again changes nothing, so records nothing.
-	e.mustRun("agentd", "remote", "authorize", clientKey, "test")
+	e.mustRun("agtd", "remote", "authorize", clientKey, "test")
 	audit := e.mustRun("agt", "events")
 	authorized := regexp.MustCompile(`host\s+notice\s+authorized\s+test \(` + regexp.QuoteMeta(clientKey) + `\) authorized by hand`)
 	if n := len(authorized.FindAllString(audit, -1)); n != 1 ||
@@ -575,7 +575,7 @@ func TestRemoteAttachEndToEnd(t *testing.T) {
 	tm.write("\x1c")
 	tm.wait()
 
-	e.mustRun("agentd", "remote", "revoke", clientKey)
+	e.mustRun("agtd", "remote", "revoke", clientKey)
 	if out := e.mustRun("agt", "events"); !regexp.MustCompile(`host\s+notice\s+revoked\s+test \(` + regexp.QuoteMeta(clientKey) + `\) revoked`).MatchString(out) {
 		t.Fatalf("events after revoking:\n%s", out)
 	}
@@ -658,8 +658,8 @@ func TestDiffAndArtifactsEndToEnd(t *testing.T) {
 			addr = v
 		}
 	}
-	e.mustRun("agt", "host", "add", "dev", addr, "--fingerprint", strings.TrimSpace(e.mustRun("agentd", "remote", "id")))
-	e.mustRun("agentd", "remote", "authorize", strings.TrimSpace(e.mustRun("agt", "remote", "id")), "test")
+	e.mustRun("agt", "host", "add", "dev", addr, "--fingerprint", strings.TrimSpace(e.mustRun("agtd", "remote", "id")))
+	e.mustRun("agtd", "remote", "authorize", strings.TrimSpace(e.mustRun("agt", "remote", "id")), "test")
 	if remote := e.mustRun("agt", "--host", "dev", "diff", "demo"); remote != diff {
 		t.Fatalf("remote diff differs:\n%s", remote)
 	}
@@ -684,8 +684,8 @@ func TestRemoteAttachReconnects(t *testing.T) {
 	probe.Close()
 	e := newEnv(t, "\n[remote]\nlisten = \""+addr+"\"\n")
 	e.startAndDetach("demo")
-	e.mustRun("agt", "host", "add", "dev", addr, "--fingerprint", strings.TrimSpace(e.mustRun("agentd", "remote", "id")))
-	e.mustRun("agentd", "remote", "authorize", strings.TrimSpace(e.mustRun("agt", "remote", "id")), "test")
+	e.mustRun("agt", "host", "add", "dev", addr, "--fingerprint", strings.TrimSpace(e.mustRun("agtd", "remote", "id")))
+	e.mustRun("agtd", "remote", "authorize", strings.TrimSpace(e.mustRun("agt", "remote", "id")), "test")
 
 	tm := e.start("attach", "dev/demo")
 	m := tm.expect(0, "attached to demo")
@@ -733,8 +733,8 @@ func TestRemoteReattachRefusesARecreatedSession(t *testing.T) {
 	// The client reaches the daemon through a relay that stands in for
 	// the network.
 	relay := transporttest.NewRelay(t, addr)
-	e.mustRun("agt", "host", "add", "dev", relay.Addr(), "--fingerprint", strings.TrimSpace(e.mustRun("agentd", "remote", "id")))
-	e.mustRun("agentd", "remote", "authorize", strings.TrimSpace(e.mustRun("agt", "remote", "id")), "test")
+	e.mustRun("agt", "host", "add", "dev", relay.Addr(), "--fingerprint", strings.TrimSpace(e.mustRun("agtd", "remote", "id")))
+	e.mustRun("agtd", "remote", "authorize", strings.TrimSpace(e.mustRun("agt", "remote", "id")), "test")
 	if out := e.mustRun("agt", "status", "demo"); !strings.Contains(out, "uid: ") {
 		t.Fatalf("status shows no uid:\n%s", out)
 	}
@@ -782,7 +782,7 @@ func TestEventsEndToEnd(t *testing.T) {
 	e.mustRun("agt", "send-input", "demo",
 		`printf '\033]7501;state=blocked:kind=permission:msg=RGVwbG95Pw==\033\\'`+"\r")
 	m = follow.expect(m, "action  blocked       permission: Deploy?")
-	m = follow.expect(m, "\a\x1b]9;agentd: demo: permission: Deploy?")
+	m = follow.expect(m, "\a\x1b]9;agtd: demo: permission: Deploy?")
 
 	ls := e.mustRun("agt", "ls")
 	if !strings.Contains(ls, "⚠") || !strings.Contains(ls, "blocked") || !strings.Contains(ls, "ATTENTION") {
@@ -883,7 +883,7 @@ func TestLocalAttachSurvivesUpgradeAndRestart(t *testing.T) {
 	m = tm.expect(m, "before-2")
 
 	e.mustRun("agt", "daemon", "restart")
-	m = tm.expect(m, "connection to agentd lost, reconnecting")
+	m = tm.expect(m, "connection to agtd lost, reconnecting")
 	m = tm.expect(m, "before-2")
 	tm.write("echo $N-3\r")
 	m = tm.expect(m, "before-3")
@@ -892,7 +892,7 @@ func TestLocalAttachSurvivesUpgradeAndRestart(t *testing.T) {
 }
 
 // `agt host add` without flags shows the daemon's key and asks for the
-// code `agentd remote pair` shows there; pairing pins the key and
+// code `agtd remote pair` shows there; pairing pins the key and
 // authorizes this machine in one step. A wrong code can be retried.
 func TestHostAddPairsAtThePrompt(t *testing.T) {
 	e := newEnv(t, "\n[remote]\nlisten = \"127.0.0.1:0\"\n")
@@ -906,9 +906,9 @@ func TestHostAddPairsAtThePrompt(t *testing.T) {
 	if !strings.HasPrefix(addr, "127.0.0.1:") {
 		t.Fatalf("remote not listening at %q", addr)
 	}
-	daemonKey := strings.TrimSpace(e.mustRun("agentd", "remote", "id"))
+	daemonKey := strings.TrimSpace(e.mustRun("agtd", "remote", "id"))
 
-	pair := exec.Command(filepath.Join(binDir, "agentd"), "remote", "pair")
+	pair := exec.Command(filepath.Join(binDir, "agtd"), "remote", "pair")
 	pair.Env = e.environ()
 	var pairOut syncBuffer
 	pair.Stdout, pair.Stderr = &pairOut, &pairOut
@@ -942,7 +942,7 @@ func TestHostAddPairsAtThePrompt(t *testing.T) {
 		t.Fatalf("host add: %v\n%s", err, tm.output())
 	}
 	if err := pair.Wait(); err != nil || !strings.Contains(pairOut.String(), "now authorized") {
-		t.Fatalf("agentd remote pair: %v\n%s", err, pairOut.String())
+		t.Fatalf("agtd remote pair: %v\n%s", err, pairOut.String())
 	}
 	if out := e.mustRun("agt", "host", "ls", "--no-probe"); !strings.Contains(out, "dev\t"+addr+"\t"+daemonKey) {
 		t.Fatalf("host ls --no-probe:\n%s", out)

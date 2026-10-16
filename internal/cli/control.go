@@ -41,7 +41,7 @@ type controlStream struct {
 
 // errControlClosed means the control stream ended before a response
 // arrived.
-var errControlClosed = errors.New("agentd closed the control stream")
+var errControlClosed = errors.New("agtd closed the control stream")
 
 // openControl opens a stream and performs the handshake on it. The daemon
 // answering anything but Welcome (an older daemon answers Hello with an
@@ -63,7 +63,7 @@ func openControl(ctx context.Context, s transport.Stream) (*controlStream, error
 		err = errors.Join(ctx.Err(), err)
 	case err != nil:
 	case resp == nil:
-		err = errors.New("agentd closed the connection")
+		err = errors.New("agtd closed the connection")
 	case resp.Error != nil:
 		err = errors.New(resp.Error.Message)
 	case resp.Welcome == nil:
@@ -190,7 +190,7 @@ func (cs *controlStream) roundTrip(ctx context.Context, req *protocol.Request) (
 		return nil, &sentError{err}
 	case <-ctx.Done():
 		forget()
-		return nil, &sentError{fmt.Errorf("agentd did not answer in time: %w", ctx.Err())}
+		return nil, &sentError{fmt.Errorf("agtd did not answer in time: %w", ctx.Err())}
 	}
 }
 

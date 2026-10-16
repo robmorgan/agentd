@@ -721,9 +721,9 @@ func TestIsConnectionLost(t *testing.T) {
 		{&quic.IdleTimeoutError{}, true},
 		{&quic.HandshakeTimeoutError{}, true},
 		{&quic.StatelessResetError{}, true},
-		{fmt.Errorf("could not reach agentd: %w", &net.DNSError{Err: "no such host"}), true},
+		{fmt.Errorf("could not reach agtd: %w", &net.DNSError{Err: "no such host"}), true},
 		{fmt.Errorf("dial: %w", context.DeadlineExceeded), true},
-		{&quic.ApplicationError{Remote: true, ErrorMessage: "agentd is shutting down"}, true},
+		{&quic.ApplicationError{Remote: true, ErrorMessage: "agtd is shutting down"}, true},
 		// This client closed it.
 		{&quic.ApplicationError{Remote: false}, false},
 		// The daemon refused this client's key.

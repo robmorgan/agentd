@@ -39,7 +39,7 @@ const (
 	rows = 40
 	// workDir is fixed rather than random so re-recording gives the same
 	// paths in the output.
-	workDir = "/tmp/agentd-demo"
+	workDir = "/tmp/agtd-demo"
 )
 
 // step is one scripted action: wait until want is on screen (if set), then

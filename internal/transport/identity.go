@@ -98,7 +98,7 @@ func createIdentity(path string) (*Identity, error) {
 	}
 	// Write a temporary file, then link it into place. Unlike a rename, the
 	// link fails if the key already exists, so when two processes create it
-	// at once (the daemon starting and `agentd remote id`, say) both end up
+	// at once (the daemon starting and `agtd remote id`, say) both end up
 	// using the one that was published, never a key that was replaced.
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".key-*")
 	if err != nil {
@@ -137,7 +137,7 @@ func identityFromKey(key ed25519.PrivateKey) (*Identity, error) {
 	now := time.Now()
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: "agentd"},
+		Subject:      pkix.Name{CommonName: "agtd"},
 		NotBefore:    now.Add(-time.Hour),
 		NotAfter:     now.AddDate(10, 0, 0),
 		KeyUsage:     x509.KeyUsageDigitalSignature,

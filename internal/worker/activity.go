@@ -22,7 +22,7 @@ import (
 // The records decide the session's activity (working with progress,
 // blocked on the user and why, done, error, idle) and raise its attention;
 // a program that does not report shows as plainly `working` while it runs,
-// with no judgment attached. There is no inferred state: agentd stopped
+// with no judgment attached. There is no inferred state: agtd stopped
 // guessing from bells and output timing when the harnesses adopted the
 // protocol.
 //

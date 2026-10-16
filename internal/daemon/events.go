@@ -127,7 +127,7 @@ func (f *eventFeed) run(stop <-chan struct{}) {
 		}
 		id, err := f.db.LastEventID()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "agentd: polling events: %v\n", err)
+			fmt.Fprintf(os.Stderr, "agtd: polling events: %v\n", err)
 			continue
 		}
 		if id != last {
@@ -256,7 +256,7 @@ func (s *Server) acknowledge(id, how string) {
 func (s *Server) acknowledgeBefore(id, how string, before time.Time) {
 	changed, err := s.db.AcknowledgeBefore(id, how, before)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "agentd: acknowledging %s: %v\n", id, err)
+		fmt.Fprintf(os.Stderr, "agtd: acknowledging %s: %v\n", id, err)
 		return
 	}
 	if changed {

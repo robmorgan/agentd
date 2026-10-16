@@ -16,13 +16,13 @@ But once you run more than one, things get messy:
 * lost artifacts
 * agents needing attention
 
-`agentd` turns coding agents into **durable tasks with state, artifacts, and history.** Instead of babysitting terminal
+`agtd` turns coding agents into **durable tasks with state, artifacts, and history.** Instead of babysitting terminal
 tabs, you supervise work.
 
 ## How It Works
 
-`tmux` multiplexes terminals. `agentd` supervises agents.
-`agentd` is a daemon runtime for supervising coding agents as durable tasks.
+`tmux` multiplexes terminals. `agtd` supervises agents.
+`agtd` is a daemon runtime for supervising coding agents as durable tasks.
 
 Each task runs inside a managed session with:
 * a working directory you choose: a git worktree, a plain checkout, or any directory
@@ -34,13 +34,13 @@ This allows developers to supervise agent work without constantly switching betw
 
 ## Native Terminal First
 
-`agentd` works WITH your terminal. Ghostty, iTerm2, Kitty, WezTerm... you chose your terminal for
-a reason. `agentd` doesn't replace it.
+`agtd` works WITH your terminal. Ghostty, iTerm2, Kitty, WezTerm... you chose your terminal for
+a reason. `agtd` doesn't replace it.
 
 To view an agent: open a new tab, run `agt attach my-agent`. Or use the built-in TUI (`agt`
 with no args) for a quick overview of all sessions.
 
-What `agentd` manages that your terminal can't:
+What `agtd` manages that your terminal can't:
 
 * Daemon lifecycle: agents keep running after you disconnect
 * Attention signals: know when an agent needs you without watching it
@@ -146,7 +146,7 @@ Run the `agt` command without any arguments to open the TUI.
 
 ## Core Concepts
 
-`agentd` introduces three core primitives.
+`agtd` introduces three core primitives.
 
 - **Tasks.** A long-running unit of work. A task may spawn one or more agents and has a lifecycle (running, completed, failed).
 - **Threads.** A sequence of reasoning associated with a task. Threads capture prompts, tool calls, intermediate outputs, and final results.
@@ -168,7 +168,7 @@ Clients surface sessions based on attention instead of raw output. The signal is
 own word: [program status reports](https://mitchellh.com/writing/program-status-osc7501)
 (OSC 7501), through which a program says it is `working` (with progress), `blocked` on the user
 (and why: a permission, a question, a login), `done` or `error`, with a one-line message. Claude
-Code reports since 2.1.295, and `agentd` does not guess: a program that does not report simply
+Code reports since 2.1.295, and `agtd` does not guess: a program that does not report simply
 shows as running, with no inferred waiting or idleness. Bells and desktop notifications (OSC 9
 and OSC 777) are still recorded as info-level events for observability, and the foreground
 process is still sampled (a non-reporting foreground command that is silent for half an hour
@@ -197,21 +197,21 @@ the machines that paired, were authorized or revoked, and connected remotely (sh
 agt events                       # the latest events of every session
 agt events fix-tests --follow    # follow one session
 agt events --follow --notify     # ring the bell and post a desktop notification when a session needs you
-agt events --follow --level action --exec 'say "$AGENTD_EVENT_SESSION needs you"'
+agt events --follow --level action --exec 'say "$AGTD_EVENT_SESSION needs you"'
 agt events --json --after 120    # for scripts: everything after event 120
 ```
 
 `--notify` writes to your terminal, so it pops a desktop notification wherever your terminal
 supports one (iTerm2, Ghostty, WezTerm, kitty and others use OSC 9; GNOME Terminal and other VTE
 terminals, foot and urxvt use OSC 777; inside tmux, `set -g allow-passthrough on`). `--exec` runs a
-command for each event with `AGENTD_EVENT_ID`, `_HOST`, `_SESSION`, `_KIND`, `_ATTENTION`,
+command for each event with `AGTD_EVENT_ID`, `_HOST`, `_SESSION`, `_KIND`, `_ATTENTION`,
 `_SUMMARY` and `_TIME` set (`_SESSION` is empty for a host event). Following reconnects by itself (after a daemon restart, or a lost
 connection to a remote host) and resumes after the last event it printed.
 
 ### Making agents ask out loud
 
 The clearest signal is a program status report (OSC 7501): one escape sequence that says what the
-program is doing and what it needs. `agentd` answers the protocol's detection query (`ESC ] 7501 ;
+program is doing and what it needs. `agtd` answers the protocol's detection query (`ESC ] 7501 ;
 ? ST`) for every session, attached or not, so a program that checks before reporting finds the
 protocol supported. Any program can report:
 
@@ -222,7 +222,7 @@ printf '\e]7501;state=blocked:kind=permission:msg=%s\e\\' "$(printf 'Deploy?' | 
 Status reports are the only attention signal. Typing into the session counts a `blocked` report
 as answered until the program reports again. Bells and desktop notifications (OSC 9, OSC 777)
 are recorded as info-level events — visible in `agt events` as facts about what the terminal
-emitted — but raise no attention and trigger no `--notify`: `agentd` stopped inferring "needs
+emitted — but raise no attention and trigger no `--notify`: `agtd` stopped inferring "needs
 you" from them when the agent harnesses began reporting status themselves.
 
 - **Claude Code** reports program status natively since 2.1.295: permission prompts, questions
@@ -241,7 +241,7 @@ you" from them when the agent harnesses began reporting status themselves.
 
 ![](/.github/_docs/architecture.png)
 
-`agentd` focuses purely on agent runtime semantics:
+`agtd` focuses purely on agent runtime semantics:
 
 - durable PTY-backed agent sessions that outlive the client connection that started them
 - session metadata stored in `state.db` under the resolved runtime root
@@ -253,11 +253,11 @@ you" from them when the agent harnesses began reporting status themselves.
 
 ## Build
 
-`agentd` is two Go binaries, built from one module at the repository root: the `agt` CLI and
-the `agentd` daemon.
+`agtd` is two Go binaries, built from one module at the repository root: the `agt` CLI and
+the `agtd` daemon.
 
 ```sh
-make build    # builds libghostty-vt if needed, then bin/agentd and bin/agt
+make build    # builds libghostty-vt if needed, then bin/agtd and bin/agt
 make agt      # just the CLI: pure Go, no cgo or Zig needed
 make test     # Go tests, with -race
 make test-cgocheck  # the worker's tests with cgo's pointer checks (libghostty)
@@ -275,17 +275,17 @@ libghostty-vt is built `ReleaseFast` by default (`GHOSTTY_OPTIMIZE` overrides it
 Debug build parses PTY output at roughly 50 KB/s, which is slow enough to throttle a busy agent;
 `BenchmarkTerminalFeed` shows ~640 MB/s with ReleaseFast.
 
-Only libghostty needs cgo; `modernc.org/sqlite` is pure Go, so cross compiling `agentd` is `zig cc`
+Only libghostty needs cgo; `modernc.org/sqlite` is pure Go, so cross compiling `agtd` is `zig cc`
 plus `CGO_ENABLED=1` as described in the go-libghostty README.
 
-To measure what sessions cost on this machine, `agentd bench sessions` starts a private daemon in a
-temporary root (never `~/.agentd`), creates the sessions, prints a report, and stops everything it
+To measure what sessions cost on this machine, `agtd bench sessions` starts a private daemon in a
+temporary root (never `~/.agtd`), creates the sessions, prints a report, and stops everything it
 started, also on Ctrl-C. [BENCHMARKS.md](BENCHMARKS.md) has the numbers and what they mean:
 
 ```sh
-bin/agentd bench sessions --count 100                       # idle sessions
-bin/agentd bench sessions --count 0 --output-heavy 100 --attach 100
-bin/agentd bench sessions --count 500 --json-file report.json
+bin/agtd bench sessions --count 100                       # idle sessions
+bin/agtd bench sessions --count 0 --output-heavy 100 --attach 100
+bin/agtd bench sessions --count 500 --json-file report.json
 ```
 
 `--output-heavy N` adds sessions that write output as fast as they can, `--attach K` attaches K
@@ -308,30 +308,27 @@ curl -fsSL https://raw.githubusercontent.com/robmorgan/agtd/main/install.sh | ba
 ```
 
 or `./install.sh` from a checkout, which builds that checkout. The script installs `agt` and
-`agentd` side by side in `~/.local/bin` (`AGENTD_PREFIX` changes the prefix) and can be run again
+`agtd` side by side in `~/.local/bin` (`AGTD_PREFIX` changes the prefix) and can be run again
 at any time:
 
 - Missing base packages (git, make, a C compiler, pkg-config, curl, xz) come from apt or pacman,
   through `sudo` when you are not root. On macOS it asks for the Xcode command line tools.
 - Go and Zig are used from `PATH` when new enough. Otherwise pinned releases are downloaded into
-  `~/.local/share/agentd/toolchain` and used for the build only.
-- Without a checkout it clones `AGENTD_REF` (default `main`) into `~/.local/share/agentd/src`; a
+  `~/.local/share/agtd/toolchain` and used for the build only.
+- Without a checkout it clones `AGTD_REF` (default `main`) into `~/.local/share/agtd/src`; a
   rerun fetches and rebuilds only what changed.
-- `agent`, the CLI's old name, is kept as a link to `agt` unless another program already owns that
-  name in the same directory: Cursor's and Grok's CLIs install an `agent` of their own there. An
-  `agent` left by an earlier agentd is replaced by the link.
-- Binaries are only replaced when the build differs. If a daemon is running and `agentd` changed
-  (or the daemon still runs a binary replaced earlier), it runs `agentd upgrade`, so sessions are
-  handed over to the new binary without stopping (`AGENTD_NO_UPGRADE=1` leaves the daemon alone).
-- On Linux with systemd it installs and enables a user unit (`~/.config/systemd/user/agentd.service`)
+- Binaries are only replaced when the build differs. If a daemon is running and `agtd` changed
+  (or the daemon still runs a binary replaced earlier), it runs `agtd upgrade`, so sessions are
+  handed over to the new binary without stopping (`AGTD_NO_UPGRADE=1` leaves the daemon alone).
+- On Linux with systemd it installs and enables a user unit (`~/.config/systemd/user/agtd.service`)
   and turns on lingering, so the daemon starts at boot without anyone logging in, and a rebooted
   devbox takes remote connections again. The unit only starts the daemon, from your login shell so
   sessions get your `PATH`; `agt daemon restart` and `upgrade` still manage it, and stopping the
   unit never stops the daemon or a session. A daemon that crashes is not restarted by systemd. If
   lingering cannot be turned on, the unit is left disabled.
-  `AGENTD_NO_SERVICE=1` skips this.
+  `AGTD_NO_SERVICE=1` skips this.
 
-It never turns on remote access; see `agentd remote enable` below.
+It never turns on remote access; see `agtd remote enable` below.
 
 For development, `make install` installs the binaries from the current tree into `$GOBIN` (or
 `$(go env GOPATH)/bin`); set `BINDIR` to choose another directory.
@@ -339,7 +336,7 @@ For development, `make install` installs the binaries from the current tree into
 ## Working Directories And Worktrees
 
 A session runs in the directory you give it. `agt new` defaults to the current directory;
-pass `--cwd DIR` to pick another (it must exist). `agentd` does not create git worktrees,
+pass `--cwd DIR` to pick another (it must exist). `agtd` does not create git worktrees,
 branches, or merge anything back. If you want isolation between agents working on the same
 repository, create the worktree yourself and point the session at it:
 
@@ -353,7 +350,7 @@ will step on each other; that is your call, not the daemon's.
 
 ### What A Session Produced
 
-When a session starts in a git repository, `agentd` records HEAD's commit and branch as the
+When a session starts in a git repository, `agtd` records HEAD's commit and branch as the
 session's base. Everything is then measured from there:
 
 - `agt diff NAME` prints one unified diff of everything that differs from the base: commits made
@@ -368,16 +365,16 @@ session's base. Everything is then measured from there:
   appears once the artifact has arrived whole.
 
 These work for ended sessions too, as long as their directory is still there. A session started
-outside a repository, or before `agentd` recorded bases, is compared with HEAD instead.
+outside a repository, or before `agtd` recorded bases, is compared with HEAD instead.
 
-`agentd` only reads: it runs `git` in the session's directory without taking locks, and never
+`agtd` only reads: it runs `git` in the session's directory without taking locks, and never
 writes to the repository, its index or its refs. Untracked files are included by marking them in a
 private copy of the index. Lists are capped (200 commits, 1000 files) and say when they are. A
 download that you stop reading (say, in a pager) simply waits; nothing piles up in the daemon.
 
 ### Workspaces
 
-Working directories are resolved on the machine running `agentd`, not the client. Give the
+Working directories are resolved on the machine running `agtd`, not the client. Give the
 directories you work in a name, then start sessions by name:
 
 ```sh
@@ -391,7 +388,7 @@ agt workspace rm mono
 Workspaces are stored by the daemon in `state.db`, so they take effect immediately and are
 managed entirely from the CLI. A quoted `~/` path is expanded by the daemon against its own
 user's home; other paths are resolved by the CLI, which today always shares the daemon's
-filesystem. The directory must exist: `agentd` does not clone, create, or sync workspaces.
+filesystem. The directory must exist: `agtd` does not clone, create, or sync workspaces.
 
 With `--workspace`, `--cwd` is relative to the workspace root and may not leave it. A session
 records the workspace it was started in (`agt status` shows it); removing or re-adding a
@@ -431,22 +428,22 @@ configured and `claude` is the default.
 
 The daemon injects:
 
-- `AGENTD_SESSION_ID`
-- `AGENTD_CWD`
-- `AGENTD_SESSION_NAME` (same as `AGENTD_SESSION_ID`)
+- `AGTD_SESSION_ID`
+- `AGTD_CWD`
+- `AGTD_SESSION_NAME` (same as `AGTD_SESSION_ID`)
 
 The daemon socket is not passed to agents. They are not sandboxed, though: an agent runs as your
 user, so it can still reach the daemon at its usual path. There is no structured event channel for
-agents: `agentd` reads attention from what they print (see [Attention model](#attention-model)).
+agents: `agtd` reads attention from what they print (see [Attention model](#attention-model)).
 Session status, attention, events, and history are the supported runtime surfaces.
 
-Everything lives under one root, `~/.agentd` on macOS and Linux alike, unless `AGENTD_DIR` names
-another. Without a home directory, `XDG_RUNTIME_DIR/agentd`, `TMPDIR/agentd-<uid>` and then
-`/tmp/agentd-<uid>` are used instead; those may not survive a reboot.
+Everything lives under one root, `~/.agtd` on macOS and Linux alike, unless `AGTD_DIR` names
+another. Without a home directory, `XDG_RUNTIME_DIR/agtd`, `TMPDIR/agtd-<uid>` and then
+`/tmp/agtd-<uid>` are used instead; those may not survive a reboot.
 
 The root contains `config.toml`, `state.db`, `logs/`, `remote/` (keys for remote access),
-`hosts.toml`, and the runtime files `agentd.sock`, `agentd.lock`, `agentd.pid` and `sessions/` (one
-socket per live session). It is created private to your user (0700), and `agentd` refuses a root
+`hosts.toml`, and the runtime files `agtd.sock`, `agtd.lock`, `agtd.pid` and `sessions/` (one
+socket per live session). It is created private to your user (0700), and `agtd` refuses a root
 owned by someone else.
 
 Interactive PTY attach is available with `agt attach <name>`. Detach with `Ctrl-\`, switch to
@@ -474,14 +471,14 @@ path when a worker is focused. Background PTY writes are still available with
 
 ## Remote Access (Preview)
 
-`agentd` can accept remote clients over QUIC, so sessions on a devbox can be reached from a laptop
+`agtd` can accept remote clients over QUIC, so sessions on a devbox can be reached from a laptop
 over a LAN, Tailscale or WireGuard, without any hosted service. Both sides authenticate with pinned
 keys, like SSH host keys and `authorized_keys`.
 
 **On the devbox**, remote access is off by default. Turn it on:
 
 ```sh
-agentd remote enable
+agtd remote enable
 ```
 
 This finds the devbox's Tailscale address and listens on UDP port 7433 there. It sets
@@ -494,22 +491,22 @@ is reachable from the whole internet, so it gets a stronger warning. To choose t
 yourself (for example a WireGuard one), or to skip the question in a script:
 
 ```sh
-agentd remote enable 10.8.0.2          # port 7433
-agentd remote enable 10.8.0.2:9000
-agentd remote enable --yes             # accept the detected address
-agentd remote status
-agentd remote disable
+agtd remote enable 10.8.0.2          # port 7433
+agtd remote enable 10.8.0.2:9000
+agtd remote enable --yes             # accept the detected address
+agtd remote status
+agtd remote disable
 ```
 
 If the address does not exist yet when the daemon starts (say, Tailscale is still coming up at
-boot), the daemon keeps retrying every few seconds. `agentd remote status` and `agt daemon info`
+boot), the daemon keeps retrying every few seconds. `agtd remote status` and `agt daemon info`
 show why it is not listening.
 
 **Pair the laptop** with a short code, so neither machine's key has to be copied. On the
 devbox:
 
 ```sh
-agentd remote pair
+agtd remote pair
 ```
 
 ```text
@@ -526,16 +523,16 @@ the devbox presents and asks for the code:
 
 ```text
 $ agt host add devbox 100.64.0.5:7433
-The agentd at 100.64.0.5:7433 presents this key:
+The agtd at 100.64.0.5:7433 presents this key:
   SHA256:...
 
-To trust it, run `agentd remote pair` on `devbox` and enter the code it shows.
-(Or press Enter to compare the key with `agentd remote id` there instead.)
+To trust it, run `agtd remote pair` on `devbox` and enter the code it shows.
+(Or press Enter to compare the key with `agtd remote id` there instead.)
 Pairing code: 482-193-675
 ✓ Paired with `devbox` (100.64.0.5:7433)
 ```
 
-The laptop pins the devbox's key, the devbox authorizes the laptop's key, and `agentd remote pair`
+The laptop pins the devbox's key, the devbox authorizes the laptop's key, and `agtd remote pair`
 reports which machine paired. A mistyped code can be entered again. The code works once, expires
 after 5 minutes, and closes after 3 wrong attempts. Both outcomes are recorded in `agt events`, with
 the address the attempt came from. Neither end can be fooled into trusting a
@@ -553,12 +550,12 @@ agt host add devbox 100.64.0.5:7433 --fingerprint SHA256:...
 ```
 
 Or run it without `--fingerprint` and press Enter at the pairing code prompt: it then asks you to
-confirm the key against `agentd remote id`. Either way it then prints the command that authorizes
+confirm the key against `agtd remote id`. Either way it then prints the command that authorizes
 the laptop.
 Back on the devbox, run that command:
 
 ```sh
-agentd remote authorize SHA256:... my-laptop
+agtd remote authorize SHA256:... my-laptop
 ```
 
 Now any command can run on the devbox, with `--host` or a `host/session` address:
@@ -630,9 +627,9 @@ agt remote id                  # this machine's client key fingerprint
 agt host ls                    # with --no-probe: hosts.toml as is, with pinned keys
 agt host info devbox
 agt host rm devbox
-agentd remote pair               # on the devbox: authorize a machine with a one-time code
-agentd remote list               # on the devbox: authorized clients
-agentd remote revoke SHA256:...
+agtd remote pair               # on the devbox: authorize a machine with a one-time code
+agtd remote list               # on the devbox: authorized clients
+agtd remote revoke SHA256:...
 ```
 
 An authorized client has the same access as you have locally, except that only the devbox itself
@@ -642,9 +639,9 @@ manage the local daemon.
 
 Troubleshooting:
 
-- **"refused this machine's key"**: the laptop is not authorized; pair it (`agentd remote pair` on
-  the devbox), or run the `agentd remote authorize` command from the error there.
-- **"is not pairing"**: no `agentd remote pair` is waiting on the devbox, or its code expired or was
+- **"refused this machine's key"**: the laptop is not authorized; pair it (`agtd remote pair` on
+  the devbox), or run the `agtd remote authorize` command from the error there.
+- **"is not pairing"**: no `agtd remote pair` is waiting on the devbox, or its code expired or was
   closed by wrong attempts; run it again and use the new code.
 - **"the key of host ... has changed"**: the devbox presented a different key from the pinned one.
   If you know why (for example `remote/daemon.key` was recreated), run `agt host rm` and
@@ -664,11 +661,11 @@ scripts/do-devbox.sh ls
 scripts/do-devbox.sh destroy devbox
 ```
 
-`create` puts the droplet behind an `agentd` cloud firewall (SSH and UDP 7433 in), creates a sudo
+`create` puts the droplet behind an `agtd` cloud firewall (SSH and UDP 7433 in), creates a sudo
 user named after you with your SSH keys, runs `install.sh` there (so the daemon starts at boot),
 installs Claude Code, listens on the droplet's public address, and pairs this machine with it.
 Sign in to Claude Code in the first session you start there. `destroy` deletes the droplet and
-removes the host; it only touches droplets tagged `agentd`.
+removes the host; it only touches droplets tagged `agtd`.
 
 ## Troubleshooting
 
@@ -681,13 +678,13 @@ agt daemon upgrade
 ```
 
 `agt daemon restart` is safe while sessions run: they keep running and reattach to the new
-daemon. `agt daemon upgrade` (or `agentd upgrade`, run as the new binary) is too: it replaces the
+daemon. `agt daemon upgrade` (or `agtd upgrade`, run as the new binary) is too: it replaces the
 daemon, then hands each running session's worker over to the new binary without stopping the agent
 (a live handoff), and lists what happened to each session:
 
 ```text
 ✓ Upgraded daemon
-✓ Session fix-tests now runs /usr/local/bin/agentd (live handoff, pid 4242)
+✓ Session fix-tests now runs /usr/local/bin/agtd (live handoff, pid 4242)
 ! Session old-work keeps running on its previous binary: ...
 ```
 
@@ -696,19 +693,19 @@ run) keeps running on the binary it has. Attached clients, local or remote, reat
 after a daemon restart or a handoff and repaint the screen; output the agent writes meanwhile is
 kept. ARCHITECTURE.md lists exactly what survives each kind of restart and crash.
 
-`agt` starts the daemon on demand with `agentd serve --daemonize`, using the `agentd` binary
-installed next to `agt`. Set `AGENTD_BIN` to use a different daemon binary, for example a local
+`agt` starts the daemon on demand with `agtd serve --daemonize`, using the `agtd` binary
+installed next to `agt`. Set `AGTD_BIN` to use a different daemon binary, for example a local
 build:
 
 ```sh
-AGENTD_BIN=$PWD/bin/agentd agt daemon restart
+AGTD_BIN=$PWD/bin/agtd agt daemon restart
 ```
 
 ## Status And Limitations
 
 Current capabilities include:
 
-- local `agentd` daemon over a Unix socket
+- local `agtd` daemon over a Unix socket
 - remote sessions over QUIC with `agt --host` and pinned keys (preview)
 - PTY-backed agent processes that outlive client connections
 - sessions that survive the daemon stopping, crashing, restarting, or being upgraded: each runs

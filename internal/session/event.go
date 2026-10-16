@@ -85,10 +85,10 @@ const (
 	// EventPairFailed: a pairing window closed after too many wrong codes;
 	// the summary carries the last address that tried (notice).
 	EventPairFailed EventKind = "pair_failed"
-	// EventAuthorized: a client key was authorized by hand with `agentd
+	// EventAuthorized: a client key was authorized by hand with `agtd
 	// remote authorize` (notice).
 	EventAuthorized EventKind = "authorized"
-	// EventRevoked: a client key was revoked with `agentd remote revoke`
+	// EventRevoked: a client key was revoked with `agtd remote revoke`
 	// (notice).
 	EventRevoked EventKind = "revoked"
 	// EventConnected: an authorized remote client connected. Recorded at
@@ -150,7 +150,7 @@ const (
 	// that never ran).
 	ActivityUnknown Activity = ""
 	// ActivityWorking: the program reported it is busy, or runs without
-	// reporting status at all (agentd attaches no judgment to a program
+	// reporting status at all (agtd attaches no judgment to a program
 	// that does not speak OSC 7501).
 	ActivityWorking Activity = "working"
 	// ActivityIdle: the program reported it is waiting for the user to

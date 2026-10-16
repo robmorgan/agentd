@@ -8,12 +8,12 @@ import (
 )
 
 func TestHandoffRoundTrips(t *testing.T) {
-	roundTripRequest(t, &Request{HandoffSession: &HandoffSession{SessionID: "demo", Executable: "/usr/local/bin/agentd"}})
+	roundTripRequest(t, &Request{HandoffSession: &HandoffSession{SessionID: "demo", Executable: "/usr/local/bin/agtd"}})
 	roundTripRequest(t, &Request{AttachSession: &AttachSession{
 		SessionID: "demo", Kind: session.AttachmentAttach, Geometry: Geometry{80, 24, 0, 0},
 		Features: []string{CapSessionRestart},
 	}})
-	roundTripResponse(t, &Response{HandedOff: &HandedOff{SessionID: "demo", WorkerPID: 4242, Executable: "/bin/agentd", Handoffs: 3}})
+	roundTripResponse(t, &Response{HandedOff: &HandedOff{SessionID: "demo", WorkerPID: 4242, Executable: "/bin/agtd", Handoffs: 3}})
 	roundTripResponse(t, &Response{SessionRestarting: &SessionRestarting{SessionID: "demo", Reason: "upgrading"}})
 	if got := (&Request{HandoffSession: &HandoffSession{}}).Role(); got != RoleRequest {
 		t.Fatalf("handoff role = %v", got)
