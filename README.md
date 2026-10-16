@@ -1,9 +1,7 @@
 <h1>
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/robmorgan/agtd/main/website/public/brand/agtd-logo-on-dark.svg" />
-    <img src="https://raw.githubusercontent.com/robmorgan/agtd/main/website/public/brand/agtd-logo-on-light.svg" alt="agtd logo" width="250" />
-  </picture>
+  <img src="https://raw.githubusercontent.com/robmorgan/agtd/main/website/public/brand/agtd-logo-on-light.svg#gh-light-mode-only" alt="agtd logo" width="250" />
+  <img src="https://raw.githubusercontent.com/robmorgan/agtd/main/website/public/brand/agtd-logo-on-dark.svg#gh-dark-mode-only" alt="agtd logo" width="250" />
 </h1>
   <p align="center">
     <strong>Run coding agents like processes. Supervise them like jobs.</strong>
