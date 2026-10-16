@@ -6,8 +6,8 @@ import (
 
 	"github.com/creack/pty"
 
-	"github.com/robmorgan/agentd/internal/protocol"
-	"github.com/robmorgan/agentd/internal/session"
+	"github.com/robmorgan/agtd/internal/protocol"
+	"github.com/robmorgan/agtd/internal/session"
 )
 
 // expectSize asks the agent for the PTY's size and waits for want
