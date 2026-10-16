@@ -3,7 +3,7 @@ package session
 import "time"
 
 // GitState describes the git repository a session's working directory is
-// in, as the daemon read it just now. agentd only reads git state; it never
+// in, as the daemon read it just now. agtd only reads git state; it never
 // changes a repository, its index or its refs.
 //
 // A session created in a repository records its base: the commit HEAD
@@ -11,7 +11,7 @@ import "time"
 // produced is measured from there: Commits are the commits reachable from
 // HEAD but not from the base, and Files is everything that differs from the
 // base (committed since, staged, unstaged and untracked). Without a base (a
-// session created before agentd recorded them, or in a directory that was
+// session created before agtd recorded them, or in a directory that was
 // not a repository with commits yet) both are measured from HEAD.
 type GitState struct {
 	// Repo reports that the working directory is inside a git work tree.

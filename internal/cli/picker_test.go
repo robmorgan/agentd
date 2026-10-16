@@ -161,7 +161,7 @@ func TestPickerRendering(t *testing.T) {
 	}
 	p.mode = pickerBrowse
 	rendered = strings.Join(p.renderLines(120, true), "\n")
-	if !strings.Contains(rendered, ansiRunning) || !strings.Contains(rendered, "running") || !strings.HasPrefix(rendered, "agentd -") {
+	if !strings.Contains(rendered, ansiRunning) || !strings.Contains(rendered, "running") || !strings.HasPrefix(rendered, "agtd -") {
 		t.Fatalf("browse:\n%s", stripANSI(rendered))
 	}
 	p.toast = &toast{isError: true, message: "merge would conflict\nrun:\n  git status"}
@@ -253,7 +253,7 @@ func TestSessionList(t *testing.T) {
 			t.Errorf("missing %q", want)
 		}
 	}
-	if strings.Contains(rendered, "agentd - ") || strings.Contains(rendered, "› ") {
+	if strings.Contains(rendered, "agtd - ") || strings.Contains(rendered, "› ") {
 		t.Fatal("list has a header or selector")
 	}
 	empty := strings.Join(renderSessionListLines(nil, 120, now), "\n")

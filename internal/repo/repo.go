@@ -1,6 +1,6 @@
 // Package repo reads the state of the git repository a session works in, for
-// the daemon. agentd does not manage git: a session's directory may or may
-// not be a repository, and agentd never changes one. This package only
+// the daemon. agtd does not manage git: a session's directory may or may
+// not be a repository, and agtd never changes one. This package only
 // reads, by running the system git in the session's directory:
 //
 //   - with GIT_OPTIONAL_LOCKS=0 and core.fsmonitor off, so reading never
@@ -428,7 +428,7 @@ func quoteAlternate(path string) string {
 }
 
 func (r *repo) tempIndex(ctx context.Context) (*tempIndex, error) {
-	dir, err := os.MkdirTemp("", "agentd-git-")
+	dir, err := os.MkdirTemp("", "agtd-git-")
 	if err != nil {
 		return nil, err
 	}
@@ -710,7 +710,7 @@ func describe(args []string, err error, stderr string) error {
 	var missing *fs.PathError
 	switch {
 	case errors.Is(err, exec.ErrNotFound), errors.As(err, &missing) && missing.Path == gitPath:
-		return errors.New("git is not installed (or not on agentd's PATH)")
+		return errors.New("git is not installed (or not on agtd's PATH)")
 	case errors.Is(err, context.DeadlineExceeded):
 		return fmt.Errorf("git %s took too long", subcommand(args))
 	case errors.As(err, &exit) && exit.ExitCode() >= 0:

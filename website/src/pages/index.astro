@@ -32,7 +32,7 @@ const install = 'curl -fsSL https://agtd.sh/install.sh | bash';
 				</button>
 			</div>
 			<p class="t-small muted" style="margin: 0">
-				macOS, Debian/Ubuntu and Arch. Installs <code>agt</code> and <code>agentd</code> to <code>~/.local/bin</code>.
+				macOS, Debian/Ubuntu and Arch. Installs <code>agt</code> and <code>agtd</code> to <code>~/.local/bin</code>.
 			</p>
 		</div>
 		<div style="display: flex; flex-wrap: wrap; gap: 12px">
@@ -123,7 +123,7 @@ const install = 'curl -fsSL https://agtd.sh/install.sh | bash';
 				<h2 class="t-heading">Install</h2>
 				<p style="margin: 0">On macOS, Debian/Ubuntu or Arch (Omarchy included).</p>
 				<p class="t-small muted" style="margin: 0">
-					The script installs <code>agt</code> and <code>agentd</code> side by side in <code>~/.local/bin</code>.
+					The script installs <code>agt</code> and <code>agtd</code> side by side in <code>~/.local/bin</code>.
 					Run it again at any time to upgrade: a running daemon hands its sessions to the new binary without
 					stopping them. It never turns on remote access.
 				</p>
@@ -132,7 +132,7 @@ const install = 'curl -fsSL https://agtd.sh/install.sh | bash';
 			<div class="stack" style="flex: 1 1 560px; min-width: 0">
 				<Terminal title="shell" commands={[install]} />
 				<p class="t-small muted" style="margin: 0">
-					Or run <code>./install.sh</code> from a checkout, which builds that checkout. <code>AGENTD_PREFIX</code>
+					Or run <code>./install.sh</code> from a checkout, which builds that checkout. <code>AGTD_PREFIX</code>
 					changes the prefix.
 				</p>
 			</div>

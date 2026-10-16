@@ -48,7 +48,7 @@ type Report struct {
 		FillLines   int     `json:"fill_lines"`
 	} `json:"options"`
 
-	// DaemonStartupMs is from starting `agentd serve` to its first answer.
+	// DaemonStartupMs is from starting `agtd serve` to its first answer.
 	DaemonStartupMs float64 `json:"daemon_startup_ms"`
 	// DaemonIdle is the daemon with no sessions; DaemonLoaded with all the
 	// idle sessions running.
@@ -255,7 +255,7 @@ func count(v float64) string {
 // Print writes the report as tables.
 func (r *Report) Print(w io.Writer) {
 	m := r.Machine
-	fmt.Fprintf(w, "agentd bench sessions: %d idle", r.Options.Count)
+	fmt.Fprintf(w, "agtd bench sessions: %d idle", r.Options.Count)
 	if r.Options.OutputHeavy > 0 {
 		fmt.Fprintf(w, ", %d output-heavy (%d attached)", r.Options.OutputHeavy, r.Options.Attach)
 	}

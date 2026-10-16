@@ -47,13 +47,13 @@ type client struct {
 const (
 	localConnectTimeout = 2 * time.Second
 	// daemonStartTimeout is longer than the daemon's own 5s wait for
-	// agentd.lock, so a restart that has to wait out the previous daemon
+	// agtd.lock, so a restart that has to wait out the previous daemon
 	// still counts as a successful start.
 	daemonStartTimeout = 7 * time.Second
 	daemonStopTimeout  = 5 * time.Second
 	pollInterval       = 100 * time.Millisecond
 
-	upgradeHint = "run `agt daemon upgrade` (set AGENTD_BIN to choose the daemon binary)"
+	upgradeHint = "run `agt daemon upgrade` (set AGTD_BIN to choose the daemon binary)"
 )
 
 func (c *client) remoteName() string {
@@ -116,7 +116,7 @@ func (c *client) remoteConnection(ctx context.Context) (*transport.QUICClient, e
 			"If you trust the new key, run `agt host rm %s` and add the host again.",
 			c.host.Name, c.host.Address, c.host.Fingerprint, changed.Presented, c.host.Name)}
 	case err != nil:
-		return nil, fmt.Errorf("could not reach agentd on `%s` (%s): %w", c.host.Name, c.host.Address, err)
+		return nil, fmt.Errorf("could not reach agtd on `%s` (%s): %w", c.host.Name, c.host.Address, err)
 	}
 	c.quic = conn
 	return conn, nil
@@ -163,7 +163,7 @@ func (c *client) explain(err error) error {
 	if id, idErr := loadClientIdentity(c.paths); idErr == nil {
 		fp = id.Fingerprint
 	}
-	return fmt.Errorf("%w\nagentd on `%s` (%s) refused this machine's key. If it is not authorized yet, run on `%s`:\n  agentd remote authorize %s %s",
+	return fmt.Errorf("%w\nagtd on `%s` (%s) refused this machine's key. If it is not authorized yet, run on `%s`:\n  agtd remote authorize %s %s",
 		err, c.host.Name, c.host.Address, c.host.Name, fp, localHostname())
 }
 
@@ -218,7 +218,7 @@ func (c *client) request(req *protocol.Request, timeout time.Duration) (*protoco
 		return nil, err
 	}
 	if resp == nil {
-		return nil, errors.New("agentd closed the connection")
+		return nil, errors.New("agtd closed the connection")
 	}
 	return resp, nil
 }
@@ -391,7 +391,7 @@ func (c *client) manage(req *protocol.ManagementRequest, timeout time.Duration) 
 		return nil, err
 	}
 	if resp == nil {
-		return nil, errors.New("agentd closed the management connection")
+		return nil, errors.New("agtd closed the management connection")
 	}
 	return resp, nil
 }
@@ -406,7 +406,7 @@ func (c *client) prepareDaemon(daemonCommand string) error {
 	if c.host != nil {
 		switch daemonCommand {
 		case "restart", "upgrade":
-			return fmt.Errorf("`agt daemon %s` only manages the local daemon; run `agentd` on `%s` instead", daemonCommand, c.host.Name)
+			return fmt.Errorf("`agt daemon %s` only manages the local daemon; run `agtd` on `%s` instead", daemonCommand, c.host.Name)
 		case "":
 			return c.ensureCompatible()
 		}
@@ -450,10 +450,10 @@ func (c *client) spawnDaemon() error {
 	return c.startDaemon(exe, daemonStartTimeout)
 }
 
-// startDaemon starts `agentd serve --daemonize` and waits for its socket to
+// startDaemon starts `agtd serve --daemonize` and waits for its socket to
 // answer.
 //
-// The daemon holds an exclusive flock on agentd.lock for its whole life,
+// The daemon holds an exclusive flock on agtd.lock for its whole life,
 // waits up to 5s for it on startup (so a restart can hand over), and removes
 // a stale socket itself while holding the lock. So the CLI never deletes the
 // socket or pid file and never judges liveness from the pid file (a recycled
@@ -462,7 +462,7 @@ func (c *client) spawnDaemon() error {
 func (c *client) startDaemon(exe string, timeout time.Duration) error {
 	cmd := exec.Command(exe, "serve", "--daemonize")
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start agentd: %w", err)
+		return fmt.Errorf("failed to start agtd: %w", err)
 	}
 	// daemonize forks and exits at once; reap it so it is not left a zombie.
 	go cmd.Wait()
@@ -472,28 +472,28 @@ func (c *client) startDaemon(exe string, timeout time.Duration) error {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out waiting for agentd to start; see %s", c.paths.DaemonLogPath())
+			return fmt.Errorf("timed out waiting for agtd to start; see %s", c.paths.DaemonLogPath())
 		}
 		time.Sleep(pollInterval)
 	}
 }
 
 // daemonExecutable is the daemon started by `serve --daemonize` and
-// `upgrade`: $AGENTD_BIN when set and non-empty (for example go/bin/agentd
-// during development), otherwise the agentd next to this executable.
+// `upgrade`: $AGTD_BIN when set and non-empty (for example go/bin/agtd
+// during development), otherwise the agtd next to this executable.
 func daemonExecutable() (string, error) {
 	exe, err := os.Executable()
-	return daemonExecutableFrom(os.Getenv("AGENTD_BIN"), exe, err)
+	return daemonExecutableFrom(os.Getenv("AGTD_BIN"), exe, err)
 }
 
-func daemonExecutableFrom(agentdBin, exe string, exeErr error) (string, error) {
-	if agentdBin != "" {
-		return agentdBin, nil
+func daemonExecutableFrom(agtdBin, exe string, exeErr error) (string, error) {
+	if agtdBin != "" {
+		return agtdBin, nil
 	}
 	if exeErr != nil {
 		return "", fmt.Errorf("failed to resolve current executable: %w", exeErr)
 	}
-	return filepath.Join(filepath.Dir(exe), "agentd"), nil
+	return filepath.Join(filepath.Dir(exe), "agtd"), nil
 }
 
 // ensureCompatible performs the handshake, which agrees on a protocol
@@ -505,7 +505,7 @@ func (c *client) ensureCompatible() error {
 }
 
 func incompatibleDaemonMessage() string {
-	return fmt.Sprintf("agentd does not speak agent protocol %d; %s", protocol.ProtocolVersion, upgradeHint)
+	return fmt.Sprintf("agtd does not speak agent protocol %d; %s", protocol.ProtocolVersion, upgradeHint)
 }
 
 // welcome is the daemon's answer to this client's Hello.
@@ -551,7 +551,7 @@ func (c *client) shutdownDaemon(force bool) error {
 	deadline := time.Now().Add(daemonStopTimeout)
 	for c.localDaemonAnswers() {
 		if time.Now().After(deadline) {
-			return errors.New("timed out waiting for agentd to stop")
+			return errors.New("timed out waiting for agtd to stop")
 		}
 		time.Sleep(pollInterval)
 	}
@@ -591,11 +591,11 @@ func (c *client) upgradeDaemon() error {
 		var exit *exec.ExitError
 		if errors.As(err, &exit) {
 			if exit.ExitCode() >= 0 {
-				return fmt.Errorf("agentd upgrade exited with status %d", exit.ExitCode())
+				return fmt.Errorf("agtd upgrade exited with status %d", exit.ExitCode())
 			}
-			return errors.New("agentd upgrade terminated by signal")
+			return errors.New("agtd upgrade terminated by signal")
 		}
-		return fmt.Errorf("failed to run agentd upgrade: %w", err)
+		return fmt.Errorf("failed to run agtd upgrade: %w", err)
 	}
 	if err := c.ensureCompatible(); err != nil {
 		return err

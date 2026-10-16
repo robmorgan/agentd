@@ -303,7 +303,7 @@ func (a *app) commands() []*cobra.Command {
 	})
 	diff.Flags().BoolVar(&diffStat, "stat", false, "Show a diffstat instead of the diff")
 	diff.Flags().BoolVar(&diffNameOnly, "name-only", false, "Show only the changed files' names")
-	diff.Annotations = map[string]string{"after": "Notes:\n  The diff covers everything since the session started: commits, staged and\n  unstaged changes, and untracked files. A session started outside a repository\n  (or before agentd recorded where it started) is compared with HEAD instead.\n  Git runs on the daemon's machine and agentd never changes the repository."}
+	diff.Annotations = map[string]string{"after": "Notes:\n  The diff covers everything since the session started: commits, staged and\n  unstaged changes, and untracked files. A session started outside a repository\n  (or before agtd recorded where it started) is compared with HEAD instead.\n  Git runs on the daemon's machine and agtd never changes the repository."}
 	cmds = append(cmds, annotate(diff, "[OPTIONS] <SESSION_ID>", "<SESSION_ID>"))
 
 	cmds = append(cmds, annotate(a.command("artifacts SESSION", "List what a session produced that can be downloaded", oneArg, func(args []string) error {
@@ -343,7 +343,7 @@ func (a *app) commands() []*cobra.Command {
 	events.Flags().BoolVar(&ev.json, "json", false, "Print one JSON object per event")
 	events.Flags().BoolVarP(&ev.all, "all", "a", false, "Show the events of this machine and every host (see `agt hosts`)")
 	events.Flags().BoolVar(&ev.notify, "notify", false, "Ring the bell and post a desktop notification for action-level events")
-	events.Flags().StringVar(&ev.exec, "exec", "", "Run CMD with sh for each event, described in AGENTD_EVENT_* variables")
+	events.Flags().StringVar(&ev.exec, "exec", "", "Run CMD with sh for each event, described in AGTD_EVENT_* variables")
 	events.Flags().Func("after", "Start after event ID (from an earlier run) instead of with the newest events", func(v string) error {
 		id, err := strconv.ParseUint(v, 10, 64)
 		ev.after, ev.afterSet = id, true
@@ -358,15 +358,15 @@ func (a *app) commands() []*cobra.Command {
   agt events fix-tests -f        follow one session
   agt --host devbox events -f --notify
                                    alert when a session on devbox needs you
-  agt events -f --level action --exec 'say "$AGENTD_EVENT_SESSION needs you"'
+  agt events -f --level action --exec 'say "$AGTD_EVENT_SESSION needs you"'
 
---exec gets AGENTD_EVENT_ID, _HOST, _SESSION, _KIND, _ATTENTION, _SUMMARY and
+--exec gets AGTD_EVENT_ID, _HOST, _SESSION, _KIND, _ATTENTION, _SUMMARY and
 _TIME. Following reconnects by itself and resumes after the last event shown.`}
 	cmds = append(cmds, annotate(events, "[OPTIONS] [SESSION_ID]", "[SESSION_ID]"))
 
 	cmds = append(cmds, group("workspace", "Manage named working directories on the daemon's machine",
 		"Name directories on the daemon's machine, then start sessions in them\nwith `agt new --workspace NAME`.",
-		"Notes:\n  Paths are resolved by the daemon; `~/` is its user's home. The directory must\n  already exist: agentd does not clone, create, or sync workspaces.\n  Removing a workspace does not affect sessions already running in it.",
+		"Notes:\n  Paths are resolved by the daemon; `~/` is its user's home. The directory must\n  already exist: agtd does not clone, create, or sync workspaces.\n  Removing a workspace does not affect sessions already running in it.",
 		annotate(a.command("add NAME PATH", "Add a workspace", twoArgs, func(args []string) error {
 			c, err := a.connect(nil, "", nil)
 			if err != nil {
@@ -412,7 +412,7 @@ _TIME. Following reconnects by itself and resumes after the last event shown.`}
 		}), "<NAME>", "<NAME>"),
 	))
 
-	cmds = append(cmds, group("daemon", "Inspect or control the local agentd",
+	cmds = append(cmds, group("daemon", "Inspect or control the local agtd",
 		"Inspect, restart, or upgrade the local daemon process.",
 		"Notes:\n  `restart` keeps running sessions; they live in their own worker processes\n  and reattach to the new daemon.\n  `upgrade` replaces the daemon and hands running sessions over to the new\n  binary without stopping their agents; attached clients reattach.",
 		a.command("info", "Show daemon version, socket, pid, and compatibility", noArgs, func([]string) error {
@@ -442,7 +442,7 @@ _TIME. Following reconnects by itself and resumes after the last event shown.`}
 			}
 			return c.printDaemonStatus()
 		}),
-		a.command("upgrade", "Upgrade the daemon and running sessions to the agentd binary", noArgs, func([]string) error {
+		a.command("upgrade", "Upgrade the daemon and running sessions to the agtd binary", noArgs, func([]string) error {
 			c, err := a.connect(nil, "upgrade", nil)
 			if err != nil {
 				return err
@@ -458,9 +458,9 @@ _TIME. Following reconnects by itself and resumes after the last event shown.`}
 		}
 		return a.hostAdd(args[0], args[1], fingerprint, pairCode)
 	})
-	hostAdd.Flags().StringVar(&fingerprint, "fingerprint", "", "Expected daemon key (from `agentd remote id` on the host); skips the prompt")
+	hostAdd.Flags().StringVar(&fingerprint, "fingerprint", "", "Expected daemon key (from `agtd remote id` on the host); skips the prompt")
 	withValue(hostAdd, "fingerprint", "FP")
-	hostAdd.Flags().StringVar(&pairCode, "code", "", "Pairing code from `agentd remote pair` on the host: pins its key and authorizes this machine there")
+	hostAdd.Flags().StringVar(&pairCode, "code", "", "Pairing code from `agtd remote pair` on the host: pins its key and authorizes this machine there")
 	withValue(hostAdd, "code", "CODE")
 	var noProbe bool
 	listHosts := func([]string) error { return a.listHosts(noProbe) }
@@ -470,9 +470,9 @@ _TIME. Following reconnects by itself and resumes after the last event shown.`}
 	hosts.Flags().BoolVar(&noProbe, "no-probe", false, "List hosts.toml without contacting the hosts (shows their keys)")
 	cmds = append(cmds, hosts)
 	cmds = append(cmds, group("host", "Manage remote hosts this machine can reach",
-		"Remote hosts running agentd with `[remote] listen` set.",
+		"Remote hosts running agtd with `[remote] listen` set.",
 		"Examples:\n  agt host add devbox 100.64.0.5:7433 --code 123-456-789\n  agt host add devbox 100.64.0.5:7433\n  agt host ls\n  agt --host devbox ls\n  agt attach devbox/auth-refactor\n  agt --host auto new --workspace mono fix-tests",
-		annotate(hostAdd, "[OPTIONS] <NAME> <ADDRESS>", "<NAME>     \n<ADDRESS>  HOST:PORT of the remote agentd's QUIC listener"),
+		annotate(hostAdd, "[OPTIONS] <NAME> <ADDRESS>", "<NAME>     \n<ADDRESS>  HOST:PORT of the remote agtd's QUIC listener"),
 		hostList,
 		annotate(a.command("info NAME", "Show a host's machine, daemon, and capabilities", oneArg, func(args []string) error {
 			return a.hostInfo(args[0])
@@ -880,7 +880,7 @@ func resolveDetachSessionID(id string) (string, error) {
 	if id != "" {
 		return id, nil
 	}
-	if env := os.Getenv("AGENTD_SESSION_ID"); env != "" {
+	if env := os.Getenv("AGTD_SESSION_ID"); env != "" {
 		return env, nil
 	}
 	return "", errors.New("`agt detach` without a session id only works inside a managed session")
@@ -982,7 +982,7 @@ func (a *app) hostAdd(name, address, fingerprint, code string) error {
 			return err
 		}
 	} else if fingerprint == "" && !isTerminal(os.Stdin) {
-		return errors.New("no terminal to enter a pairing code on; pass --code CODE (from `agentd remote pair` on the host) or --fingerprint FP (from `agentd remote id` there)")
+		return errors.New("no terminal to enter a pairing code on; pass --code CODE (from `agtd remote pair` on the host) or --fingerprint FP (from `agtd remote id` there)")
 	}
 	id, err := loadClientIdentity(a.paths)
 	if err != nil {
@@ -998,7 +998,7 @@ func (a *app) hostAdd(name, address, fingerprint, code string) error {
 
 	presented, err := transport.ProbeFingerprint(context.Background(), address, id)
 	if err != nil {
-		return fmt.Errorf("could not reach agentd at %s: %w", address, err)
+		return fmt.Errorf("could not reach agtd at %s: %w", address, err)
 	}
 	if fingerprint != "" {
 		if fingerprint != presented {
@@ -1010,9 +1010,9 @@ func (a *app) hostAdd(name, address, fingerprint, code string) error {
 		return keyChanged(name, address, presented, existing.Fingerprint)
 	}
 
-	fmt.Printf("The agentd at %s presents this key:\n  %s\n\n", address, presented)
-	fmt.Printf("To trust it, run `agentd remote pair` on `%s` and enter the code it shows.\n", name)
-	fmt.Println("(Or press Enter to compare the key with `agentd remote id` there instead.)")
+	fmt.Printf("The agtd at %s presents this key:\n  %s\n\n", address, presented)
+	fmt.Printf("To trust it, run `agtd remote pair` on `%s` and enter the code it shows.\n", name)
+	fmt.Println("(Or press Enter to compare the key with `agtd remote id` there instead.)")
 	in := bufio.NewReader(os.Stdin)
 	for attempt := 1; ; attempt++ {
 		code, err := prompt(in, "Pairing code: ")
@@ -1045,7 +1045,7 @@ func (a *app) hostAdd(name, address, fingerprint, code string) error {
 	if exists {
 		return alreadyExists
 	}
-	fmt.Println("Compare it with `agentd remote id` on that machine.")
+	fmt.Println("Compare it with `agtd remote id` on that machine.")
 	answer, err := prompt(in, "Trust this key? [y/N] ")
 	if err != nil {
 		return err
@@ -1064,11 +1064,11 @@ func (a *app) pair(address string, id *transport.Identity, code string) (*transp
 	var refused *transport.PairRefusedError
 	switch {
 	case errors.Is(err, transport.ErrNotPairing):
-		return nil, fmt.Errorf("the agentd at %s is not pairing: run `agentd remote pair` there and use the code it shows (codes expire after %d minutes)", address, int(transport.PairingTTL.Minutes()))
+		return nil, fmt.Errorf("the agtd at %s is not pairing: run `agtd remote pair` there and use the code it shows (codes expire after %d minutes)", address, int(transport.PairingTTL.Minutes()))
 	case errors.As(err, &refused):
 		return nil, err
 	case err != nil:
-		return nil, fmt.Errorf("could not pair with agentd at %s: %w", address, err)
+		return nil, fmt.Errorf("could not pair with agtd at %s: %w", address, err)
 	}
 	return paired, nil
 }
@@ -1095,7 +1095,7 @@ func (a *app) addPinned(name, address, fingerprint string, id *transport.Identit
 	if err := transport.AddHost(a.paths.HostsPath(), transport.Host{Name: name, Address: address, Fingerprint: fingerprint}); err != nil {
 		return err
 	}
-	fmt.Printf("added host `%s` (%s)\n\nIf this machine is not authorized there yet, run on `%s`:\n  agentd remote authorize %s %s\n",
+	fmt.Printf("added host `%s` (%s)\n\nIf this machine is not authorized there yet, run on `%s`:\n  agtd remote authorize %s %s\n",
 		name, address, name, id.Fingerprint, localHostname())
 	return nil
 }

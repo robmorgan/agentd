@@ -86,7 +86,7 @@ func (c *client) runEvents(id string, opts eventsOptions, h *eventHandler) error
 		return err
 	}
 	if !protocol.HasCapability(w.Capabilities, protocol.CapEvents) {
-		return errors.New("this agentd does not record events; upgrade it (`agt daemon upgrade`)")
+		return errors.New("this agtd does not record events; upgrade it (`agt daemon upgrade`)")
 	}
 	var sessionID *string
 	if id != "" {
@@ -391,13 +391,13 @@ func eventJSON(ev session.Event, host string) string {
 // eventEnv describes an event to an --exec command.
 func eventEnv(ev session.Event, host string) []string {
 	return []string{
-		"AGENTD_EVENT_ID=" + strconv.FormatUint(ev.ID, 10),
-		"AGENTD_EVENT_HOST=" + host,
-		"AGENTD_EVENT_SESSION=" + ev.SessionID,
-		"AGENTD_EVENT_KIND=" + string(ev.Kind),
-		"AGENTD_EVENT_ATTENTION=" + string(ev.Attention),
-		"AGENTD_EVENT_SUMMARY=" + ev.Summary,
-		"AGENTD_EVENT_TIME=" + ev.At.UTC().Format(time.RFC3339),
+		"AGTD_EVENT_ID=" + strconv.FormatUint(ev.ID, 10),
+		"AGTD_EVENT_HOST=" + host,
+		"AGTD_EVENT_SESSION=" + ev.SessionID,
+		"AGTD_EVENT_KIND=" + string(ev.Kind),
+		"AGTD_EVENT_ATTENTION=" + string(ev.Attention),
+		"AGTD_EVENT_SUMMARY=" + ev.Summary,
+		"AGTD_EVENT_TIME=" + ev.At.UTC().Format(time.RFC3339),
 	}
 }
 
@@ -416,7 +416,7 @@ func openAlertTerminal() *os.File {
 // take OSC 777 instead. Inside tmux the sequence is passed through (tmux
 // needs `set -g allow-passthrough on`).
 func alertBytes(ev session.Event, host string, getenv func(string) string) []byte {
-	title := "agentd: " + eventSession(ev, host)
+	title := "agtd: " + eventSession(ev, host)
 	body := oscText(ev.Summary)
 	if body == "" {
 		body = string(ev.Kind)

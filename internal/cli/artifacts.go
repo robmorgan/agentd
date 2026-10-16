@@ -29,9 +29,9 @@ func (c *client) requireCapability(cap, what string) error {
 	if protocol.HasCapability(w.Capabilities, cap) {
 		return nil
 	}
-	where := "agentd"
+	where := "agtd"
 	if c.host != nil {
-		where = fmt.Sprintf("agentd on `%s`", c.host.Name)
+		where = fmt.Sprintf("agtd on `%s`", c.host.Name)
 	}
 	return fmt.Errorf("%s (version %s) does not support %s; upgrade it", where, w.DaemonVersion, what)
 }
@@ -95,7 +95,7 @@ func (c *client) streamArtifact(id, name string, w io.Writer) error {
 		case err != nil:
 			return err
 		case resp == nil:
-			return fmt.Errorf("agentd closed the stream before the end of artifact `%s`", name)
+			return fmt.Errorf("agtd closed the stream before the end of artifact `%s`", name)
 		case resp.ArtifactChunk != nil:
 			if _, err := w.Write(resp.ArtifactChunk.Data); err != nil {
 				return err

@@ -30,7 +30,7 @@ func seedFrames(f *testing.F) {
 		{GetSessionStats: &GetSessionStats{SessionID: "ab", Snapshot: true}},
 		{SubscribeEvents: &SubscribeEvents{AfterID: u64p(7), SessionID: strp("ab"), Tail: 3}},
 		{ListEvents: &ListEvents{Limit: 5}},
-		{HandoffSession: &HandoffSession{SessionID: "ab", Executable: "/bin/agentd"}},
+		{HandoffSession: &HandoffSession{SessionID: "ab", Executable: "/bin/agtd"}},
 		{AttachTakeSize: &Geometry{Cols: 120, Rows: 40}},
 		{AttachLeave: Empty},
 	}
@@ -50,7 +50,7 @@ func seedFrames(f *testing.F) {
 		{DaemonStats: &DaemonStats{Daemon: ProcessStats{PID: 1}, OpenStreams: 2}},
 		{Event: &session.Event{ID: 9, SessionID: "ab", At: now, Kind: session.EventBell, Attention: session.AttentionAction, Summary: "bell"}},
 		{Events: &[]session.Event{{ID: 1, SessionID: "ab", At: now, Kind: "future-kind", Attention: session.AttentionInfo}}},
-		{HandedOff: &HandedOff{SessionID: "ab", WorkerPID: 7, Executable: "/bin/agentd", Handoffs: 1}},
+		{HandedOff: &HandedOff{SessionID: "ab", WorkerPID: 7, Executable: "/bin/agtd", Handoffs: 1}},
 		{SessionRestarting: &SessionRestarting{SessionID: "ab", Reason: "upgrade"}},
 	}
 	for _, r := range reqs {

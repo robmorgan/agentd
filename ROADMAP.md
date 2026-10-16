@@ -1,6 +1,6 @@
-# agentd Roadmap
+# agtd Roadmap
 
-`agentd` is a daemon runtime for supervising coding agents as durable tasks.
+`agtd` is a daemon runtime for supervising coding agents as durable tasks.
 
 The long-term goal is to make agent sessions behave more like infrastructure than terminal tabs:
 
@@ -21,7 +21,7 @@ agt CLI
     │ local or remote protocol
     ▼
 ┌──────────────────────┐
-│        agentd        │
+│        agtd        │
 │                      │
 │ session lifecycle    │
 │ PTY ownership        │
@@ -35,7 +35,7 @@ agt CLI
       coding agents
 ```
 
-`agentd` runs on the machine where the work runs.
+`agtd` runs on the machine where the work runs.
 
 A future hosted service may provide discovery, identity, authorization, audit, and connectivity, but it must not be required for the core runtime.
 
@@ -45,7 +45,7 @@ A future hosted service may provide discovery, identity, authorization, audit, a
 
 ### The daemon owns the work
 
-The machine running the agent also runs `agentd`.
+The machine running the agent also runs `agtd`.
 
 If an agent runs on a remote Linux host, that host owns:
 
@@ -69,7 +69,7 @@ agent
   │
   │ Unix socket
   ▼
-agentd
+agtd
 ```
 
 Remote:
@@ -79,14 +79,14 @@ agent
   │
   │ QUIC
   ▼
-agentd
+agtd
 ```
 
 The application protocol should not care which transport is underneath it.
 
 ### QUIC is the primary remote transport
 
-Remote `agentd` connections should be designed around QUIC rather than treating remote sessions as HTTP requests or a single TCP byte stream.
+Remote `agtd` connections should be designed around QUIC rather than treating remote sessions as HTTP requests or a single TCP byte stream.
 
 QUIC gives the runtime useful primitives directly:
 
@@ -102,7 +102,7 @@ QUIC gives the runtime useful primitives directly:
 
 The goal is not to expose QUIC details throughout the application.
 
-QUIC should provide the transport substrate underneath the `agentd` session protocol.
+QUIC should provide the transport substrate underneath the `agtd` session protocol.
 
 ### No mandatory control plane
 
@@ -120,7 +120,7 @@ A hosted control plane can come later.
 
 ### The protocol is a first-class interface
 
-`agentd` should not become tightly coupled to one CLI or TUI.
+`agtd` should not become tightly coupled to one CLI or TUI.
 
 Clients should be able to:
 
@@ -141,7 +141,7 @@ over a stable application protocol.
 
 Raw PTY output is insufficient for reliable reconnect.
 
-`agentd` should maintain actual terminal state so that attaching clients can receive a snapshot of the current terminal before consuming new output.
+`agtd` should maintain actual terminal state so that attaching clients can receive a snapshot of the current terminal before consuming new output.
 
 ### Build for real workloads before generalized infrastructure
 
@@ -190,7 +190,7 @@ Before changing implementation language or transport architecture, document the 
 * [x] Test multiple simultaneous attachers (worker `TestMultipleAttachers`, `TestSlowAttacherDoesNotStallOthers`;
       daemon `TestMultipleAttachersThroughDaemon`)
 * [x] Document daemon restart behavior (ARCHITECTURE.md, "Lifecycles")
-* [x] Establish baseline benchmarks (`agentd bench sessions`; BENCHMARKS.md, "Sessions at scale" and
+* [x] Establish baseline benchmarks (`agtd bench sessions`; BENCHMARKS.md, "Sessions at scale" and
       "Terminal and worker")
 
 Baseline metrics should include:
@@ -224,7 +224,7 @@ The purpose is not merely a language rewrite. The Go implementation should becom
                    │ framed protocol
                    ▼
           ┌──────────────────┐
-          │      agentd      │
+          │      agtd      │
           │        Go        │
           │                  │
           │ task manager     │
@@ -255,7 +255,7 @@ The purpose is not merely a language rewrite. The Go implementation should becom
 * [x] Support interactive reattach
 * [x] Support PTY resize
 * [x] Support multiple attached clients
-* [x] Sessions run in a per-session `cwd`; agentd does not manage git worktrees
+* [x] Sessions run in a per-session `cwd`; agtd does not manage git worktrees
 * [x] Port SQLite-backed metadata
 * [x] Preserve compatibility with existing session semantics where practical
 * [x] Sessions survive daemon restart (each session's worker is its own process)
@@ -383,7 +383,7 @@ The protocol should operate over explicit message and stream abstractions rather
               │                     │
               ▼                     ▼
             local                 remote
-            agentd                agentd
+            agtd                agtd
 ```
 
 ## Deliverables
@@ -427,7 +427,7 @@ The protocol does not need to become a generic RPC framework.
 
 # Phase 4 — QUIC remote transport
 
-Add direct secure remote connectivity between an `agt` client and `agentd`.
+Add direct secure remote connectivity between an `agt` client and `agtd`.
 
 QUIC is the primary remote transport.
 
@@ -444,7 +444,7 @@ agt --host devbox attach auth-refactor
 
 Linux devbox
 
-agentd
+agtd
  ├── Claude Code
  ├── Codex
  └── shell
@@ -491,12 +491,12 @@ One slow session should not unnecessarily stall unrelated sessions.
 
 ## Deliverables
 
-* [x] Add QUIC listener to `agentd`
+* [x] Add QUIC listener to `agtd`
 * [x] Add QUIC client transport (`agt --host`)
-* [x] One-command setup (`agentd remote enable`, detecting a Tailscale address)
+* [x] One-command setup (`agtd remote enable`, detecting a Tailscale address)
 * [x] Establish TLS identity model (self-signed Ed25519 keys, pinned by fingerprint)
 * [x] Authenticate machines/clients (mutual TLS: authorized client keys, pinned daemon key)
-* [x] Pair machines with a one-time code (`agentd remote pair`, `agt host add --code`: CPace over a pairing ALPN)
+* [x] Pair machines with a one-time code (`agtd remote pair`, `agt host add --code`: CPace over a pairing ALPN)
 * [x] Define stream roles (one bidirectional stream per request or attachment)
 * [x] Define stream negotiation (a stream's first frame sets its role)
 * [x] Support remote:
@@ -536,7 +536,7 @@ Once basic remote connectivity works, take advantage of QUIC rather than merely 
 
 ## Goals
 
-Design stream ownership around `agentd` concepts.
+Design stream ownership around `agtd` concepts.
 
 Avoid funneling every operation through a single connection mutex or application-level multiplexer.
 
@@ -613,7 +613,7 @@ Use independent streams.
 
 QUIC connections are not themselves the durable session.
 
-The session belongs to `agentd`.
+The session belongs to `agtd`.
 
 A client must be able to lose its connection completely and create another one later.
 
@@ -624,7 +624,7 @@ client
    │
    │ QUIC connection #1
    ▼
-agentd
+agtd
    │
    └── session continues
 
@@ -634,7 +634,7 @@ client
    │
    │ QUIC connection #2
    ▼
-agentd
+agtd
    │
    └── same session
 ```
@@ -654,7 +654,7 @@ The application must not depend on transport connection identity as session iden
 * [x] Test extended offline periods (`TestReattachAfterExtendedOutage`)
 * [x] Test repeated reconnect loops (`TestRepeatedReconnectsLeakNothing`, `TestRepeatedReattachLeaksNothing`)
 
-QUIC connection migration may improve transient network changes, but `agentd` must remain correct even when migration is unavailable and a completely new connection is required.
+QUIC connection migration may improve transient network changes, but `agtd` must remain correct even when migration is unavailable and a completely new connection is required.
 
 ---
 
@@ -698,7 +698,7 @@ Eventually it should survive daemon maintenance as well.
 
 ## Goal
 
-Upgrade or restart `agentd` without unnecessarily destroying active agent work.
+Upgrade or restart `agtd` without unnecessarily destroying active agent work.
 
 ## Areas to investigate
 
@@ -716,7 +716,7 @@ Upgrade or restart `agentd` without unnecessarily destroying active agent work.
 ## Potential model
 
 ```text
-agentd v1
+agtd v1
    │
    ├── PTY fd
    ├── child process
@@ -724,7 +724,7 @@ agentd v1
           │
           │ handoff
           ▼
-agentd v2
+agtd v2
    │
    ├── same PTY
    ├── same child
@@ -737,7 +737,7 @@ agentd v2
 * [x] Preserve task metadata across restart (`state.db` plus per-session workers; `TestSessionSurvivesDaemonRestart`, `TestDaemonSIGKILLWithLiveSessions`, `TestUpgradeWithLiveSessions`)
 * [x] Investigate live PTY handoff (workers re-exec in place keeping the PTY, socket and agent; ARCHITECTURE.md, "Live Handoff")
 * [x] Prototype FD transfer (exec-inherited descriptors in `internal/worker/handoff.go`; the rejected SCM_RIGHTS design in `internal/worker/fdpass_test.go`)
-* [x] Prototype daemon upgrade (`agentd upgrade` / `agt daemon upgrade` hand running sessions to the new binary)
+* [x] Prototype daemon upgrade (`agtd upgrade` / `agt daemon upgrade` hand running sessions to the new binary)
 * [x] Ensure clients can reconnect after upgrade (attachments reattach on `SessionRestarting` and when the local daemon goes away)
 * [x] Add crash-recovery tests (`internal/daemon/crash_test.go`, `handoff_failure_test.go`)
 
@@ -754,7 +754,7 @@ Agent workflows may eventually involve dozens or hundreds of dormant sessions.
 ## Primary benchmark
 
 ```sh
-agentd bench sessions --count N
+agtd bench sessions --count N
 ```
 
 ## Measure
@@ -823,7 +823,7 @@ Prefer simple optimizations that reduce permanent per-session cost.
 
 Once durable remote sessions are solid, build agent-specific behavior above them.
 
-This is where `agentd` should differentiate itself from a terminal multiplexer.
+This is where `agtd` should differentiate itself from a terminal multiplexer.
 
 ## Attention model
 
@@ -881,7 +881,7 @@ The runtime should help answer:
 
 # Phase 11 — Multiple machines
 
-Once remote `agentd` is stable, make multiple hosts feel like one workspace without centralizing session execution.
+Once remote `agtd` is stable, make multiple hosts feel like one workspace without centralizing session execution.
 
 ## Example
 
@@ -990,7 +990,7 @@ The control plane must not become the owner of execution.
 
 ### Data plane
 
-`agentd` on each machine owns:
+`agtd` on each machine owns:
 
 ```text
 PTYs
@@ -1032,21 +1032,21 @@ policy
 
        laptop          devbox          prod
 
-       agentd          agentd          agentd
+       agtd          agtd          agtd
          │               │               │
        agents          agents          agents
 ```
 
-Where possible, the client should establish a direct QUIC connection to the machine running `agentd`.
+Where possible, the client should establish a direct QUIC connection to the machine running `agtd`.
 
 ```text
-client ═════════════ QUIC ═════════════► agentd
+client ═════════════ QUIC ═════════════► agtd
 ```
 
 rather than proxying session data through the control plane:
 
 ```text
-client ──► cloud service ──► agentd
+client ──► cloud service ──► agtd
 ```
 
 A relay may eventually exist as a fallback when direct connectivity is impossible.
@@ -1067,7 +1067,7 @@ Potential architecture:
                     /             \
                    /               \
                   ▼                 ▼
-              client             agentd
+              client             agtd
                   \                 /
                    \               /
                     ══ direct QUIC ══
@@ -1076,7 +1076,7 @@ Potential architecture:
 Fallback:
 
 ```text
-client ══ QUIC ══► relay ══ QUIC ══► agentd
+client ══ QUIC ══► relay ══ QUIC ══► agtd
 ```
 
 Potential areas:
@@ -1111,7 +1111,7 @@ WebSocket       legacy/proxy fallback
 stdio/SSH       bootstrap or debugging
 ```
 
-These should adapt to the `agentd` application protocol rather than cause that protocol to be redesigned around their limitations.
+These should adapt to the `agtd` application protocol rather than cause that protocol to be redesigned around their limitations.
 
 ---
 
@@ -1133,7 +1133,7 @@ These should adapt to the `agentd` application protocol rather than cause that p
               ▼              ▼              ▼
 
           MacBook         devbox-01      server-03
-          agentd           agentd          agentd
+          agtd           agtd          agtd
              │               │               │
           sessions        sessions        sessions
              │               │               │
@@ -1143,7 +1143,7 @@ These should adapt to the `agentd` application protocol rather than cause that p
 With an optional service layered above:
 
 ```text
-                   agentd control plane
+                   agtd control plane
 
                 identity / discovery
                 access / audit / relay
@@ -1151,7 +1151,7 @@ With an optional service layered above:
               /           |           \
              /            |            \
          MacBook        devbox-01      server-03
-          agentd          agentd          agentd
+          agtd          agtd          agtd
 ```
 
 The hosted service enhances the runtime.
@@ -1162,7 +1162,7 @@ It does not define it.
 
 # Non-goals
 
-For the foreseeable future, `agentd` is not trying to become:
+For the foreseeable future, `agtd` is not trying to become:
 
 * a general container orchestrator
 * Kubernetes for agents
@@ -1181,7 +1181,7 @@ Some of those areas may eventually overlap with the project, but they should not
 
 # Engineering areas to explore
 
-Development of `agentd` should deliberately build expertise in the systems underneath durable agent runtimes.
+Development of `agtd` should deliberately build expertise in the systems underneath durable agent runtimes.
 
 ## Go systems engineering
 
@@ -1275,7 +1275,7 @@ transport-neutral application protocol
    ↓
 QUIC transport
    ↓
-remote agentd
+remote agtd
    ↓
 disconnect
    ↓
@@ -1296,7 +1296,7 @@ Until that flow is excellent, avoid adding unnecessary infrastructure around it.
 
 # Definition of success
 
-`agentd` should eventually make this ordinary:
+`agtd` should eventually make this ordinary:
 
 ```sh
 agt --host devbox new --cwd /srv/repo auth-refactor
@@ -1334,7 +1334,7 @@ client
    ║ QUIC
    │
    ▼
-agentd
+agtd
    │
    ├── durable task
    ├── PTY

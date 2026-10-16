@@ -337,7 +337,7 @@ func formatPathCell(s string, width int) string {
 }
 
 const (
-	headerText        = "agentd - agent multiplexer"
+	headerText        = "agtd - agent multiplexer"
 	headerSuffix      = " - agent multiplexer"
 	headerSuffixGamma = 1.35
 )
@@ -351,7 +351,7 @@ var (
 
 func fgRGB(c rgb) string { return fmt.Sprintf("\x1b[38;2;%d;%d;%dm", c.r, c.g, c.b) }
 
-// header is the "agentd - agent multiplexer" banner: a fixed truecolor
+// header is the "agtd - agent multiplexer" banner: a fixed truecolor
 // gradient on a truecolor terminal, plain text anywhere else.
 func header() string {
 	if !stdoutIsTerminal() || !supportsTrueColor(os.Getenv) {
@@ -362,7 +362,7 @@ func header() string {
 
 func colorHeader() string {
 	var b strings.Builder
-	b.WriteString("\x1b[1m" + fgRGB(primaryBlue) + "agentd\x1b[39m")
+	b.WriteString("\x1b[1m" + fgRGB(primaryBlue) + "agtd\x1b[39m")
 	suffix := []rune(headerSuffix)
 	denom := math.Max(float64(len(suffix)-1), 1)
 	for i, r := range suffix {

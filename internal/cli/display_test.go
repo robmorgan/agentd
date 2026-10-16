@@ -146,8 +146,8 @@ func TestHeader(t *testing.T) {
 	if got := stripANSI(colorHeader()); got != headerText {
 		t.Fatalf("coloured header text: %q", got)
 	}
-	if !strings.Contains(colorHeader(), fgRGB(primaryBlue)+"agentd") {
-		t.Fatal("agentd is not in the primary blue")
+	if !strings.Contains(colorHeader(), fgRGB(primaryBlue)+"agtd") {
+		t.Fatal("agtd is not in the primary blue")
 	}
 	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
 	for want, vars := range map[bool]map[string]string{

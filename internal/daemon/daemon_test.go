@@ -26,7 +26,7 @@ import (
 )
 
 // These tests run the daemon in-process (so the race detector covers it)
-// against real session workers: a freshly built agentd binary, spawned as
+// against real session workers: a freshly built agtd binary, spawned as
 // separate processes exactly as in production, each owning a real PTY.
 
 const testTimeout = 15 * time.Second
@@ -34,16 +34,16 @@ const testTimeout = 15 * time.Second
 var workerBin string
 
 func TestMain(m *testing.M) {
-	dir, err := os.MkdirTemp("", "agentd-bin-")
+	dir, err := os.MkdirTemp("", "agtd-bin-")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	workerBin = filepath.Join(dir, "agentd")
-	build := exec.Command("go", "build", "-o", workerBin, "../../cmd/agentd")
+	workerBin = filepath.Join(dir, "agtd")
+	build := exec.Command("go", "build", "-o", workerBin, "../../cmd/agtd")
 	build.Stdout, build.Stderr = os.Stderr, os.Stderr
 	if err := build.Run(); err != nil {
-		fmt.Fprintln(os.Stderr, "building agentd for daemon tests:", err)
+		fmt.Fprintln(os.Stderr, "building agtd for daemon tests:", err)
 		os.Exit(1)
 	}
 	code := m.Run()

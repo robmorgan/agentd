@@ -241,7 +241,7 @@ func TestProbeHandoff(t *testing.T) {
 	for name, exe := range map[string]string{
 		"missing":   filepath.Join(dir, "missing"),
 		"failing":   script("failing", "exit 1"),
-		"too old":   script("old", `echo "agentd session-worker handoff 0"`),
+		"too old":   script("old", `echo "agtd session-worker handoff 0"`),
 		"no answer": script("silent", "exit 0"),
 		"empty":     "",
 	} {

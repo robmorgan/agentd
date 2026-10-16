@@ -24,7 +24,7 @@ import (
 // running and fully usable, or recorded as ended, never something in
 // between, and never leave an agent running unsupervised.
 
-// startDaemonProcess runs `agentd serve` on the harness root as a separate
+// startDaemonProcess runs `agtd serve` on the harness root as a separate
 // process, which a test can SIGKILL, in place of the harness's in-process
 // daemon.
 func (h *harness) startDaemonProcess() *exec.Cmd {
@@ -36,7 +36,7 @@ func (h *harness) startDaemonProcess() *exec.Cmd {
 	}
 	defer log.Close()
 	cmd := exec.Command(workerBin, "serve")
-	cmd.Env = append(os.Environ(), "AGENTD_DIR="+h.paths.Root)
+	cmd.Env = append(os.Environ(), "AGTD_DIR="+h.paths.Root)
 	cmd.Stdout, cmd.Stderr = log, log
 	if err := cmd.Start(); err != nil {
 		h.t.Fatal(err)
@@ -115,7 +115,7 @@ func TestDaemonSIGKILLWithLiveSessions(t *testing.T) {
 // orphaned, and the session is recorded failed.
 //
 // An agent that ignores SIGHUP would survive, reparented to init, with a
-// dead terminal. agentd deliberately does not then signal the pid it
+// dead terminal. agtd deliberately does not then signal the pid it
 // recorded: by the time anyone looks, that pid may belong to an unrelated
 // process (see TestRecycledPidsAreNeverSignalled).
 func TestWorkerSIGKILLHangsUpTheAgent(t *testing.T) {
@@ -142,7 +142,7 @@ func TestCrashDuringCreate(t *testing.T) {
 	h := newHarnessWithConfig(t, `
 [agents.pidfile]
 command = "/bin/sh"
-args = ["-c", '''echo $$ > "$AGENTD_SESSION_ID.pid"; stty -echo; while IFS= read -r l; do echo "got:$l"; done''']
+args = ["-c", '''echo $$ > "$AGTD_SESSION_ID.pid"; stty -echo; while IFS= read -r l; do echo "got:$l"; done''']
 `)
 	const rounds = 6
 	for i := range rounds {
@@ -204,14 +204,14 @@ args = ["-c", '''echo $$ > "$AGENTD_SESSION_ID.pid"; stty -echo; while IFS= read
 	t.Logf("outcomes: %v", outcomes)
 }
 
-// `agentd upgrade` with live sessions: the daemon is replaced, the session's
+// `agtd upgrade` with live sessions: the daemon is replaced, the session's
 // worker is handed to the new binary with its agent still running, and an
 // attached client gets back to the same agent.
 func TestUpgradeWithLiveSessions(t *testing.T) {
 	h := newHarness(t)
 	// Upgrade starts the new daemon as `<exe> serve`, which finds the root
-	// through AGENTD_DIR.
-	t.Setenv("AGENTD_DIR", h.paths.Root)
+	// through AGTD_DIR.
+	t.Setenv("AGTD_DIR", h.paths.Root)
 	id := h.mustCreate("upgraded")
 	c := h.attachRestartable(id)
 	c.input("before\n")

@@ -241,7 +241,7 @@ func TestStateTransitionGuards(t *testing.T) {
 	}
 	// A session its worker claimed is not failed by a daemon that read it
 	// as still being created.
-	if err := store.MarkFailedIfCreating("a", "agentd stopped"); err != nil {
+	if err := store.MarkFailedIfCreating("a", "agtd stopped"); err != nil {
 		t.Fatal(err)
 	}
 	if rec := get("a"); rec.Status != session.StatusRunning {

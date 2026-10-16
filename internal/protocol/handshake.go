@@ -180,10 +180,10 @@ const (
 	CapDaemonID = "daemon-id"
 	// CapSessionRestart (attach stream): the stream may end with
 	// SessionRestarting when the session's worker restarts (a live handoff
-	// to a new agentd binary); the client then attaches again.
+	// to a new agtd binary); the client then attaches again.
 	CapSessionRestart = "session-restart"
 	// CapWorkerHandoff: a session worker accepts HandoffSession. Workers
-	// list it in their answer to Hello, so agentd can tell a worker that
+	// list it in their answer to Hello, so agtd can tell a worker that
 	// supports handoff from one started by an older binary.
 	CapWorkerHandoff = "worker-handoff"
 	// CapTerminalMemory: SessionStats ends with the shadow terminal's
@@ -265,7 +265,7 @@ func NegotiateVersion(clientMin, clientMax uint16) (uint16, error) {
 	}
 	v := min(clientMax, ProtocolVersion)
 	if v < max(clientMin, MinProtocolVersion) {
-		return 0, fmt.Errorf("agentd speaks protocol versions %d-%d but the client needs %d-%d; upgrade the agt CLI or the daemon",
+		return 0, fmt.Errorf("agtd speaks protocol versions %d-%d but the client needs %d-%d; upgrade the agt CLI or the daemon",
 			MinProtocolVersion, ProtocolVersion, clientMin, clientMax)
 	}
 	return v, nil

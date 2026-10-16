@@ -1,4 +1,4 @@
-.PHONY: libghostty build agt agentd test test-cgocheck test-linux vet shellcheck dev-run install
+.PHONY: libghostty build agt agtd test test-cgocheck test-linux vet shellcheck dev-run install
 
 ZIG ?= zig
 VERSION ?= 0.1.0
@@ -9,15 +9,15 @@ export PKG_CONFIG_PATH
 LDFLAGS := -X github.com/robmorgan/agtd/internal/cli.Version=$(VERSION) \
 	-X github.com/robmorgan/agtd/internal/daemon.Version=$(VERSION)
 
-# libghostty-vt, which agentd links, needs Zig 0.16+ (see README.md).
+# libghostty-vt, which agtd links, needs Zig 0.16+ (see README.md).
 libghostty:
 	ZIG=$(ZIG) ./scripts/build-libghostty.sh
 
-build: agentd agt
+build: agtd agt
 
-# agentd links libghostty-vt (cgo, built with Zig).
-agentd: libghostty
-	go build -ldflags '$(LDFLAGS)' -o bin/agentd ./cmd/agentd
+# agtd links libghostty-vt (cgo, built with Zig).
+agtd: libghostty
+	go build -ldflags '$(LDFLAGS)' -o bin/agtd ./cmd/agtd
 
 # agt is pure Go: it needs neither cgo nor Zig.
 agt:
@@ -32,7 +32,7 @@ test-cgocheck: libghostty
 	GOEXPERIMENT=cgocheck2 go test ./internal/worker/
 
 # The same suite on Linux: directly on a Linux host, otherwise in Docker
-# (scripts/test-linux.sh; AGENTD_TEST_DOCKER=1 forces Docker).
+# (scripts/test-linux.sh; AGTD_TEST_DOCKER=1 forces Docker).
 test-linux:
 	./scripts/test-linux.sh
 
@@ -43,10 +43,10 @@ vet: libghostty
 shellcheck:
 	git ls-files -z '*.sh' | xargs -0 shellcheck
 
-# The CLI looks for agentd next to its own executable, or at $AGENTD_BIN.
+# The CLI looks for agtd next to its own executable, or at $AGTD_BIN.
 dev-run: build
-	AGENTD_BIN=$(CURDIR)/bin/agentd ./bin/agt $(ARGS)
+	AGTD_BIN=$(CURDIR)/bin/agtd ./bin/agt $(ARGS)
 
 install: build
 	install -d $(BINDIR)
-	install -m 0755 bin/agt bin/agentd $(BINDIR)/
+	install -m 0755 bin/agt bin/agtd $(BINDIR)/

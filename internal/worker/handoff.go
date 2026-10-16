@@ -74,9 +74,9 @@ import (
 // it does not know, which the old image avoids by probing first.
 const handoffVersion = 1
 
-// handoffProbeOutput is what `agentd session-worker --handoff-probe` prints:
+// handoffProbeOutput is what `agtd session-worker --handoff-probe` prints:
 // the handoff formats the binary can resume from.
-var handoffProbeOutput = fmt.Sprintf("agentd session-worker handoff %d", handoffVersion)
+var handoffProbeOutput = fmt.Sprintf("agtd session-worker handoff %d", handoffVersion)
 
 const (
 	probeTimeout = 10 * time.Second
@@ -89,7 +89,7 @@ const (
 	inputDrainTimeout = 2 * time.Second
 )
 
-// HandoffProbe answers `agentd session-worker --handoff-probe`.
+// HandoffProbe answers `agtd session-worker --handoff-probe`.
 func HandoffProbe() string { return handoffProbeOutput }
 
 // handoffState is what the old image hands the new one, besides the
@@ -372,7 +372,7 @@ func probeHandoff(exe string) error {
 	return fmt.Errorf("%s cannot resume this session (it does not support handoff format %d)", exe, handoffVersion)
 }
 
-// Resume is the new image's side of a handoff: `agentd session-worker
+// Resume is the new image's side of a handoff: `agtd session-worker
 // --resume-fd FD`, executed in place of the old image with the state file
 // at FD. It restores the session and serves it until the agent exits.
 //

@@ -1,4 +1,4 @@
-// Package daemon implements `agentd serve`: the long-lived process that owns
+// Package daemon implements `agtd serve`: the long-lived process that owns
 // the session registry, spawns one session worker per session, and serves the
 // agent protocol on the runtime root's Unix socket.
 //
@@ -92,7 +92,7 @@ type Server struct {
 	remoteErr atomic.Pointer[string]
 	// remoteListener is the bound QUIC listener, for connection status.
 	remoteListener atomic.Pointer[transport.QUICListener]
-	// pairing is the pairing window `agentd remote pair` opens; every QUIC
+	// pairing is the pairing window `agtd remote pair` opens; every QUIC
 	// listener the daemon binds serves it.
 	pairing *transport.Pairing
 
@@ -128,7 +128,7 @@ type Server struct {
 }
 
 // New opens the state database and config under p. workerBin is normally
-// os.Executable(); tests point it at a freshly built agentd.
+// os.Executable(); tests point it at a freshly built agtd.
 func New(p *paths.AppPaths, workerBin string) (*Server, error) {
 	if err := p.EnsureLayout(); err != nil {
 		return nil, err
@@ -183,7 +183,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	// Holding the lock, any socket left at the path belongs to a daemon that
 	// is gone.
 	if err := os.Remove(s.paths.Socket); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("failed to remove stale agentd socket: %w", err)
+		return fmt.Errorf("failed to remove stale agtd socket: %w", err)
 	}
 	if err := s.reconcileSessions(); err != nil {
 		return err
@@ -191,7 +191,7 @@ func (s *Server) Serve(ctx context.Context) error {
 
 	listener, err := transport.ListenUnix(s.paths.Socket, transport.UnixOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to bind agentd socket: %w", err)
+		return fmt.Errorf("failed to bind agtd socket: %w", err)
 	}
 	// The pid file is informational (agt daemon info); the lock, not the
 	// pid file, decides whether a daemon is running.
@@ -274,7 +274,7 @@ func (s *Server) startRemote() {
 	id, err := transport.LoadOrCreateIdentity(s.paths.RemoteKeyPath())
 	if err != nil {
 		s.setRemoteError(err)
-		fmt.Fprintf(os.Stderr, "agentd: remote access disabled: %v\n", err)
+		fmt.Fprintf(os.Stderr, "agtd: remote access disabled: %v\n", err)
 		return
 	}
 	// Read once here, in Serve, rather than from the retry goroutine.
@@ -285,16 +285,16 @@ func (s *Server) startRemote() {
 		Authorized: func(fp string) bool {
 			ok, err := transport.IsAuthorized(authorized, fp)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "agentd: reading %s: %v\n", authorized, err)
+				fmt.Fprintf(os.Stderr, "agtd: reading %s: %v\n", authorized, err)
 			}
 			return ok
 		},
 		OnConnect: func(fp string, remote net.Addr) {
-			fmt.Fprintf(os.Stderr, "agentd: remote client %s connected from %s\n", fp, remote)
+			fmt.Fprintf(os.Stderr, "agtd: remote client %s connected from %s\n", fp, remote)
 			s.remoteConnected(fp, remote)
 		},
 		OnRevoked: func(fp string, remote net.Addr) {
-			fmt.Fprintf(os.Stderr, "agentd: closed %s's connection from %s: key revoked\n", fp, remote)
+			fmt.Fprintf(os.Stderr, "agtd: closed %s's connection from %s: key revoked\n", fp, remote)
 			s.remoteRevoked(fp, remote)
 		},
 		Pairing: s.pairing,
@@ -304,7 +304,7 @@ func (s *Server) startRemote() {
 		if err != nil {
 			// Logged only when the reason changes, not on every retry.
 			if prev := s.remoteErr.Load(); prev == nil || *prev != err.Error() {
-				fmt.Fprintf(os.Stderr, "agentd: remote access not available yet (retrying every %s): %v\n", retry, err)
+				fmt.Fprintf(os.Stderr, "agtd: remote access not available yet (retrying every %s): %v\n", retry, err)
 			}
 			s.setRemoteError(err)
 			return nil
@@ -313,7 +313,7 @@ func (s *Server) startRemote() {
 		s.remoteAddr.Store(&bound)
 		s.remoteListener.Store(l)
 		s.remoteErr.Store(nil)
-		fmt.Fprintf(os.Stderr, "agentd: accepting remote clients over QUIC on %s (key %s)\n", bound, id.Fingerprint)
+		fmt.Fprintf(os.Stderr, "agtd: accepting remote clients over QUIC on %s (key %s)\n", bound, id.Fingerprint)
 		return l
 	}
 	l := listen()
@@ -331,7 +331,7 @@ func (s *Server) startRemote() {
 				s.remoteAddr.Store(nil)
 				s.remoteListener.Store(nil)
 				s.setRemoteError(errors.New("the QUIC listener stopped; binding it again"))
-				fmt.Fprintf(os.Stderr, "agentd: the QUIC listener stopped; binding it again\n")
+				fmt.Fprintf(os.Stderr, "agtd: the QUIC listener stopped; binding it again\n")
 			}
 			select {
 			case <-s.shutdown:
@@ -380,7 +380,7 @@ func (s *Server) serveListener(l transport.Listener) {
 	// Handlers are counted in track, under connsMu, rather than by Serve:
 	// that orders them before shutdown's Wait for every listener, including
 	// ones still winding down.
-	transport.Serve(l, "agentd", nil, s.handleStream)
+	transport.Serve(l, "agtd", nil, s.handleStream)
 }
 
 func (s *Server) handleStream(stream transport.Stream) {
@@ -391,7 +391,7 @@ func (s *Server) handleStream(stream transport.Stream) {
 	defer s.handlers.Done()
 	defer s.untrack(stream)
 	if err := s.handleConnection(stream); err != nil && !isDisconnect(err) {
-		fmt.Fprintf(os.Stderr, "agentd: connection error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "agtd: connection error: %v\n", err)
 	}
 }
 
@@ -489,12 +489,12 @@ func (s *Server) handleConnection(conn transport.Stream) error {
 		// Answer in the client's own framing so it can say why it was
 		// refused instead of reporting a dropped connection.
 		return protocol.WriteErrorAtVersion(conn, versionErr.Version, fmt.Sprintf(
-			"agentd speaks protocol version %d but this client sent version %d; upgrade the agt CLI or the daemon so they match",
+			"agtd speaks protocol version %d but this client sent version %d; upgrade the agt CLI or the daemon so they match",
 			protocol.ProtocolVersion, versionErr.Version))
 	}
 	var decodeErr *protocol.DecodeError
 	if errors.As(err, &decodeErr) {
-		msg := fmt.Sprintf("agentd could not decode the request: %v", decodeErr.Err)
+		msg := fmt.Sprintf("agtd could not decode the request: %v", decodeErr.Err)
 		if decodeErr.Version == protocol.DaemonManagementVersion {
 			return protocol.WriteManagementResponse(conn, &protocol.ManagementResponse{Error: &protocol.ErrorResponse{Message: msg}})
 		}
@@ -537,15 +537,15 @@ func (s *Server) handleManagement(conn transport.Stream, req *protocol.Managemen
 		// A remote client can stop the daemon but not start it again, so
 		// only a local one may stop it.
 		if _, local := conn.(*net.UnixConn); !local {
-			return protocol.WriteManagementResponse(conn, &protocol.ManagementResponse{Error: &protocol.ErrorResponse{Message: "agentd can only be stopped from its own machine"}})
+			return protocol.WriteManagementResponse(conn, &protocol.ManagementResponse{Error: &protocol.ErrorResponse{Message: "agtd can only be stopped from its own machine"}})
 		}
 		if running && !req.Shutdown.Force {
 			return protocol.WriteManagementResponse(conn, &protocol.ManagementResponse{Shutdown: &protocol.ManagementShutdownResult{
-				Stopped: false, RunningSessions: true, Message: "cannot shut down agentd while sessions are running",
+				Stopped: false, RunningSessions: true, Message: "cannot shut down agtd while sessions are running",
 			}})
 		}
 		err := protocol.WriteManagementResponse(conn, &protocol.ManagementResponse{Shutdown: &protocol.ManagementShutdownResult{
-			Stopped: true, RunningSessions: running, Message: "agentd stopping",
+			Stopped: true, RunningSessions: running, Message: "agtd stopping",
 		}})
 		s.Shutdown()
 		return err
@@ -620,7 +620,7 @@ func (s *Server) respond(req *protocol.Request, f protocol.Features) (resp *prot
 			return fail(err)
 		}
 		if running {
-			return protocol.ErrorResponsef("cannot shut down agentd while sessions are running"), nil
+			return protocol.ErrorResponsef("cannot shut down agtd while sessions are running"), nil
 		}
 		return protocol.OkResponse(), s.Shutdown
 	case req.CreateSession != nil:
@@ -641,7 +641,7 @@ func (s *Server) respond(req *protocol.Request, f protocol.Features) (resp *prot
 	case req.Hello != nil:
 		return protocol.ErrorResponsef("hello is only valid as the first request on a stream"), nil
 	case req.HandoffSession != nil:
-		return protocol.ErrorResponsef("session handoff is between agentd and its session workers; run `agentd upgrade` on the daemon's machine"), nil
+		return protocol.ErrorResponsef("session handoff is between agtd and its session workers; run `agtd upgrade` on the daemon's machine"), nil
 	case req.AttachSession != nil:
 		return protocol.ErrorResponsef("attach needs a stream of its own"), nil
 	case req.SubscribeEvents != nil:

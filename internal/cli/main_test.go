@@ -105,7 +105,7 @@ func TestHelp(t *testing.T) {
 	var root bytes.Buffer
 	writeHelp(&root, (&app{}).rootCommand())
 	help := root.String()
-	for _, want := range []string{"agentd - agent multiplexer", "agt 0.1.0", "list         List known sessions [aliases: ls]", "-V, --version"} {
+	for _, want := range []string{"agtd - agent multiplexer", "agt 0.1.0", "list         List known sessions [aliases: ls]", "-V, --version"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("root help lacks %q:\n%s", want, help)
 		}
@@ -116,13 +116,13 @@ func TestHelp(t *testing.T) {
 	daemon, _ := parse(t, "daemon")
 	var b bytes.Buffer
 	writeHelp(&b, daemon)
-	if strings.Contains(b.String(), "agentd - agent multiplexer") || !strings.Contains(b.String(), "agt daemon") {
+	if strings.Contains(b.String(), "agtd - agent multiplexer") || !strings.Contains(b.String(), "agt daemon") {
 		t.Errorf("daemon help:\n%s", b.String())
 	}
 }
 
 func TestMainExitStatus(t *testing.T) {
-	t.Setenv("AGENTD_DIR", filepath.Join(t.TempDir(), "root"))
+	t.Setenv("AGTD_DIR", filepath.Join(t.TempDir(), "root"))
 	if got := Main([]string{"no-such-command"}); got != 2 {
 		t.Errorf("unknown command: %d", got)
 	}
@@ -230,11 +230,11 @@ func TestRemotePaths(t *testing.T) {
 }
 
 func TestDetachSessionID(t *testing.T) {
-	t.Setenv("AGENTD_SESSION_ID", "")
+	t.Setenv("AGTD_SESSION_ID", "")
 	if _, err := resolveDetachSessionID(""); err == nil {
 		t.Fatal("no session outside a managed session")
 	}
-	t.Setenv("AGENTD_SESSION_ID", "inside")
+	t.Setenv("AGTD_SESSION_ID", "inside")
 	if got, _ := resolveDetachSessionID(""); got != "inside" {
 		t.Fatalf("from env: %q", got)
 	}
@@ -244,10 +244,10 @@ func TestDetachSessionID(t *testing.T) {
 }
 
 func TestDaemonExecutable(t *testing.T) {
-	if got, _ := daemonExecutableFrom("/custom/agentd", "/bin/agt", nil); got != "/custom/agentd" {
-		t.Fatalf("AGENTD_BIN: %q", got)
+	if got, _ := daemonExecutableFrom("/custom/agtd", "/bin/agt", nil); got != "/custom/agtd" {
+		t.Fatalf("AGTD_BIN: %q", got)
 	}
-	if got, _ := daemonExecutableFrom("", "/opt/bin/agt", nil); got != "/opt/bin/agentd" {
+	if got, _ := daemonExecutableFrom("", "/opt/bin/agt", nil); got != "/opt/bin/agtd" {
 		t.Fatalf("next to agent: %q", got)
 	}
 }

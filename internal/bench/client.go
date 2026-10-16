@@ -32,7 +32,7 @@ func (b *bench) request(req *protocol.Request) (*protocol.Response, error) {
 	case err != nil:
 		return nil, err
 	case resp == nil:
-		return nil, errors.New("agentd closed the connection")
+		return nil, errors.New("agtd closed the connection")
 	case resp.Error != nil:
 		return nil, errors.New(resp.Error.Message)
 	}
@@ -94,7 +94,7 @@ func (b *bench) attach(id string) (*attachment, time.Duration, error) {
 	switch {
 	case err != nil:
 	case resp == nil:
-		err = errors.New("agentd closed the connection")
+		err = errors.New("agtd closed the connection")
 	case resp.Error != nil:
 		err = errors.New(resp.Error.Message)
 	case resp.Attached == nil:

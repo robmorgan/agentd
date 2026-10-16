@@ -1,12 +1,12 @@
 // Package procstat reads the resource usage of a process (memory, CPU time,
 // threads, open files) from the operating system, and the Go runtime's own
 // numbers for the calling process. Session workers report their usage with
-// it and `agentd bench` measures the daemon and the agents with it.
+// it and `agtd bench` measures the daemon and the agents with it.
 //
 // The OS-specific readers live in build-tagged files: macOS asks libproc
 // (cgo), Linux reads /proc. Elsewhere Read returns ErrUnsupported.
 //
-// Only agentd uses this package; the agt CLI gets the numbers over the
+// Only agtd uses this package; the agt CLI gets the numbers over the
 // protocol.
 package procstat
 

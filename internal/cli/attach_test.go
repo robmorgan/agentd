@@ -21,7 +21,7 @@ func TestAttachSequences(t *testing.T) {
 	if strings.Contains(got, "\x1b[?1049") {
 		t.Fatal("attach enters the alternate screen")
 	}
-	if got := string(terminalTitleBytes("demo - " + attachExitTitle)); got != "\x1b]0;demo - agentd\x07\x1b]2;demo - agentd\x07" {
+	if got := string(terminalTitleBytes("demo - " + attachExitTitle)); got != "\x1b]0;demo - agtd\x07\x1b]2;demo - agtd\x07" {
 		t.Fatalf("title %q", got)
 	}
 }

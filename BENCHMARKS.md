@@ -1,6 +1,6 @@
 # Benchmarks
 
-Measurements of `agentd`, the decisions taken from them, and how to rerun them. Numbers are from
+Measurements of `agtd`, the decisions taken from them, and how to rerun them. Numbers are from
 one machine and are meant for comparison and for spotting regressions, not as guarantees.
 
 ## QUIC transport
@@ -40,7 +40,7 @@ What happens when a stream's reader stops reading:
 * Each stalled stream takes its share of the connection window, which is credited back only as
   the application reads. Once the stalled streams hold the whole connection window, nothing flows
   in that direction on any stream of the connection. With quic-go's defaults (768 KiB connection,
-  512 KiB stream) that took **2** stalled streams; with agentd's windows it takes **8**, measured in
+  512 KiB stream) that took **2** stalled streams; with agtd's windows it takes **8**, measured in
   both directions (`TestQUICFlowControlBoundsStalledStreams`,
   `TestQUICStalledAttachmentsShareTheConnectionWindow`).
 * Closing a stalled stream returns its credit, but quic-go only advertises new connection credit
@@ -49,7 +49,7 @@ What happens when a stream's reader stops reading:
 * Whatever a client does with its 256 streams, the daemon buffers at most the connection window
   for it: 4 MiB until its windows have grown, 16 MiB at most.
 
-In agentd the realistic stall is daemon to client: the CLI stops reading its attachment (a
+In agtd the realistic stall is daemon to client: the CLI stops reading its attachment (a
 terminal paused with Ctrl-S, say). The daemon's writer then blocks and the worker's bounded queue
 drops output for that attachment (see "Slow Clients" in ARCHITECTURE.md), while the overlay's
 requests on the same connection keep working: round trips beside a stalled attachment took
@@ -60,7 +60,7 @@ The maximum stream window decides how fast one large transfer can go on a long p
 sender waits for window updates once the window is smaller than the bandwidth-delay product. One
 64 MiB transfer through a relay adding delay (`BenchmarkQUICWindowAtRTT`):
 
-| Round trip | Stream 1 MiB | agentd (4 MiB) | Stream 16 MiB |
+| Round trip | Stream 1 MiB | agtd (4 MiB) | Stream 16 MiB |
 | --- | --- | --- | --- |
 | 20 ms | 35 MB/s | 81 MB/s | 82 MB/s |
 | 100 ms | 7.5 MB/s | 23 MB/s | 37 MB/s |
@@ -110,7 +110,7 @@ few milliseconds on loopback, and beside a stalled stream it was unaffected; flo
 scheduling, is what could block it, and the connection window covers that. **Decision: no
 priorities.** Revisit if a real workload (large artifact streams over a slow link, say) shows
 interactive latency suffering; prioritising would then mean either an upstream quic-go feature or
-pacing large transfers in agentd.
+pacing large transfers in agtd.
 
 ### Datagrams
 
@@ -148,7 +148,7 @@ always arrived byte-exact and in order, taking 23-50 ms at 5% loss and 2.0-2.3 s
 congestion control backs off hard). Of 500 datagrams, 3.4-4.4% were lost at 5% loss and 22-25% at
 20%, as expected without retransmission.
 
-**Decision: reliable streams stay the default and the only thing agentd uses.** Datagrams stay
+**Decision: reliable streams stay the default and the only thing agtd uses.** Datagrams stay
 disabled in `quicConfig` (`EnableDatagrams` is off) until a message exists that is replaceable,
 time-sensitive and not worth retransmitting.
 
@@ -165,7 +165,7 @@ reattaches as before.
 
 ## Sessions at scale
 
-What a session costs, measured end to end with `agentd bench sessions` (`internal/bench`): it
+What a session costs, measured end to end with `agtd bench sessions` (`internal/bench`): it
 starts a private daemon in a temporary root, creates the sessions through the protocol, asks each
 worker for its own numbers (`GetSessionStats`, see "Resource Usage" in ARCHITECTURE.md), reads CPU
 time from outside the processes, and stops everything it started.
@@ -174,23 +174,23 @@ Measured on an Apple M1 Max (10 cores, 64 GiB), macOS (Darwin 27.0.0), Go 1.26.3
 commits that added the bench (on top of `d048e1e`). The machine was shared with other jobs (load
 average 9-47 during the runs), so latency and throughput are pessimistic; memory, thread, file
 and goroutine counts are not affected. The sessions run `/bin/sh -c 'exec cat'` (idle), `yes ... & exec cat` (output-heavy)
-or print 200,000 lines and then `cat` (full scrollback), so the numbers are agentd's and not a
+or print 200,000 lines and then `cat` (full scrollback), so the numbers are agtd's and not a
 real agent's.
 
 ```sh
-make agentd
-bin/agentd bench sessions --count 1
-bin/agentd bench sessions --count 10
-bin/agentd bench sessions --count 100 --output-heavy 10 --attach 10
-bin/agentd bench sessions --count 500
-bin/agentd bench sessions --count 100 --duration 60s --fill-lines 0      # idle CPU
-bin/agentd bench sessions --count 0 --output-heavy 100 --attach 100 --duration 10s --fill-lines 0
+make agtd
+bin/agtd bench sessions --count 1
+bin/agtd bench sessions --count 10
+bin/agtd bench sessions --count 100 --output-heavy 10 --attach 10
+bin/agtd bench sessions --count 500
+bin/agtd bench sessions --count 100 --duration 60s --fill-lines 0      # idle CPU
+bin/agtd bench sessions --count 0 --output-heavy 100 --attach 100 --duration 10s --fill-lines 0
 go test ./internal/worker -run '^$' -bench TerminalMemory -benchtime 1x
 go test ./internal/db -run '^$' -bench .
 ```
 
 1,000 sessions could not be run here: macOS allows 511 pseudo-terminals for all programs together
-(`kern.tty.ptmx_max`; creating more fails with "device not configured", which agentd now explains).
+(`kern.tty.ptmx_max`; creating more fails with "device not configured", which agtd now explains).
 500 was the most this machine allowed. Every per-session cost below is flat from 1 to 500 sessions,
 so 1,000 idle sessions would cost about 8.7 GiB of worker memory, 1.2 GiB for the `cat` agents,
 1,000 more daemon threads and about 100 MiB in the daemon.
@@ -201,14 +201,14 @@ One idle session (mean over 500; the same at 1, 10 and 100):
 
 | Cost | Per session | Notes |
 | --- | --- | --- |
-| Worker private memory | 8.9 MiB | Physical footprint. RSS is 19.7 MiB, but about 10.8 MiB of it is the `agentd` executable and system libraries, shared by every worker |
+| Worker private memory | 8.9 MiB | Physical footprint. RSS is 19.7 MiB, but about 10.8 MiB of it is the `agtd` executable and system libraries, shared by every worker |
 | Worker Go heap | 2.5 MiB | About 2 MiB of it is `modernc.org/libc`'s `/etc/services` and `/etc/protocols` tables, built at start-up (see the candidates below) |
 | Worker Go runtime memory | 9.8 MiB mapped | Not all resident |
 | libghostty terminal | 25 KB | `BenchmarkTerminalMemory`: 10,000 empty terminals at 160x48. At the 10 MB scrollback limit (6,900 rows at 160 columns) a terminal holds 9.4 MiB |
 | Worker threads | 9 (8-10) | Includes the PTY reader blocked in `read(2)` and `cmd.Wait` blocked in `wait4` |
-| Worker goroutines | 27 | 10 are the GC's mark workers (one per CPU), about 10 are the runtime's, 7 are agentd's |
+| Worker goroutines | 27 | 10 are the GC's mark workers (one per CPU), about 10 are the runtime's, 7 are agtd's |
 | Worker open files | 9 | stdin, the log (stdout and stderr), the PTY, the session socket, the Go netpoller's kqueue, 2 pipes |
-| Agent (`cat`) | 1.2 MiB, 1 thread, 3 files | A real agent costs far more: this is agentd's share only |
+| Agent (`cat`) | 1.2 MiB, 1 thread, 3 files | A real agent costs far more: this is agtd's share only |
 | Daemon | 1 goroutine, 1.0 thread, 85-112 KiB, 0 files | The supervisor goroutine blocked in `wait4`, which holds a thread |
 | state.db | about 220 bytes | 112 KiB with 501 rows |
 | Idle CPU | 0.4 µs/s per worker | 100 workers over 60 s: 0.004% of a core for all of them, daemon 0.0001%. Nothing wakes an idle worker |
@@ -242,7 +242,7 @@ libghostty state, and the rest Go memory from formatting snapshots and history.
 Since the worker compresses quiet scrollback (libghostty `Terminal.Compress`; see ARCHITECTURE.md,
 "Resource Usage"), the libghostty part shrinks once the session has been quiet for three seconds:
 a full 10 MB scrollback goes from 9.4 MiB to 0.6 MiB resident (23 of 24 pages compressed,
-`TestIdleScrollbackIsCompressed`), and `agentd bench sessions` measured the full-scrollback worker
+`TestIdleScrollbackIsCompressed`), and `agtd bench sessions` measured the full-scrollback worker
 at 28.2 MiB private just after its snapshots and 19.4 MiB once idle. Formatting a snapshot from
 compressed scrollback took 5.0 ms instead of 4.5-4.9 ms, and leaves the pages decompressed until
 the next quiet tick.
@@ -296,8 +296,8 @@ costs.
 
 1. **`modernc.org/libc` parses `/etc/services` at start-up: 3.9 MiB of every worker's 8.9 MiB.**
    Its `netdb` package reads `/etc/services` (678 KB on macOS) and `/etc/protocols` in `init`:
-   3.6 MB and 44,000 allocations and about 3 ms in every `agentd` process (`GODEBUG=inittrace=1`),
-   keeping about 2 MB of tables alive that agentd never uses. With a local copy that loads the
+   3.6 MB and 44,000 allocations and about 3 ms in every `agtd` process (`GODEBUG=inittrace=1`),
+   keeping about 2 MB of tables alive that agtd never uses. With a local copy that loads the
    tables on first use (a `sync.Once` in its four lookup functions; nothing outside the package
    reads them), an idle worker held 5.0 MiB private instead of 8.9 MiB, a 150 KiB heap instead of
    2.5 MiB, and 17 goroutines instead of 27 (no garbage collection had to run, so the GC's workers
@@ -468,7 +468,7 @@ Workers now reserve ids in blocks, so an attach no longer writes.
 
 ### Attach latency through the daemon
 
-`agentd bench sessions --count 10 --fill-lines 0`, attaching to each idle session once, one at a
+`agtd bench sessions --count 10 --fill-lines 0`, attaching to each idle session once, one at a
 time (`--parallel 1`) or eight at once (`--parallel 8`, the default). Later work had put two
 database writes on every attach (numbering the attachment, acknowledging the session's attention),
 in SQLite's default rollback journal, where every access waits for any write by sleeping in steps

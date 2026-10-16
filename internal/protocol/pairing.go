@@ -48,7 +48,7 @@ type PairMessage struct {
 
 type PairHello struct {
 	// Name is the client machine's name, recorded with its key on the
-	// daemon (as `agentd remote authorize` would).
+	// daemon (as `agtd remote authorize` would).
 	Name string `json:"name"`
 	// Message is the client's CPace message.
 	Message []byte `json:"message"`

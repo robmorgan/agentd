@@ -1,11 +1,11 @@
-// Command agentd is the Go implementation of the agentd daemon and its
+// Command agtd is the Go implementation of the agtd daemon and its
 // session worker:
 //
-//	agentd serve [--daemonize]   run the daemon (the agt CLI starts it)
-//	agentd upgrade               replace the running daemon, and hand running
+//	agtd serve [--daemonize]   run the daemon (the agt CLI starts it)
+//	agtd upgrade               replace the running daemon, and hand running
 //	                             sessions' workers, over to this binary
-//	agentd bench sessions ...    measure what sessions cost, on a private daemon
-//	agentd session-worker ...    one session's PTY owner (started by serve)
+//	agtd bench sessions ...    measure what sessions cost, on a private daemon
+//	agtd session-worker ...    one session's PTY owner (started by serve)
 package main
 
 import (
@@ -61,12 +61,12 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: agentd serve [--daemonize]")
-	fmt.Fprintln(os.Stderr, "       agentd upgrade")
-	fmt.Fprintln(os.Stderr, "       agentd remote enable [ADDRESS] [--yes] | disable | status")
-	fmt.Fprintln(os.Stderr, "       agentd remote pair | id | list | authorize FINGERPRINT [NAME] | revoke FINGERPRINT")
-	fmt.Fprintln(os.Stderr, "       agentd bench sessions [--count N] [--output-heavy N] [--attach K] [--duration D] [--fill-lines L] [--json] [--json-file F]")
-	fmt.Fprintln(os.Stderr, "       agentd session-worker --session-id ID --cwd DIR --created-at TS --session-uid UID --agent-name NAME --command CMD [--model M] [--arg A]...")
+	fmt.Fprintln(os.Stderr, "usage: agtd serve [--daemonize]")
+	fmt.Fprintln(os.Stderr, "       agtd upgrade")
+	fmt.Fprintln(os.Stderr, "       agtd remote enable [ADDRESS] [--yes] | disable | status")
+	fmt.Fprintln(os.Stderr, "       agtd remote pair | id | list | authorize FINGERPRINT [NAME] | revoke FINGERPRINT")
+	fmt.Fprintln(os.Stderr, "       agtd bench sessions [--count N] [--output-heavy N] [--attach K] [--duration D] [--fill-lines L] [--json] [--json-file F]")
+	fmt.Fprintln(os.Stderr, "       agtd session-worker --session-id ID --cwd DIR --created-at TS --session-uid UID --agent-name NAME --command CMD [--model M] [--arg A]...")
 }
 
 func runServe(argv []string) int {
@@ -77,19 +77,19 @@ func runServe(argv []string) int {
 	}
 	p, exe, err := discover()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+		fmt.Fprintf(os.Stderr, "agtd: %v\n", err)
 		return 1
 	}
 	if *detach {
 		if err := daemon.Daemonize(p, exe); err != nil {
-			fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+			fmt.Fprintf(os.Stderr, "agtd: %v\n", err)
 			return 1
 		}
 		return 0
 	}
 	srv, err := daemon.New(p, exe)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+		fmt.Fprintf(os.Stderr, "agtd: %v\n", err)
 		return 1
 	}
 	// SIGTERM/SIGINT stop the daemon; sessions keep running in their
@@ -97,13 +97,13 @@ func runServe(argv []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	if err := srv.Serve(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+		fmt.Fprintf(os.Stderr, "agtd: %v\n", err)
 		return 1
 	}
 	return 0
 }
 
-// runBench runs `agentd bench sessions`, which measures what sessions cost
+// runBench runs `agtd bench sessions`, which measures what sessions cost
 // on a private daemon in a temporary root, never the user's.
 func runBench(argv []string) int {
 	if len(argv) == 0 || argv[0] != "sessions" {
@@ -130,7 +130,7 @@ func runBench(argv []string) int {
 	}
 	exe, err := os.Executable()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+		fmt.Fprintf(os.Stderr, "agtd: %v\n", err)
 		return 1
 	}
 	opts.Exe = exe
@@ -142,18 +142,18 @@ func runBench(argv []string) int {
 	defer stop()
 	report, err := bench.Run(ctx, opts)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "agentd bench: %v\n", err)
+		fmt.Fprintf(os.Stderr, "agtd bench: %v\n", err)
 		return 1
 	}
 	data, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "agentd bench: %v\n", err)
+		fmt.Fprintf(os.Stderr, "agtd bench: %v\n", err)
 		return 1
 	}
 	data = append(data, '\n')
 	if *jsonFile != "" {
 		if err := os.WriteFile(*jsonFile, data, 0o644); err != nil {
-			fmt.Fprintf(os.Stderr, "agentd bench: %v\n", err)
+			fmt.Fprintf(os.Stderr, "agtd bench: %v\n", err)
 			return 1
 		}
 	}
@@ -175,7 +175,7 @@ func runUpgrade() int {
 		results, err = daemon.Upgrade(p, exe)
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+		fmt.Fprintf(os.Stderr, "agtd: %v\n", err)
 		return 1
 	}
 	fmt.Println("✓ Upgraded daemon")
@@ -201,11 +201,11 @@ func runRemote(argv []string) int {
 		err = p.EnsureLayout()
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+		fmt.Fprintf(os.Stderr, "agtd: %v\n", err)
 		return 1
 	}
 	fail := func(err error) int {
-		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+		fmt.Fprintf(os.Stderr, "agtd: %v\n", err)
 		return 1
 	}
 	authorized := p.AuthorizedClientsPath()
@@ -266,7 +266,7 @@ func runRemote(argv []string) int {
 // The change has already been made, so failing to record it only warns.
 func auditRemote(p *paths.AppPaths, kind session.EventKind, summary string) {
 	if err := daemon.RecordHostEvent(p, kind, summary); err != nil {
-		fmt.Fprintf(os.Stderr, "agentd: warning: could not record this in agt events: %v\n", err)
+		fmt.Fprintf(os.Stderr, "agtd: warning: could not record this in agt events: %v\n", err)
 	}
 }
 
@@ -276,7 +276,7 @@ func auditRemote(p *paths.AppPaths, kind session.EventKind, summary string) {
 // changes or a public one.
 func runRemoteEnable(p *paths.AppPaths, argv []string) int {
 	fail := func(err error) int {
-		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+		fmt.Fprintf(os.Stderr, "agtd: %v\n", err)
 		return 1
 	}
 	var given string
@@ -305,7 +305,7 @@ func runRemoteEnable(p *paths.AppPaths, argv []string) int {
 	} else {
 		candidate, err := daemon.DetectListenAddress()
 		if err != nil {
-			return fail(fmt.Errorf("could not find an address to listen on (%v); pass one: agentd remote enable ADDRESS", err))
+			return fail(fmt.Errorf("could not find an address to listen on (%v); pass one: agtd remote enable ADDRESS", err))
 		}
 		addr = net.JoinHostPort(candidate.IP.String(), daemon.DefaultRemotePort)
 		switch candidate.Kind {
@@ -327,7 +327,7 @@ func runRemoteEnable(p *paths.AppPaths, argv []string) int {
 				return fail(err)
 			}
 			if !ok {
-				fmt.Println("Remote access not changed. To choose an address: agentd remote enable ADDRESS")
+				fmt.Println("Remote access not changed. To choose an address: agtd remote enable ADDRESS")
 				return 1
 			}
 		}
@@ -378,7 +378,7 @@ func runRemoteEnable(p *paths.AppPaths, argv []string) int {
 	}
 	fmt.Printf("✓ Accepting remote clients over QUIC on %s\n", status.Remote)
 	fmt.Printf("  key %s\n\n", id.Fingerprint)
-	fmt.Println("To connect from another machine, pair it: run `agentd remote pair` here and")
+	fmt.Println("To connect from another machine, pair it: run `agtd remote pair` here and")
 	fmt.Println("follow its instructions. Or, on that machine, run:")
 	fmt.Printf("  agt host add %s %s --fingerprint %s\n", shortHostname(), status.Remote, id.Fingerprint)
 	fmt.Println("and then authorize it here with the command it prints.")
@@ -401,7 +401,7 @@ func runRemotePair(p *paths.AppPaths) int {
 			fmt.Println("Pairing cancelled")
 			return 1
 		}
-		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+		fmt.Fprintf(os.Stderr, "agtd: %v\n", err)
 		return 1
 	}
 	name := paired.Name
@@ -427,7 +427,7 @@ func displayAddress(addr string) string {
 
 func runRemoteDisable(p *paths.AppPaths) int {
 	fail := func(err error) int {
-		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+		fmt.Fprintf(os.Stderr, "agtd: %v\n", err)
 		return 1
 	}
 	if err := daemon.SetRemoteListen(p.Config, ""); err != nil {
@@ -452,7 +452,7 @@ func runRemoteDisable(p *paths.AppPaths) int {
 
 func runRemoteStatus(p *paths.AppPaths) int {
 	fail := func(err error) int {
-		fmt.Fprintf(os.Stderr, "agentd: %v\n", err)
+		fmt.Fprintf(os.Stderr, "agtd: %v\n", err)
 		return 1
 	}
 	cfg, err := config.Load(p.Config)
@@ -465,15 +465,15 @@ func runRemoteStatus(p *paths.AppPaths) int {
 	}
 	switch {
 	case cfg.Remote.Listen == "":
-		fmt.Println("remote access: off (turn it on with `agentd remote enable`)")
+		fmt.Println("remote access: off (turn it on with `agtd remote enable`)")
 	case status == nil:
-		fmt.Printf("remote access: configured on %s; agentd is not running\n", cfg.Remote.Listen)
+		fmt.Printf("remote access: configured on %s; agtd is not running\n", cfg.Remote.Listen)
 	case status.Remote != "":
 		fmt.Printf("remote access: listening on %s\n", status.Remote)
 	case status.RemoteError != "":
 		fmt.Printf("remote access: configured on %s but not listening: %s\n", cfg.Remote.Listen, status.RemoteError)
 	default:
-		fmt.Printf("remote access: configured on %s; restart agentd to apply it\n", cfg.Remote.Listen)
+		fmt.Printf("remote access: configured on %s; restart agtd to apply it\n", cfg.Remote.Listen)
 	}
 	id, err := transport.LoadOrCreateIdentity(p.RemoteKeyPath())
 	if err != nil {
@@ -546,7 +546,7 @@ func discover() (*paths.AppPaths, string, error) {
 	}
 	exe, err := os.Executable()
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to resolve agentd executable: %w", err)
+		return nil, "", fmt.Errorf("failed to resolve agtd executable: %w", err)
 	}
 	return p, exe, nil
 }

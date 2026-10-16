@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs (or upgrades) agentd and the agt CLI from source, on macOS,
+# Installs (or upgrades) agtd and the agt CLI from source, on macOS,
 # Debian/Ubuntu and Arch (Omarchy included). It is safe to run again: it
 # only installs what is missing, reuses the toolchains and the libghostty
 # build it made before, and if a daemon is running, upgrades it with a live
@@ -9,17 +9,17 @@
 #   ./install.sh                  # from a checkout: builds that checkout
 #
 # Go and Zig are used from PATH when new enough; otherwise pinned releases are
-# downloaded into ~/.local/share/agentd/toolchain and used for the build only.
+# downloaded into ~/.local/share/agtd/toolchain and used for the build only.
 # Only the base packages (git, make, a C compiler, pkg-config, curl, xz) come
 # from the system package manager, through sudo when not root. On Linux with
 # systemd it also installs a user unit that starts the daemon at boot.
 #
 # Environment:
-#   AGENTD_PREFIX      install agt and agentd into $AGENTD_PREFIX/bin (default ~/.local)
-#   AGENTD_REF         branch, tag or commit to build when cloning (default main)
-#   AGENTD_SRC         where to clone the source (default ~/.local/share/agentd/src)
-#   AGENTD_NO_UPGRADE  set to 1 to leave a running daemon alone
-#   AGENTD_NO_SERVICE  set to 1 to skip the systemd unit that starts the daemon at boot (Linux)
+#   AGTD_PREFIX      install agt and agtd into $AGTD_PREFIX/bin (default ~/.local)
+#   AGTD_REF         branch, tag or commit to build when cloning (default main)
+#   AGTD_SRC         where to clone the source (default ~/.local/share/agtd/src)
+#   AGTD_NO_UPGRADE  set to 1 to leave a running daemon alone
+#   AGTD_NO_SERVICE  set to 1 to skip the systemd unit that starts the daemon at boot (Linux)
 #   ZIG                a Zig 0.16+ to use instead of the one on PATH
 
 # Everything runs from main, called on the last line, so that bash has read
@@ -30,7 +30,7 @@ set -euo pipefail
 REPO_URL="https://github.com/robmorgan/agtd.git"
 GO_VERSION="1.26.9"   # downloaded when PATH has no Go >= go.mod's
 ZIG_VERSION="0.16.0"  # downloaded when PATH has no Zig >= 0.16
-DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/agentd"
+DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/agtd"
 TOOLCHAIN_DIR="${DATA_DIR}/toolchain"
 
 step() { printf '==> %s\n' "$*" >&2; }
@@ -83,7 +83,7 @@ detect_platform() {
         *" arch "*) PKG=pacman ;;
       esac
       ;;
-    *) die "unsupported OS ${OS}; agentd runs on macOS and Linux" ;;
+    *) die "unsupported OS ${OS}; agtd runs on macOS and Linux" ;;
   esac
   step "Platform: ${OS} ${GOARCH}${PKG:+ (${PKG})}"
 }
@@ -213,7 +213,7 @@ fetch_tarball() {
 }
 
 # source_dir prints the source tree to build: the checkout this script is in,
-# or a clone of AGENTD_REF under AGENTD_SRC, created or updated.
+# or a clone of AGTD_REF under AGTD_SRC, created or updated.
 source_dir() {
   local here=""
   if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
@@ -225,15 +225,9 @@ source_dir() {
     echo "${here}"
     return
   fi
-  local src="${AGENTD_SRC:-${DATA_DIR}/src}" ref="${AGENTD_REF:-main}"
+  local src="${AGTD_SRC:-${DATA_DIR}/src}" ref="${AGTD_REF:-main}"
   if [[ -d "${src}/.git" ]]; then
     step "Source: updating ${src} to ${ref}"
-    # Clones made before the repository was renamed to agtd still point at
-    # robmorgan/agentd, which only works while GitHub redirects it. Other
-    # origins (an AGENTD_SRC clone of a fork) are left alone.
-    if [[ "$(git -C "${src}" remote get-url origin 2>/dev/null)" == "https://github.com/robmorgan/agentd.git" ]]; then
-      git -C "${src}" remote set-url origin "${REPO_URL}"
-    fi
   else
     step "Source: cloning ${REPO_URL} (${ref}) into ${src}"
     mkdir -p "$(dirname "${src}")"
@@ -248,7 +242,7 @@ source_dir() {
 # daemon_pid prints the pid of this user's running daemon, if any.
 daemon_pid() {
   # Anchored, so that a command line merely mentioning it does not match.
-  pgrep -u "$(id -u)" -f '^([^ ]*/)?agentd serve( |$)' 2>/dev/null | head -n 1 || true
+  pgrep -u "$(id -u)" -f '^([^ ]*/)?agtd serve( |$)' 2>/dev/null | head -n 1 || true
 }
 
 # daemon_stale reports whether the running daemon's binary has been replaced
@@ -262,9 +256,9 @@ daemon_stale() {
 }
 
 # upgrade_daemon hands a running daemon and its sessions over to the newly
-# installed agentd when needed is 1: this run changed agentd, or the
+# installed agtd when needed is 1: this run changed agtd, or the
 # daemon was already running a replaced binary. With no daemon running it
-# does nothing, since `agentd upgrade` would start one and the CLI starts the
+# does nothing, since `agtd upgrade` would start one and the CLI starts the
 # daemon when it is first needed.
 upgrade_daemon() {
   local bindir="$1" needed="$2"
@@ -273,15 +267,15 @@ upgrade_daemon() {
     return
   fi
   if [[ "${needed}" != 1 ]]; then
-    step "Daemon: running; agentd is unchanged, so it is left as is"
+    step "Daemon: running; agtd is unchanged, so it is left as is"
     return
   fi
-  if [[ "${AGENTD_NO_UPGRADE:-}" == 1 ]]; then
-    step "Daemon: running; left alone (AGENTD_NO_UPGRADE=1). Run \`agt daemon upgrade\` to switch to the new binary."
+  if [[ "${AGTD_NO_UPGRADE:-}" == 1 ]]; then
+    step "Daemon: running; left alone (AGTD_NO_UPGRADE=1). Run \`agt daemon upgrade\` to switch to the new binary."
     return
   fi
   step "Daemon: running; upgrading it, sessions are handed over live"
-  if ! "${bindir}/agentd" upgrade; then
+  if ! "${bindir}/agtd" upgrade; then
     note "the upgrade failed; the old daemon may still be running. Retry with \`agt daemon upgrade\`."
   fi
 }
@@ -293,7 +287,7 @@ upgrade_daemon() {
 # starts the daemon when it is first needed, as it always does.
 #
 # The unit only starts the daemon the way the CLI does (serve --daemonize)
-# and then leaves it alone. agentd replaces itself on `restart` and `upgrade`
+# and then leaves it alone. agtd replaces itself on `restart` and `upgrade`
 # without systemd, so systemd must not track the daemon as the service's
 # main process, and the unit must never kill anything: the daemon and every
 # session's worker live in its cgroup. Hence a oneshot that stays active,
@@ -306,8 +300,8 @@ upgrade_daemon() {
 install_service() {
   local bindir="$1"
   [[ "${OS}" == Linux ]] || return 0
-  if [[ "${AGENTD_NO_SERVICE:-}" == 1 ]]; then
-    step "Service: skipped (AGENTD_NO_SERVICE=1)"
+  if [[ "${AGTD_NO_SERVICE:-}" == 1 ]]; then
+    step "Service: skipped (AGTD_NO_SERVICE=1)"
     return
   fi
   if ! command -v systemctl >/dev/null 2>&1 || [[ ! -d /run/systemd/system ]]; then
@@ -323,23 +317,23 @@ install_service() {
   shell="$(getent passwd "${user}" 2>/dev/null | cut -d: -f7)"
   [[ -x "${shell}" ]] || shell=/bin/sh
   unit_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
-  unit="${unit_dir}/agentd.service"
+  unit="${unit_dir}/agtd.service"
   tmp="$(mktemp)"
-  # $$0 is systemd's escape for the shell's $0, the agentd path.
+  # $$0 is systemd's escape for the shell's $0, the agtd path.
   cat >"${tmp}" <<EOF
-# Installed by agentd's install.sh, which rewrites it on every run.
+# Installed by agtd's install.sh, which rewrites it on every run.
 [Unit]
-Description=agentd, a daemon runtime for supervising coding agents
+Description=agtd, a daemon runtime for supervising coding agents
 Documentation=https://github.com/robmorgan/agtd
 
 [Service]
-# agentd restarts and upgrades itself without systemd, so this only starts it
+# agtd restarts and upgrades itself without systemd, so this only starts it
 # at boot. KillMode=process: stopping the unit must not kill the daemon or the
 # sessions' workers, which live in its cgroup.
 Type=oneshot
 RemainAfterExit=yes
 KillMode=process
-ExecStart=${shell} -l -c 'exec "\$\$0" serve --daemonize' "${bindir}/agentd"
+ExecStart=${shell} -l -c 'exec "\$\$0" serve --daemonize' "${bindir}/agtd"
 
 [Install]
 WantedBy=default.target
@@ -360,11 +354,11 @@ EOF
   if [[ "$(loginctl show-user "${user}" --property=Linger --value 2>/dev/null)" != yes ]] &&
     ! loginctl enable-linger "${user}" 2>/dev/null &&
     ! as_root loginctl enable-linger "${user}"; then
-    systemctl --user disable --quiet agentd.service 2>/dev/null || true
+    systemctl --user disable --quiet agtd.service 2>/dev/null || true
     step "Service: not enabled, since lingering could not be turned on (loginctl enable-linger ${user}); the daemon starts when agt first needs it"
     return
   fi
-  systemctl --user enable --quiet agentd.service
+  systemctl --user enable --quiet agtd.service
   step "Service: the daemon starts at boot (systemd user unit ${unit})"
 }
 
@@ -380,34 +374,6 @@ install_binary() {
   fi
   install -m 0755 "${src}/bin/${name}" "${bindir}/${name}"
   note "${name}: installed"
-}
-
-# install_alias keeps `agent`, the CLI's old name, as a link to agt in BINDIR,
-# unless another program owns that name: Cursor's and Grok's CLIs install an
-# `agent` of their own into ~/.local/bin, and must not be overwritten. An
-# `agent` left by an earlier agentd (its --help mentions agentd) is replaced
-# by the link.
-install_alias() {
-  local bindir="$1"
-  local link="${bindir}/agent"
-  if [[ -L "${link}" ]]; then
-    case "$(readlink "${link}")" in
-      agt | "${bindir}/agt") note "agent: links to agt" ;;
-      *) note "agent: left alone; it links to $(readlink "${link}"), not agt" ;;
-    esac
-    return
-  fi
-  if [[ -e "${link}" ]]; then
-    if "${link}" --help 2>/dev/null | grep -q agentd; then
-      ln -sf agt "${link}"
-      note "agent: the earlier agentd CLI, replaced by a link to agt"
-    else
-      note "agent: left alone; ${link} is another program (use agt)"
-    fi
-    return
-  fi
-  ln -s agt "${link}"
-  note "agent: links to agt, for the old name"
 }
 
 finish() {
@@ -443,8 +409,8 @@ finish() {
 
 Next:
   agt new [--cwd DIR] NAME     start an agent session (agt --help for more)
-  agentd remote enable           let other machines connect (QUIC), then
-  agentd remote pair             show a code for \`agt host add\` on the client
+  agtd remote enable           let other machines connect (QUIC), then
+  agtd remote pair             show a code for \`agt host add\` on the client
 EOF
 }
 
@@ -454,7 +420,7 @@ main() {
     "") ;;
     *) die "unknown argument $1 (see --help)" ;;
   esac
-  local prefix="${AGENTD_PREFIX:-${HOME}/.local}"
+  local prefix="${AGTD_PREFIX:-${HOME}/.local}"
   local bindir="${prefix}/bin"
 
   detect_platform
@@ -470,8 +436,7 @@ main() {
   make -C "${src}" build ZIG="${ZIG}" >&2
   install -d "${bindir}"
   install_binary "${src}" "${bindir}" agt || true
-  install_binary "${src}" "${bindir}" agentd && needed=1
-  install_alias "${bindir}"
+  install_binary "${src}" "${bindir}" agtd && needed=1
 
   upgrade_daemon "${bindir}" "${needed}"
   install_service "${bindir}"

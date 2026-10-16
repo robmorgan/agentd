@@ -1,4 +1,4 @@
-// Package bench implements `agentd bench sessions`: it starts a private
+// Package bench implements `agtd bench sessions`: it starts a private
 // daemon in a fresh runtime root, creates many sessions, and measures what
 // they cost (memory, threads, files, CPU per process, attach and snapshot
 // latency, PTY throughput and fan-out, state.db) through the protocol and
@@ -45,7 +45,7 @@ type processStats = protocol.ProcessStats
 
 // Options configure a run.
 type Options struct {
-	// Exe is the agentd binary to run as the daemon.
+	// Exe is the agtd binary to run as the daemon.
 	Exe string
 	// Count is the number of idle sessions.
 	Count int
@@ -68,7 +68,7 @@ type Options struct {
 }
 
 // The agents the bench's sessions run. They are shell commands, so the
-// numbers are agentd's and not an agent's.
+// numbers are agtd's and not an agent's.
 const (
 	idleAgent = "exec cat"
 	// floodLine is about one terminal line of mixed text.
@@ -162,7 +162,7 @@ func (b *bench) writeConfig() error {
 
 func (b *bench) workDir() string { return filepath.Join(b.root, "work") }
 
-// startDaemon starts `agentd serve` on the private root and times how long
+// startDaemon starts `agtd serve` on the private root and times how long
 // it takes to answer a request.
 func (b *bench) startDaemon(ctx context.Context) error {
 	if err := b.paths.EnsureLayout(); err != nil {
@@ -177,7 +177,7 @@ func (b *bench) startDaemon(ctx context.Context) error {
 	}
 	defer logFile.Close()
 	cmd := exec.Command(b.opts.Exe, "serve")
-	cmd.Env = append(os.Environ(), "AGENTD_DIR="+b.root)
+	cmd.Env = append(os.Environ(), "AGTD_DIR="+b.root)
 	cmd.Stdout, cmd.Stderr = logFile, logFile
 	// Its own process group, so a Ctrl-C meant for the bench does not stop
 	// the daemon before the bench has cleaned up through it.
@@ -202,11 +202,11 @@ func (b *bench) startDaemon(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-exited:
-			return fmt.Errorf("agentd exited; see %s", logFile.Name())
+			return fmt.Errorf("agtd exited; see %s", logFile.Name())
 		case <-time.After(2 * time.Millisecond):
 		}
 		if time.Since(start) > 30*time.Second {
-			return errors.New("agentd did not start within 30s")
+			return errors.New("agtd did not start within 30s")
 		}
 	}
 	b.report.DaemonStartupMs = millis(time.Since(start))
@@ -228,7 +228,7 @@ func (b *bench) machine() Machine {
 	}
 	if s, err := transport.DialUnix(b.paths.Socket, requestTimeout); err == nil {
 		s.SetDeadline(time.Now().Add(requestTimeout))
-		if protocol.WriteRequest(s, &protocol.Request{Hello: protocol.NewHello("agentd bench")}) == nil {
+		if protocol.WriteRequest(s, &protocol.Request{Hello: protocol.NewHello("agtd bench")}) == nil {
 			if resp, err := protocol.ReadResponse(s); err == nil && resp != nil && resp.Welcome != nil {
 				h := resp.Welcome.Host
 				m.Host, m.CPUs, m.Memory = h.Name, h.CPUs, h.MemoryBytes

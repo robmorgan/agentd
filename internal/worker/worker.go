@@ -2,7 +2,7 @@
 // terminal used for reattach snapshots, and the per-session Unix socket the
 // daemon proxies client requests through.
 //
-// A worker can hand its session over to a new agentd executable without
+// A worker can hand its session over to a new agtd executable without
 // stopping the agent (see handoff.go): it re-executes itself in place,
 // keeping its pid, the PTY and its socket, and the new image restores the
 // terminal state and carries on.
@@ -223,9 +223,9 @@ func Run(args Args) error {
 	cmd := exec.Command(args.Command, args.Args...)
 	cmd.Dir = args.Cwd
 	cmd.Env = append(os.Environ(),
-		"AGENTD_SESSION_ID="+args.SessionID,
-		"AGENTD_SESSION_NAME="+args.SessionID,
-		"AGENTD_CWD="+args.Cwd,
+		"AGTD_SESSION_ID="+args.SessionID,
+		"AGTD_SESSION_NAME="+args.SessionID,
+		"AGTD_CWD="+args.Cwd,
 	)
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: defaultPtyRows, Cols: defaultPtyCols})
 	if err != nil {

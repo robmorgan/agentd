@@ -17,7 +17,7 @@ import (
 	"github.com/robmorgan/agtd/internal/transport"
 )
 
-// servePair serves `agentd remote pair`: it opens the pairing window, sends
+// servePair serves `agtd remote pair`: it opens the pairing window, sends
 // its code, and waits until a client pairs (and is authorized), the window
 // closes, or the command goes away, which cancels the window. The window
 // belongs to this stream, so an interrupted command never leaves one open.
@@ -29,12 +29,12 @@ func (s *Server) servePair(conn transport.Stream) error {
 	// could, but pairing is about trusting a machine, which is decided on
 	// this one.
 	if _, local := conn.(*net.UnixConn); !local {
-		return fail("pairing can only be started on agentd's own machine")
+		return fail("pairing can only be started on agtd's own machine")
 	}
 	remote := s.RemoteAddr()
 	if remote == "" {
 		if s.config.Remote.Listen == "" {
-			return fail("remote access is off; turn it on with `agentd remote enable`")
+			return fail("remote access is off; turn it on with `agtd remote enable`")
 		}
 		return fail(fmt.Sprintf("remote access is not listening on %s: %s", s.config.Remote.Listen, s.remoteError()))
 	}
@@ -52,7 +52,7 @@ func (s *Server) servePair(conn transport.Stream) error {
 	}}); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "agentd: pairing window open until %s\n", w.ExpiresAt.Format("15:04:05"))
+	fmt.Fprintf(os.Stderr, "agtd: pairing window open until %s\n", w.ExpiresAt.Format("15:04:05"))
 
 	// The command sends nothing more; its stream ending (Ctrl-C) cancels
 	// the window. This goroutine ends when the stream is closed, at the
@@ -65,14 +65,14 @@ func (s *Server) servePair(conn transport.Stream) error {
 	select {
 	case <-w.Done():
 	case <-gone:
-		fmt.Fprintf(os.Stderr, "agentd: pairing cancelled\n")
+		fmt.Fprintf(os.Stderr, "agtd: pairing cancelled\n")
 		return nil
 	case <-s.shutdown:
-		return fail("agentd is shutting down")
+		return fail("agtd is shutting down")
 	}
 	r := w.Result()
 	if r.Err != nil {
-		fmt.Fprintf(os.Stderr, "agentd: pairing ended: %v\n", r.Err)
+		fmt.Fprintf(os.Stderr, "agtd: pairing ended: %v\n", r.Err)
 		// Someone guessing codes is worth a record; a window that expired
 		// or was cancelled here is not.
 		if errors.Is(r.Err, transport.ErrTooManyWrongCodes) {
@@ -80,7 +80,7 @@ func (s *Server) servePair(conn transport.Stream) error {
 		}
 		return fail(r.Err.Error())
 	}
-	fmt.Fprintf(os.Stderr, "agentd: paired with %s (%s) from %s; it is now authorized\n", r.Fingerprint, r.Name, r.Remote)
+	fmt.Fprintf(os.Stderr, "agtd: paired with %s (%s) from %s; it is now authorized\n", r.Fingerprint, r.Name, r.Remote)
 	s.recordHostEvent(session.EventPaired,
 		fmt.Sprintf("%s paired from %s", transport.DescribeClient(r.Fingerprint, r.Name), hostOf(r.Remote)))
 	return protocol.WriteManagementResponse(conn, &protocol.ManagementResponse{Paired: &protocol.ManagementPaired{
@@ -97,7 +97,7 @@ func Pair(ctx context.Context, p *paths.AppPaths, opened func(*protocol.Manageme
 		return nil, err
 	}
 	if !running {
-		return nil, errors.New("agentd is not running; start it with remote access on (`agentd remote enable`)")
+		return nil, errors.New("agtd is not running; start it with remote access on (`agtd remote enable`)")
 	}
 	conn, err := transport.DialUnix(p.Socket, workerDialTimeout)
 	if err != nil {
@@ -139,9 +139,9 @@ func readPairResponse(ctx context.Context, r io.Reader) (*protocol.ManagementRes
 	case err != nil:
 		return nil, err
 	case resp == nil:
-		return nil, errors.New("agentd closed the connection")
+		return nil, errors.New("agtd closed the connection")
 	case resp.Error != nil && strings.Contains(resp.Error.Message, "unknown daemon management request kind"):
-		return nil, errors.New("the running agentd predates pairing; replace it with this version first (`agentd upgrade`)")
+		return nil, errors.New("the running agtd predates pairing; replace it with this version first (`agtd upgrade`)")
 	case resp.Error != nil:
 		return nil, errors.New(resp.Error.Message)
 	}

@@ -14,7 +14,7 @@ import (
 
 // Host is a remote daemon this machine can reach, pinned to its key.
 //
-// hosts.toml in the runtime root is the client side of agentd's SSH-style
+// hosts.toml in the runtime root is the client side of agtd's SSH-style
 // trust: like ~/.ssh/known_hosts, it records which key each named host must
 // present. The daemon side (which client keys a daemon accepts) is the
 // authorized-clients file.

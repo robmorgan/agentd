@@ -69,7 +69,7 @@ func TestEventHandlerFiltersAndRuns(t *testing.T) {
 	var out bytes.Buffer
 	dir := t.TempDir()
 	h := &eventHandler{host: "dev", minLevel: session.AttentionNotice, out: &out,
-		exec: `printf '%s|%s|%s|%s|%s\n' "$AGENTD_EVENT_ID" "$AGENTD_EVENT_HOST" "$AGENTD_EVENT_SESSION" "$AGENTD_EVENT_KIND" "$AGENTD_EVENT_SUMMARY" >> ` + dir + `/log`}
+		exec: `printf '%s|%s|%s|%s|%s\n' "$AGTD_EVENT_ID" "$AGTD_EVENT_HOST" "$AGTD_EVENT_SESSION" "$AGTD_EVENT_KIND" "$AGTD_EVENT_SUMMARY" >> ` + dir + `/log`}
 	info := demoEvent()
 	info.Attention, info.Kind = session.AttentionInfo, session.EventWorking
 	if err := h.handle(info); err != nil || out.Len() != 0 {
@@ -87,10 +87,10 @@ func TestAlertBytes(t *testing.T) {
 	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
 	ev := demoEvent()
 	ev.Summary = "Approve;\x07 now"
-	if got := string(alertBytes(ev, "", env(nil))); got != "\a\x1b]9;agentd: fix: Approve;  now\x1b\\" {
+	if got := string(alertBytes(ev, "", env(nil))); got != "\a\x1b]9;agtd: fix: Approve;  now\x1b\\" {
 		t.Fatalf("osc 9: %q", got)
 	}
-	if got := string(alertBytes(ev, "dev", env(map[string]string{"VTE_VERSION": "7600"}))); got != "\a\x1b]777;notify;agentd: dev/fix;Approve;  now\x1b\\" {
+	if got := string(alertBytes(ev, "dev", env(map[string]string{"VTE_VERSION": "7600"}))); got != "\a\x1b]777;notify;agtd: dev/fix;Approve;  now\x1b\\" {
 		t.Fatalf("osc 777: %q", got)
 	}
 	got := string(alertBytes(ev, "", env(map[string]string{"TMUX": "/tmp/tmux"})))

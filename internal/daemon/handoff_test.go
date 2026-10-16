@@ -15,7 +15,7 @@ import (
 	"github.com/robmorgan/agtd/internal/session"
 )
 
-// These tests hand real session workers over to another agentd executable
+// These tests hand real session workers over to another agtd executable
 // (a copy of the test build) while their agents run, and check that nothing
 // about the session is lost on the way.
 
@@ -25,7 +25,7 @@ var (
 	nextBinErr  error
 )
 
-// nextBinary is a second agentd executable, standing in for an upgrade.
+// nextBinary is a second agtd executable, standing in for an upgrade.
 func nextBinary(t *testing.T) string {
 	t.Helper()
 	nextBinOnce.Do(func() {
@@ -34,7 +34,7 @@ func nextBinary(t *testing.T) string {
 			nextBinErr = err
 			return
 		}
-		nextBinPath = filepath.Join(filepath.Dir(workerBin), "agentd-next")
+		nextBinPath = filepath.Join(filepath.Dir(workerBin), "agtd-next")
 		nextBinErr = os.WriteFile(nextBinPath, data, 0o755)
 	})
 	if nextBinErr != nil {

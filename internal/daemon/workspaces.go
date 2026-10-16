@@ -15,7 +15,7 @@ import (
 // Workspaces are named directories on this machine, stored in state.db and
 // managed by clients over the protocol. They exist so a client that does not
 // share this machine's filesystem can still say where a session runs. They
-// are addressing only: agentd does not create, clone or sync them.
+// are addressing only: agtd does not create, clone or sync them.
 
 func (s *Server) addWorkspace(req *protocol.AddWorkspace) (*session.Workspace, error) {
 	name := strings.TrimSpace(req.Name)

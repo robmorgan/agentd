@@ -34,7 +34,7 @@ const (
 	// the shell's prompt does not land in the middle of the agent's UI. The
 	// session's output stays in the terminal's scrollback.
 	attachDetachSequence = "\x1b[H\x1b[2J"
-	attachExitTitle      = "agentd"
+	attachExitTitle      = "agtd"
 
 	// frameQueue bounds the daemon frames read ahead of the terminal.
 	frameQueue = 16
@@ -88,7 +88,7 @@ func (c *client) attachSessionUID(id, uid string) error {
 
 var (
 	// errSessionRestarting: the session's worker is restarting (a live
-	// handoff to a new agentd binary) and ended the attach stream; the
+	// handoff to a new agtd binary) and ended the attach stream; the
 	// session is still there to attach to again.
 	errSessionRestarting = errors.New("the session is restarting")
 	// errAttachDropped: the attach stream ended without a final frame, so
@@ -235,7 +235,7 @@ func (c *client) connectAttach(ctx context.Context, id string, prev attachIdenti
 		return nil, nil, nil, err
 	case resp == nil:
 		s.Close()
-		return nil, nil, nil, errors.New("agentd closed the connection")
+		return nil, nil, nil, errors.New("agtd closed the connection")
 	case !stopWatch():
 		// ctx was cancelled after the answer arrived, closing s.
 		return nil, nil, nil, ctx.Err()
@@ -556,7 +556,7 @@ func (c *client) reconnectStatus(cause error) string {
 	case c.host != nil:
 		return fmt.Sprintf("connection to %s lost, reconnecting", c.host.Name)
 	}
-	return "connection to agentd lost, reconnecting"
+	return "connection to agtd lost, reconnecting"
 }
 
 // reconnectStatusBytes draws the reconnect status on the bottom row,
@@ -693,7 +693,7 @@ func restoreSnapshot(stream *attachStream, size *protocol.SizeOwnership) ([]byte
 			return nil, nil, fmt.Errorf("unexpected response while restoring attach snapshot: %s", describeResponse(f.resp))
 		}
 	}
-	return nil, nil, errors.New("agentd closed the attach connection")
+	return nil, nil, errors.New("agtd closed the attach connection")
 }
 
 func resizeRequest() *protocol.Request {

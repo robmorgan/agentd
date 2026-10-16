@@ -1,5 +1,5 @@
 // Package cli is the agent command-line client: every command, the
-// session picker, and attach with its overlay. It talks to agentd only
+// session picker, and attach with its overlay. It talks to agtd only
 // through the agent protocol, locally over the daemon's Unix socket or
 // remotely over QUIC, and never opens the daemon's state itself.
 package cli
@@ -21,7 +21,7 @@ import (
 )
 
 // Version is the client version, reported by `agt --version` and
-// `agt daemon info`. Builds set it (and agentd's) from one place.
+// `agt daemon info`. Builds set it (and agtd's) from one place.
 var Version = "0.1.0"
 
 const rootIntro = `A local multi-session coding workflow for daemon-backed agents.
@@ -243,7 +243,7 @@ func (a *app) rootCommand() *cobra.Command {
 	}
 	root.Annotations = map[string]string{"intro": rootIntro, "after": rootExamples}
 	root.CompletionOptions.DisableDefaultCmd = true
-	root.PersistentFlags().StringVar(&a.host, "host", "", "Talk to the agentd on a remote host (see `agt host add`)")
+	root.PersistentFlags().StringVar(&a.host, "host", "", "Talk to the agtd on a remote host (see `agt host add`)")
 	root.PersistentFlags().Lookup("host").Annotations = map[string][]string{"value": {"NAME"}}
 	root.Flags().SortFlags = false
 	root.PersistentFlags().SortFlags = false
