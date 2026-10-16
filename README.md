@@ -1,8 +1,8 @@
 <h1>
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="website/public/brand/agtd-logo-on-dark.svg" />
-    <img src="website/public/brand/agtd-logo-on-light.svg" alt="agtd logo" width="250" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/robmorgan/agtd/main/website/public/brand/agtd-logo-on-dark.svg" />
+    <img src="https://raw.githubusercontent.com/robmorgan/agtd/main/website/public/brand/agtd-logo-on-light.svg" alt="agtd logo" width="250" />
   </picture>
 </h1>
   <p align="center">
